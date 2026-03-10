@@ -1,10 +1,33 @@
 # Python-generated files
 __pycache__/
 *.py[oc]
+*.pyo
 build/
 dist/
 wheels/
-*.egg-info
+*.egg-info/
 
 # Virtual environments
-.venv
+.venv/
+
+# Data artifacts
+/data/raw/ccnews_staged/
+/data/processed/*.parquet
+/data/indices/*.parquet
+/data/indices/**/*.joblib
+/data/indices/**/*.npy
+
+# Runtime outputs
+/outputs/**
+!/outputs/.gitkeep
+
+# Logs
+/log/**/*.out
+/log/**/*.err
+
+# IDE / OS
+.DS_Store
+Thumbs.db
+
+# Local uv cache
+.uv-cache/

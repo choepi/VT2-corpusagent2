@@ -1,0 +1,7 @@
+{
+  "SentimentSeries": ["entity", "time_bin", "mean", "std", "n_docs", "model_id"],
+  "EntityTrend": ["entity", "time_bin", "count", "doc_freq", "top_cooccurring", "confidence_stats", "model_id"],
+  "TopicsOverTime": ["topic_id", "time_bin", "weight", "top_terms", "coherence_proxy"],
+  "BurstEvents": ["entity_or_term", "burst_level", "start", "end", "intensity"],
+  "Keyphrases": ["phrase", "time_bin", "score", "doc_freq", "method"]
+}

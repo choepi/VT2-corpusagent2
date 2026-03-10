@@ -1,0 +1,4 @@
+{"claim_id":"c1","claim":"Coverage shows increasingly negative sentiment around inflation.","evidence_doc_ids":[],"category":"A"}
+{"claim_id":"c2","claim":"Electric vehicle policy mentions are mostly tied to regulatory agencies.","evidence_doc_ids":[],"category":"A"}
+{"claim_id":"c3","claim":"No article mentions sanctions in connection with oil prices.","evidence_doc_ids":[],"category":"C"}
+{"claim_id":"c4","claim":"A policy event happened in 1890 within this corpus window.","evidence_doc_ids":[],"category":"D"}
