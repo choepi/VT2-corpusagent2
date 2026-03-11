@@ -47,9 +47,24 @@ class NLIVerifier:
         if not scores:
             return {"entailment": 0.0, "contradiction": 0.0, "neutral": 1.0}
 
-        row = scores[0]
+        row: list[dict] = []
+        if isinstance(scores, dict):
+            row = [scores]
+        elif isinstance(scores, list):
+            if scores and isinstance(scores[0], dict):
+                row = scores
+            elif scores and isinstance(scores[0], list):
+                row = scores[0]
+
+        if not row:
+            return {"entailment": 0.0, "contradiction": 0.0, "neutral": 1.0}
+
         mapped: dict[str, float] = {}
         for entry in row:
+            if not isinstance(entry, dict):
+                continue
+            if "label" not in entry or "score" not in entry:
+                continue
             label = entry["label"].lower()
             value = float(entry["score"])
             if "entail" in label or label.endswith("2"):

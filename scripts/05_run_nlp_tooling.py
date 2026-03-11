@@ -18,6 +18,7 @@ from corpusagent2.seed import set_global_seed
 
 
 TOKEN_PATTERN = re.compile(r"[A-Za-z]{3,}")
+ENTITY_PATTERN = re.compile(r"\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,3}\b")
 
 
 def extract_time_bin(value: str) -> str:
@@ -58,32 +59,55 @@ def textrank_keywords(text: str, top_k: int = 25, window_size: int = 4) -> list[
 
 
 def run_ner(df: pd.DataFrame, model_name: str) -> pd.DataFrame:
-    import spacy
-
-    try:
-        nlp = spacy.load(model_name)
-        model_used = model_name
-    except OSError:
-        fallback = "en_core_web_sm"
-        nlp = spacy.load(fallback)
-        model_used = fallback
-
     counts: Counter = Counter()
     doc_freq: defaultdict[tuple[str, str], set[str]] = defaultdict(set)
     cooccurrence: Counter = Counter()
 
-    for row, doc in zip(df.itertuples(index=False), nlp.pipe(df["text"].tolist(), batch_size=32), strict=False):
-        time_bin = extract_time_bin(row.published_at)
-        entities = [ent.text.strip() for ent in doc.ents if ent.label_ in {"PERSON", "ORG", "GPE", "EVENT"}]
-        unique_entities = sorted(set(entity for entity in entities if entity))
+    try:
+        import spacy
+    except Exception:
+        spacy = None
 
-        for entity in entities:
-            counts[(entity, time_bin)] += 1
-            doc_freq[(entity, time_bin)].add(str(row.doc_id))
+    nlp = None
+    model_used = "regex_fallback"
+    if spacy is not None:
+        for candidate in [model_name, "en_core_web_sm"]:
+            try:
+                nlp = spacy.load(candidate)
+                model_used = candidate
+                break
+            except OSError:
+                continue
 
-        for idx, left in enumerate(unique_entities):
-            for right in unique_entities[idx + 1 :]:
-                cooccurrence[(left, right)] += 1
+    if nlp is not None:
+        docs = nlp.pipe(df["text"].astype(str).tolist(), batch_size=32)
+        row_doc_iter = zip(df.itertuples(index=False), docs, strict=False)
+        for row, doc in row_doc_iter:
+            time_bin = extract_time_bin(row.published_at)
+            entities = [ent.text.strip() for ent in doc.ents if ent.label_ in {"PERSON", "ORG", "GPE", "EVENT"}]
+            unique_entities = sorted(set(entity for entity in entities if entity))
+
+            for entity in entities:
+                counts[(entity, time_bin)] += 1
+                doc_freq[(entity, time_bin)].add(str(row.doc_id))
+
+            for idx, left in enumerate(unique_entities):
+                for right in unique_entities[idx + 1 :]:
+                    cooccurrence[(left, right)] += 1
+    else:
+        for row in df.itertuples(index=False):
+            time_bin = extract_time_bin(row.published_at)
+            text = str(row.text)
+            entities = [match.group(0).strip() for match in ENTITY_PATTERN.finditer(text)]
+            unique_entities = sorted(set(entity for entity in entities if entity))
+
+            for entity in entities:
+                counts[(entity, time_bin)] += 1
+                doc_freq[(entity, time_bin)].add(str(row.doc_id))
+
+            for idx, left in enumerate(unique_entities):
+                for right in unique_entities[idx + 1 :]:
+                    cooccurrence[(left, right)] += 1
 
     top_neighbor_by_entity: dict[str, str] = {}
     for (left, right), _weight in cooccurrence.items():

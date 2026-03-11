@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+from dataclasses import asdict
 from pathlib import Path
 
 import pandas as pd
@@ -168,10 +169,10 @@ if __name__ == "__main__":
         evidence_scores = subset["evidence_completeness"].tolist()
 
         summary["systems"][system] = {
-            "ndcg@10": bootstrap_confidence_interval(ndcg_scores).__dict__,
-            "mrr@10": bootstrap_confidence_interval(mrr_scores).__dict__,
-            "recall@100": bootstrap_confidence_interval(recall_scores).__dict__,
-            "evidence_completeness": bootstrap_confidence_interval(evidence_scores).__dict__,
+            "ndcg@10": asdict(bootstrap_confidence_interval(ndcg_scores)),
+            "mrr@10": asdict(bootstrap_confidence_interval(mrr_scores)),
+            "recall@100": asdict(bootstrap_confidence_interval(recall_scores)),
+            "evidence_completeness": asdict(bootstrap_confidence_interval(evidence_scores)),
         }
 
     baseline = df[df["system"] == "bm25"].sort_values("query_id")

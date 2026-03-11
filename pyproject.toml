@@ -6,6 +6,8 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "bertopic>=0.17.4",
+    "datasets>=4.7.0",
+    "huggingface-hub>=1.6.0",
     "joblib>=1.5.2",
     "matplotlib>=3.10.8",
     "mcp[cli]>=1.26.0",
