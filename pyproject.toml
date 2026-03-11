@@ -3,7 +3,7 @@ name = "corpusagent2"
 version = "0.1.0"
 description = "Deterministic retrieval + NLP + verification stack for longitudinal news analysis"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 dependencies = [
     "bertopic>=0.17.4",
     "joblib>=1.5.2",
