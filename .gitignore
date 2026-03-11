@@ -31,3 +31,5 @@ Thumbs.db
 
 # Local uv cache
 .uv-cache/
+*.jsonl
+*.jsonl.gz
