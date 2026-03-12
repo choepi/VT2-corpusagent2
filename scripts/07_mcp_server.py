@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import argparse
+import json
+from json.tool import main
+import os
 import sys
 from functools import lru_cache
 from pathlib import Path
@@ -116,5 +120,68 @@ def verify_claims(claims: list[str], evidence_doc_ids: list[str]) -> dict:
     }
 
 
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Run CorpusAgent2 MCP server.")
+    parser.add_argument(
+        "--transport",
+        choices=("stdio", "sse", "streamable-http"),
+        default="stdio",
+        help="MCP transport to use (default: stdio).",
+    )
+    parser.add_argument(
+        "--warmup",
+        action="store_true",
+        help="Preload retrieval and NLI assets at startup.",
+    )
+    parser.add_argument(
+        "--self-test",
+        action="store_true",
+        help="Run one local retrieval call and exit (no MCP server loop).",
+    )
+    parser.add_argument(
+        "--self-test-query",
+        default="test query",
+        help="Query string used with --self-test.",
+    )
+    parser.add_argument(
+        "--self-test-top-k",
+        type=int,
+        default=3,
+        help="Number of results returned by --self-test.",
+    )
+    return parser.parse_args()
+
+
 if __name__ == "__main__":
-    mcp.run(transport="stdio")
+    args = parse_args()
+
+    if args.warmup:
+        print("Preloading runtime assets...", file=sys.stderr, flush=True)
+        load_runtime()
+        print("Runtime assets loaded.", file=sys.stderr, flush=True)
+
+    if args.self_test:
+        print("Running self-test retrieval...", file=sys.stderr, flush=True)
+        results = retrieve(query=args.self_test_query, top_k=max(1, args.self_test_top_k))
+        print(
+            json.dumps(
+                {
+                    "query": args.self_test_query,
+                    "top_k": max(1, args.self_test_top_k),
+                    "result_count": len(results),
+                    "results": results,
+                },
+                ensure_ascii=True,
+                indent=2,
+            )
+        )
+        print("Self-test completed.", file=sys.stderr, flush=True)
+        sys.exit(0)
+
+    print(f"MCP server starting with transport={args.transport}", file=sys.stderr, flush=True)
+    try:
+        mcp.run(transport=args.transport)
+    except KeyboardInterrupt:
+        print("MCP server interrupted; shutting down.", file=sys.stderr, flush=True)
+        # Avoid occasional stdin lock crashes during interpreter finalization on macOS.
+        os._exit(130)
