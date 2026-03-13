@@ -34,7 +34,7 @@ from corpusagent2.retrieval import (
     retrieve_dense,
     retrieve_tfidf,
 )
-from corpusagent2.seed import set_global_seed
+from corpusagent2.seed import resolve_run_mode, set_global_seed
 
 
 def metric_row(system: str, query_id: str, predicted: list[str], relevant: set[str], evidence: set[str]) -> dict:
@@ -49,7 +49,7 @@ def metric_row(system: str, query_id: str, predicted: list[str], relevant: set[s
 
 
 if __name__ == "__main__":
-    MODE = "debug"  # "debug" or "full"
+    MODE = resolve_run_mode("full")
     SEED = 42
 
     PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -195,3 +195,4 @@ if __name__ == "__main__":
 
     print(f"Wrote per-query metrics: {PER_QUERY_PATH}")
     print(f"Wrote summary: {SUMMARY_PATH}")
+

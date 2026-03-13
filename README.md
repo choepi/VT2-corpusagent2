@@ -69,6 +69,19 @@ corpusagent2/
 
 ## Local Run (No Docker)
 
+Python requirement: `3.10.x`
+
+Device selection:
+
+- default is automatic: `cuda -> mps -> cpu`
+- local override (machine-specific) uses env var `CORPUSAGENT2_DEVICE` with values: `auto`, `cuda`, `mps`, `cpu`
+- Windows current shell override example: `set CORPUSAGENT2_DEVICE=cpu`
+- hardware check via uv (no project resolution):
+
+```bash
+uv run --no-project --python .venv\Scripts\python.exe python -c "import json,sys; sys.path.insert(0,'src'); from corpusagent2.seed import runtime_device_report; print(json.dumps(runtime_device_report(), indent=2))"
+```
+
 1. Install dependencies:
 
 ```bash
@@ -145,3 +158,4 @@ For meaningful metrics, populate:
 - deterministic seeds are set in all scripts (`SEED` constant)
 - all stages write machine-readable JSON summaries in `outputs/`
 - retrieval + verification outputs are tracked by run id
+

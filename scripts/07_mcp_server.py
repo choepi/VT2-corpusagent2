@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import json
-from json.tool import main
 import os
 import sys
 from functools import lru_cache
@@ -24,6 +23,7 @@ from corpusagent2.retrieval import (
     retrieve_dense,
     retrieve_tfidf,
 )
+from corpusagent2.seed import runtime_device_report
 
 from mcp.server.fastmcp import FastMCP
 
@@ -45,6 +45,7 @@ def load_runtime() -> dict:
         str(row.doc_id): f"{str(row.title)} {str(row.text)}".strip()
         for row in metadata.itertuples(index=False)
     }
+    verifier = NLIVerifier(model_id=NLI_MODEL_ID, device=None)
     return {
         "lexical_vectorizer": lexical_vectorizer,
         "lexical_matrix": lexical_matrix,
@@ -52,7 +53,8 @@ def load_runtime() -> dict:
         "dense_embeddings": dense_embeddings,
         "dense_doc_ids": dense_doc_ids,
         "doc_text_by_id": doc_text_by_id,
-        "verifier": NLIVerifier(model_id=NLI_MODEL_ID, device=-1),
+        "verifier": verifier,
+        "device_report": runtime_device_report(),
     }
 
 
@@ -157,11 +159,13 @@ if __name__ == "__main__":
 
     if args.warmup:
         print("Preloading runtime assets...", file=sys.stderr, flush=True)
-        load_runtime()
+        runtime = load_runtime()
         print("Runtime assets loaded.", file=sys.stderr, flush=True)
+        print(f"Device report: {runtime['device_report']}", file=sys.stderr, flush=True)
 
     if args.self_test:
         print("Running self-test retrieval...", file=sys.stderr, flush=True)
+        runtime = load_runtime()
         results = retrieve(query=args.self_test_query, top_k=max(1, args.self_test_top_k))
         print(
             json.dumps(
@@ -169,6 +173,7 @@ if __name__ == "__main__":
                     "query": args.self_test_query,
                     "top_k": max(1, args.self_test_top_k),
                     "result_count": len(results),
+                    "device_report": runtime["device_report"],
                     "results": results,
                 },
                 ensure_ascii=True,

@@ -5,6 +5,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from .io_utils import sentence_split
+from .seed import hf_pipeline_device_arg, resolve_device
 
 
 @dataclass(slots=True)
@@ -30,17 +31,42 @@ class ClaimVerdict:
 
 
 class NLIVerifier:
-    def __init__(self, model_id: str, device: int = -1) -> None:
+    def __init__(self, model_id: str, device: str | int | None = None) -> None:
         from transformers import pipeline
 
         self.model_id = model_id
-        self.pipe = pipeline(
-            "text-classification",
-            model=model_id,
-            tokenizer=model_id,
-            return_all_scores=True,
-            device=device,
-        )
+        self.device = "cpu"
+        self.fallback_reason = None
+
+        if isinstance(device, int):
+            pipeline_device: int | str = device
+            self.device = "cuda" if device >= 0 else "cpu"
+        else:
+            selected = resolve_device(device)
+            pipeline_device = hf_pipeline_device_arg(selected)
+            self.device = selected
+
+        try:
+            self.pipe = pipeline(
+                "text-classification",
+                model=model_id,
+                tokenizer=model_id,
+                return_all_scores=True,
+                device=pipeline_device,
+            )
+        except Exception as exc:
+            if pipeline_device != -1:
+                self.fallback_reason = str(exc)
+                self.device = "cpu"
+                self.pipe = pipeline(
+                    "text-classification",
+                    model=model_id,
+                    tokenizer=model_id,
+                    return_all_scores=True,
+                    device=-1,
+                )
+            else:
+                raise
 
     def score(self, premise: str, hypothesis: str) -> dict[str, float]:
         scores = self.pipe({"text": premise, "text_pair": hypothesis}, truncation=True)
@@ -114,7 +140,7 @@ def evaluate_claims_with_nli(
 
     for item in claims:
         claim_id = str(item["claim_id"])
-        claim = str(item["claim"]) 
+        claim = str(item["claim"])
         evidence_doc_ids = [str(doc_id) for doc_id in item.get("evidence_doc_ids", [])]
 
         evidence_text = " ".join(doc_text_by_id.get(doc_id, "") for doc_id in evidence_doc_ids)

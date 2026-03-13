@@ -22,11 +22,11 @@ from corpusagent2.retrieval import (
     retrieve_dense,
     retrieve_tfidf,
 )
-from corpusagent2.seed import set_global_seed
+from corpusagent2.seed import resolve_run_mode, runtime_device_report, set_global_seed
 
 
 if __name__ == "__main__":
-    MODE = "debug"  # "debug" or "full"
+    MODE = resolve_run_mode("full")
     SEED = 42
 
     PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -65,7 +65,7 @@ if __name__ == "__main__":
     if not workload:
         raise RuntimeError("No workload entries found")
 
-    verifier = NLIVerifier(model_id=NLI_MODEL_ID, device=-1)
+    verifier = NLIVerifier(model_id=NLI_MODEL_ID, device=None)
 
     RUN_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -187,6 +187,9 @@ if __name__ == "__main__":
             "run_id": RUN_ID,
             "mode": MODE,
             "seed": SEED,
+            "nli_device": verifier.device,
+            "nli_fallback_reason": verifier.fallback_reason,
+            "device_report": runtime_device_report(),
             "workload_size": len(final_reports),
             "output_dir": str(RUN_OUTPUT_DIR),
         },
@@ -194,3 +197,4 @@ if __name__ == "__main__":
 
     print(f"Run completed: {RUN_ID}")
     print(f"Output directory: {RUN_OUTPUT_DIR}")
+

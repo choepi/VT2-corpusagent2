@@ -11,7 +11,7 @@ if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
 from corpusagent2.io_utils import ensure_absolute, ensure_exists, write_json
-from corpusagent2.seed import set_global_seed
+from corpusagent2.seed import resolve_run_mode, set_global_seed
 
 
 def collect_source_files(source_root: Path) -> list[Path]:
@@ -52,7 +52,7 @@ def stage_files(source_files: list[Path], destination_root: Path) -> list[dict]:
 
 
 if __name__ == "__main__":
-    MODE = "debug"  # "debug" or "full"
+    MODE = resolve_run_mode("full")
     SEED = 42
 
     PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -95,3 +95,4 @@ if __name__ == "__main__":
 
     print(f"Staged {len(selected_files)} files to {DESTINATION_ROOT}")
     print(f"Summary: {OUTPUT_SUMMARY_JSON}")
+

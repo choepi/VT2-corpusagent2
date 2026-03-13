@@ -14,7 +14,7 @@ if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
 from corpusagent2.io_utils import ensure_absolute, ensure_exists, read_documents, write_json
-from corpusagent2.seed import set_global_seed
+from corpusagent2.seed import hf_pipeline_device_arg, resolve_device, resolve_run_mode, runtime_device_report, set_global_seed
 
 
 TOKEN_PATTERN = re.compile(r"[A-Za-z]{3,}")
@@ -133,10 +133,17 @@ def run_ner(df: pd.DataFrame, model_name: str) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def run_sentiment(df: pd.DataFrame, model_id: str) -> pd.DataFrame:
+def run_sentiment(df: pd.DataFrame, model_id: str, preferred_device: str | None = None) -> tuple[pd.DataFrame, str]:
     from transformers import pipeline
 
-    pipe = pipeline("text-classification", model=model_id, tokenizer=model_id)
+    selected_device = resolve_device(preferred_device)
+    pipeline_device = hf_pipeline_device_arg(selected_device)
+
+    try:
+        pipe = pipeline("text-classification", model=model_id, tokenizer=model_id, device=pipeline_device)
+    except Exception:
+        selected_device = "cpu"
+        pipe = pipeline("text-classification", model=model_id, tokenizer=model_id, device=-1)
 
     rows = []
     for row in df.itertuples(index=False):
@@ -166,7 +173,7 @@ def run_sentiment(df: pd.DataFrame, model_id: str) -> pd.DataFrame:
         .agg(mean=("score", "mean"), std=("score", "std"), n_docs=("score", "size"))
         .fillna(0.0)
     )
-    return grouped
+    return grouped, selected_device
 
 
 def run_topics_over_time(df: pd.DataFrame) -> pd.DataFrame:
@@ -282,7 +289,7 @@ def run_keyphrases(df: pd.DataFrame, top_k: int = 25) -> pd.DataFrame:
 
 
 if __name__ == "__main__":
-    MODE = "debug"  # "debug" or "full"
+    MODE = resolve_run_mode("full")
     SEED = 42
 
     PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -293,6 +300,7 @@ if __name__ == "__main__":
     DEBUG_MAX_DOCS = 5000
     NER_MODEL_ID = "en_core_web_trf"
     SENTIMENT_MODEL_ID = "cardiffnlp/twitter-roberta-base-sentiment-latest"
+    SENTIMENT_DEVICE = None  # auto via CORPUSAGENT2_DEVICE or runtime detection
 
     ensure_absolute(DOCUMENTS_PATH, "DOCUMENTS_PATH")
     ensure_absolute(OUTPUT_DIR, "OUTPUT_DIR")
@@ -313,7 +321,7 @@ if __name__ == "__main__":
     entity_path = OUTPUT_DIR / "entity_trend.parquet"
     entity_trend_df.to_parquet(entity_path, index=False)
 
-    sentiment_df = run_sentiment(df=df, model_id=SENTIMENT_MODEL_ID)
+    sentiment_df, sentiment_device_used = run_sentiment(df=df, model_id=SENTIMENT_MODEL_ID, preferred_device=SENTIMENT_DEVICE)
     sentiment_path = OUTPUT_DIR / "sentiment_series.parquet"
     sentiment_df.to_parquet(sentiment_path, index=False)
 
@@ -333,6 +341,8 @@ if __name__ == "__main__":
         "mode": MODE,
         "seed": SEED,
         "documents_processed": int(df.shape[0]),
+        "sentiment_device": sentiment_device_used,
+        "device_report": runtime_device_report(),
         "outputs": {
             "entity_trend": str(entity_path),
             "sentiment_series": str(sentiment_path),
@@ -345,3 +355,4 @@ if __name__ == "__main__":
 
     print(f"Wrote NLP outputs to: {OUTPUT_DIR}")
     print(f"Summary: {SUMMARY_PATH}")
+

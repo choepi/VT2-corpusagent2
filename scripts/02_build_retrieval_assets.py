@@ -17,11 +17,11 @@ from corpusagent2.retrieval import (
     save_dense_assets,
     save_lexical_assets,
 )
-from corpusagent2.seed import set_global_seed
+from corpusagent2.seed import resolve_run_mode, set_global_seed
 
 
 if __name__ == "__main__":
-    MODE = "debug"  # "debug" or "full"
+    MODE = resolve_run_mode("full")
     SEED = 42
 
     PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -88,3 +88,4 @@ if __name__ == "__main__":
 
     print(f"Built lexical and dense retrieval assets for {df.shape[0]} documents")
     print(f"Summary: {SUMMARY_PATH}")
+

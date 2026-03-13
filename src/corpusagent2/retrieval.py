@@ -10,6 +10,8 @@ import pandas as pd
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 
+from .seed import resolve_device
+
 
 @dataclass(slots=True)
 class RetrievalResult:
@@ -25,6 +27,30 @@ class RetrievalResult:
             "score": self.score,
             "score_components": self.score_components,
         }
+
+
+def _load_sentence_transformer(model_id: str, device: str | None = None):
+    from sentence_transformers import SentenceTransformer
+
+    resolved_device = resolve_device(device)
+    try:
+        return SentenceTransformer(model_id, device=resolved_device), resolved_device
+    except Exception:
+        if resolved_device != "cpu":
+            return SentenceTransformer(model_id, device="cpu"), "cpu"
+        raise
+
+
+def _load_cross_encoder(model_id: str, device: str | None = None):
+    from sentence_transformers import CrossEncoder
+
+    resolved_device = resolve_device(device)
+    try:
+        return CrossEncoder(model_id, device=resolved_device), resolved_device
+    except Exception:
+        if resolved_device != "cpu":
+            return CrossEncoder(model_id, device="cpu"), "cpu"
+        raise
 
 
 def build_lexical_assets(df: pd.DataFrame, max_features: int = 250_000) -> tuple[TfidfVectorizer, object, list[str]]:
@@ -70,9 +96,8 @@ def build_dense_embeddings(
     batch_size: int = 128,
     device: str | None = None,
 ) -> tuple[np.ndarray, list[str]]:
-    from sentence_transformers import SentenceTransformer
+    model, _resolved_device = _load_sentence_transformer(model_id=model_id, device=device)
 
-    model = SentenceTransformer(model_id, device=device)
     corpus = (
         (df["title"].fillna("") + " " + df["text"].fillna(""))
         .str.replace("\n", " ", regex=False)
@@ -134,9 +159,7 @@ def retrieve_dense(
     top_k: int,
     device: str | None = None,
 ) -> list[RetrievalResult]:
-    from sentence_transformers import SentenceTransformer
-
-    model = SentenceTransformer(model_id, device=device)
+    model, _resolved_device = _load_sentence_transformer(model_id=model_id, device=device)
     query_emb = model.encode(
         [query],
         convert_to_numpy=True,
@@ -195,8 +218,6 @@ def rerank_cross_encoder(
     top_k: int,
     device: str | None = None,
 ) -> list[RetrievalResult]:
-    from sentence_transformers import CrossEncoder
-
     if not candidates:
         return []
 
@@ -212,7 +233,7 @@ def rerank_cross_encoder(
     if not pairs:
         return candidates[:top_k]
 
-    reranker = CrossEncoder(model_id, device=device)
+    reranker, _resolved_device = _load_cross_encoder(model_id=model_id, device=device)
     scores = reranker.predict(pairs)
 
     score_map = {doc_id: float(score) for doc_id, score in zip(candidate_doc_ids, scores)}

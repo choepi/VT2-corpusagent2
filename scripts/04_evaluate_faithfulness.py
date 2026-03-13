@@ -12,7 +12,7 @@ if str(SRC_ROOT) not in sys.path:
 
 from corpusagent2.faithfulness import NLIVerifier, evaluate_claims_with_nli
 from corpusagent2.io_utils import ensure_absolute, ensure_exists, read_jsonl, write_json, write_jsonl
-from corpusagent2.seed import set_global_seed
+from corpusagent2.seed import resolve_run_mode, runtime_device_report, set_global_seed
 
 
 def rejection_rate(rows: list[dict], category: str) -> float:
@@ -28,7 +28,7 @@ def rejection_rate(rows: list[dict], category: str) -> float:
 
 
 if __name__ == "__main__":
-    MODE = "debug"  # "debug" or "full"
+    MODE = resolve_run_mode("full")
     SEED = 42
 
     PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -41,7 +41,7 @@ if __name__ == "__main__":
     SUMMARY_PATH = (OUTPUT_DIR / "summary.json").resolve()
 
     NLI_MODEL_ID = "FacebookAI/roberta-large-mnli"
-    NLI_DEVICE = -1
+    NLI_DEVICE = None  # auto via CORPUSAGENT2_DEVICE or runtime detection
 
     ensure_absolute(CLAIMS_PATH, "CLAIMS_PATH")
     ensure_absolute(DOC_METADATA_PATH, "DOC_METADATA_PATH")
@@ -91,6 +91,9 @@ if __name__ == "__main__":
         "mode": MODE,
         "seed": SEED,
         "nli_model_id": NLI_MODEL_ID,
+        "nli_device": verifier.device,
+        "nli_fallback_reason": verifier.fallback_reason,
+        "device_report": runtime_device_report(),
         "faithfulness": faithfulness_summary,
         "negative_rejection_rate_C": rejection_rate(merged_rows, "C"),
         "counterfactual_rejection_rate_D": rejection_rate(merged_rows, "D"),
@@ -99,3 +102,4 @@ if __name__ == "__main__":
 
     print(f"Wrote claim verdicts: {VERDICTS_PATH}")
     print(f"Wrote summary: {SUMMARY_PATH}")
+
