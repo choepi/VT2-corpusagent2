@@ -18,13 +18,9 @@ from corpusagent2.faithfulness import NLIVerifier, evaluate_claims_with_nli
 from corpusagent2.retrieval import (
     load_dense_assets,
     load_lexical_assets,
-    pg_dsn_from_env,
-    pg_table_from_env,
     reciprocal_rank_fusion,
-    resolve_retrieval_backend,
     rerank_cross_encoder,
     retrieve_dense,
-    retrieve_dense_pgvector,
     retrieve_tfidf,
 )
 from corpusagent2.seed import runtime_device_report
@@ -36,9 +32,6 @@ INDEX_ROOT = (PROJECT_ROOT / "data" / "indices").resolve()
 DENSE_MODEL_ID = "intfloat/e5-base-v2"
 RERANK_MODEL_ID = "cross-encoder/ms-marco-MiniLM-L-6-v2"
 NLI_MODEL_ID = "FacebookAI/roberta-large-mnli"
-RETRIEVAL_BACKEND = resolve_retrieval_backend("local")
-PG_DSN = pg_dsn_from_env(required=RETRIEVAL_BACKEND == "pgvector") if RETRIEVAL_BACKEND == "pgvector" else ""
-PG_TABLE = pg_table_from_env() if RETRIEVAL_BACKEND == "pgvector" else ""
 
 mcp = FastMCP("CorpusAgent2")
 
@@ -46,10 +39,7 @@ mcp = FastMCP("CorpusAgent2")
 @lru_cache(maxsize=1)
 def load_runtime() -> dict:
     lexical_vectorizer, lexical_matrix, lexical_doc_ids = load_lexical_assets(INDEX_ROOT / "lexical")
-    dense_embeddings = None
-    dense_doc_ids = None
-    if RETRIEVAL_BACKEND == "local":
-        dense_embeddings, dense_doc_ids = load_dense_assets(INDEX_ROOT / "dense")
+    dense_embeddings, dense_doc_ids = load_dense_assets(INDEX_ROOT / "dense")
     metadata = pd.read_parquet(INDEX_ROOT / "doc_metadata.parquet")
     doc_text_by_id = {
         str(row.doc_id): f"{str(row.title)} {str(row.text)}".strip()
@@ -65,9 +55,6 @@ def load_runtime() -> dict:
         "doc_text_by_id": doc_text_by_id,
         "verifier": verifier,
         "device_report": runtime_device_report(),
-        "retrieval_backend": RETRIEVAL_BACKEND,
-        "pg_dsn": PG_DSN,
-        "pg_table": PG_TABLE,
     }
 
 
@@ -87,12 +74,6 @@ def retrieve(query: str, top_k: int = 20) -> list[dict]:
         model_id=DENSE_MODEL_ID,
         embeddings=runtime["dense_embeddings"],
         doc_ids=runtime["dense_doc_ids"],
-        top_k=max(100, top_k),
-    ) if runtime["retrieval_backend"] == "local" else retrieve_dense_pgvector(
-        query=query,
-        model_id=DENSE_MODEL_ID,
-        dsn=runtime["pg_dsn"],
-        table_name=runtime["pg_table"],
         top_k=max(100, top_k),
     )
     fused = reciprocal_rank_fusion({"bm25": bm25, "dense": dense})

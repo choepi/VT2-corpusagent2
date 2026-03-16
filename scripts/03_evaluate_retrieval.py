@@ -29,13 +29,9 @@ from corpusagent2.metrics import (
 from corpusagent2.retrieval import (
     load_dense_assets,
     load_lexical_assets,
-    pg_dsn_from_env,
-    pg_table_from_env,
     reciprocal_rank_fusion,
-    resolve_retrieval_backend,
     rerank_cross_encoder,
     retrieve_dense,
-    retrieve_dense_pgvector,
     retrieve_tfidf,
 )
 from corpusagent2.seed import resolve_run_mode, set_global_seed
@@ -67,9 +63,6 @@ if __name__ == "__main__":
     DENSE_MODEL_ID = "intfloat/e5-base-v2"
     DENSE_DEVICE = None
     CROSS_ENCODER_MODEL_ID = "cross-encoder/ms-marco-MiniLM-L-6-v2"
-    RETRIEVAL_BACKEND = resolve_retrieval_backend("local")
-    PG_DSN = pg_dsn_from_env(required=RETRIEVAL_BACKEND == "pgvector") if RETRIEVAL_BACKEND == "pgvector" else ""
-    PG_TABLE = pg_table_from_env() if RETRIEVAL_BACKEND == "pgvector" else ""
 
     TOP_K = 100
     FUSION_INPUT_K = 200
@@ -83,10 +76,7 @@ if __name__ == "__main__":
     set_global_seed(SEED)
 
     lexical_vectorizer, lexical_matrix, lexical_doc_ids = load_lexical_assets(INDEX_ROOT / "lexical")
-    dense_embeddings = None
-    dense_doc_ids = None
-    if RETRIEVAL_BACKEND == "local":
-        dense_embeddings, dense_doc_ids = load_dense_assets(INDEX_ROOT / "dense")
+    dense_embeddings, dense_doc_ids = load_dense_assets(INDEX_ROOT / "dense")
 
     metadata_path = INDEX_ROOT / "doc_metadata.parquet"
     ensure_exists(metadata_path, "doc_metadata.parquet")
@@ -127,13 +117,6 @@ if __name__ == "__main__":
             doc_ids=dense_doc_ids,
             top_k=TOP_K,
             device=DENSE_DEVICE,
-        ) if RETRIEVAL_BACKEND == "local" else retrieve_dense_pgvector(
-            query=query_text,
-            model_id=DENSE_MODEL_ID,
-            dsn=PG_DSN,
-            table_name=PG_TABLE,
-            top_k=TOP_K,
-            device=DENSE_DEVICE,
         )
 
         fused = reciprocal_rank_fusion(
@@ -172,7 +155,6 @@ if __name__ == "__main__":
     summary: dict = {
         "mode": MODE,
         "seed": SEED,
-        "retrieval_backend": RETRIEVAL_BACKEND,
         "queries": len(set(df["query_id"].tolist())),
         "systems": {},
         "paired_tests_vs_bm25": {},
@@ -213,3 +195,4 @@ if __name__ == "__main__":
 
     print(f"Wrote per-query metrics: {PER_QUERY_PATH}")
     print(f"Wrote summary: {SUMMARY_PATH}")
+

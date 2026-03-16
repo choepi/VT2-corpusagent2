@@ -82,13 +82,6 @@ Device selection:
 uv run --no-project --python .venv\Scripts\python.exe python -c "import json,sys; sys.path.insert(0,'src'); from corpusagent2.seed import runtime_device_report; print(json.dumps(runtime_device_report(), indent=2))"
 ```
 
-Retrieval backend selection:
-
-- default is local file-based retrieval assets
-- set `CORPUSAGENT2_RETRIEVAL_BACKEND=pgvector` to use Postgres/pgvector for dense retrieval
-- required for pgvector mode: `CORPUSAGENT2_PG_DSN`
-- optional: `CORPUSAGENT2_PG_TABLE` (default: `ca_documents`)
-
 1. Install dependencies:
 
 ```bash
@@ -113,22 +106,6 @@ python scripts/06_run_framework.py
 
 ```bash
 python main.py
-```
-
-5. Optional Postgres/pgvector setup:
-
-```bash
-python scripts/09_init_postgres_schema.py
-python scripts/10_ingest_parquet_to_postgres.py
-python scripts/11_build_pgvector_index.py
-```
-
-Example environment variables (Windows cmd):
-
-```bash
-set CORPUSAGENT2_PG_DSN=postgresql://USER:PASSWORD@HOST:5432/DBNAME
-set CORPUSAGENT2_PG_TABLE=ca_documents
-set CORPUSAGENT2_RETRIEVAL_BACKEND=pgvector
 ```
 
 ## MCP Server
@@ -175,12 +152,6 @@ For meaningful metrics, populate:
 - `relevant_doc_ids`
 - `gold_evidence_doc_ids`
 - claim categories (`A/B/C/D`) and evidence mapping
-
-Gold files used by scripts:
-
-- retrieval evaluation/backtests: `config/retrieval_queries.jsonl`
-- faithfulness evaluation: `config/faithfulness_claims.jsonl`
-- framework workload queries + ad-hoc claims: `config/framework_workload.jsonl`
 
 ## Reproducibility
 

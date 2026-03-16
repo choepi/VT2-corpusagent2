@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from collections import defaultdict
 from dataclasses import dataclass
-import os
 from pathlib import Path
 
 import joblib
@@ -12,8 +11,6 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 
 from .seed import resolve_device
-
-_ALLOWED_RETRIEVAL_BACKENDS = {"local", "pgvector"}
 
 
 @dataclass(slots=True)
@@ -30,39 +27,6 @@ class RetrievalResult:
             "score": self.score,
             "score_components": self.score_components,
         }
-
-
-def resolve_retrieval_backend(default: str = "local") -> str:
-    requested = os.getenv("CORPUSAGENT2_RETRIEVAL_BACKEND", "").strip().lower()
-    if requested in _ALLOWED_RETRIEVAL_BACKENDS:
-        return requested
-    normalized_default = (default or "local").strip().lower()
-    if normalized_default in _ALLOWED_RETRIEVAL_BACKENDS:
-        return normalized_default
-    return "local"
-
-
-def pg_dsn_from_env(required: bool = True) -> str:
-    dsn = os.getenv("CORPUSAGENT2_PG_DSN", "").strip()
-    if required and not dsn:
-        raise RuntimeError(
-            "CORPUSAGENT2_PG_DSN is required for Postgres/pgvector operations."
-        )
-    return dsn
-
-
-def pg_table_from_env(default: str = "ca_documents") -> str:
-    table_name = os.getenv("CORPUSAGENT2_PG_TABLE", "").strip()
-    if not table_name:
-        table_name = default
-    if not table_name.replace("_", "").isalnum():
-        raise ValueError(f"Invalid table name: {table_name}")
-    return table_name
-
-
-def _vector_literal(vector: np.ndarray) -> str:
-    values = vector.astype(np.float32).tolist()
-    return "[" + ",".join(f"{value:.8f}" for value in values) + "]"
 
 
 def _load_sentence_transformer(model_id: str, device: str | None = None):
@@ -214,57 +178,6 @@ def retrieve_dense(
                 rank=rank,
                 score=float(scores[idx]),
                 score_components={"dense": float(scores[idx])},
-            )
-        )
-    return results
-
-
-def retrieve_dense_pgvector(
-    query: str,
-    model_id: str,
-    dsn: str,
-    table_name: str,
-    top_k: int,
-    device: str | None = None,
-) -> list[RetrievalResult]:
-    if top_k <= 0:
-        return []
-
-    from psycopg import connect
-    from psycopg.rows import tuple_row
-
-    model, _resolved_device = _load_sentence_transformer(model_id=model_id, device=device)
-    query_emb = model.encode(
-        [query],
-        convert_to_numpy=True,
-        normalize_embeddings=True,
-    ).astype(np.float32)[0]
-    query_vector_literal = _vector_literal(query_emb)
-
-    sql = (
-        f"SELECT doc_id, 1 - (dense_embedding <=> %s::vector) AS score "
-        f"FROM {table_name} "
-        "WHERE dense_embedding IS NOT NULL "
-        "ORDER BY dense_embedding <=> %s::vector "
-        "LIMIT %s"
-    )
-
-    rows: list[tuple] = []
-    with connect(dsn) as conn:
-        with conn.cursor(row_factory=tuple_row) as cursor:
-            cursor.execute(sql, (query_vector_literal, query_vector_literal, int(top_k)))
-            rows = cursor.fetchall()
-
-    results: list[RetrievalResult] = []
-    for rank, row in enumerate(rows, start=1):
-        doc_id, score = row
-        score_value = float(score) if score is not None else 0.0
-        results.append(
-            RetrievalResult(
-                doc_id=str(doc_id),
-                rank=rank,
-                score=score_value,
-                score_components={"dense_pgvector": score_value},
             )
         )
     return results

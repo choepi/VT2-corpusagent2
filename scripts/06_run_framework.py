@@ -17,13 +17,9 @@ from corpusagent2.provenance import make_provenance_record
 from corpusagent2.retrieval import (
     load_dense_assets,
     load_lexical_assets,
-    pg_dsn_from_env,
-    pg_table_from_env,
     reciprocal_rank_fusion,
-    resolve_retrieval_backend,
     rerank_cross_encoder,
     retrieve_dense,
-    retrieve_dense_pgvector,
     retrieve_tfidf,
 )
 from corpusagent2.seed import resolve_run_mode, runtime_device_report, set_global_seed
@@ -44,9 +40,6 @@ if __name__ == "__main__":
     DENSE_MODEL_ID = "intfloat/e5-base-v2"
     CROSS_ENCODER_MODEL_ID = "cross-encoder/ms-marco-MiniLM-L-6-v2"
     NLI_MODEL_ID = "FacebookAI/roberta-large-mnli"
-    RETRIEVAL_BACKEND = resolve_retrieval_backend("local")
-    PG_DSN = pg_dsn_from_env(required=RETRIEVAL_BACKEND == "pgvector") if RETRIEVAL_BACKEND == "pgvector" else ""
-    PG_TABLE = pg_table_from_env() if RETRIEVAL_BACKEND == "pgvector" else ""
 
     ensure_absolute(INDEX_ROOT, "INDEX_ROOT")
     ensure_absolute(WORKLOAD_PATH, "WORKLOAD_PATH")
@@ -55,10 +48,7 @@ if __name__ == "__main__":
     set_global_seed(SEED)
 
     lexical_vectorizer, lexical_matrix, lexical_doc_ids = load_lexical_assets(INDEX_ROOT / "lexical")
-    dense_embeddings = None
-    dense_doc_ids = None
-    if RETRIEVAL_BACKEND == "local":
-        dense_embeddings, dense_doc_ids = load_dense_assets(INDEX_ROOT / "dense")
+    dense_embeddings, dense_doc_ids = load_dense_assets(INDEX_ROOT / "dense")
 
     metadata_path = INDEX_ROOT / "doc_metadata.parquet"
     ensure_exists(metadata_path, "doc_metadata.parquet")
@@ -98,12 +88,6 @@ if __name__ == "__main__":
             model_id=DENSE_MODEL_ID,
             embeddings=dense_embeddings,
             doc_ids=dense_doc_ids,
-            top_k=200,
-        ) if RETRIEVAL_BACKEND == "local" else retrieve_dense_pgvector(
-            query=query,
-            model_id=DENSE_MODEL_ID,
-            dsn=PG_DSN,
-            table_name=PG_TABLE,
             top_k=200,
         )
         fused = reciprocal_rank_fusion({"bm25": bm25, "dense": dense})
@@ -203,7 +187,6 @@ if __name__ == "__main__":
             "run_id": RUN_ID,
             "mode": MODE,
             "seed": SEED,
-            "retrieval_backend": RETRIEVAL_BACKEND,
             "nli_device": verifier.device,
             "nli_fallback_reason": verifier.fallback_reason,
             "device_report": runtime_device_report(),
@@ -214,3 +197,4 @@ if __name__ == "__main__":
 
     print(f"Run completed: {RUN_ID}")
     print(f"Output directory: {RUN_OUTPUT_DIR}")
+
