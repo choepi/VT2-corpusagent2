@@ -10,6 +10,7 @@ dependencies = [
     "matplotlib>=3.10.8",
     "mcp[cli]>=1.26.0",
     "pandas>=2.3.3",
+    "psycopg[binary]>=3.2.12",
     "pyarrow>=23.0.1",
     "scikit-learn>=1.7.2",
     "sentence-transformers>=5.2.3",
