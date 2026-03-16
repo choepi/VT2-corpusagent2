@@ -86,7 +86,7 @@ if __name__ == "__main__":
         query_id = str(item["query_id"])
         query = str(item["query"])
 
-        bm25 = retrieve_tfidf(
+        tfidf = retrieve_tfidf(
             query=query,
             vectorizer=lexical_vectorizer,
             matrix=lexical_matrix,
@@ -106,7 +106,7 @@ if __name__ == "__main__":
             table_name=PG_TABLE,
             top_k=200,
         )
-        fused = reciprocal_rank_fusion({"bm25": bm25, "dense": dense})
+        fused = reciprocal_rank_fusion({"tfidf": tfidf, "dense": dense})
         reranked = rerank_cross_encoder(
             query=query,
             candidates=fused[:150],

@@ -8,7 +8,7 @@ It is designed for two execution modes:
 
 ## Research Focus
 
-- `RQ1`: Does hybrid retrieval (`BM25/TF-IDF + Dense + Fusion + Reranker`) improve evidence completeness vs lexical-only retrieval?
+- `RQ1`: Does hybrid retrieval (`TF-IDF + Dense + Fusion + Reranker`) improve evidence completeness vs lexical-only retrieval?
 - `RQ2`: Can LLM-heavy analysis be replaced by specialized measurable tools (NER, sentiment, topics, bursts, keyphrases) without losing interpretability?
 - `RQ3`: Does NLI-based verification (`roberta-large-mnli`) reduce hallucinations in final answers?
 - `RQ4`: Which index architecture yields best cost/recall tradeoff at scale (FAISS IVF-PQ vs HNSW vs pgvector)?
@@ -69,7 +69,7 @@ corpusagent2/
 
 ## Local Run (No Docker)
 
-Python requirement: `3.10.x`
+Python requirement: `3.11.x`
 
 Device selection:
 
@@ -88,6 +88,12 @@ Retrieval backend selection:
 - set `CORPUSAGENT2_RETRIEVAL_BACKEND=pgvector` to use Postgres/pgvector for dense retrieval
 - required for pgvector mode: `CORPUSAGENT2_PG_DSN`
 - optional: `CORPUSAGENT2_PG_TABLE` (default: `ca_documents`)
+
+Temporal KPI aggregation:
+
+- set `CORPUSAGENT2_TIME_GRANULARITY=year` (default) or `month` before `scripts/05_run_nlp_tooling.py`
+- sentiment/time-series consumers should request exactly one granularity
+- mixed time bins are rejected by MCP `sentiment_over_time` tool (no silent LLM/NLI fallback)
 
 1. Install dependencies:
 

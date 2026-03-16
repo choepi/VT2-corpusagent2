@@ -309,14 +309,14 @@ def run_backtest_mode(gold_queries_path: Path) -> None:
             relevant = {str(doc_id) for doc_id in row.get("gold_evidence_doc_ids", [])}
         evidence = {str(doc_id) for doc_id in row.get("gold_evidence_doc_ids", [])}
 
-        bm25_results = retrieve_tfidf(
+        tfidf_results = retrieve_tfidf(
             query=query_text,
             vectorizer=lexical_vectorizer,
             matrix=lexical_matrix,
             doc_ids=lexical_doc_ids,
             top_k=BACKTEST_TOP_K,
         )
-        bm25_doc_ids = [item.doc_id for item in bm25_results]
+        tfidf_doc_ids = [item.doc_id for item in tfidf_results]
 
         dense_doc_ids_result = dense_retrieve_cached(
             query=query_text,
@@ -326,7 +326,7 @@ def run_backtest_mode(gold_queries_path: Path) -> None:
             top_k=BACKTEST_TOP_K,
         )
 
-        bm25_as_results = [item for item in bm25_results]
+        tfidf_as_results = [item for item in tfidf_results]
         dense_as_results = [
             RetrievalResult(
                 doc_id=doc_id,
@@ -336,13 +336,13 @@ def run_backtest_mode(gold_queries_path: Path) -> None:
             )
             for idx, doc_id in enumerate(dense_doc_ids_result)
         ]
-        fused = reciprocal_rank_fusion({"bm25": bm25_as_results, "dense": dense_as_results})[:BACKTEST_TOP_K]
+        fused = reciprocal_rank_fusion({"tfidf": tfidf_as_results, "dense": dense_as_results})[:BACKTEST_TOP_K]
         fused_doc_ids = [item.doc_id for item in fused]
 
         for system_name, predicted_doc_ids in (
-            ("bm25", bm25_doc_ids),
+            ("tfidf", tfidf_doc_ids),
             ("dense", dense_doc_ids_result),
-            ("bm25_dense_rrf", fused_doc_ids),
+            ("tfidf_dense_rrf", fused_doc_ids),
         ):
             metric_rows.append(
                 {

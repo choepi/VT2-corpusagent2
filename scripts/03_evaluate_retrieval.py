@@ -113,7 +113,7 @@ if __name__ == "__main__":
             relevant_doc_ids = {str(doc_id) for doc_id in query_row.get("gold_evidence_doc_ids", [])}
         evidence_doc_ids = {str(doc_id) for doc_id in query_row.get("gold_evidence_doc_ids", [])}
 
-        bm25 = retrieve_tfidf(
+        tfidf = retrieve_tfidf(
             query=query_text,
             vectorizer=lexical_vectorizer,
             matrix=lexical_matrix,
@@ -138,7 +138,7 @@ if __name__ == "__main__":
 
         fused = reciprocal_rank_fusion(
             {
-                "bm25": bm25[:FUSION_INPUT_K],
+                "tfidf": tfidf[:FUSION_INPUT_K],
                 "dense": dense[:FUSION_INPUT_K],
             }
         )[:TOP_K]
@@ -153,15 +153,15 @@ if __name__ == "__main__":
                 top_k=TOP_K,
             )
 
-        bm25_doc_ids = [item.doc_id for item in bm25]
+        tfidf_doc_ids = [item.doc_id for item in tfidf]
         dense_doc_ids_result = [item.doc_id for item in dense]
         fused_doc_ids = [item.doc_id for item in fused]
         rerank_doc_ids = [item.doc_id for item in reranked]
 
-        metric_rows.append(metric_row("bm25", query_id, bm25_doc_ids, relevant_doc_ids, evidence_doc_ids))
+        metric_rows.append(metric_row("tfidf", query_id, tfidf_doc_ids, relevant_doc_ids, evidence_doc_ids))
         metric_rows.append(metric_row("dense", query_id, dense_doc_ids_result, relevant_doc_ids, evidence_doc_ids))
-        metric_rows.append(metric_row("bm25_dense_rrf", query_id, fused_doc_ids, relevant_doc_ids, evidence_doc_ids))
-        metric_rows.append(metric_row("bm25_dense_rrf_rerank", query_id, rerank_doc_ids, relevant_doc_ids, evidence_doc_ids))
+        metric_rows.append(metric_row("tfidf_dense_rrf", query_id, fused_doc_ids, relevant_doc_ids, evidence_doc_ids))
+        metric_rows.append(metric_row("tfidf_dense_rrf_rerank", query_id, rerank_doc_ids, relevant_doc_ids, evidence_doc_ids))
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     write_jsonl(PER_QUERY_PATH, metric_rows)
@@ -175,7 +175,7 @@ if __name__ == "__main__":
         "retrieval_backend": RETRIEVAL_BACKEND,
         "queries": len(set(df["query_id"].tolist())),
         "systems": {},
-        "paired_tests_vs_bm25": {},
+        "paired_tests_vs_tfidf": {},
     }
 
     for system in systems:
@@ -193,16 +193,16 @@ if __name__ == "__main__":
             "evidence_completeness": asdict(bootstrap_confidence_interval(evidence_scores)),
         }
 
-    baseline = df[df["system"] == "bm25"].sort_values("query_id")
+    baseline = df[df["system"] == "tfidf"].sort_values("query_id")
     for system in systems:
-        if system == "bm25":
+        if system == "tfidf":
             continue
         test_subset = df[df["system"] == system].sort_values("query_id")
         test = paired_t_test(
             test_subset["ndcg@10"].tolist(),
             baseline["ndcg@10"].tolist(),
         )
-        summary["paired_tests_vs_bm25"][system] = {
+        summary["paired_tests_vs_tfidf"][system] = {
             "metric": "ndcg@10",
             "mean_delta": test.mean_delta,
             "t_statistic": test.t_statistic,

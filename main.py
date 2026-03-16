@@ -42,7 +42,7 @@ def run_prompt(query: str, top_k: int = 10) -> tuple[list[dict], Path | None]:
         pg_dsn = pg_dsn_from_env(required=True)
         pg_table = pg_table_from_env()
 
-    bm25 = retrieve_tfidf(query, lexical_vectorizer, lexical_matrix, lexical_doc_ids, top_k=100)
+    tfidf = retrieve_tfidf(query, lexical_vectorizer, lexical_matrix, lexical_doc_ids, top_k=100)
     dense = retrieve_dense(
         query,
         "intfloat/e5-base-v2",
@@ -56,7 +56,7 @@ def run_prompt(query: str, top_k: int = 10) -> tuple[list[dict], Path | None]:
         table_name=pg_table,
         top_k=100,
     )
-    fused = reciprocal_rank_fusion({"bm25": bm25, "dense": dense})[:top_k]
+    fused = reciprocal_rank_fusion({"tfidf": tfidf, "dense": dense})[:top_k]
 
     rows: list[dict] = []
     for item in fused:
@@ -120,7 +120,7 @@ def main() -> None:
         print("No query provided, exiting.")
         return
 
-    print("Running hybrid retrieval (BM25 + Dense + RRF)...")
+    print("Running hybrid retrieval (TF-IDF + Dense + RRF)...")
     rows, figure_path = run_prompt(query=query, top_k=10)
 
     print("\nTop documents:")

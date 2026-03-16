@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import re
 import sys
 from collections import Counter, defaultdict
@@ -15,19 +16,17 @@ if str(SRC_ROOT) not in sys.path:
 
 from corpusagent2.io_utils import ensure_absolute, ensure_exists, read_documents, write_json
 from corpusagent2.seed import hf_pipeline_device_arg, resolve_device, resolve_run_mode, runtime_device_report, set_global_seed
+from corpusagent2.temporal import extract_time_bin as extract_time_bin_granular
+from corpusagent2.temporal import normalize_granularity
 
 
 TOKEN_PATTERN = re.compile(r"[A-Za-z]{3,}")
 ENTITY_PATTERN = re.compile(r"\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,3}\b")
+TIME_GRANULARITY = normalize_granularity(os.getenv("CORPUSAGENT2_TIME_GRANULARITY", "year"))
 
 
 def extract_time_bin(value: str) -> str:
-    value = str(value).strip()
-    if not value:
-        return "unknown"
-    if len(value) >= 4 and value[:4].isdigit():
-        return value[:4]
-    return "unknown"
+    return extract_time_bin_granular(value=value, granularity=TIME_GRANULARITY)
 
 
 def tokenize(text: str) -> list[str]:
@@ -58,26 +57,47 @@ def textrank_keywords(text: str, top_k: int = 25, window_size: int = 4) -> list[
     return ranked[:top_k]
 
 
-def run_ner(df: pd.DataFrame, model_name: str) -> pd.DataFrame:
-    counts: Counter = Counter()
-    doc_freq: defaultdict[tuple[str, str], set[str]] = defaultdict(set)
-    cooccurrence: Counter = Counter()
-
+def load_spacy_ner_model(model_name: str):
     try:
         import spacy
     except Exception:
-        spacy = None
+        return None, "regex_fallback"
 
-    nlp = None
-    model_used = "regex_fallback"
-    if spacy is not None:
-        for candidate in [model_name, "en_core_web_sm"]:
-            try:
-                nlp = spacy.load(candidate)
-                model_used = candidate
-                break
-            except OSError:
-                continue
+    candidates = [model_name, "en_core_web_lg", "en_core_web_sm"]
+    for candidate in candidates:
+        try:
+            nlp = spacy.load(candidate)
+            return nlp, candidate
+        except Exception:
+            continue
+
+    # Last attempt: install small model automatically if missing.
+    try:
+        from spacy.cli import download
+
+        download("en_core_web_sm")
+        nlp = spacy.load("en_core_web_sm")
+        return nlp, "en_core_web_sm"
+    except BaseException:
+        return None, "regex_fallback"
+
+
+def maybe_sample(df: pd.DataFrame, max_docs: int | None, seed: int) -> pd.DataFrame:
+    if max_docs is None:
+        return df
+    if max_docs <= 0:
+        return df.head(0).copy()
+    if df.shape[0] <= max_docs:
+        return df
+    return df.sample(n=max_docs, random_state=seed).reset_index(drop=True)
+
+
+def run_ner(df: pd.DataFrame, model_name: str, max_docs: int | None = None, seed: int = 42) -> pd.DataFrame:
+    df = maybe_sample(df=df, max_docs=max_docs, seed=seed)
+    counts: Counter = Counter()
+    doc_freq: defaultdict[tuple[str, str], set[str]] = defaultdict(set)
+    cooccurrence: Counter = Counter()
+    nlp, model_used = load_spacy_ner_model(model_name=model_name)
 
     if nlp is not None:
         docs = nlp.pipe(df["text"].astype(str).tolist(), batch_size=32)
@@ -133,7 +153,15 @@ def run_ner(df: pd.DataFrame, model_name: str) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def run_sentiment(df: pd.DataFrame, model_id: str, preferred_device: str | None = None) -> tuple[pd.DataFrame, str]:
+def run_sentiment(
+    df: pd.DataFrame,
+    model_id: str,
+    preferred_device: str | None = None,
+    batch_size: int = 16,
+    max_docs: int | None = None,
+    seed: int = 42,
+) -> tuple[pd.DataFrame, str]:
+    df = maybe_sample(df=df, max_docs=max_docs, seed=seed)
     from transformers import pipeline
 
     selected_device = resolve_device(preferred_device)
@@ -146,26 +174,40 @@ def run_sentiment(df: pd.DataFrame, model_id: str, preferred_device: str | None 
         pipe = pipeline("text-classification", model=model_id, tokenizer=model_id, device=-1)
 
     rows = []
-    for row in df.itertuples(index=False):
-        text = str(row.text)[:1200]
-        pred = pipe(text, truncation=True)[0]
-        label = str(pred["label"]).lower()
+    time_bins = [extract_time_bin(value) for value in df["published_at"].astype(str).tolist()]
+    texts = [str(text)[:1200] for text in df["text"].astype(str).tolist()]
 
-        if "neg" in label:
-            score = -1.0
-        elif "pos" in label:
-            score = 1.0
-        else:
-            score = 0.0
+    for start in range(0, len(texts), batch_size):
+        batch_texts = texts[start : start + batch_size]
+        batch_bins = time_bins[start : start + batch_size]
+        try:
+            preds = pipe(batch_texts, truncation=True, batch_size=batch_size)
+        except Exception:
+            # Robust fallback to CPU if runtime errors happen on selected device.
+            if selected_device != "cpu":
+                selected_device = "cpu"
+                pipe = pipeline("text-classification", model=model_id, tokenizer=model_id, device=-1)
+                preds = pipe(batch_texts, truncation=True, batch_size=batch_size)
+            else:
+                preds = [{"label": "neutral", "score": 0.0} for _ in batch_texts]
 
-        rows.append(
-            {
-                "entity": "__all__",
-                "time_bin": extract_time_bin(row.published_at),
-                "score": score,
-                "model_id": model_id,
-            }
-        )
+        for pred, time_bin in zip(preds, batch_bins, strict=False):
+            label = str(pred.get("label", "")).lower()
+            if "neg" in label:
+                score = -1.0
+            elif "pos" in label:
+                score = 1.0
+            else:
+                score = 0.0
+
+            rows.append(
+                {
+                    "entity": "__all__",
+                    "time_bin": time_bin,
+                    "score": score,
+                    "model_id": model_id,
+                }
+            )
 
     sentiment_df = pd.DataFrame(rows)
     grouped = (
@@ -176,7 +218,10 @@ def run_sentiment(df: pd.DataFrame, model_id: str, preferred_device: str | None 
     return grouped, selected_device
 
 
-def run_topics_over_time(df: pd.DataFrame) -> pd.DataFrame:
+def run_topics_over_time(df: pd.DataFrame, max_docs: int | None = None, seed: int = 42) -> pd.DataFrame:
+    df = maybe_sample(df=df, max_docs=max_docs, seed=seed)
+    if df.empty:
+        return pd.DataFrame(columns=["topic_id", "time_bin", "weight", "top_terms", "coherence_proxy"])
     from bertopic import BERTopic
 
     texts = df["text"].astype(str).tolist()
@@ -266,9 +311,16 @@ def run_burst_detection(entity_trend_df: pd.DataFrame, z_threshold: float = 2.0)
     return pd.DataFrame(rows)
 
 
-def run_keyphrases(df: pd.DataFrame, top_k: int = 25) -> pd.DataFrame:
+def run_keyphrases(
+    df: pd.DataFrame,
+    top_k: int = 25,
+    max_docs_per_bin: int = 5_000,
+    seed: int = 42,
+) -> pd.DataFrame:
     rows = []
     for time_bin, subset in df.groupby(df["published_at"].map(extract_time_bin)):
+        if subset.shape[0] > max_docs_per_bin:
+            subset = subset.sample(n=max_docs_per_bin, random_state=seed)
         combined_text = " ".join(subset["text"].astype(str).tolist())
         ranked = textrank_keywords(combined_text, top_k=top_k)
         docs = subset["text"].astype(str).tolist()
@@ -298,9 +350,15 @@ if __name__ == "__main__":
     SUMMARY_PATH = (OUTPUT_DIR / "summary.json").resolve()
 
     DEBUG_MAX_DOCS = 5000
+    FULL_MAX_DOCS = 624_095
+    NER_MAX_DOCS_FULL = 30_000
+    SENTIMENT_MAX_DOCS_FULL = 30_000
+    TOPICS_MAX_DOCS_FULL = 20_000
+    KEYPHRASES_MAX_DOCS_PER_BIN = 2_500
+
     NER_MODEL_ID = "en_core_web_trf"
     SENTIMENT_MODEL_ID = "cardiffnlp/twitter-roberta-base-sentiment-latest"
-    SENTIMENT_DEVICE = None  # auto via CORPUSAGENT2_DEVICE or runtime detection
+    SENTIMENT_DEVICE = os.getenv("CORPUSAGENT2_SENTIMENT_DEVICE", "cpu").strip().lower() or "cpu"
 
     ensure_absolute(DOCUMENTS_PATH, "DOCUMENTS_PATH")
     ensure_absolute(OUTPUT_DIR, "OUTPUT_DIR")
@@ -311,38 +369,93 @@ if __name__ == "__main__":
     df = read_documents(DOCUMENTS_PATH)
     if MODE == "debug":
         df = df.head(DEBUG_MAX_DOCS).copy()
+    else:
+        df = df.head(FULL_MAX_DOCS).copy()
 
     if df.empty:
         raise RuntimeError("Input documents are empty")
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    entity_trend_df = run_ner(df=df, model_name=NER_MODEL_ID)
+    errors: dict[str, str] = {}
+    tool_rows: dict[str, int] = {}
+
+    try:
+        entity_trend_df = run_ner(
+            df=df,
+            model_name=NER_MODEL_ID,
+            max_docs=DEBUG_MAX_DOCS if MODE == "debug" else NER_MAX_DOCS_FULL,
+            seed=SEED,
+        )
+    except Exception as exc:
+        entity_trend_df = pd.DataFrame(
+            columns=["entity", "time_bin", "count", "doc_freq", "top_cooccurring", "confidence_stats", "model_id"]
+        )
+        errors["entity_trend"] = str(exc)
     entity_path = OUTPUT_DIR / "entity_trend.parquet"
     entity_trend_df.to_parquet(entity_path, index=False)
+    tool_rows["entity_trend"] = int(entity_trend_df.shape[0])
 
-    sentiment_df, sentiment_device_used = run_sentiment(df=df, model_id=SENTIMENT_MODEL_ID, preferred_device=SENTIMENT_DEVICE)
+    try:
+        sentiment_df, sentiment_device_used = run_sentiment(
+            df=df,
+            model_id=SENTIMENT_MODEL_ID,
+            preferred_device=SENTIMENT_DEVICE,
+            max_docs=DEBUG_MAX_DOCS if MODE == "debug" else SENTIMENT_MAX_DOCS_FULL,
+            seed=SEED,
+        )
+    except Exception as exc:
+        sentiment_df = pd.DataFrame(columns=["entity", "time_bin", "model_id", "mean", "std", "n_docs"])
+        sentiment_device_used = "cpu"
+        errors["sentiment_series"] = str(exc)
     sentiment_path = OUTPUT_DIR / "sentiment_series.parquet"
     sentiment_df.to_parquet(sentiment_path, index=False)
+    tool_rows["sentiment_series"] = int(sentiment_df.shape[0])
 
-    topics_df = run_topics_over_time(df=df)
+    try:
+        topics_df = run_topics_over_time(
+            df=df,
+            max_docs=DEBUG_MAX_DOCS if MODE == "debug" else TOPICS_MAX_DOCS_FULL,
+            seed=SEED,
+        )
+    except Exception as exc:
+        topics_df = pd.DataFrame(columns=["topic_id", "time_bin", "weight", "top_terms", "coherence_proxy"])
+        errors["topics_over_time"] = str(exc)
     topics_path = OUTPUT_DIR / "topics_over_time.parquet"
     topics_df.to_parquet(topics_path, index=False)
+    tool_rows["topics_over_time"] = int(topics_df.shape[0])
 
-    burst_df = run_burst_detection(entity_trend_df=entity_trend_df)
+    try:
+        burst_df = run_burst_detection(entity_trend_df=entity_trend_df)
+    except Exception as exc:
+        burst_df = pd.DataFrame(columns=["entity_or_term", "burst_level", "start", "end", "intensity"])
+        errors["burst_events"] = str(exc)
     burst_path = OUTPUT_DIR / "burst_events.parquet"
     burst_df.to_parquet(burst_path, index=False)
+    tool_rows["burst_events"] = int(burst_df.shape[0])
 
-    keyphrases_df = run_keyphrases(df=df)
+    try:
+        keyphrases_df = run_keyphrases(
+            df=df,
+            max_docs_per_bin=KEYPHRASES_MAX_DOCS_PER_BIN,
+            seed=SEED,
+        )
+    except Exception as exc:
+        keyphrases_df = pd.DataFrame(columns=["phrase", "time_bin", "score", "doc_freq", "method"])
+        errors["keyphrases"] = str(exc)
     keyphrase_path = OUTPUT_DIR / "keyphrases.parquet"
     keyphrases_df.to_parquet(keyphrase_path, index=False)
+    tool_rows["keyphrases"] = int(keyphrases_df.shape[0])
 
     summary = {
         "mode": MODE,
         "seed": SEED,
+        "time_granularity": TIME_GRANULARITY,
         "documents_processed": int(df.shape[0]),
         "sentiment_device": sentiment_device_used,
         "device_report": runtime_device_report(),
+        "tool_rows": tool_rows,
+        "errors": errors,
         "outputs": {
             "entity_trend": str(entity_path),
             "sentiment_series": str(sentiment_path),
@@ -355,4 +468,3 @@ if __name__ == "__main__":
 
     print(f"Wrote NLP outputs to: {OUTPUT_DIR}")
     print(f"Summary: {SUMMARY_PATH}")
-

@@ -28,11 +28,13 @@ from corpusagent2.retrieval import (
     retrieve_tfidf,
 )
 from corpusagent2.seed import runtime_device_report
+from corpusagent2.temporal import classify_time_bin_format, incompatible_time_bins, normalize_granularity
 
 from mcp.server.fastmcp import FastMCP
 
 
 INDEX_ROOT = (PROJECT_ROOT / "data" / "indices").resolve()
+NLP_OUTPUT_DIR = (PROJECT_ROOT / "outputs" / "nlp_tools").resolve()
 DENSE_MODEL_ID = "intfloat/e5-base-v2"
 RERANK_MODEL_ID = "cross-encoder/ms-marco-MiniLM-L-6-v2"
 NLI_MODEL_ID = "FacebookAI/roberta-large-mnli"
@@ -56,6 +58,26 @@ def load_runtime() -> dict:
         for row in metadata.itertuples(index=False)
     }
     verifier = NLIVerifier(model_id=NLI_MODEL_ID, device=None)
+    sentiment_path = NLP_OUTPUT_DIR / "sentiment_series.parquet"
+    sentiment_summary_path = NLP_OUTPUT_DIR / "summary.json"
+    sentiment_df = pd.DataFrame(columns=["entity", "time_bin", "mean", "std", "n_docs", "model_id"])
+    sentiment_time_granularity = ""
+    if sentiment_path.exists():
+        sentiment_df = pd.read_parquet(sentiment_path)
+    if sentiment_summary_path.exists():
+        try:
+            payload = json.loads(sentiment_summary_path.read_text(encoding="utf-8"))
+            sentiment_time_granularity = str(payload.get("time_granularity", "")).strip().lower()
+        except Exception:
+            sentiment_time_granularity = ""
+    if sentiment_time_granularity not in {"year", "month"}:
+        inferred = ""
+        for value in sentiment_df.get("time_bin", pd.Series([], dtype="object")).astype(str).tolist():
+            bucket = classify_time_bin_format(value)
+            if bucket in {"year", "month"}:
+                inferred = bucket
+                break
+        sentiment_time_granularity = inferred
     return {
         "lexical_vectorizer": lexical_vectorizer,
         "lexical_matrix": lexical_matrix,
@@ -68,6 +90,8 @@ def load_runtime() -> dict:
         "retrieval_backend": RETRIEVAL_BACKEND,
         "pg_dsn": PG_DSN,
         "pg_table": PG_TABLE,
+        "sentiment_df": sentiment_df,
+        "sentiment_time_granularity": sentiment_time_granularity,
     }
 
 
@@ -75,7 +99,7 @@ def load_runtime() -> dict:
 def retrieve(query: str, top_k: int = 20) -> list[dict]:
     runtime = load_runtime()
 
-    bm25 = retrieve_tfidf(
+    tfidf = retrieve_tfidf(
         query=query,
         vectorizer=runtime["lexical_vectorizer"],
         matrix=runtime["lexical_matrix"],
@@ -95,7 +119,7 @@ def retrieve(query: str, top_k: int = 20) -> list[dict]:
         table_name=runtime["pg_table"],
         top_k=max(100, top_k),
     )
-    fused = reciprocal_rank_fusion({"bm25": bm25, "dense": dense})
+    fused = reciprocal_rank_fusion({"tfidf": tfidf, "dense": dense})
     reranked = rerank_cross_encoder(
         query=query,
         candidates=fused[:150],
@@ -138,6 +162,76 @@ def verify_claims(claims: list[str], evidence_doc_ids: list[str]) -> dict:
     return {
         "summary": summary,
         "verdicts": [item.to_dict() for item in verdicts],
+    }
+
+
+@mcp.tool()
+def sentiment_over_time(
+    entity: str = "__all__",
+    granularity: str = "year",
+    start_time_bin: str = "",
+    end_time_bin: str = "",
+) -> dict:
+    runtime = load_runtime()
+    requested = normalize_granularity(granularity)
+    available = str(runtime.get("sentiment_time_granularity", "")).strip().lower()
+    sentiment_df = runtime["sentiment_df"].copy()
+
+    if sentiment_df.empty:
+        return {
+            "status": "no_data",
+            "message": f"Missing sentiment artifact at {NLP_OUTPUT_DIR / 'sentiment_series.parquet'}",
+            "requested_granularity": requested,
+        }
+
+    if available in {"year", "month"} and available != requested:
+        raise ValueError(
+            "Granularity mismatch: "
+            f"requested={requested}, available={available}. "
+            f"Regenerate NLP tooling with CORPUSAGENT2_TIME_GRANULARITY={requested}."
+        )
+
+    bins = sentiment_df.get("time_bin", pd.Series([], dtype="object")).astype(str).tolist()
+    incompatible = incompatible_time_bins(bins, requested)
+    if incompatible:
+        sample = incompatible[:10]
+        raise ValueError(
+            "Incompatible mixed time bins in sentiment data. "
+            f"Requested '{requested}' but found incompatible bins, sample={sample}."
+        )
+
+    subset = sentiment_df.copy()
+    if entity.strip():
+        subset = subset[subset["entity"].astype(str) == entity]
+    subset = subset[subset["time_bin"].astype(str) != "unknown"]
+
+    if start_time_bin.strip():
+        subset = subset[subset["time_bin"].astype(str) >= start_time_bin.strip()]
+    if end_time_bin.strip():
+        subset = subset[subset["time_bin"].astype(str) <= end_time_bin.strip()]
+
+    subset = subset.sort_values("time_bin")
+
+    rows = [
+        {
+            "entity": str(row.entity),
+            "time_bin": str(row.time_bin),
+            "mean": float(row.mean),
+            "std": float(row.std),
+            "n_docs": int(row.n_docs),
+            "model_id": str(row.model_id),
+        }
+        for row in subset.itertuples(index=False)
+    ]
+
+    return {
+        "status": "ok",
+        "requested_granularity": requested,
+        "available_granularity": available or requested,
+        "entity": entity,
+        "start_time_bin": start_time_bin,
+        "end_time_bin": end_time_bin,
+        "rows": rows,
     }
 
 
