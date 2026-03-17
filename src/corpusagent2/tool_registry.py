@@ -1,0 +1,153 @@
+from __future__ import annotations
+
+from abc import ABC, abstractmethod
+from dataclasses import asdict, dataclass, field
+from typing import Any
+
+
+@dataclass(slots=True)
+class SchemaDescriptor:
+    name: str
+    fields: dict[str, str]
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(slots=True)
+class ToolRequirement:
+    requirement_type: str
+    name: str
+    detail: str = ""
+
+    def to_dict(self) -> dict[str, str]:
+        return asdict(self)
+
+
+@dataclass(slots=True)
+class ToolSpec:
+    tool_name: str
+    provider: str
+    capabilities: list[str]
+    input_schema: SchemaDescriptor
+    output_schema: SchemaDescriptor
+    requirements: list[ToolRequirement] = field(default_factory=list)
+    cost_class: str = "medium"
+    deterministic: bool = True
+    languages_supported: list[str] = field(default_factory=lambda: ["en"])
+    priority: int = 0
+    fallback_of: str | None = None
+    tool_version: str = "1.0.0"
+    model_id: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        payload = asdict(self)
+        payload["input_schema"] = self.input_schema.to_dict()
+        payload["output_schema"] = self.output_schema.to_dict()
+        payload["requirements"] = [item.to_dict() for item in self.requirements]
+        return payload
+
+
+@dataclass(slots=True)
+class ToolExecutionResult:
+    payload: Any
+    evidence: list[dict[str, Any]] = field(default_factory=list)
+    artifacts: list[str] = field(default_factory=list)
+    caveats: list[str] = field(default_factory=list)
+    unsupported_parts: list[str] = field(default_factory=list)
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
+class ToolResolution:
+    capability: str
+    spec: ToolSpec
+    adapter: "CapabilityToolAdapter"
+    reason: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "capability": self.capability,
+            "reason": self.reason,
+            "spec": self.spec.to_dict(),
+        }
+
+
+class CapabilityToolAdapter(ABC):
+    spec: ToolSpec
+
+    @abstractmethod
+    def is_available(self, context: Any, params: dict[str, Any]) -> tuple[bool, list[str]]:
+        raise NotImplementedError
+
+    @abstractmethod
+    def run(
+        self,
+        params: dict[str, Any],
+        dependency_results: dict[str, ToolExecutionResult],
+        context: Any,
+    ) -> ToolExecutionResult:
+        raise NotImplementedError
+
+
+class ToolRegistry:
+    def __init__(self) -> None:
+        self._adapters: list[CapabilityToolAdapter] = []
+
+    def register(self, adapter: CapabilityToolAdapter) -> None:
+        self._adapters.append(adapter)
+
+    def list_tools(self, capability: str | None = None) -> list[ToolSpec]:
+        specs = [adapter.spec for adapter in self._adapters]
+        if capability is None:
+            return specs
+        return [spec for spec in specs if capability in spec.capabilities]
+
+    def resolve(
+        self,
+        capability: str,
+        context: Any,
+        params: dict[str, Any] | None = None,
+    ) -> ToolResolution:
+        params = params or {}
+        candidates: list[tuple[CapabilityToolAdapter, list[str]]] = []
+        reasons: list[str] = []
+
+        for adapter in self._adapters:
+            if capability not in adapter.spec.capabilities:
+                continue
+            available, details = adapter.is_available(context=context, params=params)
+            if available:
+                candidates.append((adapter, details))
+            else:
+                reason = "; ".join(details) if details else "unspecified"
+                reasons.append(f"{adapter.spec.tool_name}: {reason}")
+
+        if not candidates:
+            suffix = f" Unavailable candidates: {', '.join(reasons)}." if reasons else ""
+            raise LookupError(f"No tool available for capability '{capability}'.{suffix}")
+
+        cost_rank = {"low": 0, "medium": 1, "high": 2}
+        ranked = sorted(
+            candidates,
+            key=lambda item: (
+                0 if item[0].spec.deterministic else 1,
+                cost_rank.get(item[0].spec.cost_class, 3),
+                -item[0].spec.priority,
+                item[0].spec.tool_name,
+            ),
+        )
+        adapter, details = ranked[0]
+        detail_text = "; ".join(details) if details else "available"
+        reason = (
+            f"Selected {adapter.spec.tool_name} for capability '{capability}' "
+            f"because it is {'deterministic' if adapter.spec.deterministic else 'non-deterministic'}, "
+            f"cost_class={adapter.spec.cost_class}, priority={adapter.spec.priority}. "
+            f"Availability notes: {detail_text}."
+        )
+        return ToolResolution(
+            capability=capability,
+            spec=adapter.spec,
+            adapter=adapter,
+            reason=reason,
+        )
