@@ -1,0 +1,57 @@
+[
+  {
+    "question_id": "b01",
+    "raw_question": "What happened in inflation coverage in 2022?",
+    "expected_question_class": "retrieval_qa"
+  },
+  {
+    "question_id": "b02",
+    "raw_question": "Track sentiment for inflation coverage by year from 2019 to 2024.",
+    "expected_question_class": "sentiment_trend"
+  },
+  {
+    "question_id": "b03",
+    "raw_question": "Which organizations appear most in EV policy narratives over time?",
+    "expected_question_class": "entity_trend"
+  },
+  {
+    "question_id": "b04",
+    "raw_question": "Show topic shifts in energy transition reporting between 2020 and 2024.",
+    "expected_question_class": "topic_trend"
+  },
+  {
+    "question_id": "b05",
+    "raw_question": "Find burst events for mentions of OPEC in 2021-2024.",
+    "expected_question_class": "burst_analysis"
+  },
+  {
+    "question_id": "b06",
+    "raw_question": "Extract keyphrases by year for AI regulation reporting.",
+    "expected_question_class": "keyphrase_analysis"
+  },
+  {
+    "question_id": "b07",
+    "raw_question": "Compare sentiment and entities in articles about Tesla and BYD.",
+    "expected_question_class": "comparative_analysis"
+  },
+  {
+    "question_id": "b08",
+    "raw_question": "Verify the claim that inflation coverage is mostly negative.",
+    "expected_question_class": "claim_verification"
+  },
+  {
+    "question_id": "b09",
+    "raw_question": "Analyze sentiment, entities, and topics for hydrogen policy discourse.",
+    "expected_question_class": "multi_analysis"
+  },
+  {
+    "question_id": "b10",
+    "raw_question": "Compare narratives about subsidies between Europe and the United States.",
+    "expected_question_class": "comparative_analysis"
+  },
+  {
+    "question_id": "b11",
+    "raw_question": "What changed in central-bank narratives after 2023?",
+    "expected_question_class": "retrieval_qa"
+  }
+]

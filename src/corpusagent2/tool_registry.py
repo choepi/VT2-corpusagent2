@@ -57,6 +57,16 @@ class ToolExecutionResult:
     unsupported_parts: list[str] = field(default_factory=list)
     metadata: dict[str, Any] = field(default_factory=dict)
 
+    @property
+    def evidence_items(self) -> list[dict[str, Any]]:
+        # Backward-compat accessor for older code paths.
+        return self.evidence
+
+    @property
+    def artifacts_used(self) -> list[str]:
+        # Backward-compat accessor for older code paths.
+        return self.artifacts
+
 
 @dataclass(slots=True)
 class ToolResolution:
@@ -139,12 +149,20 @@ class ToolRegistry:
         )
         adapter, details = ranked[0]
         detail_text = "; ".join(details) if details else "available"
+        alternatives = [item[0].spec.tool_name for item in ranked[1:]]
+        fallback_text = (
+            f" fallback_of={adapter.spec.fallback_of}"
+            if adapter.spec.fallback_of
+            else ""
+        )
         reason = (
             f"Selected {adapter.spec.tool_name} for capability '{capability}' "
             f"because it is {'deterministic' if adapter.spec.deterministic else 'non-deterministic'}, "
             f"cost_class={adapter.spec.cost_class}, priority={adapter.spec.priority}. "
-            f"Availability notes: {detail_text}."
+            f"Availability notes: {detail_text}.{fallback_text}"
         )
+        if alternatives:
+            reason += f" Other available implementations: {alternatives}."
         return ToolResolution(
             capability=capability,
             spec=adapter.spec,

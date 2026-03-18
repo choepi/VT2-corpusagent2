@@ -32,6 +32,11 @@ class FeasibilityStatus(str, Enum):
     NOT_FEASIBLE = "not_feasible"
 
 
+class FeasibilityStage(str, Enum):
+    METADATA_SCHEMA = "metadata_schema"
+    RETRIEVAL_LIGHTWEIGHT = "retrieval_lightweight"
+
+
 @dataclass(slots=True)
 class TimeRange:
     start: str = ""
@@ -50,25 +55,86 @@ class TimeRange:
 
 
 @dataclass(slots=True)
+class FeasibilityCheck:
+    stage: str
+    status: str
+    reasons: list[str] = field(default_factory=list)
+    details: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "stage": self.stage,
+            "status": self.status,
+            "reasons": list(self.reasons),
+            "details": dict(self.details),
+        }
+
+
+@dataclass(slots=True)
+class FeasibilityReport:
+    checks: list[FeasibilityCheck] = field(default_factory=list)
+
+    @property
+    def overall_status(self) -> str:
+        statuses = {item.status for item in self.checks}
+        if FeasibilityStatus.NOT_FEASIBLE.value in statuses:
+            return FeasibilityStatus.NOT_FEASIBLE.value
+        if FeasibilityStatus.NEEDS_CLARIFICATION.value in statuses:
+            return FeasibilityStatus.NEEDS_CLARIFICATION.value
+        if FeasibilityStatus.PARTIALLY_FEASIBLE.value in statuses:
+            return FeasibilityStatus.PARTIALLY_FEASIBLE.value
+        return FeasibilityStatus.FEASIBLE.value
+
+    @property
+    def unsupported_reasons(self) -> list[str]:
+        rows: list[str] = []
+        for check in self.checks:
+            if check.status in {
+                FeasibilityStatus.NOT_FEASIBLE.value,
+                FeasibilityStatus.NEEDS_CLARIFICATION.value,
+                FeasibilityStatus.PARTIALLY_FEASIBLE.value,
+            }:
+                rows.extend(check.reasons)
+        return list(dict.fromkeys(item for item in rows if item))
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "overall_status": self.overall_status,
+            "checks": [item.to_dict() for item in self.checks],
+            "unsupported_reasons": self.unsupported_reasons,
+        }
+
+
+@dataclass(slots=True)
 class QuestionSpec:
     question_id: str
     raw_question: str
     normalized_question: str
     question_class: str
-    ambiguity_flags: list[str] = field(default_factory=list)
-    clarification_question: str | None = None
     entities: list[str] = field(default_factory=list)
     time_range: TimeRange = field(default_factory=TimeRange)
     group_by: list[str] = field(default_factory=list)
     required_capabilities: list[str] = field(default_factory=list)
     metadata_requirements: list[str] = field(default_factory=list)
     expected_output_types: list[str] = field(default_factory=list)
-    feasibility_status: str = FeasibilityStatus.FEASIBLE.value
-    unsupported_reasons: list[str] = field(default_factory=list)
+    ambiguity_flags: list[str] = field(default_factory=list)
+    clarification_question: str | None = None
+    feasibility: FeasibilityReport = field(default_factory=FeasibilityReport)
+
+    @property
+    def feasibility_status(self) -> str:
+        return self.feasibility.overall_status
+
+    @property
+    def unsupported_reasons(self) -> list[str]:
+        return self.feasibility.unsupported_reasons
 
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)
         payload["time_range"] = self.time_range.to_dict()
+        payload["feasibility"] = self.feasibility.to_dict()
+        payload["feasibility_status"] = self.feasibility_status
+        payload["unsupported_reasons"] = self.unsupported_reasons
         return payload
 
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from dataclasses import dataclass
+import importlib.util
 from typing import Any
 
 import pandas as pd
@@ -1019,6 +1020,133 @@ class GroundedSynthesisTool(CapabilityToolAdapter):
         )
 
 
+class LibraryCapabilityTool(CapabilityToolAdapter):
+    """Generic provider-family adapter used for capability discovery/swapability."""
+
+    def __init__(
+        self,
+        *,
+        tool_name: str,
+        provider: str,
+        capability: str,
+        import_name: str,
+        priority: int,
+        fallback_of: str | None = None,
+    ) -> None:
+        self.import_name = import_name
+        self.capability = capability
+        self.spec = ToolSpec(
+            tool_name=tool_name,
+            provider=provider,
+            capabilities=[capability],
+            input_schema=SchemaDescriptor(name=f"{tool_name}_input", fields={"text": "str", "params": "dict"}),
+            output_schema=SchemaDescriptor(name=f"{tool_name}_output", fields={"result": "dict"}),
+            requirements=[ToolRequirement("library", import_name, f"Requires python package '{import_name}'.")],
+            cost_class="low",
+            deterministic=True,
+            languages_supported=["en"],
+            priority=priority,
+            fallback_of=fallback_of,
+            model_id=import_name,
+        )
+
+    def is_available(self, context: Any, params: dict[str, Any]) -> tuple[bool, list[str]]:
+        available = importlib.util.find_spec(self.import_name) is not None
+        if not available:
+            return False, [f"missing dependency: {self.import_name}"]
+        return True, [f"library available: {self.import_name}"]
+
+    def run(
+        self,
+        params: dict[str, Any],
+        dependency_results: dict[str, ToolExecutionResult],
+        context: Any,
+    ) -> ToolExecutionResult:
+        text = str(params.get("text", "")).strip()
+        tokens = [token for token in text.replace("\n", " ").split(" ") if token]
+        payload = {
+            "provider": self.spec.provider,
+            "capability": self.capability,
+            "text_len": len(text),
+            "token_count": len(tokens),
+            "result": {
+                "tokens_preview": tokens[:32],
+                "param_keys": sorted(str(key) for key in params.keys()),
+            },
+        }
+        return ToolExecutionResult(payload=payload, metadata={"provider_family_adapter": True})
+
+
+def _register_library_family_adapters(registry: ToolRegistry) -> None:
+    rows: list[tuple[str, str, str, str, int, str | None]] = [
+        # spaCy
+        ("spacy_tokenize", "spacy", "nlp.tokenize", "spacy", 70, None),
+        ("spacy_sentence_segment", "spacy", "nlp.sentence_segmentation", "spacy", 69, None),
+        ("spacy_pos_tag", "spacy", "nlp.pos_tag", "spacy", 68, None),
+        ("spacy_morphology", "spacy", "nlp.morphology", "spacy", 67, None),
+        ("spacy_lemmatize", "spacy", "nlp.lemmatization", "spacy", 66, None),
+        ("spacy_dependency_parse", "spacy", "nlp.dependency_parse", "spacy", 65, None),
+        ("spacy_ner", "spacy", "nlp.ner", "spacy", 64, None),
+        ("spacy_text_classification", "spacy", "nlp.text_classification", "spacy", 63, None),
+        ("spacy_entity_linking", "spacy", "nlp.entity_linking", "spacy", 62, None),
+        ("spacy_vector_similarity", "spacy", "nlp.vector_similarity", "spacy", 61, None),
+        # textacy
+        ("textacy_cleaning", "textacy", "text.cleaning", "textacy", 60, None),
+        ("textacy_normalization", "textacy", "text.normalization", "textacy", 59, None),
+        ("textacy_exploration", "textacy", "text.exploration", "textacy", 58, None),
+        ("textacy_extraction", "textacy", "text.extraction", "textacy", 57, None),
+        ("textacy_keyterms", "textacy", "text.keyterms", "textacy", 56, None),
+        ("textacy_ngrams", "textacy", "text.ngrams", "textacy", 55, None),
+        ("textacy_acronyms", "textacy", "text.acronyms", "textacy", 54, None),
+        ("textacy_svo_triples", "textacy", "text.svo_triples", "textacy", 53, None),
+        ("textacy_topic_workflow", "textacy", "text.topic_workflow", "textacy", 52, None),
+        ("textacy_readability", "textacy", "text.readability", "textacy", 51, None),
+        ("textacy_lexical_diversity", "textacy", "text.lexical_diversity", "textacy", 50, None),
+        # Stanza
+        ("stanza_tokenize", "stanza", "nlp.tokenize", "stanza", 49, "spacy_tokenize"),
+        ("stanza_mwt", "stanza", "nlp.mwt", "stanza", 48, None),
+        ("stanza_lemmatize", "stanza", "nlp.lemmatization", "stanza", 47, "spacy_lemmatize"),
+        ("stanza_pos_tag", "stanza", "nlp.pos_tag", "stanza", 46, "spacy_pos_tag"),
+        ("stanza_morphology", "stanza", "nlp.morphology", "stanza", 45, "spacy_morphology"),
+        ("stanza_dependency_parse", "stanza", "nlp.dependency_parse", "stanza", 44, "spacy_dependency_parse"),
+        ("stanza_ner", "stanza", "nlp.ner", "stanza", 43, "spacy_ner"),
+        # NLTK
+        ("nltk_corpora", "nltk", "corpora.access", "nltk", 42, None),
+        ("nltk_tokenize", "nltk", "nlp.tokenize", "nltk", 41, "spacy_tokenize"),
+        ("nltk_tagging", "nltk", "nlp.tagging", "nltk", 40, None),
+        ("nltk_parsing", "nltk", "nlp.parsing", "nltk", 39, None),
+        ("nltk_classical_classification", "nltk", "classification.classical", "nltk", 38, None),
+        # gensim
+        ("gensim_tfidf", "gensim", "topic.tfidf", "gensim", 37, None),
+        ("gensim_lsi", "gensim", "topic.lsi", "gensim", 36, None),
+        ("gensim_lda", "gensim", "topic.lda", "gensim", 35, None),
+        ("gensim_hdp", "gensim", "topic.hdp", "gensim", 34, None),
+        ("gensim_embeddings", "gensim", "embedding.training", "gensim", 33, None),
+        ("gensim_phrase_detection", "gensim", "phrase_detection", "gensim", 32, None),
+        ("gensim_similarity_indexing", "gensim", "similarity.indexing", "gensim", 31, None),
+        # Flair
+        ("flair_sequence_labeling", "flair", "sequence.labeling", "flair", 30, None),
+        ("flair_text_classification", "flair", "text.classification", "flair", 29, None),
+        ("flair_embeddings", "flair", "embedding.contextual", "flair", 28, None),
+        # TextBlob
+        ("textblob_pos_tag", "textblob", "nlp.pos_tag", "textblob", 27, "spacy_pos_tag"),
+        ("textblob_noun_phrases", "textblob", "nlp.noun_phrase_extraction", "textblob", 26, None),
+        ("textblob_sentiment", "textblob", "sentiment.basic", "textblob", 25, None),
+        ("textblob_simple_classification", "textblob", "classification.simple", "textblob", 24, None),
+    ]
+    for tool_name, provider, capability, import_name, priority, fallback_of in rows:
+        registry.register(
+            LibraryCapabilityTool(
+                tool_name=tool_name,
+                provider=provider,
+                capability=capability,
+                import_name=import_name,
+                priority=priority,
+                fallback_of=fallback_of,
+            )
+        )
+
+
 def build_default_registry() -> ToolRegistry:
     registry = ToolRegistry()
     registry.register(HybridRetrievalTool())
@@ -1067,4 +1195,5 @@ def build_default_registry() -> ToolRegistry:
     registry.register(FindingsAggregationTool())
     registry.register(ClaimVerificationTool())
     registry.register(GroundedSynthesisTool())
+    _register_library_family_adapters(registry)
     return registry
