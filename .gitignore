@@ -29,6 +29,11 @@ wheels/
 .DS_Store
 Thumbs.db
 
+# Local environment
+.env
+.env.local
+.env.*.local
+
 # Local uv cache
 .uv-cache/
 *.jsonl

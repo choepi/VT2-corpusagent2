@@ -2,6 +2,11 @@ from __future__ import annotations
 
 from typing import Any, Callable
 
+from corpusagent2.agent_backends import InMemoryWorkingSetStore
+import pandas as pd
+
+from corpusagent2.agent_runtime import AgentRuntime, AgentRuntimeConfig
+
 from corpusagent2.tool_registry import (
     CapabilityToolAdapter,
     SchemaDescriptor,
@@ -48,3 +53,83 @@ class StaticAdapter(CapabilityToolAdapter):
         if self._run_fn is None:
             return ToolExecutionResult(payload={"ok": True})
         return self._run_fn(params, dependency_results, context)
+
+
+class FailingLLMClient:
+    def complete(self, messages: list[dict[str, str]], *, model: str, temperature: float = 0.0) -> str:
+        raise RuntimeError("LLM intentionally disabled in tests")
+
+    def complete_json(self, messages: list[dict[str, str]], *, model: str, temperature: float = 0.0) -> dict[str, Any]:
+        raise RuntimeError("LLM intentionally disabled in tests")
+
+
+class FakeSearchBackend:
+    def __init__(self, rows_by_query: dict[str, list[dict[str, Any]]]) -> None:
+        self.rows_by_query = rows_by_query
+
+    def search(
+        self,
+        *,
+        query: str,
+        top_k: int,
+        date_from: str = "",
+        date_to: str = "",
+    ) -> list[dict[str, Any]]:
+        for key, rows in self.rows_by_query.items():
+            if key.lower() in query.lower():
+                filtered = []
+                for row in rows:
+                    date = str(row.get("date", ""))
+                    if date_from and date and date < date_from:
+                        continue
+                    if date_to and date and date > date_to:
+                        continue
+                    filtered.append(dict(row))
+                return filtered[:top_k]
+        return []
+
+
+def build_test_runtime(
+    *,
+    tmp_path,
+    documents: list[dict[str, Any]],
+    search_rows_by_query: dict[str, list[dict[str, Any]]],
+):
+    class FakeRuntime:
+        def __init__(self, rows: list[dict[str, Any]]) -> None:
+            self._df = pd.DataFrame(rows)
+
+        def load_metadata(self):
+            return self._df.copy()
+
+        def doc_lookup(self):
+            return {
+                str(row["doc_id"]): {
+                    "doc_id": str(row["doc_id"]),
+                    "title": str(row.get("title", "")),
+                    "text": str(row.get("text", "")),
+                    "published_at": str(row.get("published_at", row.get("date", ""))),
+                    "source": str(row.get("source", row.get("outlet", ""))),
+                }
+                for row in documents
+            }
+
+        def load_docs(self, doc_ids):
+            if not doc_ids:
+                return self._df.copy()
+            wanted = {str(item) for item in doc_ids}
+            return self._df[self._df["doc_id"].astype(str).isin(wanted)].reset_index(drop=True)
+
+    runtime = FakeRuntime(documents)
+    store = InMemoryWorkingSetStore()
+    for document in documents:
+        store.document_lookup[str(document["doc_id"])] = dict(document)
+    config = AgentRuntimeConfig(project_root=tmp_path, outputs_root=(tmp_path / "outputs" / "agent_runtime"))
+    return AgentRuntime(
+        config=config,
+        runtime=runtime,
+        llm_client=FailingLLMClient(),
+        search_backend=FakeSearchBackend(search_rows_by_query),
+        working_store=store,
+        python_runner=None,
+    )

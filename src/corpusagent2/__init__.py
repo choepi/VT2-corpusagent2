@@ -1,15 +1,23 @@
 """CorpusAgent2 core package."""
 
 __all__ = [
+    "agent_backends",
+    "agent_capabilities",
+    "agent_executor",
+    "agent_models",
+    "agent_runtime",
+    "api",
     "execution_engine",
     "faithfulness",
     "framework",
     "io_utils",
+    "llm_provider",
     "metrics",
     "plan_graph",
     "planner",
     "provider_adapters",
     "provenance",
+    "python_runner_service",
     "question_spec",
     "retrieval",
     "run_manifest",

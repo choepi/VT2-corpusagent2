@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>CorpusAgent2 Prototype</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <section class="card hero">
+        <p class="eyebrow">CorpusAgent2 Prototype</p>
+        <h1>Ask hard corpus questions without sending every document to an LLM.</h1>
+        <p class="lede">
+          This static frontend can be hosted on GitHub Pages and pointed at a FastAPI backend on a VM.
+        </p>
+      </section>
+
+      <section class="card">
+        <label for="apiBase">API Base URL</label>
+        <input id="apiBase" type="url" value="http://127.0.0.1:8001" />
+
+        <label for="question">Question</label>
+        <textarea id="question" rows="5">Which media predicted the outbreak of the Ukraine war in 2022?</textarea>
+
+        <div class="controls">
+          <label><input id="forceAnswer" type="checkbox" /> Force answer</label>
+          <label><input id="noCache" type="checkbox" /> No cache</label>
+          <button id="runButton" type="button">Run Query</button>
+        </div>
+      </section>
+
+      <section class="grid">
+        <article class="card">
+          <h2>Run Status</h2>
+          <div id="statusBox" class="status idle">Idle</div>
+          <p id="detailText" class="muted">No run started yet.</p>
+          <h3>Active Steps</h3>
+          <ul id="activeSteps"></ul>
+          <h3>Completed Steps</h3>
+          <ul id="completedSteps"></ul>
+          <h3>Failed Steps</h3>
+          <ul id="failedSteps"></ul>
+        </article>
+
+        <article class="card">
+          <h2>Answer</h2>
+          <pre id="answerText" class="answer">Waiting for a run.</pre>
+          <h3>Evidence</h3>
+          <div id="evidenceTable"></div>
+        </article>
+      </section>
+    </main>
+
+    <script src="./app.js"></script>
+  </body>
+</html>
