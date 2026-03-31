@@ -5,7 +5,7 @@ import time
 
 from corpusagent2.api import build_app
 
-from .helpers import build_test_runtime
+from .helpers import StaticLLMClient, build_test_runtime
 
 
 def _sample_documents() -> list[dict]:
@@ -175,3 +175,41 @@ def test_api_async_submission_exposes_live_status(tmp_path: Path) -> None:
 
     assert status_payload["run_id"] == run_id
     assert "completed_steps" in status_payload
+
+
+def test_force_answer_ignores_clarification_loop(tmp_path: Path) -> None:
+    docs = _sample_documents()
+    llm = StaticLLMClient(
+        [
+            {
+                "action": "ask_clarification",
+                "rewritten_question": "Please clarify which media sources you mean.",
+                "clarification_question": "Which sources?",
+                "assumptions": [],
+                "message": "",
+            },
+            {
+                "action": "ask_clarification",
+                "rewritten_question": "Still unclear.",
+                "clarification_question": "Clarify more.",
+                "assumptions": [],
+                "message": "",
+            },
+        ]
+    )
+    runtime = build_test_runtime(
+        tmp_path=tmp_path,
+        documents=docs,
+        search_rows_by_query=_search_rows(docs),
+    )
+    runtime.llm_client = llm
+    runtime.orchestrator.llm_client = llm
+
+    manifest = runtime.handle_query(
+        "Which media predicted the outbreak of the Ukraine war in 2022?",
+        force_answer=True,
+        no_cache=True,
+    )
+
+    assert manifest.status in {"completed", "partial"}
+    assert "Which sources?" not in manifest.rewritten_question

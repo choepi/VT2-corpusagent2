@@ -4,7 +4,6 @@ import asyncio
 from dataclasses import dataclass
 from datetime import UTC, datetime
 import json
-import os
 from pathlib import Path
 import threading
 import uuid
@@ -31,6 +30,7 @@ from .agent_models import (
     PlannerAction,
 )
 from .agent_policy import evidence_required, rejection_reason_for_question, rewrite_special_cases
+from .app_config import load_project_configuration
 from .llm_provider import LLMClient, LLMProviderConfig, OpenAICompatibleLLMClient
 from .retrieval import pg_dsn_from_env, pg_table_from_env
 from .run_manifest import FinalAnswerPayload
@@ -52,22 +52,6 @@ class AgentRuntimeConfig:
             project_root=project_root,
             outputs_root=(project_root / "outputs" / "agent_runtime").resolve(),
         )
-
-
-def _load_project_env(project_root: Path) -> None:
-    env_path = project_root / ".env"
-    if not env_path.exists():
-        return
-    for raw_line in env_path.read_text(encoding="utf-8").splitlines():
-        line = raw_line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, value = line.split("=", 1)
-        key = key.strip()
-        value = value.strip().strip('"').strip("'")
-        if key and key not in os.environ:
-            os.environ[key] = value
-
 
 class MagicBoxOrchestrator:
     def __init__(self, llm_client: LLMClient | None = None, llm_config: LLMProviderConfig | None = None) -> None:
@@ -113,6 +97,17 @@ class MagicBoxOrchestrator:
                 temperature=0.0,
             )
             action = PlannerAction.from_dict(payload)
+            if action.action == "ask_clarification" and state.force_answer:
+                forced_rewrite = rewritten or state.question
+                forced_assumptions = list(dict.fromkeys(list(action.assumptions) + assumptions + [
+                    "force_answer=true: proceeded with best-effort assumptions instead of waiting for clarification."
+                ]))
+                return PlannerAction(
+                    action="accept_with_assumptions",
+                    rewritten_question=forced_rewrite,
+                    assumptions=forced_assumptions,
+                    message=action.message,
+                )
             if not action.rewritten_question:
                 action.rewritten_question = rewritten
             if assumptions:
@@ -211,7 +206,17 @@ class MagicBoxOrchestrator:
                 model=self.llm_config.planner_model,
                 temperature=0.0,
             )
-            return PlannerAction.from_dict(payload)
+            action = PlannerAction.from_dict(payload)
+            if action.action == "ask_clarification" and state.force_answer:
+                heuristic = self._heuristic_plan(state)
+                heuristic.assumptions = list(
+                    dict.fromkeys(
+                        list(action.assumptions)
+                        + ["force_answer=true: planner clarification skipped and best-effort heuristic plan was used."]
+                    )
+                )
+                return heuristic
+            return action
         except Exception:
             return self._heuristic_plan(state)
 
@@ -373,7 +378,7 @@ class AgentRuntime:
         python_runner: DockerPythonRunnerService | None = None,
     ) -> None:
         self.config = config
-        _load_project_env(config.project_root)
+        self.app_config = load_project_configuration(config.project_root)
         self.runtime = runtime or CorpusRuntime.from_project_root(config.project_root)
         self.llm_config = llm_config or LLMProviderConfig.from_env()
         self.llm_client = llm_client or OpenAICompatibleLLMClient(self.llm_config)

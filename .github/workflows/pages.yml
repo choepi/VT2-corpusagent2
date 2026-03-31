@@ -27,6 +27,14 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Generate frontend runtime config
+        run: python scripts/13_write_frontend_config.py
+
       - name: Configure Pages
         uses: actions/configure-pages@v5
 

@@ -316,24 +316,36 @@ def _fetch_documents(params: dict[str, Any], deps: dict[str, ToolExecutionResult
     doc_ids = [str(item) for item in params.get("doc_ids", []) if str(item).strip()]
     if not doc_ids:
         doc_ids = [str(row.get("doc_id", "")) for row in _search_rows(deps) if str(row.get("doc_id", "")).strip()]
-    rows = context.working_store.fetch_documents(doc_ids)
+    if not doc_ids:
+        return ToolExecutionResult(payload={"documents": []}, evidence=[])
+
+    caveats: list[str] = []
+    try:
+        rows = context.working_store.fetch_documents(doc_ids)
+    except Exception as exc:
+        rows = []
+        caveats.append(f"Working-set document fetch failed and runtime fallback was used: {exc}")
     if not rows and context.runtime is not None:
-        df = context.runtime.load_docs(doc_ids)
-        rows = [
-            {
-                "doc_id": str(row.doc_id),
-                "title": str(getattr(row, "title", "")),
-                "text": str(getattr(row, "text", "")),
-                "published_at": str(getattr(row, "published_at", "")),
-                "date": str(getattr(row, "published_at", "")),
-                "outlet": str(getattr(row, "source", "")),
-                "source": str(getattr(row, "source", "")),
-            }
-            for row in df.itertuples(index=False)
-        ]
+        try:
+            df = context.runtime.load_docs(doc_ids)
+            rows = [
+                {
+                    "doc_id": str(row.doc_id),
+                    "title": str(getattr(row, "title", "")),
+                    "text": str(getattr(row, "text", "")),
+                    "published_at": str(getattr(row, "published_at", "")),
+                    "date": str(getattr(row, "published_at", "")),
+                    "outlet": str(getattr(row, "source", "")),
+                    "source": str(getattr(row, "source", "")),
+                }
+                for row in df.itertuples(index=False)
+            ]
+        except Exception as exc:
+            caveats.append(f"Runtime document lookup fallback failed: {exc}")
     return ToolExecutionResult(
         payload={"documents": rows},
         evidence=[{"doc_id": row["doc_id"]} for row in rows],
+        caveats=caveats,
     )
 
 

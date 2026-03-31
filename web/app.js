@@ -12,6 +12,13 @@ const answerText = document.getElementById("answerText");
 const evidenceTable = document.getElementById("evidenceTable");
 
 let pollTimer = null;
+const runtimeConfig = window.CORPUSAGENT2_CONFIG || {};
+if (runtimeConfig.apiBaseUrl) {
+  apiBaseInput.value = runtimeConfig.apiBaseUrl;
+}
+if (runtimeConfig.title) {
+  document.title = runtimeConfig.title;
+}
 
 function renderList(element, rows, formatter) {
   element.innerHTML = "";

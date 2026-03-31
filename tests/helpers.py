@@ -63,6 +63,23 @@ class FailingLLMClient:
         raise RuntimeError("LLM intentionally disabled in tests")
 
 
+class StaticLLMClient:
+    def __init__(self, payloads: list[dict[str, Any]]) -> None:
+        self._payloads = list(payloads)
+
+    def complete(self, messages: list[dict[str, str]], *, model: str, temperature: float = 0.0) -> str:
+        import json
+
+        if not self._payloads:
+            raise RuntimeError("No payloads left in StaticLLMClient")
+        return json.dumps(self._payloads.pop(0))
+
+    def complete_json(self, messages: list[dict[str, str]], *, model: str, temperature: float = 0.0) -> dict[str, Any]:
+        if not self._payloads:
+            raise RuntimeError("No payloads left in StaticLLMClient")
+        return dict(self._payloads.pop(0))
+
+
 class FakeSearchBackend:
     def __init__(self, rows_by_query: dict[str, list[dict[str, Any]]]) -> None:
         self.rows_by_query = rows_by_query

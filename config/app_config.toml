@@ -1,0 +1,41 @@
+[server]
+host = "127.0.0.1"
+port = 8001
+cors_origins = ["*"]
+
+[frontend]
+api_base_url = "http://127.0.0.1:8001"
+title = "CorpusAgent2 Prototype"
+
+[llm]
+provider = "uncloseai"
+base_url = "https://hermes.ai.unturf.com/v1"
+api_key = "choose-any-value"
+planner_model = "adamo1139/Hermes-3-Llama-3.1-8B-FP8-Dynamic"
+synthesis_model = "adamo1139/Hermes-3-Llama-3.1-8B-FP8-Dynamic"
+timeout_s = 60
+verify_ssl = true
+
+[retrieval]
+backend = "local"
+
+[postgres]
+dsn = "postgresql://corpus:corpus@localhost:5432/corpus_db"
+table = "article_corpus"
+
+[opensearch]
+url = "https://localhost:9200"
+index = "article-corpus-opensearch"
+username = "admin"
+password = "VerySecurePassword123!"
+verify_ssl = false
+timeout_s = 20
+
+[provider_order]
+tokenize = ["spacy", "stanza", "nltk", "regex"]
+sentence_split = ["spacy", "stanza", "nltk", "heuristic"]
+pos_morph = ["spacy", "stanza", "flair", "nltk", "heuristic"]
+lemmatize = ["spacy", "stanza", "textblob", "heuristic"]
+ner = ["spacy", "stanza", "flair", "regex"]
+sentiment = ["flair", "textblob", "heuristic"]
+topic_model = ["textacy", "gensim", "heuristic"]

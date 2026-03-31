@@ -1,6 +1,7 @@
 """CorpusAgent2 core package."""
 
 __all__ = [
+    "app_config",
     "agent_backends",
     "agent_capabilities",
     "agent_executor",

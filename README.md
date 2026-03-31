@@ -137,6 +137,59 @@ set CORPUSAGENT2_PG_TABLE=ca_documents
 set CORPUSAGENT2_RETRIEVAL_BACKEND=pgvector
 ```
 
+## Agent Runtime Quick Start
+
+The first-trial agent runtime uses `config/app_config.toml` as the default toggle file and lets `.env` override those values for machine-specific secrets.
+
+Useful overrides include:
+
+- `CORPUSAGENT2_LLM_PROVIDER`
+- `CORPUSAGENT2_LLM_BASE_URL`
+- `CORPUSAGENT2_LLM_API_KEY`
+- `CORPUSAGENT2_FRONTEND_API_BASE_URL`
+- `CORPUSAGENT2_PG_DSN`
+- `CORPUSAGENT2_OPENSEARCH_URL`
+
+1. Inspect the effective config:
+
+```bash
+python scripts/16_print_effective_config.py
+```
+
+2. Start backend + static frontend together:
+
+```bash
+python scripts/15_start_local_stack.py
+```
+
+3. If you prefer to run them separately:
+
+```bash
+python scripts/12_run_agent_api.py
+python scripts/13_write_frontend_config.py
+python scripts/14_run_static_frontend.py
+```
+
+4. Optional temporary public demo path:
+
+- keep the static frontend on GitHub Pages
+- expose the FastAPI backend with Cloudflare Tunnel or a VM HTTPS endpoint
+- do not expose Postgres or OpenSearch directly
+- Quick Tunnels are for testing/development only
+
+5. Optional Ubuntu VM bootstrap:
+
+```bash
+bash scripts/bootstrap_ubuntu_vm.sh /home/$USER/corpusagent2
+```
+
+6. Deployment notes:
+
+- GitHub Pages deploys only `web/`
+- the Pages workflow generates `web/config.js` from `config/app_config.toml`
+- keep machine-specific secrets and backend URLs in `.env`
+- see `docs/deployment.md` for local, tunnel, and VM deployment paths
+
 ## MCP Server
 
 Run the MCP server when you want tool-based integration (stdio transport):

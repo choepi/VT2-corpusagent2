@@ -18,6 +18,27 @@ def _serialize(value: Any) -> Any:
     return value
 
 
+def _coerce_string_list(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        item = value.strip()
+        return [item] if item else []
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()]
+    return [str(value).strip()] if str(value).strip() else []
+
+
+def _coerce_dict_list(value: Any) -> list[dict[str, Any]]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return [item for item in value if isinstance(item, dict)]
+    if isinstance(value, dict):
+        return [value]
+    return []
+
+
 @dataclass(slots=True)
 class FinalAnswerPayload:
     answer_text: str
@@ -32,11 +53,11 @@ class FinalAnswerPayload:
         payload = payload or {}
         return cls(
             answer_text=str(payload.get("answer_text", "")).strip(),
-            evidence_items=list(payload.get("evidence_items", [])),
-            artifacts_used=list(payload.get("artifacts_used", [])),
-            unsupported_parts=list(payload.get("unsupported_parts", [])),
-            caveats=list(payload.get("caveats", [])),
-            claim_verdicts=list(payload.get("claim_verdicts", [])),
+            evidence_items=_coerce_dict_list(payload.get("evidence_items", [])),
+            artifacts_used=_coerce_string_list(payload.get("artifacts_used", [])),
+            unsupported_parts=_coerce_string_list(payload.get("unsupported_parts", [])),
+            caveats=_coerce_string_list(payload.get("caveats", [])),
+            claim_verdicts=_coerce_dict_list(payload.get("claim_verdicts", [])),
         )
 
     def to_dict(self) -> dict[str, Any]:
