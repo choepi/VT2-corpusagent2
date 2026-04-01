@@ -213,3 +213,21 @@ def test_force_answer_ignores_clarification_loop(tmp_path: Path) -> None:
 
     assert manifest.status in {"completed", "partial"}
     assert "Which sources?" not in manifest.rewritten_question
+
+
+def test_clarification_history_allows_follow_up_run(tmp_path: Path) -> None:
+    docs = _sample_documents()
+    runtime = build_test_runtime(
+        tmp_path=tmp_path,
+        documents=docs,
+        search_rows_by_query=_search_rows(docs),
+    )
+
+    manifest = runtime.handle_query(
+        "How does football coverage differ between groups?",
+        clarification_history=["Compare NZZ and TA football coverage only."],
+        no_cache=True,
+    )
+
+    assert manifest.status in {"completed", "partial"}
+    assert "Compare NZZ and TA football coverage only." in manifest.rewritten_question

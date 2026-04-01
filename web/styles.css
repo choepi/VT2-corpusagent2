@@ -37,6 +37,10 @@ body {
   margin-bottom: 20px;
 }
 
+.hidden {
+  display: none;
+}
+
 .hero h1 {
   margin: 0 0 8px;
   font-size: clamp(2rem, 4vw, 3.3rem);
@@ -92,6 +96,11 @@ button {
   background: var(--accent);
   color: white;
   cursor: pointer;
+}
+
+button.secondary {
+  background: #e5dcc9;
+  color: var(--ink);
 }
 
 .grid {

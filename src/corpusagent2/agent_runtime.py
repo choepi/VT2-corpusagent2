@@ -58,13 +58,27 @@ class MagicBoxOrchestrator:
         self.llm_client = llm_client
         self.llm_config = llm_config or LLMProviderConfig.from_env()
 
+    def _question_with_clarifications(self, state: AgentRunState) -> str:
+        history = [str(item).strip() for item in state.clarification_history if str(item).strip()]
+        if not history:
+            return state.question
+        suffix = "\n".join(f"- {item}" for item in history)
+        return f"{state.question}\n\nUser clarification history:\n{suffix}"
+
     def rephrase_or_clarify(self, state: AgentRunState) -> PlannerAction:
         rejection_reason = rejection_reason_for_question(state.question)
         if rejection_reason:
             return PlannerAction(action="grounded_rejection", rejection_reason=rejection_reason)
 
-        rewritten, assumptions = rewrite_special_cases(state.question)
+        enriched_question = self._question_with_clarifications(state)
+        rewritten, assumptions = rewrite_special_cases(enriched_question)
         if self.llm_client is None:
+            if state.clarification_history:
+                return PlannerAction(
+                    action="accept_with_assumptions",
+                    rewritten_question=rewritten,
+                    assumptions=assumptions,
+                )
             if " between groups " in f" {state.question.lower()} " and not state.force_answer:
                 return PlannerAction(
                     action="ask_clarification",
@@ -88,7 +102,16 @@ class MagicBoxOrchestrator:
                     "Reject hidden-motive questions. Ask clarification only if workflow changes materially."
                 ),
             },
-            {"role": "user", "content": state.question},
+            {
+                "role": "user",
+                "content": json.dumps(
+                    {
+                        "question": state.question,
+                        "clarification_history": list(state.clarification_history),
+                    },
+                    ensure_ascii=True,
+                ),
+            },
         ]
         try:
             payload = self.llm_client.complete_json(
@@ -121,7 +144,7 @@ class MagicBoxOrchestrator:
             )
 
     def _heuristic_plan(self, state: AgentRunState) -> PlannerAction:
-        text = (state.rewritten_question or state.question).lower()
+        text = (state.rewritten_question or self._question_with_clarifications(state)).lower()
         if "distribution" in text and "noun" in text:
             dag = AgentPlanDAG(
                 nodes=[
@@ -192,6 +215,7 @@ class MagicBoxOrchestrator:
                     {
                         "question": state.question,
                         "rewritten_question": state.rewritten_question,
+                        "clarification_history": list(state.clarification_history),
                         "available_capabilities": state.available_capabilities,
                         "corpus_schema": state.corpus_schema,
                         "failures": state.failures,
@@ -509,7 +533,10 @@ class AgentRuntime:
                 caveats=["Clarification is required before planning can continue."],
             ),
             artifacts_dir=str(artifacts_dir),
-            metadata={"clarification_question": clarification_question},
+            metadata={
+                "clarification_question": clarification_question,
+                "clarification_history": list(state.clarification_history),
+            },
         )
 
     def _run_query(
@@ -692,7 +719,10 @@ class AgentRuntime:
             final_answer=final_answer,
             artifacts_dir=str(artifacts_dir),
             failures=list(snapshot.failures),
-            metadata={"planner_calls_used": state.planner_calls_used},
+            metadata={
+                "planner_calls_used": state.planner_calls_used,
+                "clarification_history": list(state.clarification_history),
+            },
         )
         self._persist_manifest(manifest)
         return manifest

@@ -30,6 +30,27 @@
         </div>
       </section>
 
+      <section id="clarificationPanel" class="card hidden">
+        <h2>Clarification Needed</h2>
+        <p id="clarificationPrompt" class="muted">
+          The backend has not requested a clarification yet.
+        </p>
+
+        <label for="clarificationInput">Your clarification</label>
+        <textarea
+          id="clarificationInput"
+          rows="4"
+          placeholder="Type the missing detail here, for example: compare NZZ and Tages-Anzeiger only."
+        ></textarea>
+
+        <div class="controls">
+          <button id="continueButton" type="button">Continue With Clarification</button>
+        </div>
+
+        <h3>Clarification History</h3>
+        <ul id="clarificationHistory"></ul>
+      </section>
+
       <section class="grid">
         <article class="card">
           <h2>Run Status</h2>

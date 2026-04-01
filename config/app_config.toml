@@ -8,7 +8,7 @@ api_base_url = "http://127.0.0.1:8001"
 title = "CorpusAgent2 Prototype"
 
 [llm]
-provider = "uncloseai"
+provider = "openai"
 base_url = "https://hermes.ai.unturf.com/v1"
 api_key = "choose-any-value"
 planner_model = "adamo1139/Hermes-3-Llama-3.1-8B-FP8-Dynamic"

@@ -3,6 +3,11 @@ const questionInput = document.getElementById("question");
 const forceAnswerInput = document.getElementById("forceAnswer");
 const noCacheInput = document.getElementById("noCache");
 const runButton = document.getElementById("runButton");
+const continueButton = document.getElementById("continueButton");
+const clarificationPanel = document.getElementById("clarificationPanel");
+const clarificationPrompt = document.getElementById("clarificationPrompt");
+const clarificationInput = document.getElementById("clarificationInput");
+const clarificationHistoryList = document.getElementById("clarificationHistory");
 const statusBox = document.getElementById("statusBox");
 const detailText = document.getElementById("detailText");
 const activeSteps = document.getElementById("activeSteps");
@@ -12,6 +17,9 @@ const answerText = document.getElementById("answerText");
 const evidenceTable = document.getElementById("evidenceTable");
 
 let pollTimer = null;
+let clarificationHistory = [];
+let pendingClarificationQuestion = "";
+
 const runtimeConfig = window.CORPUSAGENT2_CONFIG || {};
 if (runtimeConfig.apiBaseUrl) {
   apiBaseInput.value = runtimeConfig.apiBaseUrl;
@@ -38,7 +46,7 @@ function renderEvidence(rows) {
     evidenceTable.innerHTML = "<p class=\"muted\">No evidence rows returned.</p>";
     return;
   }
-  const header = `
+  evidenceTable.innerHTML = `
     <table>
       <thead>
         <tr>
@@ -65,7 +73,20 @@ function renderEvidence(rows) {
       </tbody>
     </table>
   `;
-  evidenceTable.innerHTML = header;
+}
+
+function renderClarificationState() {
+  clarificationPanel.classList.toggle("hidden", !pendingClarificationQuestion);
+  clarificationPrompt.textContent =
+    pendingClarificationQuestion || "The backend has not requested a clarification yet.";
+  renderList(clarificationHistoryList, clarificationHistory, (row, index) => row);
+}
+
+function resetClarificationState() {
+  pendingClarificationQuestion = "";
+  clarificationHistory = [];
+  clarificationInput.value = "";
+  renderClarificationState();
 }
 
 function setStatus(payload) {
@@ -80,6 +101,11 @@ function setStatus(payload) {
     payload.failed_steps || [],
     (row) => `${row.capability} (${row.node_id})${row.error ? ` - ${row.error}` : ""}`
   );
+  const clarificationQuestions = payload.clarification_questions || [];
+  if (status === "needs_clarification" && clarificationQuestions.length > 0) {
+    pendingClarificationQuestion = clarificationQuestions[0];
+  }
+  renderClarificationState();
 }
 
 async function fetchJson(url, options = {}) {
@@ -93,6 +119,41 @@ async function fetchJson(url, options = {}) {
   return response.json();
 }
 
+async function submitQuery({ preserveClarificationHistory = false } = {}) {
+  if (pollTimer) {
+    clearInterval(pollTimer);
+    pollTimer = null;
+  }
+  if (!preserveClarificationHistory) {
+    resetClarificationState();
+  }
+  answerText.textContent = "Waiting for result...";
+  renderEvidence([]);
+  setStatus({
+    status: "running",
+    current_phase: "submitting",
+    detail: "Submitting query to backend",
+    active_steps: [],
+    completed_steps: [],
+    failed_steps: [],
+    clarification_questions: preserveClarificationHistory && pendingClarificationQuestion ? [pendingClarificationQuestion] : [],
+  });
+
+  const base = apiBaseInput.value.replace(/\/$/, "");
+  const payload = await fetchJson(`${base}/query/submit`, {
+    method: "POST",
+    body: JSON.stringify({
+      question: questionInput.value,
+      force_answer: forceAnswerInput.checked,
+      no_cache: noCacheInput.checked,
+      clarification_history: clarificationHistory,
+    }),
+  });
+  setStatus(payload);
+  pollTimer = setInterval(() => pollRun(payload.run_id), 1500);
+  await pollRun(payload.run_id);
+}
+
 async function pollRun(runId) {
   try {
     const base = apiBaseInput.value.replace(/\/$/, "");
@@ -103,13 +164,34 @@ async function pollRun(runId) {
       clearInterval(pollTimer);
       pollTimer = null;
       const manifest = await fetchJson(`${base}/runs/${runId}`);
-      answerText.textContent = manifest.final_answer?.answer_text || "No answer text returned.";
+      answerText.textContent =
+        manifest.status === "needs_clarification"
+          ? "Clarification required before the planner can continue."
+          : manifest.final_answer?.answer_text || "No answer text returned.";
       renderEvidence(manifest.evidence_table || []);
+      const manifestHistory = manifest.metadata?.clarification_history || [];
+      if (Array.isArray(manifestHistory) && manifestHistory.length > 0) {
+        clarificationHistory = manifestHistory;
+      }
+      if (manifest.status === "needs_clarification") {
+        pendingClarificationQuestion =
+          manifest.metadata?.clarification_question ||
+          manifest.clarification_questions?.[0] ||
+          "Clarification required.";
+      } else {
+        pendingClarificationQuestion = "";
+        clarificationInput.value = "";
+      }
+      renderClarificationState();
       setStatus({
         ...statusPayload,
+        clarification_questions:
+          manifest.status === "needs_clarification" && pendingClarificationQuestion
+            ? [pendingClarificationQuestion]
+            : [],
         detail:
           manifest.status === "needs_clarification"
-            ? (manifest.metadata?.clarification_question || "Clarification required.")
+            ? pendingClarificationQuestion
             : statusPayload.detail,
       });
     }
@@ -123,37 +205,30 @@ async function pollRun(runId) {
 }
 
 runButton.addEventListener("click", async () => {
-  if (pollTimer) {
-    clearInterval(pollTimer);
-    pollTimer = null;
-  }
-  answerText.textContent = "Waiting for result...";
-  renderEvidence([]);
-  setStatus({
-    status: "running",
-    current_phase: "submitting",
-    detail: "Submitting query to backend",
-    active_steps: [],
-    completed_steps: [],
-    failed_steps: [],
-  });
-
   try {
-    const base = apiBaseInput.value.replace(/\/$/, "");
-    const payload = await fetchJson(`${base}/query/submit`, {
-      method: "POST",
-      body: JSON.stringify({
-        question: questionInput.value,
-        force_answer: forceAnswerInput.checked,
-        no_cache: noCacheInput.checked,
-      }),
-    });
-    setStatus(payload);
-    pollTimer = setInterval(() => pollRun(payload.run_id), 1500);
-    await pollRun(payload.run_id);
+    await submitQuery({ preserveClarificationHistory: false });
   } catch (error) {
     statusBox.textContent = "failed";
     statusBox.className = "status failed";
     detailText.textContent = `Submission failed: ${error.message}`;
   }
 });
+
+continueButton.addEventListener("click", async () => {
+  const text = clarificationInput.value.trim();
+  if (!text) {
+    detailText.textContent = "Please type a clarification before continuing.";
+    return;
+  }
+  clarificationHistory = [...clarificationHistory, text];
+  clarificationInput.value = "";
+  try {
+    await submitQuery({ preserveClarificationHistory: true });
+  } catch (error) {
+    statusBox.textContent = "failed";
+    statusBox.className = "status failed";
+    detailText.textContent = `Clarification submission failed: ${error.message}`;
+  }
+});
+
+renderClarificationState();
