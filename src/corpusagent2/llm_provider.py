@@ -1,5 +1,6 @@
 ﻿from __future__ import annotations
 
+import ast
 from dataclasses import dataclass, field
 import json
 import os
@@ -32,7 +33,38 @@ def _extract_content(payload: dict[str, Any]) -> str:
     return str(content).strip()
 
 
+def _escape_control_chars_in_json_strings(text: str) -> str:
+    result: list[str] = []
+    in_string = False
+    escape_next = False
+    for char in text:
+        if escape_next:
+            result.append(char)
+            escape_next = False
+            continue
+        if char == "\\":
+            result.append(char)
+            escape_next = True
+            continue
+        if char == '"':
+            result.append(char)
+            in_string = not in_string
+            continue
+        if in_string and char in {"\n", "\r", "\t"}:
+            result.append({"\n": "\\n", "\r": "\\r", "\t": "\\t"}[char])
+            continue
+        result.append(char)
+    return "".join(result)
+
+
 def _extract_json_object(text: str) -> dict[str, Any]:
+    def _parse_python_literal(candidate: str) -> dict[str, Any] | None:
+        try:
+            parsed = ast.literal_eval(candidate)
+        except (SyntaxError, ValueError):
+            return None
+        return parsed if isinstance(parsed, dict) else None
+
     stripped = text.strip()
     try:
         parsed = json.loads(stripped)
@@ -40,12 +72,31 @@ def _extract_json_object(text: str) -> dict[str, Any]:
             return parsed
     except json.JSONDecodeError:
         pass
+    sanitized = _escape_control_chars_in_json_strings(stripped)
+    if sanitized != stripped:
+        try:
+            parsed = json.loads(sanitized)
+            if isinstance(parsed, dict):
+                return parsed
+        except json.JSONDecodeError:
+            pass
     start = stripped.find("{")
     end = stripped.rfind("}")
     if start >= 0 and end > start:
-        parsed = json.loads(stripped[start : end + 1])
-        if isinstance(parsed, dict):
-            return parsed
+        candidate = stripped[start : end + 1]
+        for attempt in (candidate, _escape_control_chars_in_json_strings(candidate)):
+            try:
+                parsed = json.loads(attempt)
+                if isinstance(parsed, dict):
+                    return parsed
+            except json.JSONDecodeError:
+                literal = _parse_python_literal(attempt)
+                if literal is not None:
+                    return literal
+                continue
+    literal = _parse_python_literal(stripped)
+    if literal is not None:
+        return literal
     raise ValueError(f"Could not parse JSON object from LLM response: {text[:240]}")
 
 
@@ -65,6 +116,18 @@ class LLMProviderConfig:
     def from_env(cls) -> "LLMProviderConfig":
         raw_toggle = os.getenv("CORPUSAGENT2_USE_OPENAI")
         legacy_provider = os.getenv("CORPUSAGENT2_LLM_PROVIDER", "").strip().lower()
+        explicit_provider_specific = any(
+            os.getenv(name) is not None
+            for name in (
+                "CORPUSAGENT2_OPENAI_BASE_URL",
+                "CORPUSAGENT2_OPENAI_PLANNER_MODEL",
+                "CORPUSAGENT2_OPENAI_SYNTHESIS_MODEL",
+                "CORPUSAGENT2_UNCLOSE_BASE_URL",
+                "CORPUSAGENT2_UNCLOSE_PLANNER_MODEL",
+                "CORPUSAGENT2_UNCLOSE_SYNTHESIS_MODEL",
+            )
+        )
+        legacy_mode = raw_toggle is None and not explicit_provider_specific and bool(legacy_provider)
         use_openai = _truthy(raw_toggle) if raw_toggle is not None else legacy_provider == "openai"
         provider_name = "openai" if use_openai else "uncloseai"
 
@@ -82,6 +145,9 @@ class LLMProviderConfig:
             unclose_planner_model,
         ).strip() or unclose_planner_model
 
+        legacy_base_url = os.getenv("CORPUSAGENT2_LLM_BASE_URL", "").strip()
+        legacy_planner_model = os.getenv("CORPUSAGENT2_LLM_PLANNER_MODEL", "").strip()
+        legacy_synthesis_model = os.getenv("CORPUSAGENT2_LLM_SYNTHESIS_MODEL", "").strip()
         api_key = os.getenv("CORPUSAGENT2_LLM_API_KEY", "").strip()
         if use_openai:
             api_key = os.getenv("OPENAI_API_KEY", "").strip() or api_key
@@ -91,22 +157,24 @@ class LLMProviderConfig:
         default_base_url = openai_base_url if use_openai else unclose_base_url
         default_planner_model = openai_planner_model if use_openai else unclose_planner_model
         default_synthesis_model = openai_synthesis_model if use_openai else unclose_synthesis_model
+        resolved_base_url = default_base_url
+        resolved_planner_model = default_planner_model
+        resolved_synthesis_model = default_synthesis_model
+        if legacy_mode:
+            if legacy_base_url:
+                resolved_base_url = legacy_base_url
+            if legacy_planner_model:
+                resolved_planner_model = legacy_planner_model
+            if legacy_synthesis_model:
+                resolved_synthesis_model = legacy_synthesis_model
 
         return cls(
             use_openai=use_openai,
             provider_name=provider_name,
-            base_url=os.getenv("CORPUSAGENT2_LLM_BASE_URL", default_base_url).strip() or default_base_url,
+            base_url=resolved_base_url,
             api_key=api_key,
-            planner_model=os.getenv(
-                "CORPUSAGENT2_LLM_PLANNER_MODEL",
-                default_planner_model,
-            ).strip()
-            or default_planner_model,
-            synthesis_model=os.getenv(
-                "CORPUSAGENT2_LLM_SYNTHESIS_MODEL",
-                default_synthesis_model,
-            ).strip()
-            or default_synthesis_model,
+            planner_model=resolved_planner_model,
+            synthesis_model=resolved_synthesis_model,
             timeout_s=float(os.getenv("CORPUSAGENT2_LLM_TIMEOUT_S", "60").strip() or "60"),
             verify_ssl=os.getenv("CORPUSAGENT2_LLM_VERIFY_SSL", "true").strip().lower()
             not in {"0", "false", "no", "off"},

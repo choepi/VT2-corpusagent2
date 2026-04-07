@@ -14,7 +14,7 @@ dependencies = [
     "matplotlib>=3.10.8",
     "mcp[cli]>=1.26.0",
     "networkx>=3.5",
-    "numpy>=2.3.0",
+    "numpy>=1.26.4,<2.0.0",
     "pandas>=2.3.3",
     "psycopg[binary]>=3.2.12",
     "pytest>=9.0.2",
@@ -23,7 +23,9 @@ dependencies = [
     "scipy>=1.16.0",
     "sentence-transformers>=5.2.3",
     "spacy>=3.8.11",
-    "torch>=2.10.0",
+    "torch==2.3.1",
+    "torchaudio==2.3.1",
+    "torchvision==0.18.1",
     "transformers>=4.45.0,<5.0.0",
     "uvicorn>=0.41.0",
 ]
@@ -40,3 +42,13 @@ nlp-providers = [
 
 [tool.uv]
 package = true
+
+[[tool.uv.index]]
+name = "pytorch-cu118"
+url = "https://download.pytorch.org/whl/cu118"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu118", marker = "sys_platform == 'linux' or sys_platform == 'win32'" }
+torchvision = { index = "pytorch-cu118", marker = "sys_platform == 'linux' or sys_platform == 'win32'" }
+torchaudio = { index = "pytorch-cu118", marker = "sys_platform == 'linux' or sys_platform == 'win32'" }

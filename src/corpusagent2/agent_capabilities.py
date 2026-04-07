@@ -174,6 +174,28 @@ def _search_rows(dependency_results: dict[str, ToolExecutionResult]) -> list[dic
     return []
 
 
+def _coerce_score(value: Any) -> float:
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    if not pd.notna(numeric):
+        return 0.0
+    return numeric
+
+
+def _score_display(value: Any) -> str:
+    numeric = _coerce_score(value)
+    absolute = abs(numeric)
+    if absolute >= 1:
+        return f"{numeric:.3f}".rstrip("0").rstrip(".")
+    if absolute >= 0.01:
+        return f"{numeric:.4f}".rstrip("0").rstrip(".")
+    if absolute > 0:
+        return f"{numeric:.2e}"
+    return "0"
+
+
 def _time_bin(value: str) -> str:
     text = str(value)
     if len(text) >= 7 and text[4] == "-":
@@ -286,12 +308,24 @@ def _db_search(params: dict[str, Any], deps: dict[str, ToolExecutionResult], con
     top_k = int(params.get("top_k", 20))
     date_from = str(params.get("date_from", "")).strip()
     date_to = str(params.get("date_to", "")).strip()
+    retrieval_mode = str(params.get("retrieval_mode", os.getenv("CORPUSAGENT2_DEFAULT_RETRIEVAL_MODE", "hybrid"))).strip().lower() or "hybrid"
+    lexical_top_k = int(params.get("lexical_top_k", top_k * 5 or 50))
+    dense_top_k = int(params.get("dense_top_k", top_k * 5 or 50))
+    use_rerank = str(params.get("use_rerank", os.getenv("CORPUSAGENT2_RETRIEVAL_USE_RERANK", "true"))).strip().lower() not in {"0", "false", "no", "off"}
+    rerank_top_k = int(params.get("rerank_top_k", os.getenv("CORPUSAGENT2_RETRIEVAL_RERANK_TOP_K", "25")))
+    fusion_k = int(params.get("fusion_k", os.getenv("CORPUSAGENT2_RETRIEVAL_FUSION_K", "60")))
     try:
         rows = context.search_backend.search(
             query=query,
             top_k=top_k,
             date_from=date_from,
             date_to=date_to,
+            retrieval_mode=retrieval_mode,
+            lexical_top_k=lexical_top_k,
+            dense_top_k=dense_top_k,
+            use_rerank=use_rerank,
+            rerank_top_k=rerank_top_k,
+            fusion_k=fusion_k,
         )
     except Exception as exc:
         if context.runtime is None:
@@ -303,21 +337,50 @@ def _db_search(params: dict[str, Any], deps: dict[str, ToolExecutionResult], con
             top_k=top_k,
             date_from=date_from,
             date_to=date_to,
+            retrieval_mode=retrieval_mode,
+            lexical_top_k=lexical_top_k,
+            dense_top_k=dense_top_k,
+            use_rerank=use_rerank,
+            rerank_top_k=rerank_top_k,
+            fusion_k=fusion_k,
         )
         return ToolExecutionResult(
-            payload={"results": rows, "query": query},
+            payload={"results": rows, "query": query, "retrieval_mode": retrieval_mode},
             evidence=list(rows),
             caveats=[f"Primary search backend failed and local retrieval fallback was used: {exc}"],
         )
-    return ToolExecutionResult(payload={"results": rows, "query": query}, evidence=list(rows))
+    return ToolExecutionResult(
+        payload={"results": rows, "query": query, "retrieval_mode": retrieval_mode},
+        evidence=list(rows),
+    )
 
 
 def _fetch_documents(params: dict[str, Any], deps: dict[str, ToolExecutionResult], context: AgentExecutionContext) -> ToolExecutionResult:
     doc_ids = [str(item) for item in params.get("doc_ids", []) if str(item).strip()]
+    search_rows = _search_rows(deps)
+    search_lookup = {
+        str(row.get("doc_id", "")).strip(): row
+        for row in search_rows
+        if str(row.get("doc_id", "")).strip()
+    }
     if not doc_ids:
-        doc_ids = [str(row.get("doc_id", "")) for row in _search_rows(deps) if str(row.get("doc_id", "")).strip()]
+        doc_ids = [str(row.get("doc_id", "")) for row in search_rows if str(row.get("doc_id", "")).strip()]
     if not doc_ids:
         return ToolExecutionResult(payload={"documents": []}, evidence=[])
+
+    def _merge_document(row: dict[str, Any]) -> dict[str, Any]:
+        doc_id = str(row.get("doc_id", "")).strip()
+        merged = dict(search_lookup.get(doc_id, {}))
+        merged.update(row)
+        if "date" not in merged or not str(merged.get("date", "")).strip():
+            merged["date"] = str(merged.get("published_at", merged.get("year", "")))
+        if "outlet" not in merged or not str(merged.get("outlet", "")).strip():
+            merged["outlet"] = str(merged.get("source", merged.get("source_domain", "")))
+        merged["score"] = _coerce_score(merged.get("score", 0.0))
+        merged["score_display"] = str(merged.get("score_display") or _score_display(merged["score"]))
+        if "score_components" in merged and not isinstance(merged.get("score_components"), dict):
+            merged.pop("score_components", None)
+        return merged
 
     caveats: list[str] = []
     try:
@@ -329,22 +392,26 @@ def _fetch_documents(params: dict[str, Any], deps: dict[str, ToolExecutionResult
         try:
             df = context.runtime.load_docs(doc_ids)
             rows = [
-                {
-                    "doc_id": str(row.doc_id),
-                    "title": str(getattr(row, "title", "")),
-                    "text": str(getattr(row, "text", "")),
-                    "published_at": str(getattr(row, "published_at", "")),
-                    "date": str(getattr(row, "published_at", "")),
-                    "outlet": str(getattr(row, "source", "")),
-                    "source": str(getattr(row, "source", "")),
-                }
+                _merge_document(
+                    {
+                        "doc_id": str(row.doc_id),
+                        "title": str(getattr(row, "title", "")),
+                        "text": str(getattr(row, "text", "")),
+                        "published_at": str(getattr(row, "published_at", "")),
+                        "date": str(getattr(row, "published_at", "")),
+                        "outlet": str(getattr(row, "source", "")),
+                        "source": str(getattr(row, "source", "")),
+                    }
+                )
                 for row in df.itertuples(index=False)
             ]
         except Exception as exc:
             caveats.append(f"Runtime document lookup fallback failed: {exc}")
+    else:
+        rows = [_merge_document(dict(row)) for row in rows]
     return ToolExecutionResult(
         payload={"documents": rows},
-        evidence=[{"doc_id": row["doc_id"]} for row in rows],
+        evidence=[{"doc_id": row["doc_id"], "score": row.get("score", 0.0)} for row in rows],
         caveats=caveats,
     )
 
@@ -1285,6 +1352,11 @@ def _quote_attribute(params: dict[str, Any], deps: dict[str, ToolExecutionResult
 
 def _build_evidence_table(params: dict[str, Any], deps: dict[str, ToolExecutionResult], context: AgentExecutionContext) -> ToolExecutionResult:
     rows = []
+    search_score_lookup = {
+        str(row.get("doc_id", "")).strip(): _coerce_score(row.get("score", 0.0))
+        for row in _search_rows(deps)
+        if str(row.get("doc_id", "")).strip()
+    }
     for result in deps.values():
         payload = result.payload
         if isinstance(payload, dict) and "rows" in payload:
@@ -1294,7 +1366,9 @@ def _build_evidence_table(params: dict[str, Any], deps: dict[str, ToolExecutionR
         doc_id = str(row.get("doc_id", ""))
         if not doc_id:
             continue
-        score = float(row.get("score", 0.0))
+        score = _coerce_score(row.get("score", search_score_lookup.get(doc_id, 0.0)))
+        if score == 0.0 and doc_id in search_score_lookup:
+            score = search_score_lookup[doc_id]
         current = evidence_map.get(doc_id)
         candidate = EvidenceRow(
             doc_id=doc_id,
@@ -1305,7 +1379,12 @@ def _build_evidence_table(params: dict[str, Any], deps: dict[str, ToolExecutionR
         )
         if current is None or candidate.score > current.score:
             evidence_map[doc_id] = candidate
-    evidence = [item.to_dict() for item in sorted(evidence_map.values(), key=lambda item: item.score, reverse=True)]
+    evidence = []
+    for rank, item in enumerate(sorted(evidence_map.values(), key=lambda item: item.score, reverse=True), start=1):
+        payload = item.to_dict()
+        payload["score_display"] = _score_display(item.score)
+        payload["rank"] = rank
+        evidence.append(payload)
     return ToolExecutionResult(payload={"rows": evidence}, evidence=evidence)
 
 
@@ -1366,22 +1445,100 @@ def _plot_artifact(params: dict[str, Any], deps: dict[str, ToolExecutionResult],
     plot_dir = context.artifacts_dir / "plots"
     plot_dir.mkdir(parents=True, exist_ok=True)
     target = plot_dir / f"{params.get('plot_name', 'plot')}.png"
-    first = rows[:10]
-    labels = [
-        str(item.get("entity", item.get("term", item.get("doc_id", item.get("time_bin", "row")))))
+    plt.style.use("seaborn-v0_8-whitegrid")
+    figure, axis = plt.subplots(figsize=(12.5, 6.6), dpi=180)
+    plot_name = str(params.get("plot_name", "plot")).replace("_", " ").title()
+    first = rows[:16]
+    unique_time_bins = {
+        str(item.get("time_bin", "unknown"))
         for item in first
-    ]
-    values = [
-        float(item.get("count", item.get("score", item.get("weight", item.get("intensity", 0.0)))))
-        for item in first
-    ]
-    plt.figure(figsize=(10, 4))
-    plt.bar(labels, values)
-    plt.xticks(rotation=45, ha="right")
+        if item.get("time_bin") is not None
+    }
+    topic_like = bool(first and "topic_id" in first[0] and any(item.get("top_terms") for item in first))
+    time_series_like = bool(first and "time_bin" in first[0] and len(unique_time_bins) > 1)
+
+    if topic_like:
+        labels = []
+        values = []
+        for index, item in enumerate(first):
+            top_terms = [str(term) for term in item.get("top_terms", [])[:4] if str(term).strip()]
+            label = f"Topic {item.get('topic_id', index + 1)}"
+            if top_terms:
+                label = f"{label}: {', '.join(top_terms)}"
+            labels.append(label)
+            values.append(float(item.get("weight", 0.0)))
+        colors = ["#0f766e", "#138f7a", "#16a085", "#54b499", "#7ec9b4", "#a5ded0"]
+        axis.barh(labels[::-1], values[::-1], color=colors[: len(values)][::-1], edgecolor="#17312d", linewidth=0.7)
+        axis.set_xlabel("Topic weight")
+        max_value = max(values) if values else 0.0
+        for idx, value in enumerate(values[::-1]):
+            axis.text(value + max(max_value * 0.015, 0.02), idx, f"{value:.2f}", va="center", fontsize=8, color="#17312d")
+    elif time_series_like:
+        series_by_entity: defaultdict[str, list[tuple[str, float]]] = defaultdict(list)
+        for item in rows:
+            entity = str(item.get("entity", item.get("label", item.get("term", "__all__"))))
+            value = float(item.get("count", item.get("score", item.get("weight", item.get("intensity", 0.0)))))
+            series_by_entity[entity].append((str(item.get("time_bin", "unknown")), value))
+        top_entities = sorted(
+            series_by_entity.items(),
+            key=lambda entry: sum(value for _, value in entry[1]),
+            reverse=True,
+        )[:5]
+        palette = ["#0f766e", "#b45309", "#7c3aed", "#be123c", "#2563eb"]
+        for index, (entity, points) in enumerate(top_entities):
+            ordered = sorted(points)
+            x_labels = [item[0] for item in ordered]
+            x_values = list(range(len(x_labels)))
+            y_values = [item[1] for item in ordered]
+            axis.plot(
+                x_values,
+                y_values,
+                marker="o",
+                linewidth=2.4,
+                color=palette[index % len(palette)],
+                label=entity,
+            )
+            axis.fill_between(x_values, y_values, alpha=0.08, color=palette[index % len(palette)])
+        if top_entities:
+            axis.set_xticks(list(range(len(x_labels))), x_labels, rotation=35, ha="right")
+        axis.set_ylabel("Signal")
+        handles, labels = axis.get_legend_handles_labels()
+        if handles:
+            axis.legend(loc="best", fontsize=8, frameon=True)
+    else:
+        labels = [
+            str(item.get("entity", item.get("term", item.get("doc_id", item.get("time_bin", "row")))))
+            for item in first
+        ]
+        values = [
+            float(item.get("count", item.get("score", item.get("weight", item.get("intensity", 0.0)))))
+            for item in first
+        ]
+        colors = ["#0f766e" if value >= 0 else "#be123c" for value in values]
+        bars = axis.bar(labels, values, color=colors, edgecolor="#17312d", linewidth=0.5)
+        for bar, value in zip(bars, values, strict=False):
+            axis.text(
+                bar.get_x() + bar.get_width() / 2,
+                value,
+                f"{value:.2f}",
+                ha="center",
+                va="bottom" if value >= 0 else "top",
+                fontsize=8,
+            )
+        axis.tick_params(axis="x", rotation=35)
+
+    axis.set_title(plot_name, fontsize=15, fontweight="bold")
+    axis.set_facecolor("#fffaf2")
+    figure.patch.set_facecolor("#fffdf8")
+    axis.spines["top"].set_visible(False)
+    axis.spines["right"].set_visible(False)
     plt.tight_layout()
     plt.savefig(target)
     plt.close()
-    return ToolExecutionResult(payload={"artifact_path": str(target), "rows": first}, artifacts=[str(target)])
+    return ToolExecutionResult(
+        payload={"artifact_path": str(target), "rows": first, "plot_name": plot_name},
+        artifacts=[str(target)],
+    )
 
 
 def _python_runner(params: dict[str, Any], deps: dict[str, ToolExecutionResult], context: AgentExecutionContext) -> ToolExecutionResult:

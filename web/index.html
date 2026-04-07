@@ -133,7 +133,7 @@
           </div>
 
           <h3>Claim Verdicts</h3>
-          <div id="claimVerdicts" class="stack-panel"></div>
+          <div id="claimVerdicts" class="stack-panel scroll-panel compact-scroll"></div>
         </article>
 
         <article class="card magic-card">
@@ -142,11 +142,11 @@
             <span class="pill subtle">Planner transparency</span>
           </div>
           <h3>Planner Actions</h3>
-          <div id="plannerActions" class="stack-panel"></div>
+          <div id="plannerActions" class="stack-panel scroll-panel compact-scroll"></div>
           <h3>Plan DAG</h3>
-          <div id="planNodes" class="stack-panel"></div>
+          <div id="planNodes" class="stack-panel scroll-panel compact-scroll"></div>
           <h3>Raw LLM Outputs</h3>
-          <div id="llmTraces" class="stack-panel"></div>
+          <div id="llmTraces" class="stack-panel scroll-panel tall-scroll"></div>
         </article>
       </section>
 
@@ -156,9 +156,9 @@
             <h2>Evidence Panel</h2>
             <span class="pill subtle">Visible on every run</span>
           </div>
-          <div id="evidenceTable"></div>
+          <div id="evidenceTable" class="table-scroll"></div>
           <h3>Selected Documents</h3>
-          <div id="selectedDocs" class="stack-panel"></div>
+          <div id="selectedDocs" class="stack-panel scroll-panel tall-scroll"></div>
         </article>
 
         <article class="card artifact-card">
@@ -167,12 +167,22 @@
             <span class="pill subtle">Inspector</span>
           </div>
           <h3>Artifacts</h3>
-          <div id="artifactList" class="stack-panel"></div>
+          <div id="artifactList" class="stack-panel scroll-panel compact-scroll"></div>
           <h3>Plots</h3>
-          <div id="plotGallery" class="plot-grid"></div>
+          <div id="plotGallery" class="plot-grid scroll-panel medium-scroll"></div>
         </article>
       </section>
     </main>
+
+    <div id="plotModal" class="modal-overlay hidden" aria-hidden="true">
+      <div class="modal-shell">
+        <div class="modal-head">
+          <strong id="plotModalTitle">Plot preview</strong>
+          <button id="plotModalClose" type="button" class="ghost-button">Close</button>
+        </div>
+        <img id="plotModalImage" src="" alt="Expanded plot preview" />
+      </div>
+    </div>
 
     <script src="./config.js"></script>
     <script src="./app.js"></script>

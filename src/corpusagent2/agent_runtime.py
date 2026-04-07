@@ -13,6 +13,7 @@ import uuid
 from typing import Any
 
 from .agent_backends import (
+    HybridSearchBackend,
     InMemoryWorkingSetStore,
     LocalSearchBackend,
     OpenSearchBackend,
@@ -222,7 +223,7 @@ class MagicBoxOrchestrator:
         if "distribution" in text and "noun" in text:
             dag = AgentPlanDAG(
                 nodes=[
-                    AgentPlanNode("search", "db_search", {"top_k": 40}),
+                    AgentPlanNode("search", "db_search", {"top_k": 40, "retrieval_mode": "hybrid", "use_rerank": False}),
                     AgentPlanNode("fetch", "fetch_documents", depends_on=["search"]),
                     AgentPlanNode("working_set", "create_working_set", depends_on=["fetch"]),
                     AgentPlanNode("pos", "pos_morph", depends_on=["fetch"]),
@@ -235,7 +236,7 @@ class MagicBoxOrchestrator:
         if "named entit" in text or ("climate" in text and "entity" in text):
             dag = AgentPlanDAG(
                 nodes=[
-                    AgentPlanNode("search", "db_search", {"top_k": 60}),
+                    AgentPlanNode("search", "db_search", {"top_k": 60, "retrieval_mode": "hybrid", "use_rerank": True, "rerank_top_k": 30}),
                     AgentPlanNode("fetch", "fetch_documents", depends_on=["search"]),
                     AgentPlanNode("working_set", "create_working_set", depends_on=["fetch"]),
                     AgentPlanNode("ner", "ner", depends_on=["fetch"]),
@@ -249,7 +250,7 @@ class MagicBoxOrchestrator:
         if "ukraine" in text and "predict" in text:
             dag = AgentPlanDAG(
                 nodes=[
-                    AgentPlanNode("search", "db_search", {"top_k": 80, "date_to": "2022-02-23"}),
+                    AgentPlanNode("search", "db_search", {"top_k": 80, "date_to": "2022-02-23", "retrieval_mode": "hybrid", "use_rerank": True, "rerank_top_k": 40}),
                     AgentPlanNode("fetch", "fetch_documents", depends_on=["search"]),
                     AgentPlanNode("working_set", "create_working_set", depends_on=["fetch"]),
                     AgentPlanNode("claim_spans", "claim_span_extract", depends_on=["fetch"]),
@@ -263,6 +264,9 @@ class MagicBoxOrchestrator:
         if any(term in text for term in framing_terms) and any(term in text for term in ["shift", "changed", "change", "correspond", "over time"]):
             search_inputs: dict[str, Any] = {
                 "top_k": 100,
+                "retrieval_mode": "hybrid",
+                "use_rerank": True,
+                "rerank_top_k": 50,
                 "query": self._compact_query_terms(
                     rewritten,
                     [
@@ -311,7 +315,7 @@ class MagicBoxOrchestrator:
             )
         dag = AgentPlanDAG(
             nodes=[
-                AgentPlanNode("search", "db_search", {"top_k": 40}),
+                AgentPlanNode("search", "db_search", {"top_k": 40, "retrieval_mode": "hybrid", "use_rerank": True, "rerank_top_k": 25}),
                 AgentPlanNode("fetch", "fetch_documents", depends_on=["search"]),
                 AgentPlanNode("working_set", "create_working_set", depends_on=["fetch"]),
                 AgentPlanNode("keyterms", "extract_keyterms", depends_on=["fetch"], optional=True),
@@ -354,6 +358,12 @@ class MagicBoxOrchestrator:
                 ),
             },
         ]
+        repair_system_message = (
+            "You previously returned an invalid or empty plan for a corpus-analysis agent. "
+            "Return valid JSON with keys action, rewritten_question, assumptions, clarification_question, rejection_reason, message, plan_dag. "
+            "Allowed actions: ask_clarification, emit_plan_dag, grounded_rejection. "
+            "If action is emit_plan_dag, plan_dag.nodes must contain at least one executable node with node_id, capability, inputs, and depends_on."
+        )
         try:
             trace = self.llm_client.complete_json_trace(
                 messages,
@@ -363,6 +373,32 @@ class MagicBoxOrchestrator:
             payload = dict(trace["parsed_json"])
             self._record_llm_trace(state, stage="plan", trace=trace)
             action = PlannerAction.from_dict(payload)
+            if action.action == "emit_plan_dag" and action.plan_dag is None:
+                repair_messages = [
+                    {"role": "system", "content": repair_system_message},
+                    {
+                        "role": "user",
+                        "content": json.dumps(
+                            {
+                                "question": state.question,
+                                "rewritten_question": state.rewritten_question,
+                                "available_capabilities": state.available_capabilities,
+                                "corpus_schema": state.corpus_schema,
+                                "previous_invalid_output": trace.get("raw_text", ""),
+                            },
+                            ensure_ascii=True,
+                        ),
+                    },
+                ]
+                repair_trace = self.llm_client.complete_json_trace(
+                    repair_messages,
+                    model=self.llm_config.planner_model,
+                    temperature=0.0,
+                )
+                self._record_llm_trace(state, stage="plan_repair", trace=repair_trace)
+                action = PlannerAction.from_dict(dict(repair_trace["parsed_json"]))
+                if action.action == "emit_plan_dag" and action.plan_dag is None:
+                    raise ValueError("Planner returned no executable nodes.")
             if action.action == "ask_clarification" and state.force_answer:
                 heuristic = self._heuristic_plan(state)
                 heuristic.assumptions = list(
@@ -421,14 +457,19 @@ class MagicBoxOrchestrator:
                 used_fallback=True,
                 note="No LLM client configured; fallback synthesis used.",
             )
-            return self._fallback_synthesis(state, evidence_rows, summary, snapshot)
+            return self._apply_answer_guardrails(
+                state,
+                snapshot,
+                self._fallback_synthesis(state, evidence_rows, summary, snapshot),
+            )
         messages = [
             {
                 "role": "system",
                 "content": (
                     "You are the grounded synthesis module for a corpus-analysis agent. "
                     "Return JSON with keys answer_text, evidence_items, artifacts_used, unsupported_parts, caveats, claim_verdicts. "
-                    "Use only the provided summaries, tool outputs, and evidence."
+                    "Use only the provided summaries, tool outputs, and evidence. "
+                    "Do not claim direct correspondence to stock-price moves or external market behavior unless an external series was explicitly attached."
                 ),
             },
             {
@@ -440,6 +481,7 @@ class MagicBoxOrchestrator:
                         "summary": summary,
                         "evidence_rows": evidence_rows,
                         "failures": [item.to_dict() for item in snapshot.failures],
+                        "has_external_series": self._has_external_series(snapshot),
                     },
                     ensure_ascii=True,
                 ),
@@ -456,7 +498,7 @@ class MagicBoxOrchestrator:
             answer = FinalAnswerPayload.from_payload(payload)
             if evidence_rows:
                 answer.evidence_items = evidence_rows
-            return answer
+            return self._apply_answer_guardrails(state, snapshot, answer)
         except Exception as exc:
             self._record_llm_trace(
                 state,
@@ -465,7 +507,11 @@ class MagicBoxOrchestrator:
                 error=str(exc),
                 note="LLM synthesis failed; fallback synthesis used.",
             )
-            return self._fallback_synthesis(state, evidence_rows, summary, snapshot)
+            return self._apply_answer_guardrails(
+                state,
+                snapshot,
+                self._fallback_synthesis(state, evidence_rows, summary, snapshot),
+            )
 
     def _extract_evidence(self, snapshot: AgentExecutionSnapshot) -> list[dict[str, Any]]:
         for node_id, result in snapshot.node_results.items():
@@ -473,7 +519,17 @@ class MagicBoxOrchestrator:
             if isinstance(payload, dict) and "rows" in payload and payload["rows"]:
                 first = payload["rows"][0]
                 if {"doc_id", "outlet", "date", "excerpt", "score"}.issubset(first.keys()):
-                    return list(payload["rows"])
+                    rows = []
+                    for row in payload["rows"]:
+                        copied = dict(row)
+                        score = copied.get("score", 0.0)
+                        try:
+                            numeric = float(score)
+                        except (TypeError, ValueError):
+                            numeric = 0.0
+                        copied.setdefault("score_display", f"{numeric:.4f}".rstrip("0").rstrip(".") if abs(numeric) >= 0.01 else (f"{numeric:.2e}" if abs(numeric) > 0 else "0"))
+                        rows.append(copied)
+                    return rows
         fallback_rows: list[dict[str, Any]] = []
         for row in snapshot.selected_docs[:10]:
             doc_id = str(row.get("doc_id", "")).strip()
@@ -502,6 +558,7 @@ class MagicBoxOrchestrator:
                     "date": str(row.get("published_at") or row.get("date") or row.get("year") or ""),
                     "excerpt": excerpt,
                     "score": float(row.get("score", 0.0) or 0.0),
+                    "score_display": str(row.get("score_display") or ""),
                 }
             )
         return fallback_rows
@@ -554,6 +611,42 @@ class MagicBoxOrchestrator:
             elif {"doc_id", "outlet", "date", "excerpt", "score"}.issubset(first.keys()):
                 summary["evidence_rows"] = rows[:10]
         return summary
+
+    def _has_external_series(self, snapshot: AgentExecutionSnapshot) -> bool:
+        for node_id, result in snapshot.node_results.items():
+            payload = result.payload if isinstance(result.payload, dict) else {}
+            if node_id == "join_external_series":
+                rows = list(payload.get("rows", []))
+                if rows:
+                    return True
+        return False
+
+    def _apply_answer_guardrails(
+        self,
+        state: AgentRunState,
+        snapshot: AgentExecutionSnapshot,
+        answer: FinalAnswerPayload,
+    ) -> FinalAnswerPayload:
+        question_text = f"{state.question} {state.rewritten_question}".lower()
+        needs_market_guardrail = any(
+            term in question_text
+            for term in ["stock", "drawdown", "share price", "valuation", "market"]
+        )
+        if needs_market_guardrail and not self._has_external_series(snapshot):
+            note = (
+                "This run did not attach an external market time series, so any direct correspondence to stock drawdowns remains unverified."
+            )
+            unsupported = "Direct stock-price or drawdown correspondence was not verified because no external market series was attached."
+            if note not in answer.caveats:
+                answer.caveats.append(note)
+            if unsupported not in answer.unsupported_parts:
+                answer.unsupported_parts.append(unsupported)
+            lowered_answer = answer.answer_text.lower()
+            if "unverified" not in lowered_answer and "not verified" not in lowered_answer and "not attach" not in lowered_answer:
+                answer.answer_text = f"{answer.answer_text.rstrip()} {note}".strip()
+        if answer.evidence_items:
+            answer.evidence_items = list(answer.evidence_items)[:10]
+        return answer
 
     def _fallback_synthesis(
         self,
@@ -647,9 +740,10 @@ class AgentRuntime:
 
     def _build_search_backend(self):
         try:
-            return OpenSearchBackend(OpenSearchConfig.from_env())
+            lexical_backend = OpenSearchBackend(OpenSearchConfig.from_env())
         except Exception:
-            return LocalSearchBackend(self.runtime)
+            lexical_backend = None
+        return HybridSearchBackend(self.runtime, lexical_backend=lexical_backend)
 
     def _build_working_store(self) -> WorkingSetStore:
         try:
@@ -669,6 +763,17 @@ class AgentRuntime:
         provider_modules = {}
         for module_name in ["spacy", "textacy", "stanza", "nltk", "gensim", "flair", "textblob", "torch"]:
             provider_modules[module_name] = importlib.util.find_spec(module_name) is not None
+        device_report = runtime_device_report()
+        llm_warnings: list[str] = []
+        if self.llm_config.use_openai and "hermes.ai.unturf.com" in self.llm_config.base_url:
+            llm_warnings.append("OpenAI mode is enabled but the resolved base URL still points to UncloseAI/Hermes.")
+        if not self.llm_config.use_openai and "api.openai.com" in self.llm_config.base_url:
+            llm_warnings.append("UncloseAI mode is enabled but the resolved base URL still points to api.openai.com.")
+        gpu_warnings: list[str] = []
+        if device_report.get("nvidia_smi_ok") and not device_report.get("cuda_available"):
+            gpu_warnings.append(
+                "An NVIDIA GPU is visible through nvidia-smi, but PyTorch is a CPU-only build. Reinstall a CUDA-enabled torch wheel to use the GPU."
+            )
 
         provider_orders = {
             capability.lower().replace("CORPUSAGENT2_PROVIDER_ORDER_", ""): value
@@ -683,11 +788,25 @@ class AgentRuntime:
                 "planner_model": self.llm_config.planner_model,
                 "synthesis_model": self.llm_config.synthesis_model,
                 "api_key_present": bool(self.llm_config.api_key),
+                "warnings": llm_warnings,
             },
-            "device": runtime_device_report(),
+            "device": {
+                **device_report,
+                "warnings": gpu_warnings,
+            },
             "providers_installed": provider_modules,
             "provider_order": provider_orders,
             "capability_count": len(self.registry.list_tools()),
+            "retrieval": {
+                "backend": self.runtime.retrieval_backend,
+                "default_mode": os.getenv("CORPUSAGENT2_DEFAULT_RETRIEVAL_MODE", "hybrid"),
+                "rerank_enabled": os.getenv("CORPUSAGENT2_RETRIEVAL_USE_RERANK", "true").strip().lower()
+                not in {"0", "false", "no", "off"},
+                "rerank_top_k": int(os.getenv("CORPUSAGENT2_RETRIEVAL_RERANK_TOP_K", "25").strip() or "25"),
+                "fusion_k": int(os.getenv("CORPUSAGENT2_RETRIEVAL_FUSION_K", "60").strip() or "60"),
+                "dense_model_id": self.runtime.dense_model_id,
+                "rerank_model_id": self.runtime.rerank_model_id,
+            },
             "analysis_notes": [
                 "Toggle providers with CORPUSAGENT2_USE_OPENAI=true or false, then restart the backend.",
                 "Classical spaCy/textacy/gensim analytics are usually CPU-bound even when CUDA is available.",

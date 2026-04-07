@@ -36,6 +36,10 @@ const evidenceTable = document.getElementById("evidenceTable");
 const selectedDocs = document.getElementById("selectedDocs");
 const artifactList = document.getElementById("artifactList");
 const plotGallery = document.getElementById("plotGallery");
+const plotModal = document.getElementById("plotModal");
+const plotModalImage = document.getElementById("plotModalImage");
+const plotModalTitle = document.getElementById("plotModalTitle");
+const plotModalClose = document.getElementById("plotModalClose");
 
 let pollTimer = null;
 let clarificationHistory = [];
@@ -50,7 +54,7 @@ if (runtimeConfig.apiBaseUrl) {
 if (runtimeConfig.title) {
   document.title = runtimeConfig.title;
 }
-providerBadge.textContent = `LLM: ${runtimeConfig.useOpenAI ? "OpenAI" : "UncloseAI"}`;
+providerBadge.textContent = "LLM: loading...";
 
 function escapeHtml(value) {
   return String(value ?? "")
@@ -96,6 +100,24 @@ function formatJson(value) {
   return escapeHtml(JSON.stringify(value ?? {}, null, 2));
 }
 
+function formatScore(value) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) {
+    return "";
+  }
+  const absolute = Math.abs(numeric);
+  if (absolute >= 1) {
+    return numeric.toFixed(3).replace(/\.?0+$/, "");
+  }
+  if (absolute >= 0.01) {
+    return numeric.toFixed(4).replace(/\.?0+$/, "");
+  }
+  if (absolute > 0) {
+    return numeric.toExponential(2);
+  }
+  return "0";
+}
+
 function artifactUrl(runId, artifactPath) {
   const base = apiBaseInput.value.replace(/\/$/, "");
   return `${base}/runs/${encodeURIComponent(runId)}/artifact?artifact_path=${encodeURIComponent(artifactPath)}`;
@@ -107,6 +129,21 @@ function collectArtifacts(manifest) {
   return [...new Set([...fromNodes, ...fromAnswer].filter(Boolean))];
 }
 
+function openPlotModal(src, caption) {
+  plotModalImage.src = src;
+  plotModalTitle.textContent = caption || "Plot preview";
+  plotModal.classList.remove("hidden");
+  plotModal.setAttribute("aria-hidden", "false");
+  document.body.style.overflow = "hidden";
+}
+
+function closePlotModal() {
+  plotModal.classList.add("hidden");
+  plotModal.setAttribute("aria-hidden", "true");
+  plotModalImage.src = "";
+  document.body.style.overflow = "";
+}
+
 function renderEvidence(rows) {
   if (!rows || rows.length === 0) {
     evidenceTable.innerHTML = '<p class="muted">No evidence rows returned yet. Retrieved support documents will still appear below.</p>';
@@ -114,6 +151,13 @@ function renderEvidence(rows) {
   }
   evidenceTable.innerHTML = `
     <table>
+      <colgroup>
+        <col style="width: 21%" />
+        <col style="width: 18%" />
+        <col style="width: 12%" />
+        <col style="width: 39%" />
+        <col style="width: 10%" />
+      </colgroup>
       <thead>
         <tr>
           <th>Doc</th>
@@ -128,11 +172,11 @@ function renderEvidence(rows) {
           .map(
             (row) => `
               <tr>
-                <td>${escapeHtml(row.doc_id ?? "")}</td>
-                <td>${escapeHtml(row.outlet ?? "")}</td>
+                <td class="evidence-doc">${escapeHtml(row.doc_id ?? "")}</td>
+                <td class="evidence-outlet">${escapeHtml(row.outlet ?? "")}</td>
                 <td>${escapeHtml(row.date ?? "")}</td>
-                <td>${escapeHtml(row.excerpt ?? "")}</td>
-                <td>${escapeHtml(row.score ?? "")}</td>
+                <td class="evidence-excerpt">${escapeHtml(row.excerpt ?? "")}</td>
+                <td class="evidence-score">${escapeHtml(row.score_display ?? formatScore(row.score ?? ""))}</td>
               </tr>`
           )
           .join("")}
@@ -158,19 +202,23 @@ function renderRuntimeInfo(payload) {
   latestRuntimeInfo = payload;
   const llm = payload.llm || {};
   const device = payload.device || {};
+  const retrieval = payload.retrieval || {};
   providerBadge.textContent = `LLM: ${llm.provider_name || "unknown"}`;
   providerBadge.className = `pill ${llm.use_openai ? "openai" : "unclose"}`;
   modelBadge.textContent = `Planner: ${llm.planner_model || "unknown"}`;
   deviceBadge.textContent = `Device: ${device.recommended_device || "unknown"}`;
   runtimeModeBadge.textContent = llm.use_openai ? "OpenAI mode" : "UncloseAI mode";
 
-  runtimeSummary.innerHTML = `
-    <div class="metric-row"><span>Backend</span><strong>${escapeHtml(llm.base_url || "")}</strong></div>
-    <div class="metric-row"><span>Synthesis model</span><strong>${escapeHtml(llm.synthesis_model || "")}</strong></div>
-    <div class="metric-row"><span>API key present</span><strong>${llm.api_key_present ? "yes" : "no"}</strong></div>
-    <div class="metric-row"><span>CUDA available</span><strong>${device.cuda_available ? "yes" : "no"}</strong></div>
-    <div class="metric-row"><span>GPU count</span><strong>${escapeHtml(device.cuda_device_count ?? 0)}</strong></div>
-  `;
+    runtimeSummary.innerHTML = `
+      <div class="metric-row"><span>Backend</span><strong>${escapeHtml(llm.base_url || "")}</strong></div>
+      <div class="metric-row"><span>Synthesis model</span><strong>${escapeHtml(llm.synthesis_model || "")}</strong></div>
+      <div class="metric-row"><span>API key present</span><strong>${llm.api_key_present ? "yes" : "no"}</strong></div>
+      <div class="metric-row"><span>CUDA available</span><strong>${device.cuda_available ? "yes" : "no"}</strong></div>
+      <div class="metric-row"><span>GPU count</span><strong>${escapeHtml(device.cuda_device_count ?? 0)}</strong></div>
+      <div class="metric-row"><span>Retrieval mode</span><strong>${escapeHtml(retrieval.default_mode || "unknown")}</strong></div>
+      <div class="metric-row"><span>Re-rank</span><strong>${retrieval.rerank_enabled ? `on (top ${escapeHtml(retrieval.rerank_top_k ?? "")})` : "off"}</strong></div>
+      <div class="metric-row"><span>Dense model</span><strong>${escapeHtml(retrieval.dense_model_id || "")}</strong></div>
+    `;
 
   providersInstalled.innerHTML = "";
   Object.entries(payload.providers_installed || {}).forEach(([name, installed]) => {
@@ -188,7 +236,7 @@ function renderRuntimeInfo(payload) {
     providerOrder.appendChild(chip);
   });
 
-  renderList(runtimeNotes, payload.analysis_notes || [], (row) => escapeHtml(row));
+    renderList(runtimeNotes, [...(payload.analysis_notes || []), ...(llm.warnings || []), ...(device.warnings || [])], (row) => escapeHtml(row));
 }
 
 function renderPlannerActions(actions) {
@@ -271,15 +319,21 @@ function renderSelectedDocs(rows) {
   const blocks = (rows || []).map((row) => {
     const previewSource = row.snippet || row.text || row.body || row.title || "";
     const preview = String(previewSource).slice(0, 260);
-    return `
-      <div class="trace-head">
-        <span class="pill subtle">${escapeHtml(row.doc_id || "doc")}</span>
-        <strong>${escapeHtml(row.outlet || row.source || row.source_domain || "")}</strong>
-      </div>
-      <p><strong>Date:</strong> ${escapeHtml(row.published_at || row.date || row.year || "")}</p>
-      <p>${escapeHtml(preview)}</p>
-    `;
-  });
+      return `
+        <div class="trace-head">
+          <span class="pill subtle">${escapeHtml(row.doc_id || "doc")}</span>
+          <strong>${escapeHtml(row.outlet || row.source || row.source_domain || "")}</strong>
+        </div>
+        <p><strong>Date:</strong> ${escapeHtml(row.published_at || row.date || row.year || "")}</p>
+        <p><strong>Score:</strong> ${escapeHtml(formatScore(row.score_display ?? row.score ?? ""))}</p>
+        ${
+          row.score_components
+            ? `<details><summary>Score components</summary><pre>${formatJson(row.score_components)}</pre></details>`
+            : ""
+        }
+        <p class="selected-doc-snippet">${escapeHtml(preview)}</p>
+      `;
+    });
   renderStackPanel(selectedDocs, blocks, "Retrieved support documents will appear here.");
 }
 
@@ -306,9 +360,13 @@ function renderArtifacts(manifest) {
   plots.forEach((path) => {
     const figure = document.createElement("figure");
     figure.className = "plot-card";
+    const fileName = path.split(/[/\\]/).pop() || path;
+    const src = artifactUrl(runId, path);
     figure.innerHTML = `
-      <img src="${artifactUrl(runId, path)}" alt="Plot artifact" />
-      <figcaption>${escapeHtml(path.split(/[/\\]/).pop() || path)}</figcaption>
+      <button class="plot-button" type="button" data-src="${src}" data-caption="${escapeHtml(fileName)}">
+        <img src="${src}" alt="Plot artifact" />
+        <figcaption>${escapeHtml(fileName)}</figcaption>
+      </button>
     `;
     plotGallery.appendChild(figure);
   });
@@ -508,6 +566,26 @@ continueButton.addEventListener("click", async () => {
     statusBox.textContent = "failed";
     statusBox.className = "status failed";
     detailText.textContent = `Clarification submission failed: ${error.message}`;
+  }
+});
+
+plotGallery.addEventListener("click", (event) => {
+  const button = event.target.closest(".plot-button");
+  if (!button) {
+    return;
+  }
+  openPlotModal(button.dataset.src || "", button.dataset.caption || "Plot preview");
+});
+
+plotModalClose.addEventListener("click", closePlotModal);
+plotModal.addEventListener("click", (event) => {
+  if (event.target === plotModal) {
+    closePlotModal();
+  }
+});
+window.addEventListener("keydown", (event) => {
+  if (event.key === "Escape" && !plotModal.classList.contains("hidden")) {
+    closePlotModal();
   }
 });
 

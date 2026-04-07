@@ -137,22 +137,24 @@ class PlannerAction:
         plan_dag = None
         if isinstance(dag_payload, dict):
             node_payloads = list(dag_payload.get("nodes", []))
-            plan_dag = AgentPlanDAG(
-                nodes=[
-                    AgentPlanNode(
-                        node_id=str(item.get("id", item.get("node_id", ""))),
-                        capability=str(item["capability"]),
-                        inputs=dict(item.get("inputs", {})),
-                        depends_on=[str(dep) for dep in item.get("depends_on", [])],
-                        optional=bool(item.get("optional", False)),
-                        cacheable=bool(item.get("cacheable", True)),
-                        description=str(item.get("description", "")),
-                    )
-                    for item in node_payloads
-                    if str(item.get("id", item.get("node_id", ""))).strip() and str(item.get("capability", "")).strip()
-                ],
-                metadata=dict(dag_payload.get("metadata", {})),
-            )
+            parsed_nodes = [
+                AgentPlanNode(
+                    node_id=str(item.get("id", item.get("node_id", ""))),
+                    capability=str(item["capability"]),
+                    inputs=dict(item.get("inputs", {})),
+                    depends_on=[str(dep) for dep in item.get("depends_on", [])],
+                    optional=bool(item.get("optional", False)),
+                    cacheable=bool(item.get("cacheable", True)),
+                    description=str(item.get("description", "")),
+                )
+                for item in node_payloads
+                if str(item.get("id", item.get("node_id", ""))).strip() and str(item.get("capability", "")).strip()
+            ]
+            if parsed_nodes:
+                plan_dag = AgentPlanDAG(
+                    nodes=parsed_nodes,
+                    metadata=dict(dag_payload.get("metadata", {})),
+                )
         return cls(
             action=action,
             rewritten_question=str(payload.get("rewritten_question", "")).strip(),

@@ -31,16 +31,16 @@ body {
 }
 
 .shell {
-  max-width: 1480px;
+  max-width: 1760px;
   margin: 0 auto;
-  padding: 32px 20px 48px;
+  padding: 28px 20px 44px;
 }
 
 .card {
   background: linear-gradient(180deg, var(--paper-strong) 0%, var(--paper) 100%);
   border: 1px solid var(--border);
   border-radius: 22px;
-  padding: 22px;
+  padding: 20px;
   box-shadow: var(--shadow);
   margin-bottom: 20px;
 }
@@ -153,11 +153,17 @@ button:hover {
 }
 
 .main-grid {
-  grid-template-columns: minmax(340px, 1fr) minmax(380px, 1.05fr);
+  grid-template-columns: minmax(420px, 0.95fr) minmax(520px, 1.05fr);
 }
 
 .evidence-grid {
-  grid-template-columns: 1.2fr 0.8fr;
+  grid-template-columns: 1.08fr 0.92fr;
+}
+
+.top-grid,
+.main-grid,
+.evidence-grid {
+  align-items: start;
 }
 
 .section-head {
@@ -301,6 +307,25 @@ h3 {
   gap: 12px;
 }
 
+.scroll-panel,
+.table-scroll {
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding-right: 6px;
+}
+
+.compact-scroll {
+  max-height: 300px;
+}
+
+.medium-scroll {
+  max-height: 520px;
+}
+
+.tall-scroll {
+  max-height: 620px;
+}
+
 .trace-card {
   background: rgba(255, 255, 255, 0.72);
   border: 1px solid var(--border);
@@ -327,7 +352,8 @@ h3 {
   border-radius: 12px;
   padding: 12px;
   white-space: pre-wrap;
-  overflow-x: auto;
+  overflow-x: hidden;
+  overflow-wrap: anywhere;
 }
 
 .danger {
@@ -370,11 +396,20 @@ h3 {
   padding: 12px;
 }
 
+.plot-button {
+  all: unset;
+  display: block;
+  width: 100%;
+  cursor: zoom-in;
+}
+
 .plot-card img {
   width: 100%;
   border-radius: 12px;
   display: block;
   border: 1px solid #ede6da;
+  aspect-ratio: 16 / 10;
+  object-fit: cover;
 }
 
 ul {
@@ -397,6 +432,7 @@ table {
   background: rgba(255, 255, 255, 0.82);
   border-radius: 14px;
   overflow: hidden;
+  table-layout: fixed;
 }
 
 th,
@@ -405,10 +441,101 @@ td {
   text-align: left;
   padding: 9px 8px;
   vertical-align: top;
+  overflow-wrap: anywhere;
 }
 
 th {
   background: #f7f1e6;
+}
+
+.table-scroll {
+  max-height: 540px;
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  background: rgba(255, 255, 255, 0.72);
+}
+
+.table-scroll table {
+  border-radius: 0;
+}
+
+.table-scroll thead th {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+}
+
+.evidence-doc {
+  font-family: "Consolas", "SFMono-Regular", monospace;
+  font-size: 0.8rem;
+}
+
+.evidence-outlet {
+  font-size: 0.88rem;
+}
+
+.evidence-score {
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.selected-doc-snippet,
+.evidence-excerpt {
+  line-height: 1.35;
+}
+
+#activeSteps,
+#completedSteps,
+#failedSteps,
+#assumptionsList,
+#runtimeNotes {
+  max-height: 160px;
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding-right: 6px;
+}
+
+.modal-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  background: rgba(22, 18, 12, 0.72);
+  display: grid;
+  place-items: center;
+  padding: 24px;
+}
+
+.modal-shell {
+  width: min(96vw, 1600px);
+  max-height: 94vh;
+  background: linear-gradient(180deg, var(--paper-strong) 0%, var(--paper) 100%);
+  border: 1px solid rgba(255, 250, 242, 0.3);
+  border-radius: 24px;
+  box-shadow: 0 30px 80px rgba(0, 0, 0, 0.28);
+  padding: 20px;
+  display: grid;
+  gap: 14px;
+}
+
+.modal-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.modal-shell img {
+  width: 100%;
+  max-height: calc(94vh - 110px);
+  object-fit: contain;
+  border-radius: 18px;
+  background: #fff;
+}
+
+.ghost-button {
+  background: rgba(14, 107, 91, 0.1);
+  color: var(--accent);
+  box-shadow: none;
 }
 
 @media (max-width: 1080px) {

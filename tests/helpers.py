@@ -108,6 +108,12 @@ class FakeSearchBackend:
         top_k: int,
         date_from: str = "",
         date_to: str = "",
+        retrieval_mode: str = "hybrid",
+        lexical_top_k: int | None = None,
+        dense_top_k: int | None = None,
+        use_rerank: bool = False,
+        rerank_top_k: int = 0,
+        fusion_k: int = 60,
     ) -> list[dict[str, Any]]:
         for key, rows in self.rows_by_query.items():
             if key.lower() in query.lower():
@@ -118,7 +124,11 @@ class FakeSearchBackend:
                         continue
                     if date_to and date and date > date_to:
                         continue
-                    filtered.append(dict(row))
+                    copy = dict(row)
+                    copy.setdefault("score", 0.75)
+                    copy.setdefault("score_display", 1.0)
+                    copy.setdefault("retrieval_mode", retrieval_mode)
+                    filtered.append(copy)
                 return filtered[:top_k]
         return []
 
@@ -132,6 +142,9 @@ def build_test_runtime(
     class FakeRuntime:
         def __init__(self, rows: list[dict[str, Any]]) -> None:
             self._df = pd.DataFrame(rows)
+            self.retrieval_backend = "local"
+            self.dense_model_id = "intfloat/e5-base-v2"
+            self.rerank_model_id = "cross-encoder/ms-marco-MiniLM-L-6-v2"
 
         def load_metadata(self):
             return self._df.copy()

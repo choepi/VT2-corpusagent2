@@ -4,6 +4,7 @@ from collections import defaultdict
 from dataclasses import dataclass
 import os
 from pathlib import Path
+from typing import Any
 
 import joblib
 import numpy as np
@@ -14,6 +15,9 @@ from sklearn.metrics.pairwise import cosine_similarity
 from .seed import resolve_device
 
 _ALLOWED_RETRIEVAL_BACKENDS = {"local", "pgvector"}
+_SENTENCE_TRANSFORMER_CACHE: dict[tuple[str, str], Any] = {}
+_CROSS_ENCODER_CACHE: dict[tuple[str, str], Any] = {}
+_TORCH_DENSE_CACHE: dict[tuple[int, str], Any] = {}
 
 
 @dataclass(slots=True)
@@ -69,11 +73,21 @@ def _load_sentence_transformer(model_id: str, device: str | None = None):
     from sentence_transformers import SentenceTransformer
 
     resolved_device = resolve_device(device)
+    cache_key = (model_id, resolved_device)
+    if cache_key in _SENTENCE_TRANSFORMER_CACHE:
+        return _SENTENCE_TRANSFORMER_CACHE[cache_key], resolved_device
     try:
-        return SentenceTransformer(model_id, device=resolved_device), resolved_device
+        model = SentenceTransformer(model_id, device=resolved_device)
+        _SENTENCE_TRANSFORMER_CACHE[cache_key] = model
+        return model, resolved_device
     except Exception:
         if resolved_device != "cpu":
-            return SentenceTransformer(model_id, device="cpu"), "cpu"
+            cpu_key = (model_id, "cpu")
+            if cpu_key in _SENTENCE_TRANSFORMER_CACHE:
+                return _SENTENCE_TRANSFORMER_CACHE[cpu_key], "cpu"
+            model = SentenceTransformer(model_id, device="cpu")
+            _SENTENCE_TRANSFORMER_CACHE[cpu_key] = model
+            return model, "cpu"
         raise
 
 
@@ -81,11 +95,21 @@ def _load_cross_encoder(model_id: str, device: str | None = None):
     from sentence_transformers import CrossEncoder
 
     resolved_device = resolve_device(device)
+    cache_key = (model_id, resolved_device)
+    if cache_key in _CROSS_ENCODER_CACHE:
+        return _CROSS_ENCODER_CACHE[cache_key], resolved_device
     try:
-        return CrossEncoder(model_id, device=resolved_device), resolved_device
+        model = CrossEncoder(model_id, device=resolved_device)
+        _CROSS_ENCODER_CACHE[cache_key] = model
+        return model, resolved_device
     except Exception:
         if resolved_device != "cpu":
-            return CrossEncoder(model_id, device="cpu"), "cpu"
+            cpu_key = (model_id, "cpu")
+            if cpu_key in _CROSS_ENCODER_CACHE:
+                return _CROSS_ENCODER_CACHE[cpu_key], "cpu"
+            model = CrossEncoder(model_id, device="cpu")
+            _CROSS_ENCODER_CACHE[cpu_key] = model
+            return model, "cpu"
         raise
 
 
@@ -157,7 +181,7 @@ def save_dense_assets(index_dir: Path, embeddings: np.ndarray, doc_ids: list[str
 
 
 def load_dense_assets(index_dir: Path) -> tuple[np.ndarray, list[str]]:
-    embeddings = np.load(index_dir / "dense_embeddings.npy")
+    embeddings = np.load(index_dir / "dense_embeddings.npy", mmap_mode="r")
     doc_ids = joblib.load(index_dir / "dense_doc_ids.joblib")
     return embeddings, doc_ids
 
@@ -169,10 +193,20 @@ def retrieve_tfidf(
     doc_ids: list[str],
     top_k: int,
 ) -> list[RetrievalResult]:
+    if top_k <= 0:
+        return []
     query_vec = vectorizer.transform([query])
+    if query_vec.nnz == 0:
+        return []
     scores = cosine_similarity(query_vec, matrix).ravel()
-    best = np.argpartition(scores, -top_k)[-top_k:]
-    ranked_idx = best[np.argsort(scores[best])[::-1]]
+    positive_idx = np.flatnonzero(scores > 0.0)
+    if positive_idx.size == 0:
+        return []
+    limit = min(int(top_k), int(positive_idx.size))
+    positive_scores = scores[positive_idx]
+    best_relative = np.argpartition(positive_scores, -limit)[-limit:]
+    ranked_relative = best_relative[np.argsort(positive_scores[best_relative])[::-1]]
+    ranked_idx = positive_idx[ranked_relative]
 
     results: list[RetrievalResult] = []
     for rank, idx in enumerate(ranked_idx, start=1):
@@ -195,15 +229,37 @@ def retrieve_dense(
     top_k: int,
     device: str | None = None,
 ) -> list[RetrievalResult]:
+    if top_k <= 0:
+        return []
     model, _resolved_device = _load_sentence_transformer(model_id=model_id, device=device)
     query_emb = model.encode(
         [query],
         convert_to_numpy=True,
         normalize_embeddings=True,
     ).astype(np.float32)
+    scores: np.ndarray
+    if _resolved_device == "cuda":
+        try:
+            import torch
 
-    scores = (query_emb @ embeddings.T).ravel()
-    best = np.argpartition(scores, -top_k)[-top_k:]
+            cache_key = (id(embeddings), _resolved_device)
+            if cache_key not in _TORCH_DENSE_CACHE:
+                _TORCH_DENSE_CACHE[cache_key] = torch.as_tensor(
+                    np.asarray(embeddings),
+                    dtype=torch.float32,
+                    device=_resolved_device,
+                )
+            dense_tensor = _TORCH_DENSE_CACHE[cache_key]
+            query_tensor = torch.as_tensor(query_emb, dtype=torch.float32, device=_resolved_device)
+            scores = torch.matmul(query_tensor, dense_tensor.T).detach().cpu().numpy().ravel()
+        except Exception:
+            scores = (query_emb @ np.asarray(embeddings).T).ravel()
+    else:
+        scores = (query_emb @ np.asarray(embeddings).T).ravel()
+    limit = min(int(top_k), int(scores.shape[0]))
+    if limit <= 0:
+        return []
+    best = np.argpartition(scores, -limit)[-limit:]
     ranked_idx = best[np.argsort(scores[best])[::-1]]
 
     results: list[RetrievalResult] = []
@@ -281,7 +337,7 @@ def reciprocal_rank_fusion(
         for rank, result in enumerate(results, start=1):
             fused = 1.0 / float(k + rank)
             score_map[result.doc_id] += fused
-            component_map[result.doc_id][method_name] = fused
+            component_map[result.doc_id][method_name] = round(fused, 6)
 
     ranked = sorted(score_map.items(), key=lambda pair: pair[1], reverse=True)
     fused_results: list[RetrievalResult] = []

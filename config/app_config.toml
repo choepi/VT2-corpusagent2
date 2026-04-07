@@ -20,6 +20,13 @@ verify_ssl = true
 
 [retrieval]
 backend = "local"
+default_mode = "hybrid"
+use_rerank = true
+rerank_top_k = 25
+fusion_k = 60
+
+[runtime]
+device = "auto"
 
 [postgres]
 dsn = "postgresql://corpus:corpus@localhost:5432/corpus_db"

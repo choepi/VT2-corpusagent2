@@ -9,7 +9,14 @@ from typing import Any, Protocol
 import httpx
 
 from .io_utils import write_json
-from .retrieval import reciprocal_rank_fusion, retrieve_dense, retrieve_dense_pgvector, retrieve_tfidf
+from .retrieval import (
+    RetrievalResult,
+    reciprocal_rank_fusion,
+    rerank_cross_encoder,
+    retrieve_dense,
+    retrieve_dense_pgvector,
+    retrieve_tfidf,
+)
 from .runtime_context import CorpusRuntime
 
 
@@ -49,6 +56,12 @@ class SearchBackend(Protocol):
         top_k: int,
         date_from: str = "",
         date_to: str = "",
+        retrieval_mode: str = "hybrid",
+        lexical_top_k: int | None = None,
+        dense_top_k: int | None = None,
+        use_rerank: bool = False,
+        rerank_top_k: int = 0,
+        fusion_k: int = 60,
     ) -> list[dict[str, Any]]:
         ...
 
@@ -83,7 +96,14 @@ class OpenSearchBackend:
         top_k: int,
         date_from: str = "",
         date_to: str = "",
+        retrieval_mode: str = "lexical",
+        lexical_top_k: int | None = None,
+        dense_top_k: int | None = None,
+        use_rerank: bool = False,
+        rerank_top_k: int = 0,
+        fusion_k: int = 60,
     ) -> list[dict[str, Any]]:
+        limit = int(lexical_top_k or top_k)
         clauses: list[dict[str, Any]] = [
             {
                 "multi_match": {
@@ -102,7 +122,7 @@ class OpenSearchBackend:
                 range_body["lte"] = date_to
             filters.append({"range": {"published_at": range_body}})
         payload = {
-            "size": top_k,
+            "size": limit,
             "query": {
                 "bool": {
                     "must": clauses,
@@ -125,6 +145,77 @@ class LocalSearchBackend:
     def __init__(self, runtime: CorpusRuntime) -> None:
         self.runtime = runtime
 
+    def _lookup_row(self, doc_id: str) -> dict[str, Any]:
+        return self.runtime.doc_lookup().get(str(doc_id), {})
+
+    def _results_to_rows(
+        self,
+        results: list[RetrievalResult],
+        *,
+        retrieval_mode: str,
+        date_from: str = "",
+        date_to: str = "",
+    ) -> list[dict[str, Any]]:
+        lookup = self.runtime.doc_lookup()
+        filtered: list[dict[str, Any]] = []
+        if not results:
+            return filtered
+        max_score = max((float(item.score) for item in results), default=0.0)
+        for item in results:
+            row = lookup.get(item.doc_id, {})
+            published_at = str(row.get("published_at", ""))
+            if date_from and published_at and published_at < date_from:
+                continue
+            if date_to and published_at and published_at > date_to:
+                continue
+            normalized = float(item.score) / max_score if max_score > 0 else 0.0
+            filtered.append(
+                {
+                    "doc_id": str(row.get("doc_id", item.doc_id)),
+                    "title": str(row.get("title", "")),
+                    "snippet": str(row.get("text", ""))[:360],
+                    "outlet": str(row.get("source", "")),
+                    "date": published_at,
+                    "score": round(float(item.score), 6),
+                    "score_display": round(normalized, 4),
+                    "rank": int(item.rank),
+                    "retrieval_mode": retrieval_mode,
+                    "score_components": {key: round(float(value), 6) for key, value in item.score_components.items()},
+                }
+            )
+        return filtered
+
+    def lexical_results(self, *, query: str, top_k: int) -> list[RetrievalResult]:
+        lexical_vectorizer, lexical_matrix, lexical_doc_ids = self.runtime.load_lexical_assets()
+        return retrieve_tfidf(
+            query=query,
+            vectorizer=lexical_vectorizer,
+            matrix=lexical_matrix,
+            doc_ids=lexical_doc_ids,
+            top_k=max(top_k, 1),
+        )
+
+    def dense_results(self, *, query: str, top_k: int) -> list[RetrievalResult]:
+        if self.runtime.retrieval_backend == "local":
+            dense_assets = self.runtime.load_dense_assets()
+            if dense_assets is None:
+                return []
+            dense_embeddings, dense_doc_ids = dense_assets
+            return retrieve_dense(
+                query=query,
+                model_id=self.runtime.dense_model_id,
+                embeddings=dense_embeddings,
+                doc_ids=dense_doc_ids,
+                top_k=max(top_k, 1),
+            )
+        return retrieve_dense_pgvector(
+            query=query,
+            model_id=self.runtime.dense_model_id,
+            dsn=self.runtime.pg_dsn,
+            table_name=self.runtime.pg_table,
+            top_k=max(top_k, 1),
+        )
+
     def search(
         self,
         *,
@@ -132,57 +223,122 @@ class LocalSearchBackend:
         top_k: int,
         date_from: str = "",
         date_to: str = "",
+        retrieval_mode: str = "hybrid",
+        lexical_top_k: int | None = None,
+        dense_top_k: int | None = None,
+        use_rerank: bool = False,
+        rerank_top_k: int = 0,
+        fusion_k: int = 60,
     ) -> list[dict[str, Any]]:
-        lexical_vectorizer, lexical_matrix, lexical_doc_ids = self.runtime.load_lexical_assets()
-        tfidf = retrieve_tfidf(
-            query=query,
-            vectorizer=lexical_vectorizer,
-            matrix=lexical_matrix,
-            doc_ids=lexical_doc_ids,
-            top_k=max(top_k * 5, 50),
-        )
-        if self.runtime.retrieval_backend == "local":
-            dense_assets = self.runtime.load_dense_assets()
-            if dense_assets is None:
-                dense = []
-            else:
-                dense_embeddings, dense_doc_ids = dense_assets
-                dense = retrieve_dense(
-                    query=query,
-                    model_id=self.runtime.dense_model_id,
-                    embeddings=dense_embeddings,
-                    doc_ids=dense_doc_ids,
-                    top_k=max(top_k * 5, 50),
-                )
+        mode = str(retrieval_mode or "hybrid").strip().lower()
+        lexical_limit = int(lexical_top_k or max(top_k * 5, 50))
+        dense_limit = int(dense_top_k or max(top_k * 5, 50))
+        if mode == "lexical":
+            ranked = self.lexical_results(query=query, top_k=lexical_limit)[:top_k]
+        elif mode == "dense":
+            ranked = self.dense_results(query=query, top_k=dense_limit)[:top_k]
         else:
-            dense = retrieve_dense_pgvector(
+            lexical = self.lexical_results(query=query, top_k=lexical_limit)
+            dense = self.dense_results(query=query, top_k=dense_limit)
+            ranked = reciprocal_rank_fusion({"lexical": lexical, "dense": dense}, k=fusion_k)[:top_k]
+
+        if use_rerank and ranked:
+            rerank_limit = min(max(int(rerank_top_k or top_k), top_k), len(ranked))
+            reranked = rerank_cross_encoder(
                 query=query,
-                model_id=self.runtime.dense_model_id,
-                dsn=self.runtime.pg_dsn,
-                table_name=self.runtime.pg_table,
-                top_k=max(top_k * 5, 50),
+                candidates=ranked[:rerank_limit],
+                doc_text_by_id=self.runtime.doc_text_by_id(),
+                model_id=self.runtime.rerank_model_id,
+                top_k=top_k,
             )
-        fused = reciprocal_rank_fusion({"tfidf": tfidf, "dense": dense})[:top_k]
-        lookup = self.runtime.doc_lookup()
-        rows: list[dict[str, Any]] = []
-        for item in fused:
-            row = lookup.get(item.doc_id, {})
-            published_at = str(row.get("published_at", ""))
-            if date_from and published_at and published_at < date_from:
+            ranked = reranked + ranked[rerank_limit:top_k]
+
+        return self._results_to_rows(ranked[:top_k], retrieval_mode=mode, date_from=date_from, date_to=date_to)
+
+
+class HybridSearchBackend:
+    def __init__(self, runtime: CorpusRuntime, lexical_backend: OpenSearchBackend | None = None) -> None:
+        self.runtime = runtime
+        self.local_backend = LocalSearchBackend(runtime)
+        self.lexical_backend = lexical_backend
+
+    def _rows_to_results(self, rows: list[dict[str, Any]], component_name: str) -> list[RetrievalResult]:
+        results: list[RetrievalResult] = []
+        for rank, row in enumerate(rows, start=1):
+            raw_score = float(row.get("score", 0.0) or 0.0)
+            if component_name == "lexical" and raw_score <= 0.0:
                 continue
-            if date_to and published_at and published_at > date_to:
-                continue
-            rows.append(
-                {
-                    "doc_id": str(row.get("doc_id", item.doc_id)),
-                    "title": str(row.get("title", "")),
-                    "snippet": str(row.get("text", ""))[:240],
-                    "outlet": str(row.get("source", "")),
-                    "date": published_at,
-                    "score": float(item.score),
-                }
+            results.append(
+                RetrievalResult(
+                    doc_id=str(row.get("doc_id", "")),
+                    rank=rank,
+                    score=raw_score,
+                    score_components={component_name: raw_score},
+                )
             )
-        return rows[:top_k]
+        return results
+
+    def search(
+        self,
+        *,
+        query: str,
+        top_k: int,
+        date_from: str = "",
+        date_to: str = "",
+        retrieval_mode: str = "hybrid",
+        lexical_top_k: int | None = None,
+        dense_top_k: int | None = None,
+        use_rerank: bool = False,
+        rerank_top_k: int = 0,
+        fusion_k: int = 60,
+    ) -> list[dict[str, Any]]:
+        mode = str(retrieval_mode or "hybrid").strip().lower()
+        lexical_limit = int(lexical_top_k or max(top_k * 5, 50))
+        dense_limit = int(dense_top_k or max(top_k * 5, 50))
+
+        def lexical_results() -> list[RetrievalResult]:
+            if self.lexical_backend is not None:
+                try:
+                    remote_rows = self.lexical_backend.search(
+                        query=query,
+                        top_k=lexical_limit,
+                        date_from=date_from,
+                        date_to=date_to,
+                        retrieval_mode="lexical",
+                    )
+                    remote_results = self._rows_to_results(remote_rows, "lexical")
+                    if remote_results:
+                        return remote_results
+                except Exception:
+                    pass
+            return self.local_backend.lexical_results(query=query, top_k=lexical_limit)
+
+        if mode == "dense":
+            ranked = self.local_backend.dense_results(query=query, top_k=dense_limit)[:top_k]
+        elif mode == "lexical":
+            ranked = lexical_results()[:top_k]
+        else:
+            lexical = lexical_results()
+            dense = self.local_backend.dense_results(query=query, top_k=dense_limit)
+            ranked = reciprocal_rank_fusion({"lexical": lexical, "dense": dense}, k=fusion_k)[:top_k]
+
+        if use_rerank and ranked:
+            rerank_limit = min(max(int(rerank_top_k or top_k), top_k), len(ranked))
+            reranked = rerank_cross_encoder(
+                query=query,
+                candidates=ranked[:rerank_limit],
+                doc_text_by_id=self.runtime.doc_text_by_id(),
+                model_id=self.runtime.rerank_model_id,
+                top_k=top_k,
+            )
+            ranked = reranked + ranked[rerank_limit:top_k]
+
+        return self.local_backend._results_to_rows(
+            ranked[:top_k],
+            retrieval_mode=mode,
+            date_from=date_from,
+            date_to=date_to,
+        )
 
 
 class WorkingSetStore(Protocol):

@@ -138,6 +138,18 @@ def test_runtime_q7_builds_evidence_table(tmp_path: Path) -> None:
     assert manifest.evidence_table
     first = manifest.evidence_table[0]
     assert {"doc_id", "outlet", "date", "excerpt", "score"}.issubset(first.keys())
+    assert "score_display" in first
+
+
+def test_selected_docs_keep_retrieval_scores_after_fetch(tmp_path: Path) -> None:
+    docs = _sample_documents()
+    runtime = build_test_runtime(tmp_path=tmp_path, documents=docs, search_rows_by_query=_search_rows(docs))
+
+    manifest = runtime.handle_query("Which media predicted the outbreak of the Ukraine war in 2022?", no_cache=True)
+
+    assert manifest.selected_docs
+    assert any(float(row.get("score", 0.0)) > 0 for row in manifest.selected_docs)
+    assert any(str(row.get("score_display", "")).strip() for row in manifest.selected_docs)
 
 
 def test_runtime_cache_can_be_used_or_skipped(tmp_path: Path) -> None:
@@ -285,6 +297,22 @@ def test_invalid_llm_plan_falls_back_to_framing_shift_heuristic(tmp_path: Path, 
                 "rejection_reason": "",
                 "message": "",
             },
+            {
+                "action": "emit_plan_dag",
+                "rewritten_question": "How did Facebook coverage shift from innovation/growth framing to privacy/regulation framing around the Cambridge Analytica scandal (2016-2019), and how did this correspond to FB stock drawdowns?",
+                "plan_dag": {
+                    "nodes": [
+                        {"node_id": "search", "capability": "db_search", "inputs": {"top_k": 60, "retrieval_mode": "hybrid", "use_rerank": True}},
+                        {"node_id": "fetch", "capability": "fetch_documents", "depends_on": ["search"]},
+                        {"node_id": "topics", "capability": "topic_model", "depends_on": ["fetch"]},
+                        {"node_id": "sentiment", "capability": "sentiment", "depends_on": ["fetch"]},
+                    ]
+                },
+                "assumptions": [],
+                "clarification_question": "",
+                "rejection_reason": "",
+                "message": "",
+            },
         ]
     )
     runtime = build_test_runtime(
@@ -305,7 +333,7 @@ def test_invalid_llm_plan_falls_back_to_framing_shift_heuristic(tmp_path: Path, 
     assert any(record.capability == "topic_model" for record in manifest.node_records)
     assert any(record.capability == "sentiment" for record in manifest.node_records)
     assert any(action.get("action") == "emit_plan_dag" for action in manifest.planner_actions)
-    assert any(trace.get("used_fallback") for trace in manifest.metadata.get("llm_traces", []))
+    assert any(trace.get("stage") == "plan_repair" for trace in manifest.metadata.get("llm_traces", []))
     assert manifest.evidence_table
     assert any("stock-price correspondence" in caveat for caveat in manifest.final_answer.caveats)
 
@@ -325,6 +353,61 @@ def test_api_runtime_info_reports_provider_and_device(tmp_path: Path) -> None:
     assert "llm" in payload
     assert "device" in payload
     assert "providers_installed" in payload
+
+
+def test_synthesis_guardrail_blocks_unverified_stock_claims(tmp_path: Path) -> None:
+    docs = _sample_documents()
+    llm = StaticLLMClient(
+        [
+            {
+                "action": "accept_with_assumptions",
+                "rewritten_question": "How did Facebook coverage shift from innovation to privacy framing, and how did this correspond to stock drawdowns?",
+                "assumptions": [],
+                "clarification_question": "",
+                "rejection_reason": "",
+                "message": "",
+            },
+            {
+                "action": "emit_plan_dag",
+                "rewritten_question": "How did Facebook coverage shift from innovation to privacy framing, and how did this correspond to stock drawdowns?",
+                "plan_dag": {
+                    "nodes": [
+                        {"node_id": "search", "capability": "db_search", "inputs": {"top_k": 10, "retrieval_mode": "hybrid", "use_rerank": False}},
+                        {"node_id": "fetch", "capability": "fetch_documents", "depends_on": ["search"]},
+                    ]
+                },
+                "assumptions": [],
+                "clarification_question": "",
+                "rejection_reason": "",
+                "message": "",
+            },
+            {
+                "answer_text": "Coverage shifted toward privacy and regulation, and this corresponded to Facebook stock drawdowns.",
+                "evidence_items": [],
+                "artifacts_used": [],
+                "unsupported_parts": [],
+                "caveats": [],
+                "claim_verdicts": [],
+            },
+        ]
+    )
+    runtime = build_test_runtime(
+        tmp_path=tmp_path,
+        documents=docs,
+        search_rows_by_query=_search_rows(docs),
+    )
+    runtime.llm_client = llm
+    runtime.orchestrator.llm_client = llm
+
+    manifest = runtime.handle_query(
+        "How did Facebook coverage shift from innovation/growth framing to privacy/regulation framing around the Cambridge Analytica scandal (2016-2019), and how did this correspond to FB stock drawdowns?",
+        force_answer=True,
+        no_cache=True,
+    )
+
+    assert any("external market time series" in caveat for caveat in manifest.final_answer.caveats)
+    assert any("stock-price or drawdown correspondence" in item for item in manifest.final_answer.unsupported_parts)
+    assert "unverified" in manifest.final_answer.answer_text.lower()
 
 
 def test_artifact_endpoint_serves_node_artifacts(tmp_path: Path) -> None:
