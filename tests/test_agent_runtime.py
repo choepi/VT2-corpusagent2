@@ -182,6 +182,64 @@ def test_api_query_endpoint_returns_manifest(tmp_path: Path) -> None:
     assert "runtime_info" in payload["metadata"]
 
 
+def test_runtime_can_update_and_reset_llm_settings(monkeypatch, tmp_path: Path) -> None:
+    docs = _sample_documents()
+    monkeypatch.setenv("CORPUSAGENT2_USE_OPENAI", "false")
+    monkeypatch.setenv("CORPUSAGENT2_UNCLOSE_PLANNER_MODEL", "hermes-plan")
+    monkeypatch.setenv("CORPUSAGENT2_UNCLOSE_SYNTHESIS_MODEL", "hermes-synth")
+    monkeypatch.setenv("CORPUSAGENT2_OPENAI_PLANNER_MODEL", "gpt-4.1-mini")
+    monkeypatch.setenv("CORPUSAGENT2_OPENAI_SYNTHESIS_MODEL", "gpt-4.1")
+    monkeypatch.setenv("OPENAI_API_KEY", "openai-key")
+    runtime = build_test_runtime(tmp_path=tmp_path, documents=docs, search_rows_by_query=_search_rows(docs))
+
+    updated = runtime.update_llm_runtime_settings(
+        use_openai=True,
+        planner_model="gpt-4.1-nano",
+        synthesis_model="gpt-4.1-mini",
+    )
+
+    assert updated["llm"]["use_openai"] is True
+    assert updated["llm"]["override_active"] is True
+    assert updated["llm"]["planner_model"] == "gpt-4.1-nano"
+
+    reset = runtime.reset_llm_runtime_settings()
+
+    assert reset["llm"]["use_openai"] is False
+    assert reset["llm"]["override_active"] is False
+    assert reset["llm"]["planner_model"] == "hermes-plan"
+
+
+def test_api_llm_settings_endpoint_updates_runtime(monkeypatch, tmp_path: Path) -> None:
+    docs = _sample_documents()
+    monkeypatch.setenv("CORPUSAGENT2_USE_OPENAI", "false")
+    monkeypatch.setenv("CORPUSAGENT2_OPENAI_PLANNER_MODEL", "gpt-4.1-mini")
+    monkeypatch.setenv("CORPUSAGENT2_OPENAI_SYNTHESIS_MODEL", "gpt-4.1")
+    monkeypatch.setenv("OPENAI_API_KEY", "openai-key")
+    runtime = build_test_runtime(tmp_path=tmp_path, documents=docs, search_rows_by_query=_search_rows(docs))
+    app = build_app(runtime=runtime, project_root=tmp_path)
+
+    from fastapi.testclient import TestClient
+
+    client = TestClient(app)
+    response = client.post(
+        "/settings/llm",
+        json={
+            "use_openai": True,
+            "planner_model": "gpt-4.1-mini",
+            "synthesis_model": "gpt-4.1",
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["llm"]["use_openai"] is True
+    assert payload["llm"]["provider_name"] == "openai"
+
+    reset = client.post("/settings/llm/reset", json={"reset_to_startup": True})
+    assert reset.status_code == 200
+    assert reset.json()["llm"]["override_active"] is False
+
+
 def test_capability_catalog_contains_full_first_trial_surface(tmp_path: Path) -> None:
     docs = _sample_documents()
     runtime = build_test_runtime(tmp_path=tmp_path, documents=docs, search_rows_by_query=_search_rows(docs))
@@ -252,6 +310,41 @@ def test_api_abort_run_marks_async_query_aborted(tmp_path: Path) -> None:
         time.sleep(0.05)
 
     assert status_payload["status"] == "aborted"
+
+
+def test_api_llm_settings_endpoint_rejects_updates_while_run_is_active(monkeypatch, tmp_path: Path) -> None:
+    docs = _sample_documents()
+    monkeypatch.setenv("CORPUSAGENT2_USE_OPENAI", "false")
+    monkeypatch.setenv("CORPUSAGENT2_OPENAI_PLANNER_MODEL", "gpt-4.1-mini")
+    monkeypatch.setenv("CORPUSAGENT2_OPENAI_SYNTHESIS_MODEL", "gpt-4.1")
+    monkeypatch.setenv("OPENAI_API_KEY", "openai-key")
+    runtime = build_test_runtime(
+        tmp_path=tmp_path,
+        documents=docs,
+        search_rows_by_query=_search_rows(docs),
+        search_delay_s=0.35,
+    )
+    app = build_app(runtime=runtime, project_root=tmp_path)
+
+    from fastapi.testclient import TestClient
+
+    client = TestClient(app)
+    submitted = client.post(
+        "/query/submit",
+        json={"question": "Which media predicted the outbreak of the Ukraine war in 2022?"},
+    )
+    assert submitted.status_code == 200
+
+    response = client.post(
+        "/settings/llm",
+        json={
+            "use_openai": True,
+            "planner_model": "gpt-4.1-mini",
+            "synthesis_model": "gpt-4.1",
+        },
+    )
+
+    assert response.status_code == 409
 
 
 def test_api_abort_all_runs_returns_aborted_run_ids(tmp_path: Path) -> None:
@@ -331,6 +424,53 @@ def test_clarification_history_allows_follow_up_run(tmp_path: Path) -> None:
 
     assert manifest.status in {"completed", "partial"}
     assert "Compare NZZ and TA football coverage only." in manifest.rewritten_question
+
+
+def test_broad_scope_clarification_prevents_repeat_question_loop(tmp_path: Path) -> None:
+    docs = _sample_documents()
+    llm = StaticLLMClient(
+        [
+            {
+                "action": "ask_clarification",
+                "rewritten_question": "How did media coverage of Greta Thunberg and youth climate activism evolve from 2018 to 2021, and how did framing and tone vary across regions and outlet types?",
+                "clarification_question": "Could you please specify which European countries or regions you would like me to focus on in the analysis?",
+                "assumptions": [],
+                "message": "",
+            },
+            {
+                "action": "emit_plan_dag",
+                "rewritten_question": "How did media coverage of Greta Thunberg and youth climate activism evolve from 2018 to 2021, and how did framing and tone vary across regions and outlet types?",
+                "plan_dag": {
+                    "nodes": [
+                        {"node_id": "search", "capability": "db_search", "inputs": {"top_k": 40, "retrieval_mode": "hybrid", "use_rerank": True}},
+                        {"node_id": "fetch", "capability": "fetch_documents", "depends_on": ["search"]},
+                        {"node_id": "topics", "capability": "topic_model", "depends_on": ["fetch"]},
+                    ]
+                },
+                "assumptions": [],
+                "clarification_question": "",
+                "rejection_reason": "",
+                "message": "",
+            },
+        ]
+    )
+    runtime = build_test_runtime(
+        tmp_path=tmp_path,
+        documents=docs,
+        search_rows_by_query=_search_rows(docs),
+    )
+    runtime.llm_client = llm
+    runtime.orchestrator.llm_client = llm
+
+    manifest = runtime.handle_query(
+        "How did media coverage of Greta Thunberg and youth climate activism evolve from 2018 to 2021, and how did framing and tone vary across regions and outlet types?",
+        clarification_history=["europe, overall, quantitative as well"],
+        no_cache=True,
+    )
+
+    assert manifest.status in {"completed", "partial"}
+    assert not manifest.clarification_questions
+    assert any("Europe-wide overall coverage" in item for item in manifest.assumptions)
 
 
 def test_invalid_llm_plan_falls_back_to_framing_shift_heuristic(tmp_path: Path, monkeypatch) -> None:

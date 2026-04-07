@@ -14,6 +14,12 @@ const providerBadge = document.getElementById("providerBadge");
 const modelBadge = document.getElementById("modelBadge");
 const deviceBadge = document.getElementById("deviceBadge");
 const runtimeModeBadge = document.getElementById("runtimeModeBadge");
+const llmProviderSelect = document.getElementById("llmProvider");
+const plannerModelInput = document.getElementById("plannerModelInput");
+const synthesisModelInput = document.getElementById("synthesisModelInput");
+const applyLlmSettingsButton = document.getElementById("applyLlmSettingsButton");
+const resetLlmSettingsButton = document.getElementById("resetLlmSettingsButton");
+const llmSettingsNote = document.getElementById("llmSettingsNote");
 const runtimeSummary = document.getElementById("runtimeSummary");
 const providersInstalled = document.getElementById("providersInstalled");
 const providerOrder = document.getElementById("providerOrder");
@@ -67,6 +73,9 @@ function saveUiState() {
     question: questionInput.value,
     forceAnswer: forceAnswerInput.checked,
     noCache: noCacheInput.checked,
+    llmProvider: llmProviderSelect.value,
+    plannerModel: plannerModelInput.value,
+    synthesisModel: synthesisModelInput.value,
     clarificationHistory,
     pendingClarificationQuestion,
     currentRunId,
@@ -86,6 +95,9 @@ function restoreUiState() {
     questionInput.value = payload.question || questionInput.value;
     forceAnswerInput.checked = Boolean(payload.forceAnswer);
     noCacheInput.checked = Boolean(payload.noCache);
+    llmProviderSelect.value = payload.llmProvider || llmProviderSelect.value;
+    plannerModelInput.value = payload.plannerModel || plannerModelInput.value;
+    synthesisModelInput.value = payload.synthesisModel || synthesisModelInput.value;
     clarificationHistory = Array.isArray(payload.clarificationHistory) ? payload.clarificationHistory : [];
     pendingClarificationQuestion = payload.pendingClarificationQuestion || "";
     currentRunId = payload.currentRunId || "";
@@ -101,6 +113,8 @@ function hasActiveRun() {
 
 function updateControlState() {
   abortButton.disabled = !hasActiveRun();
+  applyLlmSettingsButton.disabled = hasActiveRun();
+  resetLlmSettingsButton.disabled = hasActiveRun();
 }
 
 function escapeHtml(value) {
@@ -257,11 +271,19 @@ function renderRuntimeInfo(payload) {
   modelBadge.textContent = `Planner: ${llm.planner_model || "unknown"}`;
   deviceBadge.textContent = `Device: ${device.recommended_device || "unknown"}`;
   runtimeModeBadge.textContent = llm.use_openai ? "OpenAI mode" : "UncloseAI mode";
+  llmProviderSelect.value = llm.use_openai ? "openai" : "uncloseai";
+  plannerModelInput.value = llm.planner_model || "";
+  synthesisModelInput.value = llm.synthesis_model || "";
+  llmSettingsNote.textContent = llm.override_active
+    ? "Runtime override active. New runs use the UI-selected backend until the server restarts or you reset to startup."
+    : "Using startup defaults from the backend config. Apply here to override for future runs without editing .env.";
 
     runtimeSummary.innerHTML = `
       <div class="metric-row"><span>Backend</span><strong>${escapeHtml(llm.base_url || "")}</strong></div>
       <div class="metric-row"><span>Synthesis model</span><strong>${escapeHtml(llm.synthesis_model || "")}</strong></div>
       <div class="metric-row"><span>API key present</span><strong>${llm.api_key_present ? "yes" : "no"}</strong></div>
+      <div class="metric-row"><span>Override active</span><strong>${llm.override_active ? "yes" : "no"}</strong></div>
+      <div class="metric-row"><span>Startup planner</span><strong>${escapeHtml(llm.startup_defaults?.planner_model || "")}</strong></div>
       <div class="metric-row"><span>CUDA available</span><strong>${device.cuda_available ? "yes" : "no"}</strong></div>
       <div class="metric-row"><span>GPU count</span><strong>${escapeHtml(device.cuda_device_count ?? 0)}</strong></div>
       <div class="metric-row"><span>Retrieval mode</span><strong>${escapeHtml(retrieval.default_mode || "unknown")}</strong></div>
@@ -286,6 +308,8 @@ function renderRuntimeInfo(payload) {
   });
 
     renderList(runtimeNotes, [...(payload.analysis_notes || []), ...(llm.warnings || []), ...(device.warnings || [])], (row) => escapeHtml(row));
+  updateControlState();
+  saveUiState();
 }
 
 function renderPlannerActions(actions) {
@@ -518,6 +542,34 @@ async function loadRuntimeInfo() {
   }
 }
 
+async function applyLlmSettings() {
+  const base = apiBaseInput.value.replace(/\/$/, "");
+  llmSettingsNote.textContent = "Updating backend LLM settings...";
+  const payload = await fetchJson(`${base}/settings/llm`, {
+    method: "POST",
+    body: JSON.stringify({
+      use_openai: llmProviderSelect.value === "openai",
+      planner_model: plannerModelInput.value.trim(),
+      synthesis_model: synthesisModelInput.value.trim(),
+    }),
+  });
+  renderRuntimeInfo(payload);
+  detailText.textContent = "Backend LLM settings updated. New runs will use the selected provider/models.";
+  saveUiState();
+}
+
+async function resetLlmSettings() {
+  const base = apiBaseInput.value.replace(/\/$/, "");
+  llmSettingsNote.textContent = "Resetting backend LLM settings to startup defaults...";
+  const payload = await fetchJson(`${base}/settings/llm/reset`, {
+    method: "POST",
+    body: JSON.stringify({ reset_to_startup: true }),
+  });
+  renderRuntimeInfo(payload);
+  detailText.textContent = "Backend LLM settings reset to startup defaults from config/.env.";
+  saveUiState();
+}
+
 async function abortCurrentRun({ silent = false } = {}) {
   if (!currentRunId) {
     return null;
@@ -678,6 +730,22 @@ abortAllButton.addEventListener("click", async () => {
   }
 });
 
+applyLlmSettingsButton.addEventListener("click", async () => {
+  try {
+    await applyLlmSettings();
+  } catch (error) {
+    detailText.textContent = `LLM settings update failed: ${error.message}`;
+  }
+});
+
+resetLlmSettingsButton.addEventListener("click", async () => {
+  try {
+    await resetLlmSettings();
+  } catch (error) {
+    detailText.textContent = `LLM settings reset failed: ${error.message}`;
+  }
+});
+
 continueButton.addEventListener("click", async () => {
   const text = clarificationInput.value.trim();
   if (!text) {
@@ -720,6 +788,9 @@ window.addEventListener("keydown", (event) => {
   questionInput,
   forceAnswerInput,
   noCacheInput,
+  llmProviderSelect,
+  plannerModelInput,
+  synthesisModelInput,
   clarificationInput,
 ].forEach((element) => {
   element.addEventListener("input", saveUiState);

@@ -20,6 +20,16 @@ class QueryRequest(BaseModel):
     clarification_history: list[str] = Field(default_factory=list)
 
 
+class LLMSettingsRequest(BaseModel):
+    use_openai: bool
+    planner_model: str = Field(default="")
+    synthesis_model: str = Field(default="")
+
+
+class LLMSettingsResetRequest(BaseModel):
+    reset_to_startup: bool = True
+
+
 def build_app(runtime: AgentRuntime | None = None, project_root: Path | None = None) -> FastAPI:
     resolved_runtime = runtime or AgentRuntime(
         config=AgentRuntimeConfig.from_project_root(project_root or Path(__file__).resolve().parents[2])
@@ -49,6 +59,30 @@ def build_app(runtime: AgentRuntime | None = None, project_root: Path | None = N
     @app.get("/runtime-info")
     def runtime_info() -> dict[str, Any]:
         return resolved_runtime.runtime_info()
+
+    @app.get("/settings/llm")
+    def get_llm_settings() -> dict[str, Any]:
+        return resolved_runtime.runtime_info()["llm"]
+
+    @app.post("/settings/llm")
+    def update_llm_settings(request: LLMSettingsRequest) -> dict[str, Any]:
+        try:
+            return resolved_runtime.update_llm_runtime_settings(
+                use_openai=request.use_openai,
+                planner_model=request.planner_model,
+                synthesis_model=request.synthesis_model,
+            )
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.post("/settings/llm/reset")
+    def reset_llm_settings(request: LLMSettingsResetRequest) -> dict[str, Any]:
+        if not request.reset_to_startup:
+            raise HTTPException(status_code=400, detail="reset_to_startup must be true.")
+        try:
+            return resolved_runtime.reset_llm_runtime_settings()
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     @app.post("/query")
     def query(request: QueryRequest) -> dict[str, Any]:

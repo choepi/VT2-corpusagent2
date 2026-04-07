@@ -112,6 +112,54 @@ class LLMProviderConfig:
     verify_ssl: bool = True
     extra_headers: dict[str, str] = field(default_factory=dict)
 
+    def with_runtime_overrides(
+        self,
+        *,
+        use_openai: bool | None = None,
+        planner_model: str | None = None,
+        synthesis_model: str | None = None,
+    ) -> "LLMProviderConfig":
+        resolved_use_openai = self.use_openai if use_openai is None else bool(use_openai)
+        provider_name = "openai" if resolved_use_openai else "uncloseai"
+        if resolved_use_openai:
+            base_url = os.getenv("CORPUSAGENT2_OPENAI_BASE_URL", self.openai_fallback_base_url()).strip() or self.openai_fallback_base_url()
+            api_key = os.getenv("OPENAI_API_KEY", "").strip() or os.getenv("CORPUSAGENT2_LLM_API_KEY", "").strip()
+            default_planner = os.getenv("CORPUSAGENT2_OPENAI_PLANNER_MODEL", self.openai_fallback_planner_model()).strip() or self.openai_fallback_planner_model()
+            default_synthesis = os.getenv("CORPUSAGENT2_OPENAI_SYNTHESIS_MODEL", default_planner).strip() or default_planner
+        else:
+            base_url = os.getenv("CORPUSAGENT2_UNCLOSE_BASE_URL", self.unclose_fallback_base_url()).strip() or self.unclose_fallback_base_url()
+            api_key = os.getenv("CORPUSAGENT2_LLM_API_KEY", "").strip() or "choose-any-value"
+            default_planner = os.getenv("CORPUSAGENT2_UNCLOSE_PLANNER_MODEL", self.unclose_fallback_planner_model()).strip() or self.unclose_fallback_planner_model()
+            default_synthesis = os.getenv("CORPUSAGENT2_UNCLOSE_SYNTHESIS_MODEL", default_planner).strip() or default_planner
+
+        return LLMProviderConfig(
+            use_openai=resolved_use_openai,
+            provider_name=provider_name,
+            base_url=base_url,
+            api_key=api_key,
+            planner_model=(planner_model or default_planner).strip(),
+            synthesis_model=(synthesis_model or default_synthesis).strip(),
+            timeout_s=self.timeout_s,
+            verify_ssl=self.verify_ssl,
+            extra_headers=dict(self.extra_headers),
+        )
+
+    @staticmethod
+    def openai_fallback_base_url() -> str:
+        return "https://api.openai.com/v1"
+
+    @staticmethod
+    def openai_fallback_planner_model() -> str:
+        return "gpt-4.1-mini"
+
+    @staticmethod
+    def unclose_fallback_base_url() -> str:
+        return "https://hermes.ai.unturf.com/v1"
+
+    @staticmethod
+    def unclose_fallback_planner_model() -> str:
+        return "adamo1139/Hermes-3-Llama-3.1-8B-FP8-Dynamic"
+
     @classmethod
     def from_env(cls) -> "LLMProviderConfig":
         raw_toggle = os.getenv("CORPUSAGENT2_USE_OPENAI")
@@ -131,15 +179,15 @@ class LLMProviderConfig:
         use_openai = _truthy(raw_toggle) if raw_toggle is not None else legacy_provider == "openai"
         provider_name = "openai" if use_openai else "uncloseai"
 
-        openai_base_url = os.getenv("CORPUSAGENT2_OPENAI_BASE_URL", "https://api.openai.com/v1").strip() or "https://api.openai.com/v1"
-        openai_planner_model = os.getenv("CORPUSAGENT2_OPENAI_PLANNER_MODEL", "gpt-4.1-mini").strip() or "gpt-4.1-mini"
+        openai_base_url = os.getenv("CORPUSAGENT2_OPENAI_BASE_URL", cls.openai_fallback_base_url()).strip() or cls.openai_fallback_base_url()
+        openai_planner_model = os.getenv("CORPUSAGENT2_OPENAI_PLANNER_MODEL", cls.openai_fallback_planner_model()).strip() or cls.openai_fallback_planner_model()
         openai_synthesis_model = os.getenv("CORPUSAGENT2_OPENAI_SYNTHESIS_MODEL", openai_planner_model).strip() or openai_planner_model
 
-        unclose_base_url = os.getenv("CORPUSAGENT2_UNCLOSE_BASE_URL", "https://hermes.ai.unturf.com/v1").strip() or "https://hermes.ai.unturf.com/v1"
+        unclose_base_url = os.getenv("CORPUSAGENT2_UNCLOSE_BASE_URL", cls.unclose_fallback_base_url()).strip() or cls.unclose_fallback_base_url()
         unclose_planner_model = os.getenv(
             "CORPUSAGENT2_UNCLOSE_PLANNER_MODEL",
-            "adamo1139/Hermes-3-Llama-3.1-8B-FP8-Dynamic",
-        ).strip() or "adamo1139/Hermes-3-Llama-3.1-8B-FP8-Dynamic"
+            cls.unclose_fallback_planner_model(),
+        ).strip() or cls.unclose_fallback_planner_model()
         unclose_synthesis_model = os.getenv(
             "CORPUSAGENT2_UNCLOSE_SYNTHESIS_MODEL",
             unclose_planner_model,

@@ -75,6 +75,36 @@
             <h2>Runtime Profile</h2>
             <span id="runtimeModeBadge" class="pill subtle">Loading</span>
           </div>
+          <div class="llm-settings-panel">
+            <div class="llm-settings-head">
+              <h3>Backend LLM Controls</h3>
+              <span class="pill subtle">Applies to future runs</span>
+            </div>
+            <div class="llm-settings-grid">
+              <div>
+                <label for="llmProvider">Provider</label>
+                <select id="llmProvider">
+                  <option value="uncloseai">UncloseAI / Hermes</option>
+                  <option value="openai">OpenAI</option>
+                </select>
+              </div>
+              <div>
+                <label for="plannerModelInput">Planner model</label>
+                <input id="plannerModelInput" type="text" placeholder="gpt-4.1-mini" />
+              </div>
+              <div>
+                <label for="synthesisModelInput">Synthesis model</label>
+                <input id="synthesisModelInput" type="text" placeholder="gpt-4.1-mini" />
+              </div>
+            </div>
+            <div class="controls llm-settings-controls">
+              <button id="applyLlmSettingsButton" type="button">Apply LLM Settings</button>
+              <button id="resetLlmSettingsButton" type="button" class="ghost-button">Reset To Startup</button>
+            </div>
+            <p id="llmSettingsNote" class="muted">
+              The UI controls update the backend process for future runs only. Restarting the backend returns to the startup `.env` defaults unless you also change them there.
+            </p>
+          </div>
           <div id="runtimeSummary" class="metric-stack"></div>
           <h3>Installed Providers</h3>
           <div id="providersInstalled" class="chip-wrap"></div>

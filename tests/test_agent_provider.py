@@ -67,3 +67,37 @@ def test_extract_json_object_recovers_from_python_literal_dict() -> None:
 
     assert payload["action"] == "ask_clarification"
     assert payload["clarification_question"] == "Which outlets should I compare?"
+
+
+def test_provider_config_runtime_override_switches_to_openai(monkeypatch) -> None:
+    monkeypatch.setenv("CORPUSAGENT2_USE_OPENAI", "false")
+    monkeypatch.setenv("CORPUSAGENT2_UNCLOSE_PLANNER_MODEL", "hermes-plan")
+    monkeypatch.setenv("CORPUSAGENT2_UNCLOSE_SYNTHESIS_MODEL", "hermes-synth")
+    monkeypatch.setenv("CORPUSAGENT2_OPENAI_PLANNER_MODEL", "gpt-4.1-mini")
+    monkeypatch.setenv("CORPUSAGENT2_OPENAI_SYNTHESIS_MODEL", "gpt-4.1")
+    monkeypatch.setenv("OPENAI_API_KEY", "openai-key")
+    config = LLMProviderConfig.from_env()
+
+    updated = config.with_runtime_overrides(use_openai=True)
+
+    assert updated.use_openai is True
+    assert updated.provider_name == "openai"
+    assert updated.api_key == "openai-key"
+    assert updated.planner_model == "gpt-4.1-mini"
+    assert updated.synthesis_model == "gpt-4.1"
+
+
+def test_provider_config_runtime_override_accepts_model_override(monkeypatch) -> None:
+    monkeypatch.setenv("CORPUSAGENT2_USE_OPENAI", "false")
+    monkeypatch.setenv("CORPUSAGENT2_LLM_API_KEY", "choose-any-value")
+    config = LLMProviderConfig.from_env()
+
+    updated = config.with_runtime_overrides(
+        use_openai=False,
+        planner_model="custom-plan",
+        synthesis_model="custom-synth",
+    )
+
+    assert updated.provider_name == "uncloseai"
+    assert updated.planner_model == "custom-plan"
+    assert updated.synthesis_model == "custom-synth"

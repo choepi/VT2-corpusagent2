@@ -126,6 +126,35 @@ class MagicBoxOrchestrator:
         filtered = [token for token in tokens if token.lower() not in stopwords]
         return " ".join(filtered[:8]).strip()
 
+    def _broad_scope_clarification_is_sufficient(self, state: AgentRunState) -> tuple[bool, list[str]]:
+        if not state.clarification_history:
+            return False, []
+        question_text = f"{state.question}\n" + "\n".join(state.clarification_history)
+        lowered = question_text.lower()
+        assumptions: list[str] = []
+        sufficient = False
+
+        has_broad_region = any(
+            token in lowered
+            for token in ("europe", "european", "overall europe", "across europe", "europe-wide")
+        )
+        has_broad_aggregation = any(
+            token in lowered
+            for token in ("overall", "aggregate", "broadly", "quantitative", "quantitativ")
+        )
+        asks_regional = any(token in state.question.lower() for token in ("region", "regions", "across regions"))
+        asks_outlet_types = "outlet type" in state.question.lower() or "outlet types" in state.question.lower()
+
+        if has_broad_region and asks_regional:
+            sufficient = True
+            assumptions.append("Interpret the requested region scope as Europe-wide overall coverage rather than country-by-country subregions.")
+        if has_broad_aggregation:
+            sufficient = True
+            assumptions.append("Prefer a quantitative aggregate summary where possible and note any metadata limits explicitly.")
+        if asks_outlet_types and sufficient:
+            assumptions.append("Use available outlet/source metadata as the outlet-type proxy; if outlet-type labels are sparse, report the overall pattern and the limitation.")
+        return sufficient, assumptions
+
     def rephrase_or_clarify(self, state: AgentRunState) -> PlannerAction:
         rejection_reason = rejection_reason_for_question(state.question)
         if rejection_reason:
@@ -199,6 +228,14 @@ class MagicBoxOrchestrator:
                     rewritten_question=forced_rewrite,
                     assumptions=forced_assumptions,
                     message=action.message,
+                )
+            sufficient, clarification_assumptions = self._broad_scope_clarification_is_sufficient(state)
+            if action.action == "ask_clarification" and sufficient:
+                return PlannerAction(
+                    action="accept_with_assumptions",
+                    rewritten_question=action.rewritten_question or rewritten or state.question,
+                    assumptions=list(dict.fromkeys(list(action.assumptions) + assumptions + clarification_assumptions)),
+                    message="Broad-scope clarification accepted; proceeding with explicit assumptions.",
                 )
             if not action.rewritten_question:
                 action.rewritten_question = rewritten
@@ -729,7 +766,8 @@ class AgentRuntime:
         self.config = config
         self.app_config = load_project_configuration(config.project_root)
         self.runtime = runtime or CorpusRuntime.from_project_root(config.project_root)
-        self.llm_config = llm_config or LLMProviderConfig.from_env()
+        self._startup_llm_config = llm_config or LLMProviderConfig.from_env()
+        self.llm_config = self._startup_llm_config
         self.llm_client = llm_client or OpenAICompatibleLLMClient(self.llm_config)
         self.registry = registry or build_agent_registry()
         self.search_backend = search_backend or self._build_search_backend()
@@ -741,6 +779,7 @@ class AgentRuntime:
         self._run_cancel_events: dict[str, threading.Event] = {}
         self._run_threads: dict[str, threading.Thread] = {}
         self._run_lock = threading.Lock()
+        self._llm_override_active = False
 
     def _build_search_backend(self):
         try:
@@ -762,6 +801,55 @@ class AgentRuntime:
 
     def capability_catalog(self) -> list[dict[str, Any]]:
         return [spec.to_dict() for spec in self.registry.list_tools()]
+
+    def _active_run_ids(self) -> list[str]:
+        with self._run_lock:
+            return [
+                run_id
+                for run_id, status in self._live_runs.items()
+                if status.status not in TERMINAL_RUN_STATUSES
+            ]
+
+    def update_llm_runtime_settings(
+        self,
+        *,
+        use_openai: bool,
+        planner_model: str = "",
+        synthesis_model: str = "",
+    ) -> dict[str, Any]:
+        active_run_ids = self._active_run_ids()
+        if active_run_ids:
+            raise RuntimeError(
+                "LLM settings can only be changed when no query is running. Abort active runs first."
+            )
+
+        resolved = self._startup_llm_config.with_runtime_overrides(
+            use_openai=use_openai,
+            planner_model=planner_model or None,
+            synthesis_model=synthesis_model or None,
+        )
+        self.llm_config = resolved
+        self.llm_client = OpenAICompatibleLLMClient(resolved)
+        self.orchestrator = MagicBoxOrchestrator(self.llm_client, self.llm_config)
+        self._llm_override_active = (
+            resolved.use_openai != self._startup_llm_config.use_openai
+            or resolved.planner_model != self._startup_llm_config.planner_model
+            or resolved.synthesis_model != self._startup_llm_config.synthesis_model
+            or resolved.base_url != self._startup_llm_config.base_url
+        )
+        return self.runtime_info()
+
+    def reset_llm_runtime_settings(self) -> dict[str, Any]:
+        active_run_ids = self._active_run_ids()
+        if active_run_ids:
+            raise RuntimeError(
+                "LLM settings can only be reset when no query is running. Abort active runs first."
+            )
+        self.llm_config = self._startup_llm_config
+        self.llm_client = OpenAICompatibleLLMClient(self.llm_config)
+        self.orchestrator = MagicBoxOrchestrator(self.llm_client, self.llm_config)
+        self._llm_override_active = False
+        return self.runtime_info()
 
     def runtime_info(self) -> dict[str, Any]:
         provider_modules = {}
@@ -792,6 +880,14 @@ class AgentRuntime:
                 "planner_model": self.llm_config.planner_model,
                 "synthesis_model": self.llm_config.synthesis_model,
                 "api_key_present": bool(self.llm_config.api_key),
+                "override_active": self._llm_override_active,
+                "startup_defaults": {
+                    "use_openai": self._startup_llm_config.use_openai,
+                    "provider_name": self._startup_llm_config.provider_name,
+                    "base_url": self._startup_llm_config.base_url,
+                    "planner_model": self._startup_llm_config.planner_model,
+                    "synthesis_model": self._startup_llm_config.synthesis_model,
+                },
                 "warnings": llm_warnings,
             },
             "device": {
@@ -812,11 +908,12 @@ class AgentRuntime:
                 "rerank_model_id": self.runtime.rerank_model_id,
             },
             "analysis_notes": [
-                "Toggle providers with CORPUSAGENT2_USE_OPENAI=true or false, then restart the backend.",
+                "UI model/provider changes are process-local runtime overrides. They affect future runs only and reset when the backend restarts unless you also update .env.",
                 "Classical spaCy/textacy/gensim analytics are usually CPU-bound even when CUDA is available.",
                 "GPU is mainly relevant for torch- or Flair-backed models and only when those providers are selected.",
                 "Per-node provider choice and artifacts are captured in the run manifest so you can verify what really ran.",
             ],
+            "active_run_ids": self._active_run_ids(),
         }
 
     def _set_live_status(self, run_id: str, **updates: Any) -> LiveRunStatus:
