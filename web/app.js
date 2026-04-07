@@ -132,12 +132,14 @@ function collectArtifacts(manifest) {
 function openPlotModal(src, caption) {
   plotModalImage.src = src;
   plotModalTitle.textContent = caption || "Plot preview";
+  plotModal.hidden = false;
   plotModal.classList.remove("hidden");
   plotModal.setAttribute("aria-hidden", "false");
   document.body.style.overflow = "hidden";
 }
 
 function closePlotModal() {
+  plotModal.hidden = true;
   plotModal.classList.add("hidden");
   plotModal.setAttribute("aria-hidden", "true");
   plotModalImage.src = "";
@@ -589,5 +591,6 @@ window.addEventListener("keydown", (event) => {
   }
 });
 
+closePlotModal();
 renderClarificationState();
 loadRuntimeInfo();
