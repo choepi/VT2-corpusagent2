@@ -46,6 +46,7 @@ let clarificationHistory = [];
 let pendingClarificationQuestion = "";
 let currentRunId = "";
 let latestRuntimeInfo = null;
+const POLL_INTERVAL_MS = 250;
 
 const runtimeConfig = window.CORPUSAGENT2_CONFIG || {};
 if (runtimeConfig.apiBaseUrl) {
@@ -408,14 +409,27 @@ function renderManifest(manifest) {
 
 function setStatus(payload) {
   const status = payload.status || "unknown";
+  const liveActiveSteps = Array.isArray(payload.active_steps) ? payload.active_steps : [];
+  const derivedActiveSteps =
+    liveActiveSteps.length > 0
+      ? liveActiveSteps
+      : status === "running"
+        ? [
+            {
+              node_id: payload.current_phase || "phase",
+              capability: payload.detail || payload.current_phase || "Working",
+              status: "running",
+            },
+          ]
+        : [];
   statusBox.textContent = status;
   statusBox.className = `status ${status}`;
   detailText.textContent = payload.detail || payload.current_phase || "No detail available.";
-  activeCount.textContent = String((payload.active_steps || []).length);
+  activeCount.textContent = String(derivedActiveSteps.length);
   completedCount.textContent = String((payload.completed_steps || []).length);
   failedCount.textContent = String((payload.failed_steps || []).length);
 
-  renderList(activeSteps, payload.active_steps || [], (row) => `${escapeHtml(row.capability)} (${escapeHtml(row.node_id)})`);
+  renderList(activeSteps, derivedActiveSteps, (row) => `${escapeHtml(row.capability)} (${escapeHtml(row.node_id)})`);
   renderList(completedSteps, payload.completed_steps || [], (row) => `${escapeHtml(row.capability)} (${escapeHtml(row.node_id)})`);
   renderList(
     failedSteps,
@@ -496,7 +510,7 @@ async function submitQuery({ preserveClarificationHistory = false } = {}) {
   });
   currentRunId = payload.run_id || "";
   setStatus(payload);
-  pollTimer = setInterval(() => pollRun(payload.run_id), 1500);
+  pollTimer = setInterval(() => pollRun(payload.run_id), POLL_INTERVAL_MS);
   await pollRun(payload.run_id);
 }
 
