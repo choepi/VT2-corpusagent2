@@ -90,6 +90,24 @@ class MagicBoxOrchestrator:
         }
         state.llm_traces.append(entry)
 
+    def _planner_payload_is_actionable(self, payload: dict[str, Any]) -> bool:
+        if not isinstance(payload, dict) or not payload:
+            return False
+        action = str(payload.get("action", "")).strip()
+        if action:
+            if action == "emit_plan_dag":
+                dag_payload = payload.get("plan_dag")
+                return isinstance(dag_payload, dict) and bool(dag_payload.get("nodes"))
+            return True
+        dag_payload = payload.get("plan_dag")
+        if isinstance(dag_payload, dict) and bool(dag_payload.get("nodes")):
+            return True
+        if str(payload.get("clarification_question", "")).strip():
+            return True
+        if str(payload.get("rejection_reason", "")).strip():
+            return True
+        return False
+
     def _question_with_clarifications(self, state: AgentRunState) -> str:
         history = [str(item).strip() for item in state.clarification_history if str(item).strip()]
         if not history:
@@ -411,8 +429,9 @@ class MagicBoxOrchestrator:
             )
             payload = dict(trace["parsed_json"])
             self._record_llm_trace(state, stage="plan", trace=trace)
-            action = PlannerAction.from_dict(payload)
-            if action.action == "emit_plan_dag" and action.plan_dag is None:
+            actionable_payload = self._planner_payload_is_actionable(payload)
+            action = PlannerAction.from_dict(payload) if actionable_payload else None
+            if (not actionable_payload) or (action is not None and action.action == "emit_plan_dag" and action.plan_dag is None):
                 repair_messages = [
                     {"role": "system", "content": repair_system_message},
                     {
@@ -435,9 +454,14 @@ class MagicBoxOrchestrator:
                     temperature=0.0,
                 )
                 self._record_llm_trace(state, stage="plan_repair", trace=repair_trace)
-                action = PlannerAction.from_dict(dict(repair_trace["parsed_json"]))
+                repair_payload = dict(repair_trace["parsed_json"])
+                if not self._planner_payload_is_actionable(repair_payload):
+                    raise ValueError("Planner returned no executable nodes.")
+                action = PlannerAction.from_dict(repair_payload)
                 if action.action == "emit_plan_dag" and action.plan_dag is None:
                     raise ValueError("Planner returned no executable nodes.")
+            if action is None:
+                raise ValueError("Planner returned no executable nodes.")
             if action.action == "ask_clarification" and state.force_answer:
                 heuristic = self._heuristic_plan(state)
                 heuristic.assumptions = list(
@@ -449,12 +473,17 @@ class MagicBoxOrchestrator:
                 return heuristic
             return action
         except Exception as exc:
+            error_text = str(exc)
+            note = "LLM planning step failed; heuristic planning fallback used."
+            if error_text == "Planner returned no executable nodes." or error_text.startswith("Unsupported planner action:"):
+                error_text = ""
+                note = "Planner returned no executable nodes or no actionable JSON; heuristic planning fallback used."
             self._record_llm_trace(
                 state,
                 stage="plan",
                 used_fallback=True,
-                error=str(exc),
-                note="LLM planning step failed; heuristic planning fallback used.",
+                error=error_text,
+                note=note,
             )
             return self._heuristic_plan(state)
 
@@ -856,6 +885,8 @@ class AgentRuntime:
         for module_name in ["spacy", "textacy", "stanza", "nltk", "gensim", "flair", "textblob", "torch"]:
             provider_modules[module_name] = importlib.util.find_spec(module_name) is not None
         device_report = runtime_device_report()
+        openai_defaults = self._startup_llm_config.with_runtime_overrides(use_openai=True)
+        unclose_defaults = self._startup_llm_config.with_runtime_overrides(use_openai=False)
         llm_warnings: list[str] = []
         if self.llm_config.use_openai and "hermes.ai.unturf.com" in self.llm_config.base_url:
             llm_warnings.append("OpenAI mode is enabled but the resolved base URL still points to UncloseAI/Hermes.")
@@ -887,6 +918,20 @@ class AgentRuntime:
                     "base_url": self._startup_llm_config.base_url,
                     "planner_model": self._startup_llm_config.planner_model,
                     "synthesis_model": self._startup_llm_config.synthesis_model,
+                },
+                "available_defaults": {
+                    "openai": {
+                        "provider_name": openai_defaults.provider_name,
+                        "base_url": openai_defaults.base_url,
+                        "planner_model": openai_defaults.planner_model,
+                        "synthesis_model": openai_defaults.synthesis_model,
+                    },
+                    "uncloseai": {
+                        "provider_name": unclose_defaults.provider_name,
+                        "base_url": unclose_defaults.base_url,
+                        "planner_model": unclose_defaults.planner_model,
+                        "synthesis_model": unclose_defaults.synthesis_model,
+                    },
                 },
                 "warnings": llm_warnings,
             },

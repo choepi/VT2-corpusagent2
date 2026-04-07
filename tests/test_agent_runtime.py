@@ -192,15 +192,20 @@ def test_runtime_can_update_and_reset_llm_settings(monkeypatch, tmp_path: Path) 
     monkeypatch.setenv("OPENAI_API_KEY", "openai-key")
     runtime = build_test_runtime(tmp_path=tmp_path, documents=docs, search_rows_by_query=_search_rows(docs))
 
+    initial = runtime.runtime_info()
+    assert initial["llm"]["available_defaults"]["openai"]["planner_model"] == "gpt-4.1-mini"
+    assert initial["llm"]["available_defaults"]["uncloseai"]["planner_model"] == "hermes-plan"
+
     updated = runtime.update_llm_runtime_settings(
         use_openai=True,
-        planner_model="gpt-4.1-nano",
-        synthesis_model="gpt-4.1-mini",
+        planner_model="",
+        synthesis_model="",
     )
 
     assert updated["llm"]["use_openai"] is True
     assert updated["llm"]["override_active"] is True
-    assert updated["llm"]["planner_model"] == "gpt-4.1-nano"
+    assert updated["llm"]["planner_model"] == "gpt-4.1-mini"
+    assert updated["llm"]["synthesis_model"] == "gpt-4.1"
 
     reset = runtime.reset_llm_runtime_settings()
 
@@ -406,6 +411,53 @@ def test_force_answer_ignores_clarification_loop(tmp_path: Path) -> None:
 
     assert manifest.status in {"completed", "partial"}
     assert "Which sources?" not in manifest.rewritten_question
+
+
+def test_empty_planner_payload_uses_heuristic_plan_without_scary_error(tmp_path: Path) -> None:
+    docs = _sample_documents()
+    llm = StaticLLMClient(
+        [
+            {
+                "action": "accept_with_assumptions",
+                "rewritten_question": "Which media predicted the outbreak of the Ukraine war in 2022?",
+                "assumptions": [],
+                "clarification_question": "",
+                "rejection_reason": "",
+                "message": "",
+            },
+            {},
+            {},
+            {
+                "answer_text": "Test synthesis output.",
+                "caveats": [],
+                "unsupported_parts": [],
+                "claim_verdicts": [],
+                "evidence_items": [],
+                "artifacts_used": [],
+            },
+        ]
+    )
+    runtime = build_test_runtime(
+        tmp_path=tmp_path,
+        documents=docs,
+        search_rows_by_query=_search_rows(docs),
+    )
+    runtime.llm_client = llm
+    runtime.orchestrator.llm_client = llm
+
+    manifest = runtime.handle_query(
+        "Which media predicted the outbreak of the Ukraine war in 2022?",
+        no_cache=True,
+    )
+
+    fallback_traces = [
+        trace for trace in manifest.metadata.get("llm_traces", [])
+        if trace.get("stage") == "plan" and trace.get("used_fallback")
+    ]
+    assert manifest.status in {"completed", "partial"}
+    assert fallback_traces
+    assert fallback_traces[-1]["error"] == ""
+    assert "heuristic planning fallback used" in fallback_traces[-1]["note"]
 
 
 def test_clarification_history_allows_follow_up_run(tmp_path: Path) -> None:

@@ -55,6 +55,7 @@ let pendingClarificationQuestion = "";
 let currentRunId = "";
 let currentStatus = "idle";
 let latestRuntimeInfo = null;
+let providerDefaults = {};
 const POLL_INTERVAL_MS = 250;
 const UI_STATE_KEY = "corpusagent2-ui-state-v2";
 
@@ -115,6 +116,21 @@ function updateControlState() {
   abortButton.disabled = !hasActiveRun();
   applyLlmSettingsButton.disabled = hasActiveRun();
   resetLlmSettingsButton.disabled = hasActiveRun();
+}
+
+function defaultModelsForProvider(providerName) {
+  const normalized = providerName === "openai" ? "openai" : "uncloseai";
+  return providerDefaults[normalized] || {};
+}
+
+function applyProviderDefaultsToInputs(providerName) {
+  const defaults = defaultModelsForProvider(providerName);
+  if (defaults.planner_model) {
+    plannerModelInput.value = defaults.planner_model;
+  }
+  if (defaults.synthesis_model) {
+    synthesisModelInput.value = defaults.synthesis_model;
+  }
 }
 
 function escapeHtml(value) {
@@ -266,6 +282,7 @@ function renderRuntimeInfo(payload) {
   const llm = payload.llm || {};
   const device = payload.device || {};
   const retrieval = payload.retrieval || {};
+  providerDefaults = llm.available_defaults || {};
   providerBadge.textContent = `LLM: ${llm.provider_name || "unknown"}`;
   providerBadge.className = `pill ${llm.use_openai ? "openai" : "unclose"}`;
   modelBadge.textContent = `Planner: ${llm.planner_model || "unknown"}`;
@@ -362,6 +379,7 @@ function renderLLMTraces(traces) {
           .map((item) => `${item.role}: ${String(item.content || "").slice(0, 220)}`)
           .join("\n\n")
       : "";
+    const errorClass = trace.used_fallback ? "warn" : "danger";
     return `
       <div class="trace-head">
         <span class="pill ${trace.used_fallback ? "warn" : "subtle"}">${trace.used_fallback ? "fallback" : "llm"}</span>
@@ -369,7 +387,7 @@ function renderLLMTraces(traces) {
       </div>
       <p><strong>Provider:</strong> ${escapeHtml(trace.provider_name || "")}</p>
       <p><strong>Model:</strong> ${escapeHtml(trace.model || "")}</p>
-      ${trace.error ? `<p class="danger"><strong>Error:</strong> ${escapeHtml(trace.error)}</p>` : ""}
+      ${trace.error ? `<p class="${errorClass}"><strong>${trace.used_fallback ? "Fallback reason" : "Error"}:</strong> ${escapeHtml(trace.error)}</p>` : ""}
       ${trace.note ? `<p><strong>Note:</strong> ${escapeHtml(trace.note)}</p>` : ""}
       <details>
         <summary>Prompt messages</summary>
@@ -744,6 +762,12 @@ resetLlmSettingsButton.addEventListener("click", async () => {
   } catch (error) {
     detailText.textContent = `LLM settings reset failed: ${error.message}`;
   }
+});
+
+llmProviderSelect.addEventListener("change", () => {
+  applyProviderDefaultsToInputs(llmProviderSelect.value);
+  llmSettingsNote.textContent = `Loaded default models for ${llmProviderSelect.value === "openai" ? "OpenAI" : "UncloseAI"} into the planner and synthesis fields.`;
+  saveUiState();
 });
 
 continueButton.addEventListener("click", async () => {
