@@ -3,8 +3,11 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass
 from datetime import UTC, datetime
+import importlib.util
 import json
+import os
 from pathlib import Path
+import re
 import threading
 import uuid
 from typing import Any
@@ -29,12 +32,13 @@ from .agent_models import (
     LiveRunStatus,
     PlannerAction,
 )
-from .agent_policy import evidence_required, rejection_reason_for_question, rewrite_special_cases
+from .agent_policy import rejection_reason_for_question, rewrite_special_cases
 from .app_config import load_project_configuration
 from .llm_provider import LLMClient, LLMProviderConfig, OpenAICompatibleLLMClient
 from .retrieval import pg_dsn_from_env, pg_table_from_env
 from .run_manifest import FinalAnswerPayload
 from .runtime_context import CorpusRuntime
+from .seed import runtime_device_report
 from .tool_registry import ToolRegistry
 from .python_runner_service import DockerPythonRunnerService
 
@@ -58,12 +62,66 @@ class MagicBoxOrchestrator:
         self.llm_client = llm_client
         self.llm_config = llm_config or LLMProviderConfig.from_env()
 
+    def _record_llm_trace(
+        self,
+        state: AgentRunState,
+        *,
+        stage: str,
+        trace: dict[str, Any] | None = None,
+        used_fallback: bool = False,
+        error: str = "",
+        note: str = "",
+    ) -> None:
+        entry = {
+            "stage": stage,
+            "provider_name": self.llm_config.provider_name if self.llm_client is not None else "heuristic",
+            "base_url": self.llm_config.base_url if self.llm_client is not None else "",
+            "model": trace.get("model", "") if trace else "",
+            "temperature": trace.get("temperature", 0.0) if trace else 0.0,
+            "messages": trace.get("messages", []) if trace else [],
+            "raw_text": trace.get("raw_text", "") if trace else "",
+            "parsed_json": trace.get("parsed_json", {}) if trace else {},
+            "used_fallback": used_fallback,
+            "error": error,
+            "note": note,
+        }
+        state.llm_traces.append(entry)
+
     def _question_with_clarifications(self, state: AgentRunState) -> str:
         history = [str(item).strip() for item in state.clarification_history if str(item).strip()]
         if not history:
             return state.question
         suffix = "\n".join(f"- {item}" for item in history)
         return f"{state.question}\n\nUser clarification history:\n{suffix}"
+
+    def _extract_date_window(self, text: str) -> dict[str, str]:
+        year_values = sorted({int(item) for item in re.findall(r"\b(?:19|20)\d{2}\b", text)})
+        if not year_values:
+            return {}
+        if len(year_values) == 1:
+            year = year_values[0]
+            return {"date_from": f"{year}-01-01", "date_to": f"{year}-12-31"}
+        return {
+            "date_from": f"{year_values[0]}-01-01",
+            "date_to": f"{year_values[-1]}-12-31",
+        }
+
+    def _compact_query_terms(self, text: str, preferred_terms: list[str]) -> str:
+        found_terms: list[str] = []
+        lowered = text.lower()
+        for term in preferred_terms:
+            if term.lower() in lowered and term not in found_terms:
+                found_terms.append(term)
+        if found_terms:
+            return " ".join(found_terms)
+        tokens = [token for token in re.findall(r"[A-Za-z][A-Za-z0-9\-]+", text) if len(token) > 2]
+        stopwords = {
+            "how", "did", "from", "into", "with", "what", "when", "which", "that", "this", "those",
+            "coverage", "framing", "frame", "around", "during", "between", "across", "their", "there",
+            "correspond", "corresponded", "drawdowns", "stock", "media", "shift", "shifted",
+        }
+        filtered = [token for token in tokens if token.lower() not in stopwords]
+        return " ".join(filtered[:8]).strip()
 
     def rephrase_or_clarify(self, state: AgentRunState) -> PlannerAction:
         rejection_reason = rejection_reason_for_question(state.question)
@@ -73,6 +131,12 @@ class MagicBoxOrchestrator:
         enriched_question = self._question_with_clarifications(state)
         rewritten, assumptions = rewrite_special_cases(enriched_question)
         if self.llm_client is None:
+            self._record_llm_trace(
+                state,
+                stage="rephrase_or_clarify",
+                used_fallback=True,
+                note="No LLM client configured; heuristic clarification policy used.",
+            )
             if state.clarification_history:
                 return PlannerAction(
                     action="accept_with_assumptions",
@@ -114,11 +178,13 @@ class MagicBoxOrchestrator:
             },
         ]
         try:
-            payload = self.llm_client.complete_json(
+            trace = self.llm_client.complete_json_trace(
                 messages,
                 model=self.llm_config.planner_model,
                 temperature=0.0,
             )
+            payload = dict(trace["parsed_json"])
+            self._record_llm_trace(state, stage="rephrase_or_clarify", trace=trace)
             action = PlannerAction.from_dict(payload)
             if action.action == "ask_clarification" and state.force_answer:
                 forced_rewrite = rewritten or state.question
@@ -136,7 +202,14 @@ class MagicBoxOrchestrator:
             if assumptions:
                 action.assumptions = list(dict.fromkeys(list(action.assumptions) + assumptions))
             return action
-        except Exception:
+        except Exception as exc:
+            self._record_llm_trace(
+                state,
+                stage="rephrase_or_clarify",
+                used_fallback=True,
+                error=str(exc),
+                note="LLM rephrase step failed; heuristic fallback used.",
+            )
             return PlannerAction(
                 action="accept_with_assumptions",
                 rewritten_question=rewritten,
@@ -144,7 +217,8 @@ class MagicBoxOrchestrator:
             )
 
     def _heuristic_plan(self, state: AgentRunState) -> PlannerAction:
-        text = (state.rewritten_question or self._question_with_clarifications(state)).lower()
+        rewritten = state.rewritten_question or self._question_with_clarifications(state)
+        text = rewritten.lower()
         if "distribution" in text and "noun" in text:
             dag = AgentPlanDAG(
                 nodes=[
@@ -185,6 +259,56 @@ class MagicBoxOrchestrator:
                 metadata={"question_family": "prediction_evidence"},
             )
             return PlannerAction(action="emit_plan_dag", rewritten_question=state.rewritten_question, plan_dag=dag)
+        framing_terms = ["framing", "frame", "privacy", "regulation", "innovation", "growth", "scandal", "cambridge analytica", "facebook", "meta"]
+        if any(term in text for term in framing_terms) and any(term in text for term in ["shift", "changed", "change", "correspond", "over time"]):
+            search_inputs: dict[str, Any] = {
+                "top_k": 100,
+                "query": self._compact_query_terms(
+                    rewritten,
+                    [
+                        "Facebook",
+                        "Meta",
+                        "Cambridge Analytica",
+                        "privacy",
+                        "regulation",
+                        "innovation",
+                        "growth",
+                        "stock",
+                        "drawdown",
+                    ],
+                ),
+            }
+            search_inputs.update(self._extract_date_window(rewritten))
+            nodes = [
+                AgentPlanNode("search", "db_search", search_inputs),
+                AgentPlanNode("fetch", "fetch_documents", depends_on=["search"]),
+                AgentPlanNode("working_set", "create_working_set", depends_on=["fetch"]),
+                AgentPlanNode("keyterms", "extract_keyterms", depends_on=["fetch"]),
+                AgentPlanNode("topics", "topic_model", {"num_topics": 6}, depends_on=["fetch"]),
+                AgentPlanNode("sentiment", "sentiment", depends_on=["fetch"]),
+                AgentPlanNode("series", "time_series_aggregate", depends_on=["sentiment"]),
+                AgentPlanNode("changes", "change_point_detect", depends_on=["series"], optional=True),
+                AgentPlanNode("plot_sentiment", "plot_artifact", {"plot_name": "framing_sentiment_series"}, depends_on=["series"], optional=True),
+                AgentPlanNode("plot_topics", "plot_artifact", {"plot_name": "framing_topics"}, depends_on=["topics"], optional=True),
+            ]
+            assumptions: list[str] = []
+            if any(term in text for term in ["stock", "drawdown", "share price", "market", "valuation"]):
+                assumptions.append(
+                    "External market data is not automatically attached in the first-trial runtime, so the stock-drawdown correspondence can only be assessed if matching series are supplied later."
+                )
+            dag = AgentPlanDAG(
+                nodes=nodes,
+                metadata={
+                    "question_family": "framing_shift",
+                    "requires_external_series": bool(assumptions),
+                },
+            )
+            return PlannerAction(
+                action="emit_plan_dag",
+                rewritten_question=state.rewritten_question or rewritten,
+                assumptions=assumptions,
+                plan_dag=dag,
+            )
         dag = AgentPlanDAG(
             nodes=[
                 AgentPlanNode("search", "db_search", {"top_k": 40}),
@@ -198,6 +322,12 @@ class MagicBoxOrchestrator:
 
     def plan(self, state: AgentRunState) -> PlannerAction:
         if self.llm_client is None:
+            self._record_llm_trace(
+                state,
+                stage="plan",
+                used_fallback=True,
+                note="No LLM client configured; heuristic planning policy used.",
+            )
             return self._heuristic_plan(state)
         messages = [
             {
@@ -225,11 +355,13 @@ class MagicBoxOrchestrator:
             },
         ]
         try:
-            payload = self.llm_client.complete_json(
+            trace = self.llm_client.complete_json_trace(
                 messages,
                 model=self.llm_config.planner_model,
                 temperature=0.0,
             )
+            payload = dict(trace["parsed_json"])
+            self._record_llm_trace(state, stage="plan", trace=trace)
             action = PlannerAction.from_dict(payload)
             if action.action == "ask_clarification" and state.force_answer:
                 heuristic = self._heuristic_plan(state)
@@ -241,7 +373,14 @@ class MagicBoxOrchestrator:
                 )
                 return heuristic
             return action
-        except Exception:
+        except Exception as exc:
+            self._record_llm_trace(
+                state,
+                stage="plan",
+                used_fallback=True,
+                error=str(exc),
+                note="LLM planning step failed; heuristic planning fallback used.",
+            )
             return self._heuristic_plan(state)
 
     def revise_after_failure(self, state: AgentRunState, failure: AgentFailure) -> PlannerAction | None:
@@ -276,6 +415,12 @@ class MagicBoxOrchestrator:
         evidence_rows = self._extract_evidence(snapshot)
         summary = self._derive_summary(snapshot)
         if self.llm_client is None:
+            self._record_llm_trace(
+                state,
+                stage="final_synthesis",
+                used_fallback=True,
+                note="No LLM client configured; fallback synthesis used.",
+            )
             return self._fallback_synthesis(state, evidence_rows, summary, snapshot)
         messages = [
             {
@@ -301,16 +446,25 @@ class MagicBoxOrchestrator:
             },
         ]
         try:
-            payload = self.llm_client.complete_json(
+            trace = self.llm_client.complete_json_trace(
                 messages,
                 model=self.llm_config.synthesis_model,
                 temperature=0.1,
             )
+            payload = dict(trace["parsed_json"])
+            self._record_llm_trace(state, stage="final_synthesis", trace=trace)
             answer = FinalAnswerPayload.from_payload(payload)
-            if evidence_required(state.question):
+            if evidence_rows:
                 answer.evidence_items = evidence_rows
             return answer
-        except Exception:
+        except Exception as exc:
+            self._record_llm_trace(
+                state,
+                stage="final_synthesis",
+                used_fallback=True,
+                error=str(exc),
+                note="LLM synthesis failed; fallback synthesis used.",
+            )
             return self._fallback_synthesis(state, evidence_rows, summary, snapshot)
 
     def _extract_evidence(self, snapshot: AgentExecutionSnapshot) -> list[dict[str, Any]]:
@@ -320,7 +474,37 @@ class MagicBoxOrchestrator:
                 first = payload["rows"][0]
                 if {"doc_id", "outlet", "date", "excerpt", "score"}.issubset(first.keys()):
                     return list(payload["rows"])
-        return []
+        fallback_rows: list[dict[str, Any]] = []
+        for row in snapshot.selected_docs[:10]:
+            doc_id = str(row.get("doc_id", "")).strip()
+            if not doc_id:
+                continue
+            excerpt_source = (
+                row.get("snippet")
+                or row.get("excerpt")
+                or row.get("text")
+                or row.get("body")
+                or row.get("title")
+                or ""
+            )
+            excerpt = str(excerpt_source).strip().replace("\n", " ")
+            if len(excerpt) > 280:
+                excerpt = excerpt[:277].rstrip() + "..."
+            fallback_rows.append(
+                {
+                    "doc_id": doc_id,
+                    "outlet": str(
+                        row.get("outlet")
+                        or row.get("source")
+                        or row.get("source_domain")
+                        or ""
+                    ),
+                    "date": str(row.get("published_at") or row.get("date") or row.get("year") or ""),
+                    "excerpt": excerpt,
+                    "score": float(row.get("score", 0.0) or 0.0),
+                }
+            )
+        return fallback_rows
 
     def _derive_summary(self, snapshot: AgentExecutionSnapshot) -> dict[str, Any]:
         summary: dict[str, Any] = {}
@@ -346,6 +530,27 @@ class MagicBoxOrchestrator:
                     entity = str(row.get("entity", ""))
                     grouped[entity] = grouped.get(entity, 0) + int(row.get("count", 1))
                 summary["entity_trend"] = sorted(grouped.items(), key=lambda item: item[1], reverse=True)[:15]
+            elif "term" in first and "score" in first:
+                summary["keyterms"] = rows[:15]
+            elif "topic_id" in first and "top_terms" in first:
+                summary["topics"] = rows[:10]
+            elif "label" in first and "time_bin" in first and "score" in first:
+                by_time: dict[str, dict[str, float]] = {}
+                for row in rows:
+                    time_bin = str(row.get("time_bin", "unknown"))
+                    bucket = by_time.setdefault(time_bin, {"count": 0.0, "score_total": 0.0})
+                    bucket["count"] += 1.0
+                    bucket["score_total"] += float(row.get("score", 0.0))
+                summary["sentiment_trend"] = [
+                    {
+                        "time_bin": time_bin,
+                        "average_score": round(values["score_total"] / max(values["count"], 1.0), 4),
+                        "documents": int(values["count"]),
+                    }
+                    for time_bin, values in sorted(by_time.items())
+                ]
+            elif "delta" in first and "time_bin" in first:
+                summary["change_points"] = rows[:10]
             elif {"doc_id", "outlet", "date", "excerpt", "score"}.issubset(first.keys()):
                 summary["evidence_rows"] = rows[:10]
         return summary
@@ -361,6 +566,31 @@ class MagicBoxOrchestrator:
         if "noun_distribution" in summary:
             top = ", ".join(f"{term} ({count})" for term, count in summary["noun_distribution"][:8])
             answer_text = f"Top noun lemmas in the retrieved slice are: {top}."
+        elif "topics" in summary or "keyterms" in summary or "sentiment_trend" in summary:
+            topic_text = ""
+            keyterm_text = ""
+            sentiment_text = ""
+            if "topics" in summary:
+                topic_bits = []
+                for topic in summary["topics"][:4]:
+                    top_terms = ", ".join(str(term) for term in topic.get("top_terms", [])[:5])
+                    topic_bits.append(f"{topic.get('time_bin', 'all')}: {top_terms}")
+                topic_text = "Topic slices: " + " | ".join(topic_bits) + "."
+            if "keyterms" in summary:
+                keyterm_text = "Key terms: " + ", ".join(
+                    f"{row.get('term', '')} ({row.get('score', 0):.2f})"
+                    for row in summary["keyterms"][:8]
+                ) + "."
+            if "sentiment_trend" in summary:
+                sentiment_text = "Sentiment over time: " + " | ".join(
+                    f"{row.get('time_bin', 'unknown')} avg={row.get('average_score', 0):.2f}"
+                    for row in summary["sentiment_trend"][:6]
+                ) + "."
+            answer_text = " ".join(part for part in [topic_text, keyterm_text, sentiment_text] if part).strip()
+            if any(term in state.question.lower() for term in ["stock", "drawdown", "share price", "valuation", "market"]):
+                caveats.append(
+                    "The current run did not attach an external market series, so stock-price correspondence cannot be measured directly yet."
+                )
         elif "entity_trend" in summary:
             top = ", ".join(f"{entity} ({count})" for entity, count in summary["entity_trend"][:8])
             answer_text = f"Most prominent entities in the retrieved slice are: {top}."
@@ -376,7 +606,7 @@ class MagicBoxOrchestrator:
             answer_text = "The agent completed the available analysis steps and returned the grounded artifacts for inspection."
         return FinalAnswerPayload(
             answer_text=answer_text,
-            evidence_items=evidence_rows if evidence_required(state.question) else [],
+            evidence_items=evidence_rows,
             artifacts_used=[
                 artifact
                 for record in snapshot.node_records
@@ -434,6 +664,37 @@ class AgentRuntime:
 
     def capability_catalog(self) -> list[dict[str, Any]]:
         return [spec.to_dict() for spec in self.registry.list_tools()]
+
+    def runtime_info(self) -> dict[str, Any]:
+        provider_modules = {}
+        for module_name in ["spacy", "textacy", "stanza", "nltk", "gensim", "flair", "textblob", "torch"]:
+            provider_modules[module_name] = importlib.util.find_spec(module_name) is not None
+
+        provider_orders = {
+            capability.lower().replace("CORPUSAGENT2_PROVIDER_ORDER_", ""): value
+            for capability, value in os.environ.items()
+            if capability.startswith("CORPUSAGENT2_PROVIDER_ORDER_")
+        }
+        return {
+            "llm": {
+                "use_openai": self.llm_config.use_openai,
+                "provider_name": self.llm_config.provider_name,
+                "base_url": self.llm_config.base_url,
+                "planner_model": self.llm_config.planner_model,
+                "synthesis_model": self.llm_config.synthesis_model,
+                "api_key_present": bool(self.llm_config.api_key),
+            },
+            "device": runtime_device_report(),
+            "providers_installed": provider_modules,
+            "provider_order": provider_orders,
+            "capability_count": len(self.registry.list_tools()),
+            "analysis_notes": [
+                "Toggle providers with CORPUSAGENT2_USE_OPENAI=true or false, then restart the backend.",
+                "Classical spaCy/textacy/gensim analytics are usually CPU-bound even when CUDA is available.",
+                "GPU is mainly relevant for torch- or Flair-backed models and only when those providers are selected.",
+                "Per-node provider choice and artifacts are captured in the run manifest so you can verify what really ran.",
+            ],
+        }
 
     def _set_live_status(self, run_id: str, **updates: Any) -> LiveRunStatus:
         with self._run_lock:
@@ -536,6 +797,8 @@ class AgentRuntime:
             metadata={
                 "clarification_question": clarification_question,
                 "clarification_history": list(state.clarification_history),
+                "llm_traces": list(state.llm_traces),
+                "runtime_info": self.runtime_info(),
             },
         )
 
@@ -586,7 +849,7 @@ class AgentRuntime:
         rephrase_action = self.orchestrator.rephrase_or_clarify(state)
         state.planner_calls_used += 1
         state.planner_actions.append(rephrase_action.to_dict())
-        self._set_live_status(run_id, planner_actions=list(state.planner_actions))
+        self._set_live_status(run_id, planner_actions=list(state.planner_actions), llm_traces=list(state.llm_traces))
         if rephrase_action.assumptions:
             state.assumptions = list(dict.fromkeys(state.assumptions + rephrase_action.assumptions))
             self._set_live_status(run_id, assumptions=list(state.assumptions))
@@ -610,6 +873,10 @@ class AgentRuntime:
                     caveats=[],
                 ),
                 artifacts_dir=str(artifacts_dir),
+                metadata={
+                    "llm_traces": list(state.llm_traces),
+                    "runtime_info": self.runtime_info(),
+                },
             )
             self._persist_manifest(manifest)
             return manifest
@@ -646,7 +913,9 @@ class AgentRuntime:
         plan_action = self.orchestrator.plan(state)
         state.planner_calls_used += 1
         state.planner_actions.append(plan_action.to_dict())
-        self._set_live_status(run_id, planner_actions=list(state.planner_actions))
+        if plan_action.assumptions:
+            state.assumptions = list(dict.fromkeys(state.assumptions + plan_action.assumptions))
+        self._set_live_status(run_id, planner_actions=list(state.planner_actions), llm_traces=list(state.llm_traces))
         if plan_action.action == "ask_clarification" and not force_answer and len(state.clarification_history) < 2:
             manifest = self._needs_clarification_manifest(
                 run_id=run_id,
@@ -696,7 +965,9 @@ class AgentRuntime:
             if revised is not None and revised.plan_dag is not None:
                 state.planner_calls_used += 1
                 state.planner_actions.append(revised.to_dict())
-                self._set_live_status(run_id, planner_actions=list(state.planner_actions))
+                if revised.assumptions:
+                    state.assumptions = list(dict.fromkeys(state.assumptions + revised.assumptions))
+                self._set_live_status(run_id, planner_actions=list(state.planner_actions), llm_traces=list(state.llm_traces))
                 revised_snapshot = asyncio.run(self.executor.execute(revised.plan_dag, context))
                 plan_dags.append(revised.plan_dag.to_dict())
                 snapshot = revised_snapshot
@@ -722,6 +993,8 @@ class AgentRuntime:
             metadata={
                 "planner_calls_used": state.planner_calls_used,
                 "clarification_history": list(state.clarification_history),
+                "llm_traces": list(state.llm_traces),
+                "runtime_info": self.runtime_info(),
             },
         )
         self._persist_manifest(manifest)
@@ -798,6 +1071,7 @@ class AgentRuntime:
             detail="Run finished",
             assumptions=list(manifest.assumptions),
             planner_actions=list(manifest.planner_actions),
+            llm_traces=list(manifest.metadata.get("llm_traces", [])),
             clarification_questions=list(manifest.clarification_questions),
             final_manifest_path=str(manifest_path),
         )
@@ -814,3 +1088,16 @@ class AgentRuntime:
         if not manifest_path.exists():
             raise FileNotFoundError(f"Run manifest not found for run_id={run_id}")
         return json.loads(manifest_path.read_text(encoding="utf-8"))
+
+    def resolve_artifact_path(self, run_id: str, artifact_path: str) -> Path:
+        manifest = self.get_run(run_id)
+        base_dir = Path(str(manifest.get("artifacts_dir", ""))).resolve()
+        target = Path(artifact_path)
+        resolved = target.resolve() if target.is_absolute() else (base_dir / target).resolve()
+        try:
+            resolved.relative_to(base_dir)
+        except ValueError as exc:
+            raise PermissionError("Artifact path escapes the run artifact directory.") from exc
+        if not resolved.exists() or not resolved.is_file():
+            raise FileNotFoundError(f"Artifact not found: {artifact_path}")
+        return resolved

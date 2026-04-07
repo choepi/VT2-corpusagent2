@@ -6,6 +6,7 @@ from typing import Any
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
 from .agent_runtime import AgentRuntime, AgentRuntimeConfig
@@ -45,6 +46,10 @@ def build_app(runtime: AgentRuntime | None = None, project_root: Path | None = N
     def capabilities() -> dict[str, Any]:
         return {"capabilities": resolved_runtime.capability_catalog()}
 
+    @app.get("/runtime-info")
+    def runtime_info() -> dict[str, Any]:
+        return resolved_runtime.runtime_info()
+
     @app.post("/query")
     def query(request: QueryRequest) -> dict[str, Any]:
         if request.async_mode:
@@ -79,6 +84,16 @@ def build_app(runtime: AgentRuntime | None = None, project_root: Path | None = N
             return resolved_runtime.get_run(run_id)
         except FileNotFoundError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.get("/runs/{run_id}/artifact")
+    def get_run_artifact(run_id: str, artifact_path: str) -> FileResponse:
+        try:
+            resolved = resolved_runtime.resolve_artifact_path(run_id, artifact_path)
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except PermissionError as exc:
+            raise HTTPException(status_code=403, detail=str(exc)) from exc
+        return FileResponse(resolved)
 
     @app.get("/runs/{run_id}/status")
     def get_run_status(run_id: str) -> dict[str, Any]:

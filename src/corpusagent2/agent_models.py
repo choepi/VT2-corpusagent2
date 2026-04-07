@@ -127,12 +127,20 @@ class PlannerAction:
     def from_dict(cls, payload: dict[str, Any]) -> "PlannerAction":
         action = str(payload.get("action", "")).strip()
         dag_payload = payload.get("plan_dag")
+        if not action:
+            if isinstance(dag_payload, dict):
+                action = "emit_plan_dag"
+            elif str(payload.get("clarification_question", "")).strip():
+                action = "ask_clarification"
+            elif str(payload.get("rejection_reason", "")).strip():
+                action = "grounded_rejection"
         plan_dag = None
         if isinstance(dag_payload, dict):
+            node_payloads = list(dag_payload.get("nodes", []))
             plan_dag = AgentPlanDAG(
                 nodes=[
                     AgentPlanNode(
-                        node_id=str(item["id"]),
+                        node_id=str(item.get("id", item.get("node_id", ""))),
                         capability=str(item["capability"]),
                         inputs=dict(item.get("inputs", {})),
                         depends_on=[str(dep) for dep in item.get("depends_on", [])],
@@ -140,7 +148,8 @@ class PlannerAction:
                         cacheable=bool(item.get("cacheable", True)),
                         description=str(item.get("description", "")),
                     )
-                    for item in dag_payload.get("nodes", [])
+                    for item in node_payloads
+                    if str(item.get("id", item.get("node_id", ""))).strip() and str(item.get("capability", "")).strip()
                 ],
                 metadata=dict(dag_payload.get("metadata", {})),
             )
@@ -220,6 +229,7 @@ class AgentRunState:
     planner_calls_used: int = 0
     planner_calls_max: int = 6
     planner_actions: list[dict[str, Any]] = field(default_factory=list)
+    llm_traces: list[dict[str, Any]] = field(default_factory=list)
     no_cache: bool = False
     last_plan: dict[str, Any] | None = None
 
@@ -282,6 +292,7 @@ class LiveRunStatus:
     completed_steps: list[dict[str, Any]] = field(default_factory=list)
     failed_steps: list[dict[str, Any]] = field(default_factory=list)
     planner_actions: list[dict[str, Any]] = field(default_factory=list)
+    llm_traces: list[dict[str, Any]] = field(default_factory=list)
     final_manifest_path: str = ""
     updated_at_utc: str = field(default_factory=lambda: datetime.now(UTC).isoformat())
 
@@ -298,6 +309,7 @@ class LiveRunStatus:
             "completed_steps": _serialize(self.completed_steps),
             "failed_steps": _serialize(self.failed_steps),
             "planner_actions": _serialize(self.planner_actions),
+            "llm_traces": _serialize(self.llm_traces),
             "final_manifest_path": self.final_manifest_path,
             "updated_at_utc": self.updated_at_utc,
         }

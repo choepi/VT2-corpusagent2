@@ -1147,9 +1147,17 @@ def _time_series_aggregate(params: dict[str, Any], deps: dict[str, ToolExecution
             break
     grouped: defaultdict[tuple[str, str], int] = defaultdict(int)
     for row in source_rows:
-        entity = str(row.get("entity", row.get("label", row.get("doc_id", "__all__"))))
+        entity = str(
+            row.get("entity")
+            or row.get("label")
+            or row.get("term")
+            or (f"topic_{row.get('topic_id')}" if row.get("topic_id") is not None else "")
+            or row.get("doc_id")
+            or "__all__"
+        )
         time_bin = str(row.get("time_bin", "unknown"))
-        grouped[(entity, time_bin)] += int(row.get("count", 1))
+        value = row.get("count", row.get("weight", row.get("score", 1)))
+        grouped[(entity, time_bin)] += int(round(float(value)))
     rows = [{"entity": entity, "time_bin": time_bin, "count": count} for (entity, time_bin), count in sorted(grouped.items())]
     return ToolExecutionResult(payload={"rows": rows})
 

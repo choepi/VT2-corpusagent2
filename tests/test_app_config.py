@@ -13,7 +13,8 @@ def test_app_config_loads_defaults_from_project_root() -> None:
 
     assert config.server.port == 8001
     assert config.frontend.api_base_url == "http://127.0.0.1:8001"
-    assert config.env_map["CORPUSAGENT2_LLM_PROVIDER"] == "uncloseai"
+    assert config.llm.use_openai is False
+    assert config.env_map["CORPUSAGENT2_USE_OPENAI"] == "False"
     assert config.env_map["CORPUSAGENT2_PG_TABLE"] == "article_corpus"
 
 
@@ -24,6 +25,7 @@ def test_frontend_runtime_payload_uses_app_config() -> None:
 
     assert payload["apiBaseUrl"] == "http://127.0.0.1:8001"
     assert "CorpusAgent2" in payload["title"]
+    assert payload["useOpenAI"] is False
 
 
 def test_load_project_configuration_prefers_dotenv_over_repo_defaults(tmp_path, monkeypatch) -> None:
@@ -31,22 +33,22 @@ def test_load_project_configuration_prefers_dotenv_over_repo_defaults(tmp_path, 
     (tmp_path / "config" / "app_config.toml").write_text(
         """
 [llm]
-provider = "uncloseai"
-base_url = "https://hermes.ai.unturf.com/v1"
+use_openai = false
+unclose_base_url = "https://hermes.ai.unturf.com/v1"
         """.strip(),
         encoding="utf-8",
     )
     (tmp_path / ".env").write_text(
-        "CORPUSAGENT2_LLM_PROVIDER=openai\nCORPUSAGENT2_LLM_BASE_URL=https://api.openai.com/v1\n",
+        "CORPUSAGENT2_USE_OPENAI=true\nCORPUSAGENT2_OPENAI_BASE_URL=https://api.openai.com/v1\n",
         encoding="utf-8",
     )
-    monkeypatch.delenv("CORPUSAGENT2_LLM_PROVIDER", raising=False)
-    monkeypatch.delenv("CORPUSAGENT2_LLM_BASE_URL", raising=False)
+    monkeypatch.delenv("CORPUSAGENT2_USE_OPENAI", raising=False)
+    monkeypatch.delenv("CORPUSAGENT2_OPENAI_BASE_URL", raising=False)
 
     load_project_configuration(tmp_path)
 
-    assert os.environ["CORPUSAGENT2_LLM_PROVIDER"] == "openai"
-    assert os.environ["CORPUSAGENT2_LLM_BASE_URL"] == "https://api.openai.com/v1"
+    assert os.environ["CORPUSAGENT2_USE_OPENAI"] == "true"
+    assert os.environ["CORPUSAGENT2_OPENAI_BASE_URL"] == "https://api.openai.com/v1"
 
 
 def test_load_project_configuration_prefers_process_env_over_dotenv(tmp_path, monkeypatch) -> None:
@@ -54,16 +56,16 @@ def test_load_project_configuration_prefers_process_env_over_dotenv(tmp_path, mo
     (tmp_path / "config" / "app_config.toml").write_text(
         """
 [llm]
-provider = "uncloseai"
+use_openai = false
         """.strip(),
         encoding="utf-8",
     )
-    (tmp_path / ".env").write_text("CORPUSAGENT2_LLM_PROVIDER=openai\n", encoding="utf-8")
-    monkeypatch.setenv("CORPUSAGENT2_LLM_PROVIDER", "manual-override")
+    (tmp_path / ".env").write_text("CORPUSAGENT2_USE_OPENAI=true\n", encoding="utf-8")
+    monkeypatch.setenv("CORPUSAGENT2_USE_OPENAI", "manual-override")
 
     load_project_configuration(tmp_path)
 
-    assert os.environ["CORPUSAGENT2_LLM_PROVIDER"] == "manual-override"
+    assert os.environ["CORPUSAGENT2_USE_OPENAI"] == "manual-override"
 
 
 def test_frontend_runtime_payload_respects_env_override(tmp_path, monkeypatch) -> None:

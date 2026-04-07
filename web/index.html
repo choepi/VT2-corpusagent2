@@ -1,4 +1,4 @@
-<!doctype html>
+﻿<!doctype html>
 <html lang="en">
   <head>
     <meta charset="utf-8" />
@@ -9,19 +9,32 @@
   <body>
     <main class="shell">
       <section class="card hero">
-        <p class="eyebrow">CorpusAgent2 Prototype</p>
-        <h1>Ask hard corpus questions without sending every document to an LLM.</h1>
-        <p class="lede">
-          This static frontend can be hosted on GitHub Pages and pointed at a FastAPI backend on a VM.
-        </p>
+        <div class="hero-copy">
+          <p class="eyebrow">CorpusAgent2 Prototype</p>
+          <h1>Watch the magic box reason, plan, run tools, and ground the answer.</h1>
+          <p class="lede">
+            This frontend keeps the planner traces, executor state, evidence, artifacts, and plots visible while the
+            backend works.
+          </p>
+        </div>
+        <div class="hero-badges">
+          <span id="providerBadge" class="pill">LLM: unknown</span>
+          <span id="modelBadge" class="pill subtle">Model: waiting</span>
+          <span id="deviceBadge" class="pill subtle">Device: waiting</span>
+        </div>
       </section>
 
-      <section class="card">
-        <label for="apiBase">API Base URL</label>
-        <input id="apiBase" type="url" value="http://127.0.0.1:8001" />
-
-        <label for="question">Question</label>
-        <textarea id="question" rows="5">Which media predicted the outbreak of the Ukraine war in 2022?</textarea>
+      <section class="card controls-card">
+        <div class="controls-grid">
+          <div>
+            <label for="apiBase">API Base URL</label>
+            <input id="apiBase" type="url" value="http://127.0.0.1:8001" />
+          </div>
+          <div>
+            <label for="question">Question</label>
+            <textarea id="question" rows="5">Which media predicted the outbreak of the Ukraine war in 2022?</textarea>
+          </div>
+        </div>
 
         <div class="controls">
           <label><input id="forceAnswer" type="checkbox" /> Force answer</label>
@@ -31,7 +44,10 @@
       </section>
 
       <section id="clarificationPanel" class="card hidden">
-        <h2>Clarification Needed</h2>
+        <div class="section-head">
+          <h2>Clarification Needed</h2>
+          <span class="pill warn">Follow-up required</span>
+        </div>
         <p id="clarificationPrompt" class="muted">
           The backend has not requested a clarification yet.
         </p>
@@ -51,24 +67,109 @@
         <ul id="clarificationHistory"></ul>
       </section>
 
-      <section class="grid">
-        <article class="card">
-          <h2>Run Status</h2>
-          <div id="statusBox" class="status idle">Idle</div>
+      <section class="top-grid">
+        <article class="card runtime-card">
+          <div class="section-head">
+            <h2>Runtime Profile</h2>
+            <span id="runtimeModeBadge" class="pill subtle">Loading</span>
+          </div>
+          <div id="runtimeSummary" class="metric-stack"></div>
+          <h3>Installed Providers</h3>
+          <div id="providersInstalled" class="chip-wrap"></div>
+          <h3>Provider Order</h3>
+          <div id="providerOrder" class="chip-wrap"></div>
+          <h3>Execution Notes</h3>
+          <ul id="runtimeNotes"></ul>
+        </article>
+
+        <article class="card status-card">
+          <div class="section-head">
+            <h2>Run Status</h2>
+            <div id="statusBox" class="status idle">Idle</div>
+          </div>
           <p id="detailText" class="muted">No run started yet.</p>
+          <div class="metric-strip">
+            <div>
+              <span class="metric-label">Active</span>
+              <strong id="activeCount">0</strong>
+            </div>
+            <div>
+              <span class="metric-label">Completed</span>
+              <strong id="completedCount">0</strong>
+            </div>
+            <div>
+              <span class="metric-label">Failed</span>
+              <strong id="failedCount">0</strong>
+            </div>
+          </div>
           <h3>Active Steps</h3>
           <ul id="activeSteps"></ul>
           <h3>Completed Steps</h3>
           <ul id="completedSteps"></ul>
           <h3>Failed Steps</h3>
           <ul id="failedSteps"></ul>
+          <h3>Assumptions</h3>
+          <ul id="assumptionsList"></ul>
+        </article>
+      </section>
+
+      <section class="main-grid">
+        <article class="card answer-card">
+          <div class="section-head">
+            <h2>Grounded Answer</h2>
+            <span class="pill subtle">Always visible</span>
+          </div>
+          <pre id="answerText" class="answer">Waiting for a run.</pre>
+
+          <div class="subgrid">
+            <div>
+              <h3>Caveats</h3>
+              <ul id="caveatsList"></ul>
+            </div>
+            <div>
+              <h3>Unsupported Parts</h3>
+              <ul id="unsupportedList"></ul>
+            </div>
+          </div>
+
+          <h3>Claim Verdicts</h3>
+          <div id="claimVerdicts" class="stack-panel"></div>
         </article>
 
-        <article class="card">
-          <h2>Answer</h2>
-          <pre id="answerText" class="answer">Waiting for a run.</pre>
-          <h3>Evidence</h3>
+        <article class="card magic-card">
+          <div class="section-head">
+            <h2>Magic Box Trace</h2>
+            <span class="pill subtle">Planner transparency</span>
+          </div>
+          <h3>Planner Actions</h3>
+          <div id="plannerActions" class="stack-panel"></div>
+          <h3>Plan DAG</h3>
+          <div id="planNodes" class="stack-panel"></div>
+          <h3>Raw LLM Outputs</h3>
+          <div id="llmTraces" class="stack-panel"></div>
+        </article>
+      </section>
+
+      <section class="evidence-grid">
+        <article class="card evidence-card">
+          <div class="section-head">
+            <h2>Evidence Panel</h2>
+            <span class="pill subtle">Visible on every run</span>
+          </div>
           <div id="evidenceTable"></div>
+          <h3>Selected Documents</h3>
+          <div id="selectedDocs" class="stack-panel"></div>
+        </article>
+
+        <article class="card artifact-card">
+          <div class="section-head">
+            <h2>Artifacts And Plots</h2>
+            <span class="pill subtle">Inspector</span>
+          </div>
+          <h3>Artifacts</h3>
+          <div id="artifactList" class="stack-panel"></div>
+          <h3>Plots</h3>
+          <div id="plotGallery" class="plot-grid"></div>
         </article>
       </section>
     </main>

@@ -27,6 +27,17 @@ if __name__ == "__main__":
             "api_base_url": config.frontend.api_base_url,
             "title": config.frontend.title,
         },
+        "llm": {
+            "use_openai": config.llm.use_openai,
+            "openai_base_url": config.llm.openai_base_url,
+            "openai_planner_model": config.llm.openai_planner_model,
+            "openai_synthesis_model": config.llm.openai_synthesis_model,
+            "unclose_base_url": config.llm.unclose_base_url,
+            "unclose_planner_model": config.llm.unclose_planner_model,
+            "unclose_synthesis_model": config.llm.unclose_synthesis_model,
+            "timeout_s": config.llm.timeout_s,
+            "verify_ssl": config.llm.verify_ssl,
+        },
         "effective_env": {
             key: os.environ.get(key, "")
             for key in sorted(config.env_map.keys())

@@ -64,12 +64,39 @@ def _sample_documents() -> list[dict]:
             "source": "Guardian",
             "outlet": "Guardian",
         },
+        {
+            "doc_id": "fb1",
+            "title": "Facebook growth story",
+            "text": "Facebook innovation growth advertising platform expansion impressed investors and market analysts.",
+            "published_at": "2016-06-01",
+            "date": "2016-06-01",
+            "source": "Reuters",
+            "outlet": "Reuters",
+        },
+        {
+            "doc_id": "fb2",
+            "title": "Facebook privacy pressure",
+            "text": "Cambridge Analytica pushed Facebook into a privacy and regulation debate as lawmakers demanded oversight.",
+            "published_at": "2018-03-20",
+            "date": "2018-03-20",
+            "source": "Reuters",
+            "outlet": "Reuters",
+        },
+        {
+            "doc_id": "fb3",
+            "title": "Facebook regulation focus",
+            "text": "Coverage focused on privacy, regulation, accountability and the risk of drawdowns after the scandal.",
+            "published_at": "2019-01-18",
+            "date": "2019-01-18",
+            "source": "FT",
+            "outlet": "FT",
+        },
     ]
 
 
 def _search_rows(documents: list[dict]) -> dict[str, list[dict]]:
     mapping = {}
-    for key in ("football", "climate", "ukraine", "invasion"):
+    for key in ("football", "climate", "ukraine", "invasion", "facebook", "cambridge", "privacy", "regulation"):
         rows = []
         for row in documents:
             haystack = f"{row['title']} {row['text']}".lower()
@@ -139,6 +166,8 @@ def test_api_query_endpoint_returns_manifest(tmp_path: Path) -> None:
     payload = response.json()
     assert payload["status"] in {"completed", "partial"}
     assert payload["run_id"]
+    assert "llm_traces" in payload["metadata"]
+    assert "runtime_info" in payload["metadata"]
 
 
 def test_capability_catalog_contains_full_first_trial_surface(tmp_path: Path) -> None:
@@ -175,6 +204,7 @@ def test_api_async_submission_exposes_live_status(tmp_path: Path) -> None:
 
     assert status_payload["run_id"] == run_id
     assert "completed_steps" in status_payload
+    assert "llm_traces" in status_payload
 
 
 def test_force_answer_ignores_clarification_loop(tmp_path: Path) -> None:
@@ -231,3 +261,89 @@ def test_clarification_history_allows_follow_up_run(tmp_path: Path) -> None:
 
     assert manifest.status in {"completed", "partial"}
     assert "Compare NZZ and TA football coverage only." in manifest.rewritten_question
+
+
+def test_invalid_llm_plan_falls_back_to_framing_shift_heuristic(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("CORPUSAGENT2_PROVIDER_ORDER_SENTIMENT", "heuristic")
+    docs = _sample_documents()
+    llm = StaticLLMClient(
+        [
+            {
+                "action": "accept_with_assumptions",
+                "rewritten_question": "How did Facebook coverage shift from innovation/growth framing to privacy/regulation framing around the Cambridge Analytica scandal (2016-2019), and how did this correspond to FB stock drawdowns?",
+                "assumptions": [],
+                "clarification_question": "",
+                "rejection_reason": "",
+                "message": "",
+            },
+            {
+                "action": "emit_plan_dag",
+                "rewritten_question": "How did Facebook coverage shift from innovation/growth framing to privacy/regulation framing around the Cambridge Analytica scandal (2016-2019), and how did this correspond to FB stock drawdowns?",
+                "plan_dag": {},
+                "assumptions": [],
+                "clarification_question": "",
+                "rejection_reason": "",
+                "message": "",
+            },
+        ]
+    )
+    runtime = build_test_runtime(
+        tmp_path=tmp_path,
+        documents=docs,
+        search_rows_by_query=_search_rows(docs),
+    )
+    runtime.llm_client = llm
+    runtime.orchestrator.llm_client = llm
+
+    manifest = runtime.handle_query(
+        "How did Facebook coverage shift from innovation/growth framing to privacy/regulation framing around the Cambridge Analytica scandal (2016-2019), and how did this correspond to FB stock drawdowns?",
+        force_answer=True,
+        no_cache=True,
+    )
+
+    assert manifest.status in {"completed", "partial"}
+    assert any(record.capability == "topic_model" for record in manifest.node_records)
+    assert any(record.capability == "sentiment" for record in manifest.node_records)
+    assert any(action.get("action") == "emit_plan_dag" for action in manifest.planner_actions)
+    assert any(trace.get("used_fallback") for trace in manifest.metadata.get("llm_traces", []))
+    assert manifest.evidence_table
+    assert any("stock-price correspondence" in caveat for caveat in manifest.final_answer.caveats)
+
+
+def test_api_runtime_info_reports_provider_and_device(tmp_path: Path) -> None:
+    docs = _sample_documents()
+    runtime = build_test_runtime(tmp_path=tmp_path, documents=docs, search_rows_by_query=_search_rows(docs))
+    app = build_app(runtime=runtime, project_root=tmp_path)
+
+    from fastapi.testclient import TestClient
+
+    client = TestClient(app)
+    response = client.get("/runtime-info")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert "llm" in payload
+    assert "device" in payload
+    assert "providers_installed" in payload
+
+
+def test_artifact_endpoint_serves_node_artifacts(tmp_path: Path) -> None:
+    docs = _sample_documents()
+    runtime = build_test_runtime(tmp_path=tmp_path, documents=docs, search_rows_by_query=_search_rows(docs))
+    app = build_app(runtime=runtime, project_root=tmp_path)
+
+    from fastapi.testclient import TestClient
+
+    client = TestClient(app)
+    response = client.post("/query", json={"question": "What is the distribution of nouns in football reports?"})
+
+    assert response.status_code == 200
+    payload = response.json()
+    artifact_path = payload["node_records"][0]["artifacts_used"][-1]
+    artifact_response = client.get(
+        f"/runs/{payload['run_id']}/artifact",
+        params={"artifact_path": artifact_path},
+    )
+
+    assert artifact_response.status_code == 200
+    assert artifact_response.content

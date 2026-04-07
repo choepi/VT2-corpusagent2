@@ -8,11 +8,13 @@ api_base_url = "http://127.0.0.1:8001"
 title = "CorpusAgent2 Prototype"
 
 [llm]
-provider = "openai"
-base_url = "https://hermes.ai.unturf.com/v1"
-api_key = "choose-any-value"
-planner_model = "adamo1139/Hermes-3-Llama-3.1-8B-FP8-Dynamic"
-synthesis_model = "adamo1139/Hermes-3-Llama-3.1-8B-FP8-Dynamic"
+use_openai = false
+openai_base_url = "https://api.openai.com/v1"
+openai_planner_model = "gpt-4.1-mini"
+openai_synthesis_model = "gpt-4.1-mini"
+unclose_base_url = "https://hermes.ai.unturf.com/v1"
+unclose_planner_model = "adamo1139/Hermes-3-Llama-3.1-8B-FP8-Dynamic"
+unclose_synthesis_model = "adamo1139/Hermes-3-Llama-3.1-8B-FP8-Dynamic"
 timeout_s = 60
 verify_ssl = true
 

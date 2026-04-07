@@ -20,6 +20,19 @@ class FrontendConfig:
 
 
 @dataclass(slots=True)
+class LLMAppConfig:
+    use_openai: bool = False
+    openai_base_url: str = "https://api.openai.com/v1"
+    openai_planner_model: str = "gpt-4.1-mini"
+    openai_synthesis_model: str = "gpt-4.1-mini"
+    unclose_base_url: str = "https://hermes.ai.unturf.com/v1"
+    unclose_planner_model: str = "adamo1139/Hermes-3-Llama-3.1-8B-FP8-Dynamic"
+    unclose_synthesis_model: str = "adamo1139/Hermes-3-Llama-3.1-8B-FP8-Dynamic"
+    timeout_s: float = 60.0
+    verify_ssl: bool = True
+
+
+@dataclass(slots=True)
 class ServerConfig:
     host: str = "127.0.0.1"
     port: int = 8001
@@ -30,6 +43,7 @@ class ServerConfig:
 class AppConfig:
     server: ServerConfig = field(default_factory=ServerConfig)
     frontend: FrontendConfig = field(default_factory=FrontendConfig)
+    llm: LLMAppConfig = field(default_factory=LLMAppConfig)
     env_map: dict[str, str] = field(default_factory=dict)
     source_path: str = ""
 
@@ -39,6 +53,7 @@ class AppConfig:
         raw = _read_toml(config_path)
         server_payload = raw.get("server", {})
         frontend_payload = raw.get("frontend", {})
+        llm_payload = raw.get("llm", {})
         env_map = cls._env_map_from_payload(raw)
         return cls(
             server=ServerConfig(
@@ -55,6 +70,28 @@ class AppConfig:
                 api_base_url=str(frontend_payload.get("api_base_url", "http://127.0.0.1:8001")),
                 title=str(frontend_payload.get("title", "CorpusAgent2 Prototype")),
             ),
+            llm=LLMAppConfig(
+                use_openai=str(llm_payload.get("use_openai", "false")).strip().lower() in {"1", "true", "yes", "on"},
+                openai_base_url=str(llm_payload.get("openai_base_url", "https://api.openai.com/v1")),
+                openai_planner_model=str(llm_payload.get("openai_planner_model", "gpt-4.1-mini")),
+                openai_synthesis_model=str(llm_payload.get("openai_synthesis_model", "gpt-4.1-mini")),
+                unclose_base_url=str(llm_payload.get("unclose_base_url", "https://hermes.ai.unturf.com/v1")),
+                unclose_planner_model=str(
+                    llm_payload.get(
+                        "unclose_planner_model",
+                        "adamo1139/Hermes-3-Llama-3.1-8B-FP8-Dynamic",
+                    )
+                ),
+                unclose_synthesis_model=str(
+                    llm_payload.get(
+                        "unclose_synthesis_model",
+                        "adamo1139/Hermes-3-Llama-3.1-8B-FP8-Dynamic",
+                    )
+                ),
+                timeout_s=float(llm_payload.get("timeout_s", 60)),
+                verify_ssl=str(llm_payload.get("verify_ssl", "true")).strip().lower()
+                not in {"0", "false", "no", "off"},
+            ),
             env_map=env_map,
             source_path=str(config_path),
         )
@@ -67,11 +104,13 @@ class AppConfig:
             ("server", "port", "CORPUSAGENT2_SERVER_PORT"),
             ("frontend", "api_base_url", "CORPUSAGENT2_FRONTEND_API_BASE_URL"),
             ("frontend", "title", "CORPUSAGENT2_FRONTEND_TITLE"),
-            ("llm", "provider", "CORPUSAGENT2_LLM_PROVIDER"),
-            ("llm", "base_url", "CORPUSAGENT2_LLM_BASE_URL"),
-            ("llm", "api_key", "CORPUSAGENT2_LLM_API_KEY"),
-            ("llm", "planner_model", "CORPUSAGENT2_LLM_PLANNER_MODEL"),
-            ("llm", "synthesis_model", "CORPUSAGENT2_LLM_SYNTHESIS_MODEL"),
+            ("llm", "use_openai", "CORPUSAGENT2_USE_OPENAI"),
+            ("llm", "openai_base_url", "CORPUSAGENT2_OPENAI_BASE_URL"),
+            ("llm", "openai_planner_model", "CORPUSAGENT2_OPENAI_PLANNER_MODEL"),
+            ("llm", "openai_synthesis_model", "CORPUSAGENT2_OPENAI_SYNTHESIS_MODEL"),
+            ("llm", "unclose_base_url", "CORPUSAGENT2_UNCLOSE_BASE_URL"),
+            ("llm", "unclose_planner_model", "CORPUSAGENT2_UNCLOSE_PLANNER_MODEL"),
+            ("llm", "unclose_synthesis_model", "CORPUSAGENT2_UNCLOSE_SYNTHESIS_MODEL"),
             ("llm", "timeout_s", "CORPUSAGENT2_LLM_TIMEOUT_S"),
             ("llm", "verify_ssl", "CORPUSAGENT2_LLM_VERIFY_SSL"),
             ("retrieval", "backend", "CORPUSAGENT2_RETRIEVAL_BACKEND"),
@@ -129,6 +168,17 @@ def load_project_configuration(project_root: Path) -> AppConfig:
         config.server.cors_origins = [item.strip() for item in cors_raw.split(",") if item.strip()] or ["*"]
     config.frontend.api_base_url = os.getenv("CORPUSAGENT2_FRONTEND_API_BASE_URL", config.frontend.api_base_url).strip() or config.frontend.api_base_url
     config.frontend.title = os.getenv("CORPUSAGENT2_FRONTEND_TITLE", config.frontend.title).strip() or config.frontend.title
+    raw_toggle = os.getenv("CORPUSAGENT2_USE_OPENAI")
+    if raw_toggle is not None:
+        config.llm.use_openai = raw_toggle.strip().lower() in {"1", "true", "yes", "on"}
+    config.llm.openai_base_url = os.getenv("CORPUSAGENT2_OPENAI_BASE_URL", config.llm.openai_base_url).strip() or config.llm.openai_base_url
+    config.llm.openai_planner_model = os.getenv("CORPUSAGENT2_OPENAI_PLANNER_MODEL", config.llm.openai_planner_model).strip() or config.llm.openai_planner_model
+    config.llm.openai_synthesis_model = os.getenv("CORPUSAGENT2_OPENAI_SYNTHESIS_MODEL", config.llm.openai_synthesis_model).strip() or config.llm.openai_synthesis_model
+    config.llm.unclose_base_url = os.getenv("CORPUSAGENT2_UNCLOSE_BASE_URL", config.llm.unclose_base_url).strip() or config.llm.unclose_base_url
+    config.llm.unclose_planner_model = os.getenv("CORPUSAGENT2_UNCLOSE_PLANNER_MODEL", config.llm.unclose_planner_model).strip() or config.llm.unclose_planner_model
+    config.llm.unclose_synthesis_model = os.getenv("CORPUSAGENT2_UNCLOSE_SYNTHESIS_MODEL", config.llm.unclose_synthesis_model).strip() or config.llm.unclose_synthesis_model
+    config.llm.timeout_s = float(os.getenv("CORPUSAGENT2_LLM_TIMEOUT_S", str(config.llm.timeout_s)).strip() or str(config.llm.timeout_s))
+    config.llm.verify_ssl = os.getenv("CORPUSAGENT2_LLM_VERIFY_SSL", str(config.llm.verify_ssl)).strip().lower() not in {"0", "false", "no", "off"}
     return config
 
 
@@ -137,4 +187,5 @@ def frontend_runtime_payload(project_root: Path) -> dict[str, Any]:
     return {
         "apiBaseUrl": config.frontend.api_base_url,
         "title": config.frontend.title,
+        "useOpenAI": config.llm.use_openai,
     }
