@@ -219,6 +219,64 @@ def test_api_async_submission_exposes_live_status(tmp_path: Path) -> None:
     assert "llm_traces" in status_payload
 
 
+def test_api_abort_run_marks_async_query_aborted(tmp_path: Path) -> None:
+    docs = _sample_documents()
+    runtime = build_test_runtime(
+        tmp_path=tmp_path,
+        documents=docs,
+        search_rows_by_query=_search_rows(docs),
+        search_delay_s=0.35,
+    )
+    app = build_app(runtime=runtime, project_root=tmp_path)
+
+    from fastapi.testclient import TestClient
+
+    client = TestClient(app)
+    submitted = client.post(
+        "/query/submit",
+        json={"question": "Which media predicted the outbreak of the Ukraine war in 2022?"},
+    )
+    assert submitted.status_code == 200
+    run_id = submitted.json()["run_id"]
+
+    aborted = client.post(f"/runs/{run_id}/abort")
+    assert aborted.status_code == 200
+    assert aborted.json()["status"] == "aborting"
+
+    deadline = time.time() + 5
+    status_payload = {}
+    while time.time() < deadline:
+        status_payload = client.get(f"/runs/{run_id}/status").json()
+        if status_payload["status"] == "aborted":
+            break
+        time.sleep(0.05)
+
+    assert status_payload["status"] == "aborted"
+
+
+def test_api_abort_all_runs_returns_aborted_run_ids(tmp_path: Path) -> None:
+    docs = _sample_documents()
+    runtime = build_test_runtime(
+        tmp_path=tmp_path,
+        documents=docs,
+        search_rows_by_query=_search_rows(docs),
+        search_delay_s=0.35,
+    )
+    app = build_app(runtime=runtime, project_root=tmp_path)
+
+    from fastapi.testclient import TestClient
+
+    client = TestClient(app)
+    first = client.post("/query/submit", json={"question": "Which named entities dominate climate coverage?"}).json()
+    second = client.post("/query/submit", json={"question": "Which media predicted the outbreak of the Ukraine war in 2022?"}).json()
+
+    aborted = client.post("/runs/abort-all")
+    assert aborted.status_code == 200
+    payload = aborted.json()
+    assert payload["count"] >= 1
+    assert first["run_id"] in payload["aborted_run_ids"] or second["run_id"] in payload["aborted_run_ids"]
+
+
 def test_force_answer_ignores_clarification_loop(tmp_path: Path) -> None:
     docs = _sample_documents()
     llm = StaticLLMClient(

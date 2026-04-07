@@ -102,4 +102,15 @@ def build_app(runtime: AgentRuntime | None = None, project_root: Path | None = N
         except FileNotFoundError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
 
+    @app.post("/runs/{run_id}/abort")
+    def abort_run(run_id: str) -> dict[str, Any]:
+        try:
+            return resolved_runtime.abort_run(run_id)
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.post("/runs/abort-all")
+    def abort_all_runs() -> dict[str, Any]:
+        return resolved_runtime.abort_all_runs()
+
     return app

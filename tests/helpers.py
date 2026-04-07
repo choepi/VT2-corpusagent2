@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from typing import Any, Callable
+import time
 
 from corpusagent2.agent_backends import InMemoryWorkingSetStore
 import pandas as pd
@@ -98,8 +99,9 @@ class StaticLLMClient:
 
 
 class FakeSearchBackend:
-    def __init__(self, rows_by_query: dict[str, list[dict[str, Any]]]) -> None:
+    def __init__(self, rows_by_query: dict[str, list[dict[str, Any]]], delay_s: float = 0.0) -> None:
         self.rows_by_query = rows_by_query
+        self.delay_s = delay_s
 
     def search(
         self,
@@ -115,6 +117,8 @@ class FakeSearchBackend:
         rerank_top_k: int = 0,
         fusion_k: int = 60,
     ) -> list[dict[str, Any]]:
+        if self.delay_s > 0:
+            time.sleep(self.delay_s)
         for key, rows in self.rows_by_query.items():
             if key.lower() in query.lower():
                 filtered = []
@@ -138,6 +142,7 @@ def build_test_runtime(
     tmp_path,
     documents: list[dict[str, Any]],
     search_rows_by_query: dict[str, list[dict[str, Any]]],
+    search_delay_s: float = 0.0,
 ):
     class FakeRuntime:
         def __init__(self, rows: list[dict[str, Any]]) -> None:
@@ -176,7 +181,7 @@ def build_test_runtime(
         config=config,
         runtime=runtime,
         llm_client=FailingLLMClient(),
-        search_backend=FakeSearchBackend(search_rows_by_query),
+        search_backend=FakeSearchBackend(search_rows_by_query, delay_s=search_delay_s),
         working_store=store,
         python_runner=None,
     )

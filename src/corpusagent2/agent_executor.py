@@ -68,6 +68,9 @@ class AsyncPlanExecutor:
             return
         context.event_callback(payload)
 
+    def _is_cancelled(self, context: AgentExecutionContext) -> bool:
+        return bool(context.cancel_requested is not None and context.cancel_requested())
+
     async def _execute_node(
         self,
         node: AgentPlanNode,
@@ -351,6 +354,15 @@ class AsyncPlanExecutor:
         selected_docs: list[dict[str, Any]] = []
 
         while pending:
+            if self._is_cancelled(context):
+                return AgentExecutionSnapshot(
+                    node_records=node_records,
+                    node_results=completed,
+                    failures=failures,
+                    provenance_records=provenance_rows,
+                    selected_docs=selected_docs,
+                    status="aborted",
+                )
             ready_ids = []
             for node_id in list(pending):
                 node = node_map[node_id]
@@ -387,6 +399,15 @@ class AsyncPlanExecutor:
                             selected_docs=selected_docs,
                             status="failed",
                         )
+            if self._is_cancelled(context):
+                return AgentExecutionSnapshot(
+                    node_records=node_records,
+                    node_results=completed,
+                    failures=failures,
+                    provenance_records=provenance_rows,
+                    selected_docs=selected_docs,
+                    status="aborted",
+                )
 
         status = "completed" if not failures else "partial"
         return AgentExecutionSnapshot(

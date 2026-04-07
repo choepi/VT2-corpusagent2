@@ -62,6 +62,7 @@ class AgentExecutionContext:
     runtime: Any | None = None
     state: Any | None = None
     event_callback: Callable[[dict[str, Any]], None] | None = None
+    cancel_requested: Callable[[], bool] | None = None
 
 
 class FunctionalToolAdapter(CapabilityToolAdapter):

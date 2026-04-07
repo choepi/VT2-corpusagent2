@@ -3,6 +3,8 @@ const questionInput = document.getElementById("question");
 const forceAnswerInput = document.getElementById("forceAnswer");
 const noCacheInput = document.getElementById("noCache");
 const runButton = document.getElementById("runButton");
+const abortButton = document.getElementById("abortButton");
+const abortAllButton = document.getElementById("abortAllButton");
 const continueButton = document.getElementById("continueButton");
 const clarificationPanel = document.getElementById("clarificationPanel");
 const clarificationPrompt = document.getElementById("clarificationPrompt");
@@ -45,8 +47,10 @@ let pollTimer = null;
 let clarificationHistory = [];
 let pendingClarificationQuestion = "";
 let currentRunId = "";
+let currentStatus = "idle";
 let latestRuntimeInfo = null;
 const POLL_INTERVAL_MS = 250;
+const UI_STATE_KEY = "corpusagent2-ui-state-v2";
 
 const runtimeConfig = window.CORPUSAGENT2_CONFIG || {};
 if (runtimeConfig.apiBaseUrl) {
@@ -56,6 +60,48 @@ if (runtimeConfig.title) {
   document.title = runtimeConfig.title;
 }
 providerBadge.textContent = "LLM: loading...";
+
+function saveUiState() {
+  const payload = {
+    apiBase: apiBaseInput.value,
+    question: questionInput.value,
+    forceAnswer: forceAnswerInput.checked,
+    noCache: noCacheInput.checked,
+    clarificationHistory,
+    pendingClarificationQuestion,
+    currentRunId,
+    currentStatus,
+  };
+  window.localStorage.setItem(UI_STATE_KEY, JSON.stringify(payload));
+}
+
+function restoreUiState() {
+  try {
+    const raw = window.localStorage.getItem(UI_STATE_KEY);
+    if (!raw) {
+      return;
+    }
+    const payload = JSON.parse(raw);
+    apiBaseInput.value = payload.apiBase || apiBaseInput.value;
+    questionInput.value = payload.question || questionInput.value;
+    forceAnswerInput.checked = Boolean(payload.forceAnswer);
+    noCacheInput.checked = Boolean(payload.noCache);
+    clarificationHistory = Array.isArray(payload.clarificationHistory) ? payload.clarificationHistory : [];
+    pendingClarificationQuestion = payload.pendingClarificationQuestion || "";
+    currentRunId = payload.currentRunId || "";
+    currentStatus = payload.currentStatus || "idle";
+  } catch (error) {
+    console.warn("Could not restore UI state", error);
+  }
+}
+
+function hasActiveRun() {
+  return ["queued", "running", "aborting"].includes(currentStatus) && Boolean(currentRunId);
+}
+
+function updateControlState() {
+  abortButton.disabled = !hasActiveRun();
+}
 
 function escapeHtml(value) {
   return String(value ?? "")
@@ -409,6 +455,7 @@ function renderManifest(manifest) {
 
 function setStatus(payload) {
   const status = payload.status || "unknown";
+  currentStatus = status;
   const liveActiveSteps = Array.isArray(payload.active_steps) ? payload.active_steps : [];
   const derivedActiveSteps =
     liveActiveSteps.length > 0
@@ -445,6 +492,8 @@ function setStatus(payload) {
     pendingClarificationQuestion = clarificationQuestions[0];
   }
   renderClarificationState();
+  updateControlState();
+  saveUiState();
 }
 
 async function fetchJson(url, options = {}) {
@@ -469,11 +518,53 @@ async function loadRuntimeInfo() {
   }
 }
 
+async function abortCurrentRun({ silent = false } = {}) {
+  if (!currentRunId) {
+    return null;
+  }
+  const base = apiBaseInput.value.replace(/\/$/, "");
+  const payload = await fetchJson(`${base}/runs/${encodeURIComponent(currentRunId)}/abort`, {
+    method: "POST",
+  });
+  if (!silent) {
+    setStatus(payload);
+  } else {
+    currentStatus = payload.status || "aborting";
+    saveUiState();
+  }
+  return payload;
+}
+
+async function abortAllRuns() {
+  const base = apiBaseInput.value.replace(/\/$/, "");
+  const payload = await fetchJson(`${base}/runs/abort-all`, { method: "POST" });
+  if (currentRunId && payload.aborted_run_ids?.includes(currentRunId)) {
+    setStatus({
+      status: "aborting",
+      current_phase: "aborting",
+      detail: "Abort requested for all running queries",
+      active_steps: [],
+      completed_steps: [],
+      failed_steps: [],
+      assumptions: [],
+      planner_actions: [],
+      llm_traces: [],
+      clarification_questions: [],
+    });
+  } else {
+    detailText.textContent = payload.count > 0 ? `Abort requested for ${payload.count} run(s).` : "No running queries to abort.";
+  }
+  return payload;
+}
+
 async function submitQuery({ preserveClarificationHistory = false } = {}) {
   await loadRuntimeInfo();
   if (pollTimer) {
     clearInterval(pollTimer);
     pollTimer = null;
+  }
+  if (hasActiveRun()) {
+    await abortCurrentRun({ silent: true });
   }
   if (!preserveClarificationHistory) {
     resetClarificationState();
@@ -521,7 +612,7 @@ async function pollRun(runId) {
     currentRunId = runId;
     setStatus(statusPayload);
 
-    if (["completed", "partial", "failed", "rejected", "needs_clarification"].includes(statusPayload.status)) {
+    if (["completed", "partial", "failed", "rejected", "needs_clarification", "aborted"].includes(statusPayload.status)) {
       clearInterval(pollTimer);
       pollTimer = null;
       const manifest = await fetchJson(`${base}/runs/${runId}`);
@@ -534,6 +625,9 @@ async function pollRun(runId) {
         pendingClarificationQuestion =
           manifest.metadata?.clarification_question || manifest.clarification_questions?.[0] || "Clarification required.";
         answerText.textContent = "Clarification required before the planner can continue.";
+      } else if (manifest.status === "aborted") {
+        pendingClarificationQuestion = "";
+        clarificationInput.value = "";
       } else {
         pendingClarificationQuestion = "";
         clarificationInput.value = "";
@@ -565,6 +659,22 @@ runButton.addEventListener("click", async () => {
     statusBox.textContent = "failed";
     statusBox.className = "status failed";
     detailText.textContent = `Submission failed: ${error.message}`;
+  }
+});
+
+abortButton.addEventListener("click", async () => {
+  try {
+    await abortCurrentRun();
+  } catch (error) {
+    detailText.textContent = `Abort failed: ${error.message}`;
+  }
+});
+
+abortAllButton.addEventListener("click", async () => {
+  try {
+    await abortAllRuns();
+  } catch (error) {
+    detailText.textContent = `Abort-all failed: ${error.message}`;
   }
 });
 
@@ -605,6 +715,27 @@ window.addEventListener("keydown", (event) => {
   }
 });
 
+[
+  apiBaseInput,
+  questionInput,
+  forceAnswerInput,
+  noCacheInput,
+  clarificationInput,
+].forEach((element) => {
+  element.addEventListener("input", saveUiState);
+  element.addEventListener("change", saveUiState);
+});
+
+restoreUiState();
 closePlotModal();
 renderClarificationState();
-loadRuntimeInfo();
+updateControlState();
+loadRuntimeInfo().then(async () => {
+  if (currentRunId) {
+    try {
+      await pollRun(currentRunId);
+    } catch (error) {
+      detailText.textContent = `Could not restore previous run: ${error.message}`;
+    }
+  }
+});

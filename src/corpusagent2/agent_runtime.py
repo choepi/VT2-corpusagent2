@@ -43,6 +43,8 @@ from .seed import runtime_device_report
 from .tool_registry import ToolRegistry
 from .python_runner_service import DockerPythonRunnerService
 
+TERMINAL_RUN_STATUSES = {"completed", "partial", "failed", "rejected", "needs_clarification", "aborted"}
+
 
 @dataclass(slots=True)
 class AgentRuntimeConfig:
@@ -736,6 +738,8 @@ class AgentRuntime:
         self.orchestrator = MagicBoxOrchestrator(self.llm_client, self.llm_config)
         self.executor = AsyncPlanExecutor(self.registry)
         self._live_runs: dict[str, LiveRunStatus] = {}
+        self._run_cancel_events: dict[str, threading.Event] = {}
+        self._run_threads: dict[str, threading.Thread] = {}
         self._run_lock = threading.Lock()
 
     def _build_search_backend(self):
@@ -830,6 +834,104 @@ class AgentRuntime:
                     setattr(status, key, value)
             status.updated_at_utc = datetime.now(UTC).isoformat()
             return status
+
+    def _register_cancel_event(self, run_id: str) -> threading.Event:
+        with self._run_lock:
+            event = self._run_cancel_events.get(run_id)
+            if event is None:
+                event = threading.Event()
+                self._run_cancel_events[run_id] = event
+            return event
+
+    def _is_cancelled(self, run_id: str) -> bool:
+        with self._run_lock:
+            event = self._run_cancel_events.get(run_id)
+            return bool(event is not None and event.is_set())
+
+    def _build_aborted_manifest(
+        self,
+        *,
+        run_id: str,
+        question: str,
+        rewritten_question: str,
+        state: AgentRunState,
+        artifacts_dir: Path,
+        snapshot: AgentExecutionSnapshot | None = None,
+        plan_dags: list[dict[str, Any]] | None = None,
+        clarification_questions: list[str] | None = None,
+    ) -> AgentRunManifest:
+        empty_snapshot = AgentExecutionSnapshot(
+            node_records=[],
+            node_results={},
+            failures=[],
+            provenance_records=[],
+            selected_docs=[],
+            status="aborted",
+        )
+        resolved_snapshot = snapshot or empty_snapshot
+        return AgentRunManifest(
+            run_id=run_id,
+            question=question,
+            rewritten_question=rewritten_question or question,
+            status="aborted",
+            clarification_questions=list(clarification_questions or []),
+            assumptions=list(state.assumptions),
+            planner_actions=list(state.planner_actions),
+            plan_dags=list(plan_dags or []),
+            selected_docs=list(resolved_snapshot.selected_docs),
+            node_records=list(resolved_snapshot.node_records),
+            provenance_records=list(resolved_snapshot.provenance_records),
+            evidence_table=list(self.orchestrator._extract_evidence(resolved_snapshot)),
+            final_answer=FinalAnswerPayload(
+                answer_text="Run aborted by user.",
+                caveats=["Run was aborted before completion; any partial outputs may be incomplete."],
+            ),
+            artifacts_dir=str(artifacts_dir),
+            failures=list(resolved_snapshot.failures),
+            metadata={
+                "clarification_history": list(state.clarification_history),
+                "llm_traces": list(state.llm_traces),
+                "runtime_info": self.runtime_info(),
+                "aborted": True,
+            },
+        )
+
+    def _maybe_abort(
+        self,
+        *,
+        run_id: str,
+        question: str,
+        rewritten_question: str,
+        state: AgentRunState,
+        artifacts_dir: Path,
+        snapshot: AgentExecutionSnapshot | None = None,
+        plan_dags: list[dict[str, Any]] | None = None,
+        clarification_questions: list[str] | None = None,
+    ) -> AgentRunManifest | None:
+        if not self._is_cancelled(run_id):
+            return None
+        self._set_live_status(
+            run_id,
+            status="aborted",
+            current_phase="aborted",
+            detail="Run aborted by user",
+            assumptions=list(state.assumptions),
+            planner_actions=list(state.planner_actions),
+            llm_traces=list(state.llm_traces),
+            clarification_questions=list(clarification_questions or []),
+        )
+        manifest = self._build_aborted_manifest(
+            run_id=run_id,
+            question=question,
+            rewritten_question=rewritten_question,
+            state=state,
+            artifacts_dir=artifacts_dir,
+            snapshot=snapshot,
+            plan_dags=plan_dags,
+            clarification_questions=clarification_questions,
+        )
+        self._persist_manifest(manifest)
+        return manifest
 
     def _record_step_event(self, run_id: str, payload: dict[str, Any]) -> None:
         with self._run_lock:
@@ -943,6 +1045,15 @@ class AgentRuntime:
         state = self._build_state(question=question, force_answer=force_answer, no_cache=no_cache)
         if clarification_history:
             state.clarification_history = list(clarification_history)
+        maybe_aborted = self._maybe_abort(
+            run_id=run_id,
+            question=question,
+            rewritten_question=question,
+            state=state,
+            artifacts_dir=artifacts_dir,
+        )
+        if maybe_aborted is not None:
+            return maybe_aborted
 
         try:
             self.working_store.create_run(
@@ -972,6 +1083,15 @@ class AgentRuntime:
         if rephrase_action.assumptions:
             state.assumptions = list(dict.fromkeys(state.assumptions + rephrase_action.assumptions))
             self._set_live_status(run_id, assumptions=list(state.assumptions))
+        maybe_aborted = self._maybe_abort(
+            run_id=run_id,
+            question=question,
+            rewritten_question=rephrase_action.rewritten_question or question,
+            state=state,
+            artifacts_dir=artifacts_dir,
+        )
+        if maybe_aborted is not None:
+            return maybe_aborted
         if rephrase_action.action == "grounded_rejection":
             manifest = AgentRunManifest(
                 run_id=run_id,
@@ -1035,6 +1155,16 @@ class AgentRuntime:
         if plan_action.assumptions:
             state.assumptions = list(dict.fromkeys(state.assumptions + plan_action.assumptions))
         self._set_live_status(run_id, planner_actions=list(state.planner_actions), llm_traces=list(state.llm_traces))
+        maybe_aborted = self._maybe_abort(
+            run_id=run_id,
+            question=question,
+            rewritten_question=state.rewritten_question,
+            state=state,
+            artifacts_dir=artifacts_dir,
+            clarification_questions=[plan_action.clarification_question] if plan_action.clarification_question else [],
+        )
+        if maybe_aborted is not None:
+            return maybe_aborted
         if plan_action.action == "ask_clarification" and not force_answer and len(state.clarification_history) < 2:
             manifest = self._needs_clarification_manifest(
                 run_id=run_id,
@@ -1071,11 +1201,23 @@ class AgentRuntime:
             runtime=self.runtime,
             state=state,
             event_callback=lambda payload: self._record_step_event(run_id, payload),
+            cancel_requested=lambda: self._is_cancelled(run_id),
         )
 
         self._set_live_status(run_id, current_phase="executing", detail="Executing plan DAG")
         snapshot = asyncio.run(self.executor.execute(plan_action.plan_dag, context))
         plan_dags = [plan_action.plan_dag.to_dict()]
+        maybe_aborted = self._maybe_abort(
+            run_id=run_id,
+            question=question,
+            rewritten_question=state.rewritten_question,
+            state=state,
+            artifacts_dir=artifacts_dir,
+            snapshot=snapshot,
+            plan_dags=plan_dags,
+        )
+        if maybe_aborted is not None:
+            return maybe_aborted
 
         if snapshot.failures:
             state.failures = [item.to_dict() for item in snapshot.failures]
@@ -1090,8 +1232,30 @@ class AgentRuntime:
                 revised_snapshot = asyncio.run(self.executor.execute(revised.plan_dag, context))
                 plan_dags.append(revised.plan_dag.to_dict())
                 snapshot = revised_snapshot
+                maybe_aborted = self._maybe_abort(
+                    run_id=run_id,
+                    question=question,
+                    rewritten_question=state.rewritten_question,
+                    state=state,
+                    artifacts_dir=artifacts_dir,
+                    snapshot=snapshot,
+                    plan_dags=plan_dags,
+                )
+                if maybe_aborted is not None:
+                    return maybe_aborted
 
         self._set_live_status(run_id, current_phase="final_synthesis", detail="Synthesizing grounded answer")
+        maybe_aborted = self._maybe_abort(
+            run_id=run_id,
+            question=question,
+            rewritten_question=state.rewritten_question,
+            state=state,
+            artifacts_dir=artifacts_dir,
+            snapshot=snapshot,
+            plan_dags=plan_dags,
+        )
+        if maybe_aborted is not None:
+            return maybe_aborted
         final_answer = self.orchestrator.synthesize(state, snapshot)
         manifest = AgentRunManifest(
             run_id=run_id,
@@ -1152,6 +1316,7 @@ class AgentRuntime:
             current_phase="queued",
             detail="Queued for execution",
         )
+        self._register_cancel_event(run_id)
 
         def _runner() -> None:
             try:
@@ -1169,8 +1334,13 @@ class AgentRuntime:
                     current_phase="failed",
                     detail=str(exc),
                 )
+            finally:
+                with self._run_lock:
+                    self._run_threads.pop(run_id, None)
 
         thread = threading.Thread(target=_runner, daemon=True, name=f"corpusagent2-{run_id}")
+        with self._run_lock:
+            self._run_threads[run_id] = thread
         thread.start()
         return status
 
@@ -1201,6 +1371,39 @@ class AgentRuntime:
             if live is not None:
                 return live.to_dict()
         return self.get_run(run_id)
+
+    def abort_run(self, run_id: str) -> dict[str, Any]:
+        with self._run_lock:
+            status = self._live_runs.get(run_id)
+            if status is None:
+                raise FileNotFoundError(f"Run not found for run_id={run_id}")
+            current_status = str(status.status)
+            if current_status in TERMINAL_RUN_STATUSES:
+                return status.to_dict()
+            event = self._run_cancel_events.get(run_id)
+            if event is None:
+                event = threading.Event()
+                self._run_cancel_events[run_id] = event
+            event.set()
+        return self._set_live_status(
+            run_id,
+            status="aborting",
+            current_phase="aborting",
+            detail="Abort requested; waiting for current step to stop",
+        ).to_dict()
+
+    def abort_all_runs(self) -> dict[str, Any]:
+        aborted_run_ids: list[str] = []
+        with self._run_lock:
+            run_ids = list(self._live_runs.keys())
+        for run_id in run_ids:
+            with self._run_lock:
+                status = self._live_runs.get(run_id)
+                current_status = str(status.status) if status is not None else ""
+            if current_status and current_status not in TERMINAL_RUN_STATUSES and current_status != "aborting":
+                self.abort_run(run_id)
+                aborted_run_ids.append(run_id)
+        return {"aborted_run_ids": aborted_run_ids, "count": len(aborted_run_ids)}
 
     def get_run(self, run_id: str) -> dict[str, Any]:
         manifest_path = self.config.outputs_root / run_id / "run_manifest.json"
