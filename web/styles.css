@@ -30,6 +30,10 @@ body {
     linear-gradient(180deg, #efe4d1 0%, var(--bg) 100%);
 }
 
+body.gate-active {
+  overflow: hidden;
+}
+
 .shell {
   max-width: 1760px;
   margin: 0 auto;
@@ -47,6 +51,36 @@ body {
 
 .hidden {
   display: none !important;
+}
+
+.access-gate {
+  position: fixed;
+  inset: 0;
+  z-index: 30;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background: rgba(26, 23, 18, 0.58);
+  backdrop-filter: blur(12px);
+}
+
+.access-card {
+  width: min(520px, 100%);
+  background: linear-gradient(180deg, var(--paper-strong) 0%, var(--paper) 100%);
+  border: 1px solid var(--border);
+  border-radius: 24px;
+  padding: 28px;
+  box-shadow: 0 24px 60px rgba(26, 23, 18, 0.28);
+}
+
+.access-card h1 {
+  margin: 0 0 8px;
+  font-size: clamp(2rem, 5vw, 3.2rem);
+  line-height: 0.98;
+}
+
+.warn {
+  color: var(--warn);
 }
 
 .hero {

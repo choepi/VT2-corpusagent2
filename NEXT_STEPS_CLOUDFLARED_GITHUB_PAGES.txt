@@ -1,0 +1,147 @@
+CorpusAgent2 next steps: Cloudflared, GitHub Pages, and a minimal access gate
+
+1. Backend shape to keep
+
+- Keep FastAPI bound to 127.0.0.1:8001.
+- Keep Postgres on localhost:5432 and OpenSearch on localhost:9200.
+- Expose only the FastAPI backend through Cloudflare Tunnel.
+- Do not bind the API to 0.0.0.0 just to make tunneling work.
+
+2. Local or VM setup before tunneling
+
+- Start the backend:
+  ./.venv/bin/python ./scripts/12_run_agent_api.py
+- Verify backend health locally:
+  curl http://127.0.0.1:8001/health
+- If you want to test the static frontend locally:
+  ./.venv/bin/python ./scripts/14_run_static_frontend.py
+- Local frontend URL:
+  http://127.0.0.1:5500
+
+3. Quick Tunnel for a temporary demo
+
+- Install cloudflared on the machine running the backend.
+- Start a quick tunnel with the repo helper:
+  ./.venv/bin/python ./scripts/23_start_cloudflared_tunnel.py
+- That will expose:
+  http://127.0.0.1:8001
+- It will print a public URL like:
+  https://random-name.trycloudflare.com
+- Paste that URL into the frontend API Base URL field.
+
+Quick Tunnel tradeoffs:
+
+- Good for testing and ad hoc demos.
+- URL changes every restart.
+- No stable DNS name.
+- No real access control by default.
+
+4. Named tunnel for a stable deployment
+
+- Authenticate cloudflared:
+  cloudflared tunnel login
+- Create a tunnel:
+  cloudflared tunnel create corpusagent2-api
+- Create a DNS record:
+  cloudflared tunnel route dns corpusagent2-api api.your-domain.example
+- Create a config file at ~/.cloudflared/config.yml with this shape:
+
+  tunnel: <tunnel-uuid>
+  credentials-file: /home/<user>/.cloudflared/<tunnel-uuid>.json
+  ingress:
+    - hostname: api.your-domain.example
+      service: http://127.0.0.1:8001
+    - service: http_status:404
+
+- Run the tunnel:
+  cloudflared tunnel run corpusagent2-api
+
+5. Run cloudflared persistently
+
+- Best practice is a systemd service on the VM.
+- Keep the backend and tunnel as separate processes.
+- Restart the backend without changing your public hostname.
+
+6. GitHub Pages setup
+
+- Keep the frontend as a static site from web/.
+- The repo already writes runtime config into web/config.js.
+- For a stable setup, set the frontend API Base URL to:
+  https://api.your-domain.example
+
+Recommended Pages flow:
+
+- Host the static frontend with GitHub Pages.
+- Let the browser talk directly to the Cloudflare tunnel hostname.
+- Keep CORS permissive for now or restrict it to your Pages domain later.
+
+7. CORS notes
+
+- Current config uses cors_origins = ["*"].
+- That is easiest for bring-up.
+- Once the deployment is stable, restrict CORS to the exact frontend origin, for example:
+  https://<your-user>.github.io
+  https://<your-custom-pages-domain>
+
+8. Best real protection: Cloudflare Access
+
+- If you want an actual login wall in front of the backend, use Cloudflare Access on the tunnel hostname.
+- Put Access in front of api.your-domain.example.
+- Require your email identity or a one-time PIN.
+- This is the right place for protection because GitHub Pages is static and cannot keep secrets.
+
+Recommended model:
+
+- GitHub Pages serves the frontend publicly.
+- Cloudflare Access protects the backend hostname.
+- Only approved users can reach the API through the tunnel.
+
+9. Minimal frontend gate included in this repo
+
+- The frontend now supports a small passphrase gate.
+- This is only a convenience barrier for casual access.
+- It is not secure against a determined user because the site is static.
+
+To enable it, set these environment variables before writing web/config.js:
+
+- CORPUSAGENT2_FRONTEND_ACCESS_GATE=true
+- CORPUSAGENT2_FRONTEND_ACCESS_PASSWORD_SHA256=<sha256 hex of your passphrase>
+- CORPUSAGENT2_FRONTEND_ACCESS_TITLE=Private Demo Access
+- CORPUSAGENT2_FRONTEND_ACCESS_SUBTITLE=Use the shared passphrase to continue.
+- CORPUSAGENT2_FRONTEND_ACCESS_HINT=<optional hint>
+
+Then regenerate the frontend config:
+
+  ./.venv/bin/python ./scripts/13_write_frontend_config.py
+
+10. How to make the passphrase hash
+
+Linux or macOS:
+
+  printf '%s' 'your-passphrase-here' | sha256sum
+
+If sha256sum is missing on macOS:
+
+  printf '%s' 'your-passphrase-here' | shasum -a 256
+
+Use the hex digest as CORPUSAGENT2_FRONTEND_ACCESS_PASSWORD_SHA256.
+
+11. What to do next after env prep
+
+- Rerun:
+  python3 scripts/22_prepare_vm_stack.py
+- The bootstrap now defaults to dense-only local asset generation on the VM path.
+- That avoids forcing the large local TF-IDF build that was killed before.
+- After bootstrap completes:
+  1. start the API
+  2. start cloudflared
+  3. point GitHub Pages to the tunnel hostname
+  4. if needed, add Cloudflare Access in front of the API
+
+12. Recommended final production shape
+
+- GitHub Pages: static frontend
+- Cloudflare Tunnel: stable backend hostname
+- Cloudflare Access: real auth gate
+- FastAPI: localhost only
+- Postgres/OpenSearch: localhost only

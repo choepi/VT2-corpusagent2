@@ -1,4 +1,11 @@
 ﻿const apiBaseInput = document.getElementById("apiBase");
+const accessGate = document.getElementById("accessGate");
+const accessGateTitle = document.getElementById("accessGateTitle");
+const accessGateSubtitle = document.getElementById("accessGateSubtitle");
+const accessGatePassword = document.getElementById("accessGatePassword");
+const accessGateHint = document.getElementById("accessGateHint");
+const accessGateError = document.getElementById("accessGateError");
+const accessGateButton = document.getElementById("accessGateButton");
 const questionInput = document.getElementById("question");
 const forceAnswerInput = document.getElementById("forceAnswer");
 const noCacheInput = document.getElementById("noCache");
@@ -60,8 +67,10 @@ const POLL_INTERVAL_MS = 250;
 const MANIFEST_FETCH_RETRY_DELAY_MS = 400;
 const MANIFEST_FETCH_MAX_ATTEMPTS = 5;
 const UI_STATE_KEY = "corpusagent2-ui-state-v2";
+const ACCESS_GATE_SESSION_KEY = "corpusagent2-access-gate-ok";
 
 const runtimeConfig = window.CORPUSAGENT2_CONFIG || {};
+const accessGateConfig = runtimeConfig.accessGate || {};
 if (runtimeConfig.apiBaseUrl) {
   apiBaseInput.value = runtimeConfig.apiBaseUrl;
 }
@@ -69,6 +78,64 @@ if (runtimeConfig.title) {
   document.title = runtimeConfig.title;
 }
 providerBadge.textContent = "LLM: loading...";
+
+function isAccessGateEnabled() {
+  return Boolean(accessGateConfig.enabled && accessGateConfig.passwordSha256);
+}
+
+function bytesToHex(buffer) {
+  return Array.from(new Uint8Array(buffer))
+    .map((byte) => byte.toString(16).padStart(2, "0"))
+    .join("");
+}
+
+async function sha256Hex(value) {
+  const encoded = new TextEncoder().encode(value);
+  const digest = await window.crypto.subtle.digest("SHA-256", encoded);
+  return bytesToHex(digest);
+}
+
+function accessGateUnlocked() {
+  return window.sessionStorage.getItem(ACCESS_GATE_SESSION_KEY) === "1";
+}
+
+function renderAccessGate() {
+  if (!isAccessGateEnabled()) {
+    accessGate.classList.add("hidden");
+    accessGate.setAttribute("aria-hidden", "true");
+    return;
+  }
+  accessGateTitle.textContent = accessGateConfig.title || "Private Demo Access";
+  accessGateSubtitle.textContent = accessGateConfig.subtitle || "Enter the shared passphrase to continue.";
+  accessGateHint.textContent = accessGateConfig.hint || "";
+  accessGateHint.classList.toggle("hidden", !accessGateConfig.hint);
+  accessGateError.classList.add("hidden");
+  const unlocked = accessGateUnlocked();
+  accessGate.classList.toggle("hidden", unlocked);
+  accessGate.setAttribute("aria-hidden", unlocked ? "true" : "false");
+  document.body.classList.toggle("gate-active", !unlocked);
+  if (!unlocked) {
+    window.setTimeout(() => accessGatePassword.focus(), 0);
+  }
+}
+
+async function unlockAccessGate() {
+  const candidate = accessGatePassword.value.trim();
+  if (!candidate) {
+    accessGateError.textContent = "Enter the shared passphrase.";
+    accessGateError.classList.remove("hidden");
+    return;
+  }
+  const hash = await sha256Hex(candidate);
+  if (hash !== String(accessGateConfig.passwordSha256 || "").toLowerCase()) {
+    accessGateError.textContent = "Passphrase did not match.";
+    accessGateError.classList.remove("hidden");
+    return;
+  }
+  window.sessionStorage.setItem(ACCESS_GATE_SESSION_KEY, "1");
+  accessGatePassword.value = "";
+  renderAccessGate();
+}
 
 function saveUiState() {
   const payload = {
@@ -857,6 +924,24 @@ restoreUiState();
 closePlotModal();
 renderClarificationState();
 updateControlState();
+renderAccessGate();
+
+accessGateButton.addEventListener("click", async () => {
+  try {
+    await unlockAccessGate();
+  } catch (error) {
+    accessGateError.textContent = `Access gate failed: ${error.message}`;
+    accessGateError.classList.remove("hidden");
+  }
+});
+
+accessGatePassword.addEventListener("keydown", async (event) => {
+  if (event.key === "Enter") {
+    event.preventDefault();
+    await unlockAccessGate();
+  }
+});
+
 loadRuntimeInfo().then(async () => {
   if (currentRunId) {
     try {
