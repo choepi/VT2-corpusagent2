@@ -27,6 +27,16 @@ _VALID_ACTIONS = {
 }
 
 
+def _coerce_mapping(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return dict(value)
+    return {}
+
+
+def _coerce_node_description(payload: dict[str, Any]) -> str:
+    return str(payload.get("description", payload.get("task", ""))).strip()
+
+
 @dataclass(slots=True)
 class EvidenceRow:
     doc_id: str
@@ -137,23 +147,42 @@ class PlannerAction:
         plan_dag = None
         if isinstance(dag_payload, dict):
             node_payloads = list(dag_payload.get("nodes", []))
-            parsed_nodes = [
-                AgentPlanNode(
-                    node_id=str(item.get("id", item.get("node_id", ""))),
-                    capability=str(item["capability"]),
-                    inputs=dict(item.get("inputs", {})),
-                    depends_on=[str(dep) for dep in item.get("depends_on", [])],
-                    optional=bool(item.get("optional", False)),
-                    cacheable=bool(item.get("cacheable", True)),
-                    description=str(item.get("description", "")),
-                )
+            node_ids = {
+                str(item.get("id", item.get("node_id", ""))).strip()
                 for item in node_payloads
-                if str(item.get("id", item.get("node_id", ""))).strip() and str(item.get("capability", "")).strip()
-            ]
+                if str(item.get("id", item.get("node_id", ""))).strip()
+            }
+            parsed_nodes = []
+            for item in node_payloads:
+                node_id = str(item.get("id", item.get("node_id", ""))).strip()
+                capability = str(item.get("capability", "")).strip()
+                if not node_id or not capability:
+                    continue
+                raw_inputs = item.get("inputs", {})
+                depends_on = [str(dep).strip() for dep in item.get("depends_on", []) if str(dep).strip()]
+                inputs = _coerce_mapping(raw_inputs)
+                if isinstance(raw_inputs, list):
+                    depends_on.extend(
+                        str(dep).strip()
+                        for dep in raw_inputs
+                        if isinstance(dep, str) and str(dep).strip() in node_ids
+                    )
+                deduped_depends_on = list(dict.fromkeys(dep for dep in depends_on if dep and dep != node_id))
+                parsed_nodes.append(
+                    AgentPlanNode(
+                        node_id=node_id,
+                        capability=capability,
+                        inputs=inputs,
+                        depends_on=deduped_depends_on,
+                        optional=bool(item.get("optional", False)),
+                        cacheable=bool(item.get("cacheable", True)),
+                        description=_coerce_node_description(item),
+                    )
+                )
             if parsed_nodes:
                 plan_dag = AgentPlanDAG(
                     nodes=parsed_nodes,
-                    metadata=dict(dag_payload.get("metadata", {})),
+                    metadata=_coerce_mapping(dag_payload.get("metadata", {})),
                 )
         return cls(
             action=action,

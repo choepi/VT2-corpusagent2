@@ -69,6 +69,15 @@ def test_extract_json_object_recovers_from_python_literal_dict() -> None:
     assert payload["clarification_question"] == "Which outlets should I compare?"
 
 
+def test_extract_json_object_recovers_partial_unclose_clarification_payload() -> None:
+    raw = '{"action": "ask_clarification", "rewritten_question": "Could you clarify the outlets you want?", "clarification_question": "Which outlets should be included?'
+
+    payload = _extract_json_object(raw)
+
+    assert payload["action"] == "ask_clarification"
+    assert "clarify the outlets" in payload["rewritten_question"]
+
+
 def test_provider_config_runtime_override_switches_to_openai(monkeypatch) -> None:
     monkeypatch.setenv("CORPUSAGENT2_USE_OPENAI", "false")
     monkeypatch.setenv("CORPUSAGENT2_UNCLOSE_PLANNER_MODEL", "hermes-plan")

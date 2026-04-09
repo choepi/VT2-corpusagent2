@@ -28,6 +28,7 @@ dependencies = [
     "torchvision==0.18.1",
     "transformers>=4.45.0,<5.0.0",
     "uvicorn>=0.41.0",
+    "yfinance>=0.2.65",
 ]
 
 [project.optional-dependencies]

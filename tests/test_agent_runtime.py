@@ -3,7 +3,11 @@ from __future__ import annotations
 from pathlib import Path
 import time
 
+from corpusagent2 import agent_capabilities
 from corpusagent2.api import build_app
+from corpusagent2.agent_executor import AgentExecutionSnapshot
+from corpusagent2.python_runner_service import PythonRunnerResult
+from corpusagent2.tool_registry import ToolExecutionResult
 
 from .helpers import StaticLLMClient, build_test_runtime
 
@@ -139,6 +143,29 @@ def test_runtime_q7_builds_evidence_table(tmp_path: Path) -> None:
     first = manifest.evidence_table[0]
     assert {"doc_id", "outlet", "date", "excerpt", "score"}.issubset(first.keys())
     assert "score_display" in first
+
+
+def test_runtime_detects_external_series_from_market_series_node(tmp_path: Path) -> None:
+    runtime = build_test_runtime(
+        tmp_path=tmp_path,
+        documents=_sample_documents(),
+        search_rows_by_query=_search_rows(_sample_documents()),
+    )
+    snapshot = AgentExecutionSnapshot(
+        node_records=[],
+        node_results={
+            "market_series": ToolExecutionResult(
+                payload={"rows": [{"time_bin": "2018-03", "market_close": 175.94}]},
+                metadata={"tool_name": "yfinance_join_external_series"},
+            )
+        },
+        failures=[],
+        provenance_records=[],
+        selected_docs=[],
+        status="completed",
+    )
+
+    assert runtime.orchestrator._has_external_series(snapshot) is True
 
 
 def test_selected_docs_keep_retrieval_scores_after_fetch(tmp_path: Path) -> None:
@@ -280,6 +307,38 @@ def test_api_async_submission_exposes_live_status(tmp_path: Path) -> None:
     assert status_payload["run_id"] == run_id
     assert "completed_steps" in status_payload
     assert "llm_traces" in status_payload
+
+
+def test_api_async_failure_persists_manifest_for_terminal_run(tmp_path: Path) -> None:
+    docs = _sample_documents()
+    runtime = build_test_runtime(tmp_path=tmp_path, documents=docs, search_rows_by_query=_search_rows(docs))
+    runtime._run_query = lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("synthetic async failure"))
+    app = build_app(runtime=runtime, project_root=tmp_path)
+
+    from fastapi.testclient import TestClient
+
+    client = TestClient(app)
+    submitted = client.post(
+        "/query/submit",
+        json={"question": "Which media predicted the outbreak of the Ukraine war in 2022?"},
+    )
+    assert submitted.status_code == 200
+    run_id = submitted.json()["run_id"]
+
+    deadline = time.time() + 5
+    status_payload = {}
+    while time.time() < deadline:
+        status_payload = client.get(f"/runs/{run_id}/status").json()
+        if status_payload["status"] == "failed":
+            break
+        time.sleep(0.05)
+
+    assert status_payload["status"] == "failed"
+    manifest = client.get(f"/runs/{run_id}")
+    assert manifest.status_code == 200
+    payload = manifest.json()
+    assert payload["status"] == "failed"
+    assert "synthetic async failure" in payload["failures"][0]["message"]
 
 
 def test_api_abort_run_marks_async_query_aborted(tmp_path: Path) -> None:
@@ -525,6 +584,123 @@ def test_broad_scope_clarification_prevents_repeat_question_loop(tmp_path: Path)
     assert any("Europe-wide overall coverage" in item for item in manifest.assumptions)
 
 
+def test_multi_year_monthly_clarification_is_accepted_as_sufficient(tmp_path: Path) -> None:
+    docs = _sample_documents()
+    llm = StaticLLMClient(
+        [
+            {
+                "action": "ask_clarification",
+                "rewritten_question": "How did Facebook coverage shift from innovation/growth framing to privacy/regulation framing around the Cambridge Analytica scandal from 2016 to 2019, and how did this correspond to stock drawdowns?",
+                "clarification_question": "Please clarify the time period, time granularity, and which scandal phases to include.",
+                "assumptions": [],
+                "message": "",
+            },
+            {
+                "action": "emit_plan_dag",
+                "rewritten_question": "How did Facebook coverage shift from innovation/growth framing to privacy/regulation framing around the Cambridge Analytica scandal from 2016 to 2019, and how did this correspond to stock drawdowns?",
+                "plan_dag": {
+                    "nodes": [
+                        {"node_id": "search", "capability": "db_search", "inputs": {"top_k": 40, "retrieval_mode": "hybrid", "use_rerank": True}},
+                        {"node_id": "fetch", "capability": "fetch_documents", "depends_on": ["search"]},
+                        {"node_id": "topics", "capability": "topic_model", "depends_on": ["fetch"]},
+                    ]
+                },
+                "assumptions": [],
+                "clarification_question": "",
+                "rejection_reason": "",
+                "message": "",
+            },
+        ]
+    )
+    runtime = build_test_runtime(
+        tmp_path=tmp_path,
+        documents=docs,
+        search_rows_by_query=_search_rows(docs),
+    )
+    runtime.llm_client = llm
+    runtime.orchestrator.llm_client = llm
+
+    manifest = runtime.handle_query(
+        "How did Facebook coverage shift from innovation/growth framing to privacy/regulation framing around the Cambridge Analytica scandal from 2016 to 2019, and how did this correspond to stock drawdowns?",
+        clarification_history=["2016-2019, monthly, all"],
+        no_cache=True,
+    )
+
+    assert manifest.status in {"completed", "partial"}
+    assert not manifest.clarification_questions
+    assert any("time range" in item.lower() for item in manifest.assumptions)
+    assert any("time granularity" in item.lower() for item in manifest.assumptions)
+
+
+def test_insufficient_clarification_history_can_still_request_more_than_two_rounds(tmp_path: Path) -> None:
+    docs = _sample_documents()
+    llm = StaticLLMClient(
+        [
+            {
+                "action": "ask_clarification",
+                "rewritten_question": "How does football coverage differ between groups?",
+                "clarification_question": "Which exact groups should be compared?",
+                "assumptions": [],
+                "message": "",
+            },
+        ]
+    )
+    runtime = build_test_runtime(
+        tmp_path=tmp_path,
+        documents=docs,
+        search_rows_by_query=_search_rows(docs),
+    )
+    runtime.llm_client = llm
+    runtime.orchestrator.llm_client = llm
+
+    manifest = runtime.handle_query(
+        "How does football coverage differ between groups?",
+        clarification_history=["not sure yet", "still broad"],
+        no_cache=True,
+    )
+
+    assert manifest.status == "needs_clarification"
+    assert manifest.clarification_questions == ["Which exact groups should be compared?"]
+
+
+def test_plan_stage_clarification_is_converted_to_heuristic_when_history_is_sufficient(tmp_path: Path) -> None:
+    docs = _sample_documents()
+    llm = StaticLLMClient(
+        [
+            {
+                "action": "accept_with_assumptions",
+                "rewritten_question": "How did Facebook coverage shift from innovation/growth framing to privacy/regulation framing around the Cambridge Analytica scandal from 2016 to 2019, and how did this correspond to stock drawdowns?",
+                "assumptions": [],
+                "message": "",
+            },
+            {
+                "action": "ask_clarification",
+                "rewritten_question": "How did Facebook coverage shift from innovation/growth framing to privacy/regulation framing around the Cambridge Analytica scandal from 2016 to 2019, and how did this correspond to stock drawdowns?",
+                "clarification_question": "What exact time period do you want?",
+                "assumptions": [],
+                "message": "",
+            },
+        ]
+    )
+    runtime = build_test_runtime(
+        tmp_path=tmp_path,
+        documents=docs,
+        search_rows_by_query=_search_rows(docs),
+    )
+    runtime.llm_client = llm
+    runtime.orchestrator.llm_client = llm
+
+    manifest = runtime.handle_query(
+        "How did Facebook coverage shift from innovation/growth framing to privacy/regulation framing around the Cambridge Analytica scandal from 2016 to 2019, and how did this correspond to stock drawdowns?",
+        clarification_history=["2016 to 2019, monthly, all"],
+        no_cache=True,
+    )
+
+    assert manifest.status in {"completed", "partial"}
+    assert not manifest.clarification_questions
+    assert manifest.plan_dags
+
+
 def test_invalid_llm_plan_falls_back_to_framing_shift_heuristic(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setenv("CORPUSAGENT2_PROVIDER_ORDER_SENTIMENT", "heuristic")
     docs = _sample_documents()
@@ -586,6 +762,188 @@ def test_invalid_llm_plan_falls_back_to_framing_shift_heuristic(tmp_path: Path, 
     assert any(trace.get("stage") == "plan_repair" for trace in manifest.metadata.get("llm_traces", []))
     assert manifest.evidence_table
     assert any("stock-price correspondence" in caveat for caveat in manifest.final_answer.caveats)
+
+
+def test_framing_shift_heuristic_query_is_entity_driven_not_hardcoded_to_facebook(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("CORPUSAGENT2_PROVIDER_ORDER_SENTIMENT", "heuristic")
+    monkeypatch.setenv("CORPUSAGENT2_PROVIDER_ORDER_TOPIC_MODEL", "heuristic")
+    docs = _sample_documents()
+    runtime = build_test_runtime(
+        tmp_path=tmp_path,
+        documents=docs,
+        search_rows_by_query=_search_rows(docs),
+    )
+    runtime.llm_client = None
+    runtime.orchestrator.llm_client = None
+
+    manifest = runtime.handle_query(
+        "How did Colgate-Palmolive coverage shift from growth framing to safety/regulation framing from 2016 to 2021, and how did this correspond to stock drawdowns?",
+        force_answer=True,
+        no_cache=True,
+    )
+
+    assert manifest.plan_dags
+    search_inputs = manifest.plan_dags[0]["nodes"][0]["inputs"]
+    query_text = str(search_inputs.get("query", ""))
+    assert "Colgate" in query_text
+    assert "Palmolive" in query_text
+    assert "Facebook" not in query_text
+    assert "Cambridge Analytica" not in query_text
+
+
+def test_openai_style_plan_without_retrieval_backbone_falls_back_to_heuristic(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("CORPUSAGENT2_PROVIDER_ORDER_SENTIMENT", "heuristic")
+    docs = _sample_documents()
+    llm = StaticLLMClient(
+        [
+            {
+                "action": "accept_with_assumptions",
+                "rewritten_question": "Analyze how Facebook coverage shifted between 2016 and 2019 from innovation/growth to privacy/regulation and compare to stock drawdowns.",
+                "assumptions": [],
+                "clarification_question": "",
+                "rejection_reason": "",
+                "message": "",
+            },
+            {
+                "action": "emit_plan_dag",
+                "rewritten_question": "Analyze how Facebook coverage shifted between 2016 and 2019 from innovation/growth to privacy/regulation and compare to stock drawdowns.",
+                "plan_dag": {
+                    "nodes": [
+                        {"id": "n1", "capability": "create_working_set", "inputs": ["corpus_schema", "rewritten_question"], "task": "Retrieve the relevant Facebook documents."},
+                        {"id": "n2", "capability": "topic_model", "inputs": ["n1"], "task": "Model the topics."},
+                        {"id": "n3", "capability": "join_external_series", "inputs": ["n2"], "task": "Join stock series."},
+                    ]
+                },
+                "assumptions": [],
+                "clarification_question": "",
+                "rejection_reason": "",
+                "message": "",
+            },
+            {
+                "answer_text": "Fallback synthesis output.",
+                "caveats": [],
+                "unsupported_parts": [],
+                "claim_verdicts": [],
+                "evidence_items": [],
+                "artifacts_used": [],
+            },
+        ]
+    )
+    runtime = build_test_runtime(
+        tmp_path=tmp_path,
+        documents=docs,
+        search_rows_by_query=_search_rows(docs),
+    )
+    runtime.llm_client = llm
+    runtime.orchestrator.llm_client = llm
+
+    manifest = runtime.handle_query(
+        "How did Facebook coverage shift from innovation/growth framing to privacy/regulation framing around the Cambridge Analytica scandal from 2016 to 2019, and how did this correspond to stock drawdowns?",
+        no_cache=True,
+    )
+
+    assert manifest.status in {"completed", "partial"}
+    assert any(action.get("action") == "emit_plan_dag" for action in manifest.planner_actions)
+    assert any(node.get("capability") == "db_search" for node in manifest.plan_dags[0]["nodes"])
+    assert any(node.get("capability") == "fetch_documents" for node in manifest.plan_dags[0]["nodes"])
+
+
+def test_finance_question_heuristic_plan_uses_market_series_when_ticker_is_inferred(tmp_path: Path, monkeypatch) -> None:
+    docs = _sample_documents()
+
+    def _fake_series(**kwargs):
+        assert kwargs["ticker"] == "META"
+        return [
+            {"ticker": "META", "date": "2018-03-01", "time_bin": "2018-03", "market_close": 180.5, "market_return": -0.01, "market_drawdown": -0.01},
+            {"ticker": "META", "date": "2018-04-01", "time_bin": "2018-04", "market_close": 165.0, "market_return": -0.04, "market_drawdown": -0.04},
+        ]
+
+    monkeypatch.setattr(agent_capabilities, "_fetch_yfinance_series_rows", _fake_series)
+    monkeypatch.setenv("CORPUSAGENT2_PROVIDER_ORDER_SENTIMENT", "heuristic")
+    monkeypatch.setenv("CORPUSAGENT2_PROVIDER_ORDER_TOPIC_MODEL", "heuristic")
+    runtime = build_test_runtime(
+        tmp_path=tmp_path,
+        documents=docs,
+        search_rows_by_query=_search_rows(docs),
+    )
+    runtime.llm_client = None
+    runtime.orchestrator.llm_client = None
+
+    manifest = runtime.handle_query(
+        "How did Facebook coverage shift from innovation/growth framing to privacy/regulation framing around the Cambridge Analytica scandal from 2016 to 2019, and how did this correspond to stock drawdowns?",
+        force_answer=True,
+        no_cache=True,
+    )
+
+    assert manifest.status in {"completed", "partial"}
+    assert any(
+        any(node.get("capability") == "join_external_series" for node in dag.get("nodes", []))
+        for dag in manifest.plan_dags
+    )
+
+
+def test_planner_can_route_fetched_documents_into_python_runner(tmp_path: Path) -> None:
+    docs = _sample_documents()
+
+    class _FakePythonRunner:
+        def __init__(self) -> None:
+            self.last_inputs = None
+
+        def run(self, code: str, inputs_json: dict):
+            self.last_inputs = dict(inputs_json)
+            return PythonRunnerResult(stdout="ok", stderr="", artifacts=[], exit_code=0)
+
+    llm = StaticLLMClient(
+        [
+            {
+                "action": "accept_with_assumptions",
+                "rewritten_question": "Inspect the fetched documents with a Python script.",
+                "assumptions": [],
+                "clarification_question": "",
+                "rejection_reason": "",
+                "message": "",
+            },
+            {
+                "action": "emit_plan_dag",
+                "rewritten_question": "Inspect the fetched documents with a Python script.",
+                "plan_dag": {
+                    "nodes": [
+                        {"node_id": "search", "capability": "db_search", "inputs": {"query": "Ukraine", "top_k": 5}},
+                        {"node_id": "fetch", "capability": "fetch_documents", "depends_on": ["search"]},
+                        {"node_id": "py", "capability": "python_runner", "inputs": {"code": "print('hi')"}, "depends_on": ["fetch"]},
+                    ]
+                },
+                "assumptions": [],
+                "clarification_question": "",
+                "rejection_reason": "",
+                "message": "",
+            },
+            {
+                "answer_text": "done",
+                "caveats": [],
+                "unsupported_parts": [],
+                "claim_verdicts": [],
+                "evidence_items": [],
+                "artifacts_used": [],
+            },
+        ]
+    )
+    fake_runner = _FakePythonRunner()
+    runtime = build_test_runtime(
+        tmp_path=tmp_path,
+        documents=docs,
+        search_rows_by_query=_search_rows(docs),
+        python_runner=fake_runner,
+    )
+    runtime.llm_client = llm
+    runtime.orchestrator.llm_client = llm
+
+    manifest = runtime.handle_query("Inspect the fetched documents with a Python script.", force_answer=True, no_cache=True)
+
+    assert manifest.status in {"completed", "partial"}
+    assert any(record.capability == "python_runner" for record in manifest.node_records)
+    assert isinstance(fake_runner.last_inputs, dict)
+    assert "fetch" in fake_runner.last_inputs
 
 
 def test_api_runtime_info_reports_provider_and_device(tmp_path: Path) -> None:

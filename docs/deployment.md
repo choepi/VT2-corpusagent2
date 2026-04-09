@@ -1,115 +1,121 @@
 # Deployment Guide
 
-This project is set up for three practical deployment modes:
+This repo now supports a simple deployment shape:
 
-1. local development on one machine
-2. temporary public testing with GitHub Pages + Cloudflare Tunnel
-3. proper thesis/demo hosting with GitHub Pages + Ubuntu VM backend
+1. GitHub Pages serves the static frontend from `web/`
+2. an Ubuntu VM runs the FastAPI backend
+3. Docker on the VM runs Postgres + OpenSearch
+4. Cloudflared can expose the backend for easy public access
 
-## 1. Config model
+## 1. First-time VM setup
 
-There are two configuration layers:
-
-- checked-in defaults: [`config/app_config.toml`](D:/OneDrive%20-%20ZHAW/MSE_school_files/Sem4/VT2/corpusagent2/config/app_config.toml)
-- machine-specific overrides: `.env`
-
-Precedence:
-
-1. real process environment
-2. `.env`
-3. `config/app_config.toml`
-
-That means you can keep safe defaults in the repo and override secrets or URLs locally.
-
-Useful inspection command:
+Clone the repo on the VM, then run the single bootstrap file:
 
 ```bash
-python scripts/16_print_effective_config.py
+python3 scripts/22_prepare_vm_stack.py --install-system
 ```
 
-## 2. Local development
+What that bootstrap does:
 
-Start backend + static frontend together:
+- installs Ubuntu system packages when `--install-system` is passed
+- creates `.venv`
+- installs Python dependencies with `uv`
+- downloads provider assets
+- downloads and preprocesses the CC-News dataset when local data is missing
+- builds lexical + dense retrieval assets when needed
+- starts Docker services from [`deploy/docker-compose.yml`](../deploy/docker-compose.yml)
+- initializes Postgres + pgvector
+- ingests the corpus into Postgres
+- bulk-indexes the corpus into OpenSearch
+- writes `web/config.js`
 
-```bash
-python scripts/15_start_local_stack.py
-```
+It is idempotent, so rerunning it after updates is safe.
 
-Endpoints:
-
-- backend: `http://127.0.0.1:8001`
-- frontend: `http://127.0.0.1:5500`
-
-## 3. GitHub Pages frontend
-
-The static frontend lives in `web/`.
-
-The GitHub Pages workflow now generates `web/config.js` during deployment by running:
-
-```bash
-python scripts/13_write_frontend_config.py
-```
-
-So the deployed frontend uses the repo defaults from `config/app_config.toml`.
-
-Important:
-
-- GitHub Pages only hosts the static frontend
-- it does not host FastAPI, Postgres, OpenSearch, or the Python sandbox
-
-## 4. Cloudflare Tunnel for temporary public testing
-
-Cloudflare Quick Tunnels are a good temporary option when:
-
-- the frontend is on GitHub Pages
-- the backend is still on your machine
-- you want to share a demo without opening raw ports
-
-Start the backend locally, then expose it:
-
-```bash
-cloudflared tunnel --url http://127.0.0.1:8001
-```
-
-Then set the frontend API base URL to the HTTPS tunnel URL.
-
-Use this for testing only. Quick Tunnels are not the final production path.
-
-## 5. Ubuntu VM deployment
-
-For the proper thesis/demo setup:
-
-- GitHub Pages hosts the static frontend
-- Ubuntu VM hosts FastAPI
-- Postgres and OpenSearch stay private behind the backend
-- only HTTPS should be public
-
-Bootstrap the VM after cloning the repo:
-
-```bash
-bash scripts/bootstrap_ubuntu_vm.sh /home/$USER/corpusagent2
-```
-
-Start backend:
+## 2. Start the backend on the VM
 
 ```bash
 ./.venv/bin/python ./scripts/12_run_agent_api.py
 ```
 
-Optional local static frontend on the VM:
+Recommended for real VM use:
+
+- keep the backend bound to `127.0.0.1`
+- keep Postgres and OpenSearch bound to `127.0.0.1`
+- expose only the backend through a tunnel or reverse proxy
+
+## 3. Easy public access with Cloudflared
+
+Install `cloudflared` once on the VM, then run:
 
 ```bash
-./.venv/bin/python ./scripts/14_run_static_frontend.py
+./.venv/bin/python ./scripts/23_start_cloudflared_tunnel.py
 ```
 
-## 6. Recommended production shape
+That helper starts a Cloudflare Quick Tunnel for `http://127.0.0.1:8001` and prints the public HTTPS URL.
 
-- OS: Ubuntu Server LTS
-- reverse proxy: Nginx or Caddy
-- backend: FastAPI on localhost
-- DB/search: internal only
-- public ports: `443` only
+Quick Tunnel notes:
 
-## 7. Current caveat
+- easiest setup
+- good for demos and remote access
+- URL changes each time you restart the tunnel
 
-If a run returns only `python_fallback`, the backend is alive but the real retrieval/fetch path is not healthy yet. Fix that before treating the deployment as demo-ready.
+If you use GitHub Pages as the frontend:
+
+- open the Pages site
+- paste the printed HTTPS tunnel URL into the `API Base URL` field
+- the UI keeps that override in browser storage
+
+Official Cloudflare references:
+
+- [Cloudflare Tunnel downloads](https://developers.cloudflare.com/tunnel/downloads/)
+- [TryCloudflare / Quick Tunnels](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/do-more-with-tunnels/trycloudflare/)
+
+## 4. GitHub Pages frontend
+
+The GitHub Pages workflow lives in [pages.yml](../.github/workflows/pages.yml).
+
+It now redeploys when these change:
+
+- `web/**`
+- `config/**`
+- `scripts/13_write_frontend_config.py`
+
+So when you push frontend or runtime-config changes to `main`, the static site redeploys automatically.
+
+## 5. Update flow after a new push to `main`
+
+On the VM:
+
+```bash
+git pull
+python3 scripts/22_prepare_vm_stack.py
+```
+
+Then restart the backend process you are using.
+
+If Docker volumes were wiped or you want a full rebuild:
+
+```bash
+python3 scripts/22_prepare_vm_stack.py --refresh-postgres --refresh-opensearch
+```
+
+If you also want to rebuild the local dataset + retrieval assets:
+
+```bash
+python3 scripts/22_prepare_vm_stack.py --refresh-data --refresh-assets --refresh-postgres --refresh-opensearch
+```
+
+## 6. Retrieval/backend shape
+
+The default retrieval backend is now `pgvector` + OpenSearch:
+
+- dense retrieval: Postgres/pgvector
+- lexical retrieval: OpenSearch
+- fusion/rerank: backend runtime
+
+The runtime stays strict about service-backed retrieval:
+
+- `CORPUSAGENT2_REQUIRE_BACKEND_SERVICES=true`
+- `CORPUSAGENT2_ALLOW_LOCAL_FALLBACK=false`
+
+That means the VM path matches the intended production architecture much more closely than the older local-fallback mode.

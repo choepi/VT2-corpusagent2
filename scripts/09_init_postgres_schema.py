@@ -11,6 +11,7 @@ if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
 from corpusagent2.io_utils import ensure_absolute, write_json
+from corpusagent2.app_config import load_project_configuration
 from corpusagent2.retrieval import pg_dsn_from_env, pg_table_from_env
 from corpusagent2.seed import set_global_seed
 
@@ -20,6 +21,8 @@ if __name__ == "__main__":
 
     PROJECT_ROOT = Path(__file__).resolve().parents[1]
     SUMMARY_PATH = (PROJECT_ROOT / "outputs" / "postgres" / "init_schema_summary.json").resolve()
+
+    load_project_configuration(PROJECT_ROOT)
 
     ensure_absolute(SUMMARY_PATH, "SUMMARY_PATH")
     set_global_seed(SEED)

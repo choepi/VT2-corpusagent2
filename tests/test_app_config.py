@@ -13,8 +13,8 @@ def test_app_config_loads_defaults_from_project_root() -> None:
 
     assert config.server.port == 8001
     assert config.frontend.api_base_url == "http://127.0.0.1:8001"
-    assert config.llm.use_openai is False
-    assert config.env_map["CORPUSAGENT2_USE_OPENAI"] == "False"
+    assert config.llm.use_openai is True
+    assert config.env_map["CORPUSAGENT2_USE_OPENAI"] == "True"
     assert config.env_map["CORPUSAGENT2_PG_TABLE"] == "article_corpus"
 
 
@@ -25,7 +25,7 @@ def test_frontend_runtime_payload_uses_app_config() -> None:
 
     assert payload["apiBaseUrl"] == "http://127.0.0.1:8001"
     assert "CorpusAgent2" in payload["title"]
-    assert payload["useOpenAI"] is False
+    assert payload["useOpenAI"] is True
 
 
 def test_load_project_configuration_prefers_dotenv_over_repo_defaults(tmp_path, monkeypatch) -> None:

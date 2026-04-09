@@ -143,6 +143,7 @@ def build_test_runtime(
     documents: list[dict[str, Any]],
     search_rows_by_query: dict[str, list[dict[str, Any]]],
     search_delay_s: float = 0.0,
+    python_runner=None,
 ):
     class FakeRuntime:
         def __init__(self, rows: list[dict[str, Any]]) -> None:
@@ -183,5 +184,5 @@ def build_test_runtime(
         llm_client=FailingLLMClient(),
         search_backend=FakeSearchBackend(search_rows_by_query, delay_s=search_delay_s),
         working_store=store,
-        python_runner=None,
+        python_runner=python_runner,
     )

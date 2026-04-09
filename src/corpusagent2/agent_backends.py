@@ -257,10 +257,17 @@ class LocalSearchBackend:
 
 
 class HybridSearchBackend:
-    def __init__(self, runtime: CorpusRuntime, lexical_backend: OpenSearchBackend | None = None) -> None:
+    def __init__(
+        self,
+        runtime: CorpusRuntime,
+        lexical_backend: OpenSearchBackend | None = None,
+        *,
+        allow_lexical_fallback: bool = True,
+    ) -> None:
         self.runtime = runtime
         self.local_backend = LocalSearchBackend(runtime)
         self.lexical_backend = lexical_backend
+        self.allow_lexical_fallback = allow_lexical_fallback
 
     def _rows_to_results(self, rows: list[dict[str, Any]], component_name: str) -> list[RetrievalResult]:
         results: list[RetrievalResult] = []
@@ -309,8 +316,11 @@ class HybridSearchBackend:
                     remote_results = self._rows_to_results(remote_rows, "lexical")
                     if remote_results:
                         return remote_results
+                    if not self.allow_lexical_fallback:
+                        return []
                 except Exception:
-                    pass
+                    if not self.allow_lexical_fallback:
+                        raise
             return self.local_backend.lexical_results(query=query, top_k=lexical_limit)
 
         if mode == "dense":

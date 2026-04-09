@@ -15,6 +15,7 @@ if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
 from corpusagent2.io_utils import ensure_absolute, ensure_exists, read_documents, write_json
+from corpusagent2.app_config import load_project_configuration
 from corpusagent2.retrieval import pg_dsn_from_env, pg_table_from_env
 from corpusagent2.seed import resolve_run_mode, set_global_seed
 
@@ -49,6 +50,8 @@ if __name__ == "__main__":
     DEBUG_MAX_DOCS = 50_000
     BATCH_SIZE = 2_000
     INCLUDE_EMBEDDINGS = parse_bool_env("CORPUSAGENT2_PG_INCLUDE_EMBEDDINGS", True)
+
+    load_project_configuration(PROJECT_ROOT)
 
     ensure_absolute(DOCUMENTS_PARQUET, "DOCUMENTS_PARQUET")
     ensure_absolute(DENSE_EMBEDDINGS_PATH, "DENSE_EMBEDDINGS_PATH")

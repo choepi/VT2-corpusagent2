@@ -5,6 +5,8 @@ on:
     branches: ["main", "master"]
     paths:
       - "web/**"
+      - "config/**"
+      - "scripts/13_write_frontend_config.py"
       - ".github/workflows/pages.yml"
   workflow_dispatch:
 

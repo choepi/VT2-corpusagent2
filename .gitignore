@@ -22,8 +22,13 @@ wheels/
 !/outputs/.gitkeep
 
 # Logs
+/log/*.log
 /log/**/*.out
 /log/**/*.err
+/log/**/*.log
+
+# VM / Docker state
+/deploy/data/
 
 # IDE / OS
 .DS_Store

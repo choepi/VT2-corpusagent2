@@ -57,6 +57,8 @@ let currentStatus = "idle";
 let latestRuntimeInfo = null;
 let providerDefaults = {};
 const POLL_INTERVAL_MS = 250;
+const MANIFEST_FETCH_RETRY_DELAY_MS = 400;
+const MANIFEST_FETCH_MAX_ATTEMPTS = 5;
 const UI_STATE_KEY = "corpusagent2-ui-state-v2";
 
 const runtimeConfig = window.CORPUSAGENT2_CONFIG || {};
@@ -275,6 +277,15 @@ function resetClarificationState() {
   clarificationHistory = [];
   clarificationInput.value = "";
   renderClarificationState();
+}
+
+function clearRestoredRunState() {
+  currentRunId = "";
+  currentStatus = "idle";
+  pendingClarificationQuestion = "";
+  saveUiState();
+  renderClarificationState();
+  updateControlState();
 }
 
 function renderRuntimeInfo(payload) {
@@ -549,6 +560,22 @@ async function fetchJson(url, options = {}) {
   return response.json();
 }
 
+async function fetchManifestWithRetry(base, runId, attempts = MANIFEST_FETCH_MAX_ATTEMPTS) {
+  let lastError = null;
+  for (let index = 0; index < attempts; index += 1) {
+    try {
+      return await fetchJson(`${base}/runs/${runId}`);
+    } catch (error) {
+      lastError = error;
+      if (!String(error.message || "").includes("404") || index === attempts - 1) {
+        throw error;
+      }
+      await new Promise((resolve) => window.setTimeout(resolve, MANIFEST_FETCH_RETRY_DELAY_MS));
+    }
+  }
+  throw lastError || new Error("Manifest fetch failed.");
+}
+
 async function loadRuntimeInfo() {
   try {
     const base = apiBaseInput.value.replace(/\/$/, "");
@@ -685,7 +712,7 @@ async function pollRun(runId) {
     if (["completed", "partial", "failed", "rejected", "needs_clarification", "aborted"].includes(statusPayload.status)) {
       clearInterval(pollTimer);
       pollTimer = null;
-      const manifest = await fetchJson(`${base}/runs/${runId}`);
+      const manifest = await fetchManifestWithRetry(base, runId);
       renderManifest(manifest);
       const manifestHistory = manifest.metadata?.clarification_history || [];
       if (Array.isArray(manifestHistory) && manifestHistory.length > 0) {
@@ -716,6 +743,11 @@ async function pollRun(runId) {
   } catch (error) {
     clearInterval(pollTimer);
     pollTimer = null;
+    if (String(error.message || "").includes("404")) {
+      clearRestoredRunState();
+      detailText.textContent = "Previous run could not be restored after restart, so the stale run state was cleared.";
+      return;
+    }
     statusBox.textContent = "failed";
     statusBox.className = "status failed";
     detailText.textContent = `Polling failed: ${error.message}`;
@@ -830,7 +862,12 @@ loadRuntimeInfo().then(async () => {
     try {
       await pollRun(currentRunId);
     } catch (error) {
-      detailText.textContent = `Could not restore previous run: ${error.message}`;
+      if (String(error.message || "").includes("404")) {
+        clearRestoredRunState();
+        detailText.textContent = "Previous run was no longer available after restart, so the saved run reference was cleared.";
+      } else {
+        detailText.textContent = `Could not restore previous run: ${error.message}`;
+      }
     }
   }
 });

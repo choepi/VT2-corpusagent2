@@ -4,6 +4,7 @@ import ast
 from dataclasses import dataclass, field
 import json
 import os
+import re
 from typing import Any, Protocol
 
 import httpx
@@ -65,6 +66,40 @@ def _extract_json_object(text: str) -> dict[str, Any]:
             return None
         return parsed if isinstance(parsed, dict) else None
 
+    def _partial_object_recovery(candidate: str) -> dict[str, Any] | None:
+        keys = [
+            "action",
+            "rewritten_question",
+            "clarification_question",
+            "rejection_reason",
+            "message",
+        ]
+        recovered: dict[str, Any] = {}
+        action_match = re.search(r'["\']action["\']\s*:\s*["\']([^"\']+)["\']', candidate, flags=re.DOTALL)
+        if action_match:
+            recovered["action"] = action_match.group(1).strip()
+
+        for key in keys[1:]:
+            anchored = re.search(
+                rf'["\']{re.escape(key)}["\']\s*:\s*["\'](?P<value>.*?)(?=["\']\s*,\s*["\'](?:action|rewritten_question|clarification_question|assumptions|plan_dag|rejection_reason|message)["\']\s*:|["\']\s*\}})',
+                candidate,
+                flags=re.DOTALL,
+            )
+            if anchored:
+                recovered[key] = anchored.group("value").strip()
+                continue
+            loose = re.search(
+                rf'["\']{re.escape(key)}["\']\s*:\s*["\'](?P<value>.+)$',
+                candidate,
+                flags=re.DOTALL,
+            )
+            if loose:
+                recovered[key] = loose.group("value").strip().rstrip(",").strip()
+        if recovered:
+            recovered.setdefault("assumptions", [])
+            return recovered
+        return None
+
     stripped = text.strip()
     try:
         parsed = json.loads(stripped)
@@ -97,6 +132,9 @@ def _extract_json_object(text: str) -> dict[str, Any]:
     literal = _parse_python_literal(stripped)
     if literal is not None:
         return literal
+    partial = _partial_object_recovery(stripped)
+    if partial is not None:
+        return partial
     raise ValueError(f"Could not parse JSON object from LLM response: {text[:240]}")
 
 

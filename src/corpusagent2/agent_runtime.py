@@ -46,6 +46,13 @@ from .python_runner_service import DockerPythonRunnerService
 TERMINAL_RUN_STATUSES = {"completed", "partial", "failed", "rejected", "needs_clarification", "aborted"}
 
 
+def _env_flag(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
 @dataclass(slots=True)
 class AgentRuntimeConfig:
     project_root: Path
@@ -61,6 +68,27 @@ class AgentRuntimeConfig:
         )
 
 class MagicBoxOrchestrator:
+    _SEARCH_BACKBONE_CAPABILITIES = {"db_search", "sql_query_search"}
+    _DOC_RETRIEVAL_BACKBONE_CAPABILITIES = {
+        "create_working_set",
+        "clean_normalize",
+        "entity_link",
+        "extract_keyterms",
+        "topic_model",
+        "text_classify",
+        "sentiment",
+        "ner",
+        "pos_morph",
+        "lemmatize",
+        "quote_extract",
+        "quote_attribute",
+        "claim_span_extract",
+        "claim_strength_score",
+        "build_evidence_table",
+        "doc_embeddings",
+        "similarity_pairwise",
+    }
+
     def __init__(self, llm_client: LLMClient | None = None, llm_config: LLMProviderConfig | None = None) -> None:
         self.llm_client = llm_client
         self.llm_config = llm_config or LLMProviderConfig.from_env()
@@ -108,6 +136,90 @@ class MagicBoxOrchestrator:
             return True
         return False
 
+    def _normalize_plan_dag(self, dag: AgentPlanDAG) -> AgentPlanDAG:
+        rewritten = ""
+        existing_ids = {node.node_id for node in dag.nodes}
+
+        def unique_node_id(preferred: str) -> str:
+            if preferred not in existing_ids:
+                existing_ids.add(preferred)
+                return preferred
+            index = 2
+            while f"{preferred}_{index}" in existing_ids:
+                index += 1
+            node_id = f"{preferred}_{index}"
+            existing_ids.add(node_id)
+            return node_id
+
+        search_node_id = next((node.node_id for node in dag.nodes if node.capability in self._SEARCH_BACKBONE_CAPABILITIES), "")
+        fetch_node_id = next((node.node_id for node in dag.nodes if node.capability == "fetch_documents"), "")
+        requires_retrieval_backbone = any(
+            node.capability in self._DOC_RETRIEVAL_BACKBONE_CAPABILITIES
+            for node in dag.nodes
+        )
+        if requires_retrieval_backbone and not search_node_id:
+            search_node_id = unique_node_id("search")
+        if requires_retrieval_backbone and not fetch_node_id:
+            fetch_node_id = unique_node_id("fetch")
+
+        search_inputs: dict[str, Any] = {
+            "top_k": 80,
+            "retrieval_mode": "hybrid",
+            "use_rerank": True,
+            "rerank_top_k": 40,
+        }
+        if requires_retrieval_backbone:
+            dag_text = " ".join(
+                part
+                for part in [rewritten, dag.metadata.get("question_family", "")]
+                if part
+            ).strip()
+            search_inputs.update(self._extract_date_window(dag_text))
+
+        normalized_nodes: list[AgentPlanNode] = []
+        if requires_retrieval_backbone and not any(node.capability in self._SEARCH_BACKBONE_CAPABILITIES for node in dag.nodes):
+            normalized_nodes.append(
+                AgentPlanNode(
+                    node_id=search_node_id,
+                    capability="db_search",
+                    inputs=search_inputs,
+                )
+            )
+        if requires_retrieval_backbone and not any(node.capability == "fetch_documents" for node in dag.nodes):
+            normalized_nodes.append(
+                AgentPlanNode(
+                    node_id=fetch_node_id,
+                    capability="fetch_documents",
+                    inputs={},
+                    depends_on=[search_node_id],
+                )
+            )
+
+        for node in dag.nodes:
+            depends_on = list(node.depends_on)
+            if node.capability == "fetch_documents" and search_node_id and not depends_on:
+                depends_on = [search_node_id]
+            elif (
+                fetch_node_id
+                and node.capability in self._DOC_RETRIEVAL_BACKBONE_CAPABILITIES
+                and node.capability != "fetch_documents"
+                and node.node_id != fetch_node_id
+                and not depends_on
+            ):
+                depends_on = [fetch_node_id]
+            normalized_nodes.append(
+                AgentPlanNode(
+                    node_id=node.node_id,
+                    capability=node.capability,
+                    inputs=dict(node.inputs),
+                    depends_on=list(dict.fromkeys(depends_on)),
+                    optional=node.optional,
+                    cacheable=node.cacheable,
+                    description=node.description,
+                )
+            )
+        return AgentPlanDAG(nodes=normalized_nodes, metadata=dict(dag.metadata))
+
     def _question_with_clarifications(self, state: AgentRunState) -> str:
         history = [str(item).strip() for item in state.clarification_history if str(item).strip()]
         if not history:
@@ -144,24 +256,97 @@ class MagicBoxOrchestrator:
         filtered = [token for token in tokens if token.lower() not in stopwords]
         return " ".join(filtered[:8]).strip()
 
+    def _query_anchor_terms(self, text: str) -> list[str]:
+        anchors: list[str] = []
+        for match in re.finditer(r"\b[A-Z][A-Za-z0-9]*(?:-[A-Z]?[A-Za-z0-9]+)?\b", text):
+            token = match.group(0).strip()
+            lowered = token.lower()
+            if lowered in {"how", "what", "which", "who", "why", "when", "where"}:
+                continue
+            if token not in anchors:
+                anchors.append(token)
+            if "-" in token:
+                for part in token.split("-"):
+                    part = part.strip()
+                    if len(part) >= 3 and part not in anchors:
+                        anchors.append(part)
+        return anchors[:8]
+
+    def _infer_market_ticker(self, text: str) -> str:
+        aliases = {
+            "facebook": "META",
+            "meta": "META",
+            "amazon": "AMZN",
+            "aws": "AMZN",
+            "google": "GOOGL",
+            "alphabet": "GOOGL",
+            "apple": "AAPL",
+            "microsoft": "MSFT",
+            "tesla": "TSLA",
+            "nvidia": "NVDA",
+            "netflix": "NFLX",
+        }
+        lowered = text.lower()
+        for alias, ticker in aliases.items():
+            if alias in lowered:
+                return ticker
+        return ""
+
     def _broad_scope_clarification_is_sufficient(self, state: AgentRunState) -> tuple[bool, list[str]]:
-        if not state.clarification_history:
-            return False, []
         question_text = f"{state.question}\n" + "\n".join(state.clarification_history)
         lowered = question_text.lower()
         assumptions: list[str] = []
         sufficient = False
 
         has_broad_region = any(
-            token in lowered
-            for token in ("europe", "european", "overall europe", "across europe", "europe-wide")
+            pattern.search(lowered)
+            for pattern in (
+                re.compile(r"\beurope\b"),
+                re.compile(r"\beuropean\b"),
+                re.compile(r"\boverall europe\b"),
+                re.compile(r"\bacross europe\b"),
+                re.compile(r"\beurope-wide\b"),
+            )
         )
         has_broad_aggregation = any(
-            token in lowered
-            for token in ("overall", "aggregate", "broadly", "quantitative", "quantitativ")
+            pattern.search(lowered)
+            for pattern in (
+                re.compile(r"\boverall\b"),
+                re.compile(r"\baggregate\b"),
+                re.compile(r"\bbroadly\b"),
+                re.compile(r"\bquantitative\b"),
+                re.compile(r"\bquantitativ\b"),
+            )
+        )
+        has_explicit_range = bool(re.search(r"\b20\d{2}\s*-\s*20\d{2}\b", lowered)) or (
+            any(year in lowered for year in ("2016", "2017", "2018", "2019", "2020", "2021"))
+            and any(token in lowered for token in ("from", "between", "to", "-", "through"))
+        )
+        has_time_granularity = any(
+            pattern.search(lowered)
+            for pattern in (
+                re.compile(r"\bmonthly\b"),
+                re.compile(r"\bmonth(?:ly)?\b"),
+                re.compile(r"\bweekly\b"),
+                re.compile(r"\bdaily\b"),
+                re.compile(r"\bquarterly\b"),
+            )
+        )
+        has_all_scope = any(
+            pattern.search(lowered)
+            for pattern in (
+                re.compile(r"\ball phases\b"),
+                re.compile(r"\beverything\b"),
+                re.compile(r"\boverall\b"),
+                re.compile(r"\ball\b"),
+            )
         )
         asks_regional = any(token in state.question.lower() for token in ("region", "regions", "across regions"))
         asks_outlet_types = "outlet type" in state.question.lower() or "outlet types" in state.question.lower()
+        asks_time_or_market_detail = any(
+            token in state.question.lower()
+            for token in ("2016", "2017", "2018", "2019", "stock", "drawdown", "share price", "granular", "monthly", "weekly", "daily")
+        )
 
         if has_broad_region and asks_regional:
             sufficient = True
@@ -169,6 +354,15 @@ class MagicBoxOrchestrator:
         if has_broad_aggregation:
             sufficient = True
             assumptions.append("Prefer a quantitative aggregate summary where possible and note any metadata limits explicitly.")
+        if asks_time_or_market_detail and has_explicit_range:
+            sufficient = True
+            assumptions.append("Use the explicitly provided time range for retrieval, comparison, and market alignment.")
+        if asks_time_or_market_detail and has_time_granularity:
+            sufficient = True
+            assumptions.append("Use the requested time granularity for temporal aggregation and plots.")
+        if has_all_scope:
+            sufficient = True
+            assumptions.append("Cover all major scandal phases within the requested window rather than only the initial disclosure event.")
         if asks_outlet_types and sufficient:
             assumptions.append("Use available outlet/source metadata as the outlet-type proxy; if outlet-type labels are sparse, report the overall pattern and the limitation.")
         return sufficient, assumptions
@@ -317,8 +511,21 @@ class MagicBoxOrchestrator:
                 metadata={"question_family": "prediction_evidence"},
             )
             return PlannerAction(action="emit_plan_dag", rewritten_question=state.rewritten_question, plan_dag=dag)
-        framing_terms = ["framing", "frame", "privacy", "regulation", "innovation", "growth", "scandal", "cambridge analytica", "facebook", "meta"]
+        if "similar" in text or "semantically" in text:
+            dag = AgentPlanDAG(
+                nodes=[
+                    AgentPlanNode("search", "db_search", {"top_k": 50, "retrieval_mode": "hybrid", "use_rerank": True, "rerank_top_k": 25}),
+                    AgentPlanNode("fetch", "fetch_documents", depends_on=["search"]),
+                    AgentPlanNode("working_set", "create_working_set", depends_on=["fetch"]),
+                    AgentPlanNode("doc_embeddings", "doc_embeddings", depends_on=["fetch"]),
+                    AgentPlanNode("similarity", "similarity_pairwise", depends_on=["fetch"]),
+                ],
+                metadata={"question_family": "similarity_analysis"},
+            )
+            return PlannerAction(action="emit_plan_dag", rewritten_question=state.rewritten_question, plan_dag=dag)
+        framing_terms = ["framing", "frame", "privacy", "regulation", "innovation", "growth", "scandal"]
         if any(term in text for term in framing_terms) and any(term in text for term in ["shift", "changed", "change", "correspond", "over time"]):
+            anchor_terms = self._query_anchor_terms(rewritten)
             search_inputs: dict[str, Any] = {
                 "top_k": 100,
                 "retrieval_mode": "hybrid",
@@ -326,20 +533,21 @@ class MagicBoxOrchestrator:
                 "rerank_top_k": 50,
                 "query": self._compact_query_terms(
                     rewritten,
-                    [
-                        "Facebook",
-                        "Meta",
-                        "Cambridge Analytica",
+                    anchor_terms
+                    + [
                         "privacy",
                         "regulation",
                         "innovation",
                         "growth",
                         "stock",
                         "drawdown",
+                        "media",
+                        "coverage",
                     ],
                 ),
             }
             search_inputs.update(self._extract_date_window(rewritten))
+            market_ticker = self._infer_market_ticker(rewritten)
             nodes = [
                 AgentPlanNode("search", "db_search", search_inputs),
                 AgentPlanNode("fetch", "fetch_documents", depends_on=["search"]),
@@ -354,14 +562,41 @@ class MagicBoxOrchestrator:
             ]
             assumptions: list[str] = []
             if any(term in text for term in ["stock", "drawdown", "share price", "market", "valuation"]):
-                assumptions.append(
-                    "External market data is not automatically attached in the first-trial runtime, so the stock-drawdown correspondence can only be assessed if matching series are supplied later."
-                )
+                if market_ticker:
+                    nodes.append(
+                        AgentPlanNode(
+                            "market_series",
+                            "join_external_series",
+                            {
+                                "ticker": market_ticker,
+                                "date_from": search_inputs.get("date_from", ""),
+                                "date_to": search_inputs.get("date_to", ""),
+                                "left_key": "time_bin",
+                                "right_key": "time_bin",
+                                "how": "left",
+                            },
+                            depends_on=["series"],
+                        )
+                    )
+                    nodes.append(
+                        AgentPlanNode(
+                            "plot_market",
+                            "plot_artifact",
+                            {"plot_name": f"{market_ticker.lower()}_market_overlay"},
+                            depends_on=["market_series"],
+                            optional=True,
+                        )
+                    )
+                else:
+                    assumptions.append(
+                        "The runtime could not infer a market ticker automatically, so stock-drawdown correspondence needs a supplied ticker or external series."
+                    )
             dag = AgentPlanDAG(
                 nodes=nodes,
                 metadata={
                     "question_family": "framing_shift",
-                    "requires_external_series": bool(assumptions),
+                    "requires_external_series": any(term in text for term in ["stock", "drawdown", "share price", "market", "valuation"]),
+                    "market_ticker": market_ticker,
                 },
             )
             return PlannerAction(
@@ -397,7 +632,9 @@ class MagicBoxOrchestrator:
                     "You are the planning module for a corpus-analysis agent. "
                     "Return JSON with keys action, rewritten_question, assumptions, clarification_question, rejection_reason, message, plan_dag. "
                     "Allowed actions: ask_clarification, emit_plan_dag, grounded_rejection. "
-                    "Choose capabilities, not libraries. Keep plans compact and parallel where possible."
+                    "Choose capabilities, not libraries. Keep plans compact and parallel where possible. "
+                    "Prefer db_search plus fetch_documents for normal retrieval. "
+                    "Use sql_query_search when hybrid retrieval is sparse, off-target, or entity coverage is poor."
                 ),
             },
             {
@@ -462,12 +699,27 @@ class MagicBoxOrchestrator:
                     raise ValueError("Planner returned no executable nodes.")
             if action is None:
                 raise ValueError("Planner returned no executable nodes.")
+            if action.action == "emit_plan_dag" and action.plan_dag is not None:
+                action.plan_dag = self._normalize_plan_dag(action.plan_dag)
             if action.action == "ask_clarification" and state.force_answer:
                 heuristic = self._heuristic_plan(state)
                 heuristic.assumptions = list(
                     dict.fromkeys(
                         list(action.assumptions)
                         + ["force_answer=true: planner clarification skipped and best-effort heuristic plan was used."]
+                    )
+                )
+                return heuristic
+            sufficient, clarification_assumptions = self._broad_scope_clarification_is_sufficient(state)
+            if action.action == "ask_clarification" and sufficient:
+                heuristic = self._heuristic_plan(state)
+                heuristic.rewritten_question = action.rewritten_question or heuristic.rewritten_question or state.rewritten_question
+                heuristic.assumptions = list(
+                    dict.fromkeys(
+                        list(action.assumptions)
+                        + list(heuristic.assumptions)
+                        + clarification_assumptions
+                        + ["Planner clarification was skipped because the provided clarification history was already sufficient."]
                     )
                 )
                 return heuristic
@@ -683,10 +935,17 @@ class MagicBoxOrchestrator:
     def _has_external_series(self, snapshot: AgentExecutionSnapshot) -> bool:
         for node_id, result in snapshot.node_results.items():
             payload = result.payload if isinstance(result.payload, dict) else {}
+            metadata = result.metadata if isinstance(result.metadata, dict) else {}
+            rows = list(payload.get("rows", []))
+            if not rows:
+                continue
             if node_id == "join_external_series":
-                rows = list(payload.get("rows", []))
-                if rows:
-                    return True
+                return True
+            if str(metadata.get("tool_name", "")).endswith("join_external_series"):
+                return True
+            first = rows[0] if rows else {}
+            if isinstance(first, dict) and any(str(key).startswith("market_") for key in first.keys()):
+                return True
         return False
 
     def _apply_answer_guardrails(
@@ -799,6 +1058,10 @@ class AgentRuntime:
         self.llm_config = self._startup_llm_config
         self.llm_client = llm_client or OpenAICompatibleLLMClient(self.llm_config)
         self.registry = registry or build_agent_registry()
+        self.require_backend_services = _env_flag("CORPUSAGENT2_REQUIRE_BACKEND_SERVICES", False)
+        self.allow_local_fallback = _env_flag("CORPUSAGENT2_ALLOW_LOCAL_FALLBACK", True)
+        if self.require_backend_services:
+            self.allow_local_fallback = False
         self.search_backend = search_backend or self._build_search_backend()
         self.working_store = working_store or self._build_working_store()
         self.python_runner = python_runner or DockerPythonRunnerService()
@@ -811,11 +1074,17 @@ class AgentRuntime:
         self._llm_override_active = False
 
     def _build_search_backend(self):
+        lexical_backend = None
         try:
             lexical_backend = OpenSearchBackend(OpenSearchConfig.from_env())
-        except Exception:
-            lexical_backend = None
-        return HybridSearchBackend(self.runtime, lexical_backend=lexical_backend)
+        except Exception as exc:
+            if self.require_backend_services:
+                raise RuntimeError(f"OpenSearch backend is required but unavailable: {exc}") from exc
+        return HybridSearchBackend(
+            self.runtime,
+            lexical_backend=lexical_backend,
+            allow_lexical_fallback=self.allow_local_fallback,
+        )
 
     def _build_working_store(self) -> WorkingSetStore:
         try:
@@ -824,6 +1093,8 @@ class AgentRuntime:
             dsn = ""
         if dsn:
             return PostgresWorkingSetStore(dsn=dsn, documents_table=pg_table_from_env(default="article_corpus"))
+        if self.require_backend_services:
+            raise RuntimeError("Postgres working store is required but CORPUSAGENT2_PG_DSN is not configured.")
         store = InMemoryWorkingSetStore()
         store.document_lookup.update(self.runtime.doc_lookup())
         return store
@@ -882,7 +1153,7 @@ class AgentRuntime:
 
     def runtime_info(self) -> dict[str, Any]:
         provider_modules = {}
-        for module_name in ["spacy", "textacy", "stanza", "nltk", "gensim", "flair", "textblob", "torch"]:
+        for module_name in ["spacy", "textacy", "stanza", "nltk", "gensim", "flair", "textblob", "torch", "yfinance"]:
             provider_modules[module_name] = importlib.util.find_spec(module_name) is not None
         device_report = runtime_device_report()
         openai_defaults = self._startup_llm_config.with_runtime_overrides(use_openai=True)
@@ -951,12 +1222,16 @@ class AgentRuntime:
                 "fusion_k": int(os.getenv("CORPUSAGENT2_RETRIEVAL_FUSION_K", "60").strip() or "60"),
                 "dense_model_id": self.runtime.dense_model_id,
                 "rerank_model_id": self.runtime.rerank_model_id,
+                "require_backend_services": self.require_backend_services,
+                "allow_local_fallback": self.allow_local_fallback,
+                "time_granularity": os.getenv("CORPUSAGENT2_TIME_GRANULARITY", "month").strip() or "month",
             },
             "analysis_notes": [
                 "UI model/provider changes are process-local runtime overrides. They affect future runs only and reset when the backend restarts unless you also update .env.",
                 "Classical spaCy/textacy/gensim analytics are usually CPU-bound even when CUDA is available.",
                 "GPU is mainly relevant for torch- or Flair-backed models and only when those providers are selected.",
                 "Per-node provider choice and artifacts are captured in the run manifest so you can verify what really ran.",
+                "Some analytics remain heuristic by design in the prototype, especially claim scoring, quote attribution, and burst detection; check provenance and caveats per node.",
             ],
             "active_run_ids": self._active_run_ids(),
         }
@@ -1165,6 +1440,58 @@ class AgentRuntime:
             },
         )
 
+    def _failed_manifest(
+        self,
+        *,
+        run_id: str,
+        question: str,
+        rewritten_question: str,
+        assumptions: list[str],
+        artifacts_dir: Path,
+        state: AgentRunState | None,
+        error: Exception,
+    ) -> AgentRunManifest:
+        failure = AgentFailure(
+            node_id="runtime",
+            capability="runtime",
+            error_type=type(error).__name__,
+            message=str(error),
+            retriable=False,
+        )
+        llm_traces = list(state.llm_traces) if state is not None else []
+        planner_actions = list(state.planner_actions) if state is not None else []
+        clarification_history = list(state.clarification_history) if state is not None else []
+        return AgentRunManifest(
+            run_id=run_id,
+            question=question,
+            rewritten_question=rewritten_question or question,
+            status="failed",
+            clarification_questions=[],
+            assumptions=list(assumptions),
+            planner_actions=planner_actions,
+            plan_dags=[state.last_plan] if state is not None and state.last_plan else [],
+            selected_docs=[],
+            node_records=[],
+            provenance_records=[],
+            evidence_table=[],
+            final_answer=FinalAnswerPayload(
+                answer_text="The run failed before a grounded answer could be completed.",
+                unsupported_parts=[str(error)],
+                caveats=["Review the runtime failure details and LLM traces in the manifest."],
+            ),
+            artifacts_dir=str(artifacts_dir),
+            failures=[failure],
+            metadata={
+                "clarification_history": clarification_history,
+                "llm_traces": llm_traces,
+                "runtime_info": self.runtime_info(),
+                "runtime_error": {
+                    "type": type(error).__name__,
+                    "message": str(error),
+                },
+            },
+        )
+
     def _run_query(
         self,
         run_id: str,
@@ -1206,6 +1533,8 @@ class AgentRuntime:
                 no_cache=no_cache,
             )
         except Exception:
+            if self.require_backend_services:
+                raise
             fallback_store = InMemoryWorkingSetStore()
             fallback_store.document_lookup.update(self.runtime.doc_lookup())
             self.working_store = fallback_store
@@ -1264,11 +1593,7 @@ class AgentRuntime:
 
         state.rewritten_question = rephrase_action.rewritten_question or question
 
-        if (
-            rephrase_action.action == "ask_clarification"
-            and not force_answer
-            and len(state.clarification_history) < 2
-        ):
+        if rephrase_action.action == "ask_clarification" and not force_answer:
             manifest = self._needs_clarification_manifest(
                 run_id=run_id,
                 question=question,
@@ -1307,7 +1632,7 @@ class AgentRuntime:
         )
         if maybe_aborted is not None:
             return maybe_aborted
-        if plan_action.action == "ask_clarification" and not force_answer and len(state.clarification_history) < 2:
+        if plan_action.action == "ask_clarification" and not force_answer:
             manifest = self._needs_clarification_manifest(
                 run_id=run_id,
                 question=question,
@@ -1434,13 +1759,28 @@ class AgentRuntime:
         clarification_history: list[str] | None = None,
     ) -> AgentRunManifest:
         run_id = f"agent_{uuid.uuid4().hex[:12]}"
-        return self._run_query(
-            run_id,
-            question,
-            force_answer=force_answer,
-            no_cache=no_cache,
-            clarification_history=clarification_history,
-        )
+        try:
+            return self._run_query(
+                run_id,
+                question,
+                force_answer=force_answer,
+                no_cache=no_cache,
+                clarification_history=clarification_history,
+            )
+        except Exception as exc:
+            artifacts_dir = (self.config.outputs_root / run_id).resolve()
+            (artifacts_dir / "nodes").mkdir(parents=True, exist_ok=True)
+            manifest = self._failed_manifest(
+                run_id=run_id,
+                question=question,
+                rewritten_question=question,
+                assumptions=[],
+                artifacts_dir=artifacts_dir,
+                state=None,
+                error=exc,
+            )
+            self._persist_manifest(manifest)
+            return manifest
 
     def submit_query(
         self,
@@ -1470,12 +1810,28 @@ class AgentRuntime:
                     clarification_history=clarification_history,
                 )
             except Exception as exc:
-                self._set_live_status(
-                    run_id,
-                    status="failed",
-                    current_phase="failed",
-                    detail=str(exc),
+                artifacts_dir = (self.config.outputs_root / run_id).resolve()
+                (artifacts_dir / "nodes").mkdir(parents=True, exist_ok=True)
+                with self._run_lock:
+                    live = self._live_runs.get(run_id)
+                state = AgentRunState(
+                    question=question,
+                    rewritten_question="",
+                    clarification_history=list(clarification_history or []),
+                    assumptions=list(live.assumptions) if live is not None else [],
+                    planner_actions=list(live.planner_actions) if live is not None else [],
+                    llm_traces=list(live.llm_traces) if live is not None else [],
                 )
+                manifest = self._failed_manifest(
+                    run_id=run_id,
+                    question=question,
+                    rewritten_question=question,
+                    assumptions=list(state.assumptions),
+                    artifacts_dir=artifacts_dir,
+                    state=state,
+                    error=exc,
+                )
+                self._persist_manifest(manifest)
             finally:
                 with self._run_lock:
                     self._run_threads.pop(run_id, None)
