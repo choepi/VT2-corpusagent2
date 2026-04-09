@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
+import joblib
+import numpy as np
 import pandas as pd
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -12,12 +15,88 @@ if str(SRC_ROOT) not in sys.path:
 
 from corpusagent2.io_utils import ensure_absolute, ensure_exists, read_documents, write_json
 from corpusagent2.retrieval import (
+    _load_sentence_transformer,
     build_dense_embeddings,
     build_lexical_assets,
     save_dense_assets,
     save_lexical_assets,
 )
 from corpusagent2.seed import resolve_run_mode, set_global_seed
+
+
+def _env_flag(name: str, default: bool) -> bool:
+    raw = os.getenv(name, "").strip().lower()
+    if not raw:
+        return default
+    return raw not in {"0", "false", "no", "off"}
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    return max(int(raw), 1)
+
+
+def _build_dense_embeddings_streaming(
+    df: pd.DataFrame,
+    *,
+    model_id: str,
+    batch_size: int,
+    device: str | None,
+    chunk_size: int,
+    index_dir: Path,
+) -> tuple[Path, list[str]]:
+    model, _resolved_device = _load_sentence_transformer(model_id=model_id, device=device)
+    doc_ids = df["doc_id"].astype(str).tolist()
+    embeddings_path = index_dir / "dense_embeddings.npy"
+    index_dir.mkdir(parents=True, exist_ok=True)
+
+    total_rows = int(df.shape[0])
+    if total_rows == 0:
+        raise RuntimeError("Dense embedding build received an empty dataframe.")
+
+    first_stop = min(total_rows, chunk_size)
+    first_texts = (
+        (df.iloc[:first_stop]["title"].fillna("") + " " + df.iloc[:first_stop]["text"].fillna(""))
+        .str.replace("\n", " ", regex=False)
+        .tolist()
+    )
+    first_batch = model.encode(
+        first_texts,
+        batch_size=batch_size,
+        show_progress_bar=True,
+        convert_to_numpy=True,
+        normalize_embeddings=True,
+    ).astype(np.float32)
+
+    embedding_dim = int(first_batch.shape[1])
+    dense_memmap = np.lib.format.open_memmap(
+        embeddings_path,
+        mode="w+",
+        dtype=np.float32,
+        shape=(total_rows, embedding_dim),
+    )
+    dense_memmap[:first_stop] = first_batch
+
+    for start in range(first_stop, total_rows, chunk_size):
+        stop = min(start + chunk_size, total_rows)
+        texts = (
+            (df.iloc[start:stop]["title"].fillna("") + " " + df.iloc[start:stop]["text"].fillna(""))
+            .str.replace("\n", " ", regex=False)
+            .tolist()
+        )
+        batch = model.encode(
+            texts,
+            batch_size=batch_size,
+            show_progress_bar=True,
+            convert_to_numpy=True,
+            normalize_embeddings=True,
+        ).astype(np.float32)
+        dense_memmap[start:stop] = batch
+
+    dense_memmap.flush()
+    return embeddings_path, doc_ids
 
 
 if __name__ == "__main__":
@@ -30,10 +109,14 @@ if __name__ == "__main__":
     SUMMARY_PATH = (PROJECT_ROOT / "outputs" / "build_retrieval_assets_summary.json").resolve()
 
     DENSE_MODEL_ID = "intfloat/e5-base-v2"
-    DENSE_BATCH_SIZE = 128
+    DENSE_BATCH_SIZE = _env_int("CORPUSAGENT2_DENSE_BATCH_SIZE", 64)
+    DENSE_CHUNK_SIZE = _env_int("CORPUSAGENT2_DENSE_CHUNK_SIZE", 2048)
     DENSE_DEVICE = None
-    TFIDF_MAX_FEATURES = 250_000
-    DEBUG_MAX_DOCS = 30_000
+    TFIDF_MAX_FEATURES = _env_int("CORPUSAGENT2_TFIDF_MAX_FEATURES", 250_000)
+    DEBUG_MAX_DOCS = _env_int("CORPUSAGENT2_DEBUG_MAX_DOCS", 30_000)
+    BUILD_LEXICAL = _env_flag("CORPUSAGENT2_BUILD_LEXICAL_ASSETS", True)
+    BUILD_DENSE = _env_flag("CORPUSAGENT2_BUILD_DENSE_ASSETS", True)
+    STREAM_DENSE = _env_flag("CORPUSAGENT2_STREAM_DENSE_ASSETS", True)
 
     ensure_absolute(DOCUMENTS_PARQUET, "DOCUMENTS_PARQUET")
     ensure_absolute(INDEX_ROOT, "INDEX_ROOT")
@@ -52,16 +135,30 @@ if __name__ == "__main__":
     lexical_dir = INDEX_ROOT / "lexical"
     dense_dir = INDEX_ROOT / "dense"
 
-    vectorizer, tfidf_matrix, tfidf_doc_ids = build_lexical_assets(df=df, max_features=TFIDF_MAX_FEATURES)
-    save_lexical_assets(index_dir=lexical_dir, vectorizer=vectorizer, matrix=tfidf_matrix, doc_ids=tfidf_doc_ids)
+    if BUILD_LEXICAL:
+        vectorizer, tfidf_matrix, tfidf_doc_ids = build_lexical_assets(df=df, max_features=TFIDF_MAX_FEATURES)
+        save_lexical_assets(index_dir=lexical_dir, vectorizer=vectorizer, matrix=tfidf_matrix, doc_ids=tfidf_doc_ids)
 
-    dense_embeddings, dense_doc_ids = build_dense_embeddings(
-        df=df,
-        model_id=DENSE_MODEL_ID,
-        batch_size=DENSE_BATCH_SIZE,
-        device=DENSE_DEVICE,
-    )
-    save_dense_assets(index_dir=dense_dir, embeddings=dense_embeddings, doc_ids=dense_doc_ids)
+    if BUILD_DENSE:
+        if STREAM_DENSE:
+            _build_dense_embeddings_streaming(
+                df=df,
+                model_id=DENSE_MODEL_ID,
+                batch_size=DENSE_BATCH_SIZE,
+                device=DENSE_DEVICE,
+                chunk_size=DENSE_CHUNK_SIZE,
+                index_dir=dense_dir,
+            )
+            dense_doc_ids = df["doc_id"].astype(str).tolist()
+            joblib.dump(dense_doc_ids, dense_dir / "dense_doc_ids.joblib")
+        else:
+            dense_embeddings, dense_doc_ids = build_dense_embeddings(
+                df=df,
+                model_id=DENSE_MODEL_ID,
+                batch_size=DENSE_BATCH_SIZE,
+                device=DENSE_DEVICE,
+            )
+            save_dense_assets(index_dir=dense_dir, embeddings=dense_embeddings, doc_ids=dense_doc_ids)
 
     metadata = pd.DataFrame(
         {
@@ -79,13 +176,18 @@ if __name__ == "__main__":
         "mode": MODE,
         "seed": SEED,
         "documents_indexed": int(df.shape[0]),
-        "lexical_index": str(lexical_dir),
-        "dense_index": str(dense_dir),
+        "lexical_index": str(lexical_dir) if BUILD_LEXICAL else "",
+        "dense_index": str(dense_dir) if BUILD_DENSE else "",
         "doc_metadata": str(metadata_path),
         "dense_model_id": DENSE_MODEL_ID,
+        "build_lexical_assets": BUILD_LEXICAL,
+        "build_dense_assets": BUILD_DENSE,
+        "stream_dense_assets": STREAM_DENSE,
+        "dense_batch_size": DENSE_BATCH_SIZE,
+        "dense_chunk_size": DENSE_CHUNK_SIZE,
+        "tfidf_max_features": TFIDF_MAX_FEATURES,
     }
     write_json(SUMMARY_PATH, summary)
 
-    print(f"Built lexical and dense retrieval assets for {df.shape[0]} documents")
+    print(f"Built retrieval assets for {df.shape[0]} documents")
     print(f"Summary: {SUMMARY_PATH}")
-

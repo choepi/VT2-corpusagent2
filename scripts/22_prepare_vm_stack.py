@@ -117,6 +117,17 @@ def _docker_compose_command() -> list[str]:
     )
 
 
+def _docker_runtime_is_available() -> bool:
+    docker = shutil.which("docker")
+    if not docker:
+        return False
+    docker_probe = _capture([docker, "--version"])
+    if docker_probe.returncode != 0:
+        return False
+    compose_probe = _capture([docker, "compose", "version"])
+    return compose_probe.returncode == 0
+
+
 def _project_env() -> dict[str, str]:
     env = os.environ.copy()
     for key, value in DOTENV_VALUES.items():
@@ -173,25 +184,54 @@ def _install_system_packages() -> None:
         print("[skip] system package install is intended for Ubuntu/Linux only.")
         return
     apt_get = shutil.which("apt-get")
+    systemctl = shutil.which("systemctl")
     if not apt_get:
         raise RuntimeError("apt-get was not found. This bootstrap currently targets Ubuntu/Debian VMs.")
     prefix = _sudo_prefix()
     _run(prefix + [apt_get, "update"])
-    _run(
-        prefix
-        + [
-            apt_get,
-            "install",
-            "-y",
-            "ca-certificates",
-            "curl",
-            "git",
-            "python3",
-            "python3-venv",
-            "python3-pip",
+    base_packages = [
+        "ca-certificates",
+        "curl",
+        "git",
+        "python3",
+        "python3-venv",
+        "python3-pip",
+    ]
+    _run(prefix + [apt_get, "install", "-y", *base_packages])
 
-        ]
-    )
+    if _docker_runtime_is_available():
+        print("[ready] Docker and Docker Compose are already available; skipping package install.")
+        return
+
+    docker_package_sets = [
+        ["docker.io", "docker-compose-v2"],
+        ["docker.io", "docker-compose-plugin"],
+        ["docker.io", "docker-compose"],
+    ]
+    docker_installed = False
+    for package_set in docker_package_sets:
+        result = _capture(prefix + [apt_get, "install", "-y", *package_set])
+        if result.returncode == 0:
+            docker_installed = True
+            print(f"[ready] installed Docker packages: {', '.join(package_set)}")
+            break
+        print(
+            f"[warn] apt-get could not install Docker package set {package_set}: "
+            f"{result.stderr.strip() or result.stdout.strip()}"
+        )
+    if not docker_installed:
+        raise RuntimeError(
+            "Unable to install Docker packages with apt-get. Install docker.io plus a Docker Compose package manually."
+        )
+
+    if systemctl:
+        docker_service_name = "docker"
+        result = _capture(prefix + [systemctl, "enable", "--now", docker_service_name])
+        if result.returncode != 0:
+            print(
+                f"[warn] could not enable/start {docker_service_name} service automatically: "
+                f"{result.stderr.strip() or result.stdout.strip()}"
+            )
 
 
 def _ensure_venv_and_deps(*, skip_provider_assets: bool) -> Path:
@@ -235,6 +275,8 @@ def _ensure_data_pipeline(
     dense_dir = REPO_ROOT / "data" / "indices" / "dense"
     lexical_dir = REPO_ROOT / "data" / "indices" / "lexical"
     metadata_path = REPO_ROOT / "data" / "indices" / "doc_metadata.parquet"
+    build_lexical_assets = _truthy(_env_value("CORPUSAGENT2_BUILD_LEXICAL_ASSETS", "false"))
+    build_dense_assets = _truthy(_env_value("CORPUSAGENT2_BUILD_DENSE_ASSETS", "true"))
 
     if refresh_data or not documents_parquet.exists():
         if refresh_data or not incoming_file.exists():
@@ -243,19 +285,31 @@ def _ensure_data_pipeline(
             _run([str(python_exe), str(REPO_ROOT / "scripts" / "00_stage_ccnews_files.py")])
         _run([str(python_exe), str(REPO_ROOT / "scripts" / "01_prepare_dataset.py")])
 
-    assets_ready = all(
-        path.exists()
-        for path in [
-            lexical_dir / "tfidf_vectorizer.joblib",
-            lexical_dir / "tfidf_matrix.joblib",
-            lexical_dir / "tfidf_doc_ids.joblib",
-            dense_dir / "dense_embeddings.npy",
-            dense_dir / "dense_doc_ids.joblib",
-            metadata_path,
-        ]
-    )
+    required_paths = [metadata_path]
+    if build_lexical_assets:
+        required_paths.extend(
+            [
+                lexical_dir / "tfidf_vectorizer.joblib",
+                lexical_dir / "tfidf_matrix.joblib",
+                lexical_dir / "tfidf_doc_ids.joblib",
+            ]
+        )
+    if build_dense_assets:
+        required_paths.extend(
+            [
+                dense_dir / "dense_embeddings.npy",
+                dense_dir / "dense_doc_ids.joblib",
+            ]
+        )
+    assets_ready = all(path.exists() for path in required_paths)
     if refresh_assets or refresh_data or not assets_ready:
-        _run([str(python_exe), str(REPO_ROOT / "scripts" / "02_build_retrieval_assets.py")])
+        asset_env = os.environ.copy()
+        asset_env["CORPUSAGENT2_BUILD_LEXICAL_ASSETS"] = "true" if build_lexical_assets else "false"
+        asset_env["CORPUSAGENT2_BUILD_DENSE_ASSETS"] = "true" if build_dense_assets else "false"
+        asset_env.setdefault("CORPUSAGENT2_STREAM_DENSE_ASSETS", "true")
+        asset_env.setdefault("CORPUSAGENT2_DENSE_BATCH_SIZE", "64")
+        asset_env.setdefault("CORPUSAGENT2_DENSE_CHUNK_SIZE", "2048")
+        _run([str(python_exe), str(REPO_ROOT / "scripts" / "02_build_retrieval_assets.py")], env=asset_env)
 
 
 def _wait_for_port(host: str, port: int, *, timeout_s: float, label: str) -> None:

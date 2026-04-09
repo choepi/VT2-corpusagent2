@@ -7,6 +7,23 @@
     <link rel="stylesheet" href="./styles.css" />
   </head>
   <body>
+    <div id="accessGate" class="access-gate hidden" aria-hidden="true">
+      <div class="access-card">
+        <p class="eyebrow">Private Demo</p>
+        <h1 id="accessGateTitle">Private Demo Access</h1>
+        <p id="accessGateSubtitle" class="lede">
+          Enter the shared passphrase to continue.
+        </p>
+        <label for="accessGatePassword">Passphrase</label>
+        <input id="accessGatePassword" type="password" autocomplete="current-password" />
+        <p id="accessGateHint" class="muted hidden"></p>
+        <p id="accessGateError" class="warn hidden">Passphrase did not match.</p>
+        <div class="controls">
+          <button id="accessGateButton" type="button">Enter</button>
+        </div>
+      </div>
+    </div>
+
     <main class="shell">
       <section class="card hero">
         <div class="hero-copy">

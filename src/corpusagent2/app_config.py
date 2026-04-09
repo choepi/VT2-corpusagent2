@@ -196,4 +196,14 @@ def frontend_runtime_payload(project_root: Path) -> dict[str, Any]:
         "apiBaseUrl": config.frontend.api_base_url,
         "title": config.frontend.title,
         "useOpenAI": config.llm.use_openai,
+        "accessGate": {
+            "enabled": os.getenv("CORPUSAGENT2_FRONTEND_ACCESS_GATE", "").strip().lower() in {"1", "true", "yes", "on"},
+            "title": os.getenv("CORPUSAGENT2_FRONTEND_ACCESS_TITLE", "Private Demo Access").strip() or "Private Demo Access",
+            "subtitle": os.getenv(
+                "CORPUSAGENT2_FRONTEND_ACCESS_SUBTITLE",
+                "Use Cloudflare Access for real protection. This frontend gate only blocks casual access.",
+            ).strip(),
+            "hint": os.getenv("CORPUSAGENT2_FRONTEND_ACCESS_HINT", "").strip(),
+            "passwordSha256": os.getenv("CORPUSAGENT2_FRONTEND_ACCESS_PASSWORD_SHA256", "").strip().lower(),
+        },
     }
