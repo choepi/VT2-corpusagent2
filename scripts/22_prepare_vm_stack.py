@@ -189,8 +189,7 @@ def _install_system_packages() -> None:
             "python3",
             "python3-venv",
             "python3-pip",
-            "docker.io",
-            "docker-compose-plugin",
+
         ]
     )
 
