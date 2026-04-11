@@ -25,6 +25,12 @@ jobs:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
     runs-on: ubuntu-latest
+    env:
+      CORPUSAGENT2_FRONTEND_API_BASE_URL: https://api.dongtse.com
+      CORPUSAGENT2_FRONTEND_ACCESS_GATE: "true"
+      CORPUSAGENT2_FRONTEND_ACCESS_TITLE: Private Demo Access
+      CORPUSAGENT2_FRONTEND_ACCESS_SUBTITLE: Enter the shared passphrase to continue.
+      CORPUSAGENT2_FRONTEND_ACCESS_PASSWORD_SHA256: ${{ secrets.CORPUSAGENT2_FRONTEND_ACCESS_PASSWORD_SHA256 }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4

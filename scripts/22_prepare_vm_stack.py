@@ -29,6 +29,7 @@ DEFAULT_OPENSEARCH_INDEX = "article-corpus-opensearch"
 DEFAULT_OPENSEARCH_USERNAME = "admin"
 DEFAULT_OPENSEARCH_PASSWORD = "VerySecurePassword123!"
 DEFAULT_OPENSEARCH_VERIFY_SSL = False
+DEFAULT_RETRIEVAL_PROFILE = "no-dense"
 
 
 def _load_dotenv(path: Path) -> dict[str, str]:
@@ -134,6 +135,50 @@ def _project_env() -> dict[str, str]:
         env.setdefault(key, value)
     env.setdefault("CORPUSAGENT2_DOCKER_DATA_DIR", str(DEFAULT_DOCKER_DATA_DIR))
     return env
+
+
+def _upsert_dotenv(path: Path, updates: dict[str, str]) -> None:
+    existing_lines = path.read_text(encoding="utf-8").splitlines() if path.exists() else []
+    output: list[str] = []
+    seen: set[str] = set()
+    for line in existing_lines:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in line:
+            output.append(line)
+            continue
+        key = line.split("=", 1)[0].strip()
+        if key in updates:
+            output.append(f"{key}={updates[key]}")
+            seen.add(key)
+        else:
+            output.append(line)
+    for key, value in updates.items():
+        if key not in seen:
+            output.append(f"{key}={value}")
+    path.write_text("\n".join(output).rstrip() + "\n", encoding="utf-8")
+
+
+def _retrieval_profile_env(profile: str) -> dict[str, str]:
+    normalized = profile.strip().lower()
+    if normalized == "hybrid":
+        return {
+            "CORPUSAGENT2_VM_RETRIEVAL_PROFILE": "hybrid",
+            "CORPUSAGENT2_BUILD_LEXICAL_ASSETS": "true",
+            "CORPUSAGENT2_BUILD_DENSE_ASSETS": "true",
+            "CORPUSAGENT2_PG_INCLUDE_EMBEDDINGS": "true",
+            "CORPUSAGENT2_ENABLE_DENSE_RETRIEVAL": "true",
+            "CORPUSAGENT2_RETRIEVAL_BACKEND": "pgvector",
+            "CORPUSAGENT2_DEFAULT_RETRIEVAL_MODE": "hybrid",
+        }
+    return {
+        "CORPUSAGENT2_VM_RETRIEVAL_PROFILE": "no-dense",
+        "CORPUSAGENT2_BUILD_LEXICAL_ASSETS": "true",
+        "CORPUSAGENT2_BUILD_DENSE_ASSETS": "false",
+        "CORPUSAGENT2_PG_INCLUDE_EMBEDDINGS": "false",
+        "CORPUSAGENT2_ENABLE_DENSE_RETRIEVAL": "false",
+        "CORPUSAGENT2_RETRIEVAL_BACKEND": "local",
+        "CORPUSAGENT2_DEFAULT_RETRIEVAL_MODE": "lexical",
+    }
 
 
 def _venv_python() -> Path:
@@ -264,6 +309,7 @@ def _ensure_data_pipeline(
     skip_data: bool,
     refresh_data: bool,
     refresh_assets: bool,
+    env: dict[str, str],
 ) -> None:
     if skip_data:
         print("[skip] data preparation disabled.")
@@ -275,15 +321,15 @@ def _ensure_data_pipeline(
     dense_dir = REPO_ROOT / "data" / "indices" / "dense"
     lexical_dir = REPO_ROOT / "data" / "indices" / "lexical"
     metadata_path = REPO_ROOT / "data" / "indices" / "doc_metadata.parquet"
-    build_lexical_assets = _truthy(_env_value("CORPUSAGENT2_BUILD_LEXICAL_ASSETS", "false"))
-    build_dense_assets = _truthy(_env_value("CORPUSAGENT2_BUILD_DENSE_ASSETS", "true"))
+    build_lexical_assets = _truthy(env.get("CORPUSAGENT2_BUILD_LEXICAL_ASSETS", _env_value("CORPUSAGENT2_BUILD_LEXICAL_ASSETS", "true")))
+    build_dense_assets = _truthy(env.get("CORPUSAGENT2_BUILD_DENSE_ASSETS", _env_value("CORPUSAGENT2_BUILD_DENSE_ASSETS", "false")))
 
     if refresh_data or not documents_parquet.exists():
         if refresh_data or not incoming_file.exists():
-            _run([str(python_exe), str(REPO_ROOT / "scripts" / "00_1_downlaod.py")])
+            _run([str(python_exe), str(REPO_ROOT / "scripts" / "00_1_downlaod.py")], env=env)
         if refresh_data or not any(staged_dir.rglob("*.jsonl")) and not any(staged_dir.rglob("*.jsonl.gz")):
-            _run([str(python_exe), str(REPO_ROOT / "scripts" / "00_stage_ccnews_files.py")])
-        _run([str(python_exe), str(REPO_ROOT / "scripts" / "01_prepare_dataset.py")])
+            _run([str(python_exe), str(REPO_ROOT / "scripts" / "00_stage_ccnews_files.py")], env=env)
+        _run([str(python_exe), str(REPO_ROOT / "scripts" / "01_prepare_dataset.py")], env=env)
 
     required_paths = [metadata_path]
     if build_lexical_assets:
@@ -303,7 +349,7 @@ def _ensure_data_pipeline(
         )
     assets_ready = all(path.exists() for path in required_paths)
     if refresh_assets or refresh_data or not assets_ready:
-        asset_env = os.environ.copy()
+        asset_env = env.copy()
         asset_env["CORPUSAGENT2_BUILD_LEXICAL_ASSETS"] = "true" if build_lexical_assets else "false"
         asset_env["CORPUSAGENT2_BUILD_DENSE_ASSETS"] = "true" if build_dense_assets else "false"
         asset_env.setdefault("CORPUSAGENT2_STREAM_DENSE_ASSETS", "true")
@@ -404,6 +450,7 @@ def _maybe_run_script(
     python_exe: Path,
     script_name: str,
     *,
+    env: dict[str, str],
     summary_path: Path | None = None,
     force: bool = False,
     should_skip: bool = False,
@@ -414,7 +461,7 @@ def _maybe_run_script(
     if summary_path is not None and _summary_is_present(summary_path) and not force:
         print(f"[skip] {script_name} summary already present at {summary_path}")
         return
-    _run([str(python_exe), str(REPO_ROOT / "scripts" / script_name)])
+    _run([str(python_exe), str(REPO_ROOT / "scripts" / script_name)], env=env)
 
 
 def _write_summary(payload: dict[str, object]) -> Path:
@@ -437,6 +484,12 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--refresh-postgres", action="store_true", help="Re-run Postgres schema, ingest, and pgvector indexing.")
     parser.add_argument("--refresh-opensearch", action="store_true", help="Re-run full OpenSearch bulk indexing.")
     parser.add_argument("--with-dashboards", action="store_true", help="Start OpenSearch Dashboards as well.")
+    parser.add_argument(
+        "--retrieval-profile",
+        choices=["no-dense", "hybrid"],
+        default=_env_value("CORPUSAGENT2_VM_RETRIEVAL_PROFILE", DEFAULT_RETRIEVAL_PROFILE),
+        help="Choose a stable VM retrieval profile. 'no-dense' is the default lightweight path.",
+    )
     return parser.parse_args(argv)
 
 
@@ -446,39 +499,50 @@ def main(argv: Iterable[str] | None = None) -> None:
     if args.install_system:
         _install_system_packages()
 
+    profile_env = _retrieval_profile_env(args.retrieval_profile)
+    command_env = _project_env()
+    command_env.update(profile_env)
+    _upsert_dotenv(REPO_ROOT / ".env", profile_env)
     python_exe = _ensure_venv_and_deps(skip_provider_assets=args.skip_provider_assets)
     _ensure_data_pipeline(
         python_exe,
         skip_data=args.skip_data,
         refresh_data=args.refresh_data,
         refresh_assets=args.refresh_assets,
+        env=command_env,
     )
-    _run([str(python_exe), str(REPO_ROOT / "scripts" / "13_write_frontend_config.py")])
+    _run([str(python_exe), str(REPO_ROOT / "scripts" / "13_write_frontend_config.py")], env=command_env)
 
     postgres_schema_summary = REPO_ROOT / "outputs" / "postgres" / "init_schema_summary.json"
     postgres_ingest_summary = REPO_ROOT / "outputs" / "postgres" / "ingest_summary.json"
     pgvector_index_summary = REPO_ROOT / "outputs" / "postgres" / "build_index_summary.json"
     opensearch_summary = REPO_ROOT / "outputs" / "opensearch" / "bulk_index_summary.json"
 
+    pg_include_embeddings = _truthy(command_env.get("CORPUSAGENT2_PG_INCLUDE_EMBEDDINGS", "false"))
     if not args.skip_docker:
         _ensure_docker_services(with_dashboards=args.with_dashboards)
         _maybe_run_script(
             python_exe,
             "09_init_postgres_schema.py",
+            env=command_env,
             summary_path=postgres_schema_summary,
             force=args.refresh_postgres,
         )
         _maybe_run_script(
             python_exe,
             "10_ingest_parquet_to_postgres.py",
+            env=command_env,
             summary_path=postgres_ingest_summary,
             force=args.refresh_postgres,
         )
+
         _maybe_run_script(
             python_exe,
             "11_build_pgvector_index.py",
+            env=command_env,
             summary_path=pgvector_index_summary,
             force=args.refresh_postgres,
+            should_skip=not pg_include_embeddings,
         )
 
         documents_parquet = REPO_ROOT / "data" / "processed" / "documents.parquet"
@@ -499,6 +563,7 @@ def main(argv: Iterable[str] | None = None) -> None:
         _maybe_run_script(
             python_exe,
             "21_bulk_index_opensearch.py",
+            env=command_env,
             summary_path=opensearch_summary,
             force=opensearch_needs_refresh,
             should_skip=not opensearch_needs_refresh,
@@ -507,6 +572,7 @@ def main(argv: Iterable[str] | None = None) -> None:
     summary_path = _write_summary(
         {
             "repo_root": str(REPO_ROOT),
+            "retrieval_profile": args.retrieval_profile,
             "venv_python": str(python_exe),
             "docker_compose": str(COMPOSE_FILE),
             "docker_data_dir": str(_project_env()["CORPUSAGENT2_DOCKER_DATA_DIR"]),

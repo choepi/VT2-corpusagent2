@@ -1,5 +1,12 @@
 window.CORPUSAGENT2_CONFIG = {
-  "apiBaseUrl": "http://127.0.0.1:8001",
+  "apiBaseUrl": "https://api.dongtse.com",
   "title": "CorpusAgent2 Prototype",
-  "useOpenAI": true
+  "useOpenAI": true,
+  "accessGate": {
+    "enabled": true,
+    "title": "Private Demo Access",
+    "subtitle": "Use Cloudflare Access for real protection. This frontend gate only blocks casual access.",
+    "hint": "",
+    "passwordSha256": "0d73692da74f62ecef19209f020e3a7086464542c7d4413eed577c963f1144f4"
+  }
 };

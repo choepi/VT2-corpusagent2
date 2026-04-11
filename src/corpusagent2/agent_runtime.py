@@ -36,7 +36,7 @@ from .agent_models import (
 from .agent_policy import rejection_reason_for_question, rewrite_special_cases
 from .app_config import load_project_configuration
 from .llm_provider import LLMClient, LLMProviderConfig, OpenAICompatibleLLMClient
-from .retrieval import pg_dsn_from_env, pg_table_from_env
+from .retrieval import dense_retrieval_enabled, pg_dsn_from_env, pg_table_from_env
 from .run_manifest import FinalAnswerPayload
 from .runtime_context import CorpusRuntime
 from .seed import runtime_device_report
@@ -1174,6 +1174,11 @@ class AgentRuntime:
             for capability, value in os.environ.items()
             if capability.startswith("CORPUSAGENT2_PROVIDER_ORDER_")
         }
+        default_retrieval_mode = os.getenv("CORPUSAGENT2_DEFAULT_RETRIEVAL_MODE", "").strip().lower()
+        if not default_retrieval_mode:
+            default_retrieval_mode = (
+                "hybrid" if dense_retrieval_enabled(default=self.runtime.retrieval_backend == "pgvector") else "lexical"
+            )
         return {
             "llm": {
                 "use_openai": self.llm_config.use_openai,
@@ -1215,7 +1220,7 @@ class AgentRuntime:
             "capability_count": len(self.registry.list_tools()),
             "retrieval": {
                 "backend": self.runtime.retrieval_backend,
-                "default_mode": os.getenv("CORPUSAGENT2_DEFAULT_RETRIEVAL_MODE", "hybrid"),
+                "default_mode": default_retrieval_mode,
                 "rerank_enabled": os.getenv("CORPUSAGENT2_RETRIEVAL_USE_RERANK", "true").strip().lower()
                 not in {"0", "false", "no", "off"},
                 "rerank_top_k": int(os.getenv("CORPUSAGENT2_RETRIEVAL_RERANK_TOP_K", "25").strip() or "25"),
