@@ -264,6 +264,58 @@ function formatScore(value) {
   return "0";
 }
 
+function parseUtcTimestamp(value) {
+  const timestamp = Date.parse(String(value || ""));
+  return Number.isFinite(timestamp) ? timestamp : null;
+}
+
+function formatDurationMs(value) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric) || numeric < 0) {
+    return "";
+  }
+  if (numeric < 1000) {
+    return `${Math.round(numeric)} ms`;
+  }
+  const seconds = numeric / 1000;
+  if (seconds < 60) {
+    return `${seconds.toFixed(seconds >= 10 ? 1 : 2).replace(/\.?0+$/, "")} s`;
+  }
+  const minutes = Math.floor(seconds / 60);
+  const remainderSeconds = seconds - minutes * 60;
+  return `${minutes}m ${remainderSeconds.toFixed(remainderSeconds >= 10 ? 0 : 1).replace(/\.?0+$/, "")}s`;
+}
+
+function stepDurationLabel(row, { allowLiveElapsed = false } = {}) {
+  const explicit = formatDurationMs(row?.duration_ms);
+  if (explicit) {
+    return explicit;
+  }
+  if (!allowLiveElapsed) {
+    return "";
+  }
+  const startedAt = parseUtcTimestamp(row?.started_at_utc);
+  if (startedAt === null) {
+    return "";
+  }
+  return formatDurationMs(Date.now() - startedAt);
+}
+
+function formatStepRow(row, { allowLiveElapsed = false } = {}) {
+  const base = `${escapeHtml(row.capability || "")} (${escapeHtml(row.node_id || "")})`;
+  const duration = stepDurationLabel(row, { allowLiveElapsed });
+  const suffix = duration ? ` - ${escapeHtml(duration)}` : "";
+  const error = row.error ? ` - ${escapeHtml(row.error)}` : "";
+  return `${base}${suffix}${error}`;
+}
+
+function totalNodeDurationMs(nodeRecords) {
+  return (nodeRecords || []).reduce((sum, row) => {
+    const value = Number(row?.duration_ms);
+    return Number.isFinite(value) && value >= 0 ? sum + value : sum;
+  }, 0);
+}
+
 function artifactUrl(runId, artifactPath) {
   const base = apiBaseInput.value.replace(/\/$/, "");
   return `${base}/runs/${encodeURIComponent(runId)}/artifact?artifact_path=${encodeURIComponent(artifactPath)}`;
@@ -571,6 +623,12 @@ function renderManifest(manifest) {
   if (manifest.metadata?.runtime_info) {
     renderRuntimeInfo(manifest.metadata.runtime_info);
   }
+  if (Array.isArray(manifest.node_records) && manifest.node_records.length > 0) {
+    const totalDuration = formatDurationMs(totalNodeDurationMs(manifest.node_records));
+    if (totalDuration) {
+      detailText.textContent = `${detailText.textContent} Total executor step time: ${totalDuration}.`;
+    }
+  }
 }
 
 function setStatus(payload) {
@@ -596,12 +654,12 @@ function setStatus(payload) {
   completedCount.textContent = String((payload.completed_steps || []).length);
   failedCount.textContent = String((payload.failed_steps || []).length);
 
-  renderList(activeSteps, derivedActiveSteps, (row) => `${escapeHtml(row.capability)} (${escapeHtml(row.node_id)})`);
-  renderList(completedSteps, payload.completed_steps || [], (row) => `${escapeHtml(row.capability)} (${escapeHtml(row.node_id)})`);
+  renderList(activeSteps, derivedActiveSteps, (row) => formatStepRow(row, { allowLiveElapsed: true }));
+  renderList(completedSteps, payload.completed_steps || [], (row) => formatStepRow(row));
   renderList(
     failedSteps,
     payload.failed_steps || [],
-    (row) => `${escapeHtml(row.capability)} (${escapeHtml(row.node_id)})${row.error ? ` - ${escapeHtml(row.error)}` : ""}`
+    (row) => formatStepRow(row)
   );
   renderList(assumptionsList, payload.assumptions || [], (row) => escapeHtml(row));
   renderPlannerActions(payload.planner_actions || []);

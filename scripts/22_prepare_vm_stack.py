@@ -17,7 +17,6 @@ from urllib import error as urlerror
 from urllib import request as urlrequest
 from urllib.parse import urlparse
 
-
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEPLOY_ROOT = REPO_ROOT / "deploy"
 COMPOSE_FILE = DEPLOY_ROOT / "docker-compose.yml"
@@ -29,7 +28,7 @@ DEFAULT_OPENSEARCH_INDEX = "article-corpus-opensearch"
 DEFAULT_OPENSEARCH_USERNAME = "admin"
 DEFAULT_OPENSEARCH_PASSWORD = "VerySecurePassword123!"
 DEFAULT_OPENSEARCH_VERIFY_SSL = False
-DEFAULT_RETRIEVAL_PROFILE = "no-dense"
+DEFAULT_RETRIEVAL_PROFILE = "hybrid"
 
 
 def _load_dotenv(path: Path) -> dict[str, str]:
@@ -197,6 +196,72 @@ def _venv_uv() -> Path | None:
 
 def _summary_is_present(path: Path) -> bool:
     return path.exists() and path.stat().st_size > 0
+
+
+def _documents_row_count(path: Path) -> int | None:
+    if not path.exists():
+        return None
+    try:
+        import pyarrow.parquet as pq
+
+        return int(pq.ParquetFile(path).metadata.num_rows)
+    except Exception:
+        return None
+
+
+def _postgres_scalar(query: str) -> int | None:
+    try:
+        from psycopg import connect
+    except Exception:
+        return None
+    try:
+        with connect(_pg_dsn()) as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(query)
+                row = cursor.fetchone()
+                if not row:
+                    return None
+                return int(row[0])
+    except Exception:
+        return None
+
+
+def _postgres_table_row_count() -> int | None:
+    table_name = _env_value("CORPUSAGENT2_PG_TABLE", "article_corpus")
+    if not table_name.replace("_", "").isalnum():
+        return None
+    return _postgres_scalar(f"SELECT COUNT(*) FROM {table_name};")
+
+
+def _postgres_embedding_row_count() -> int | None:
+    table_name = _env_value("CORPUSAGENT2_PG_TABLE", "article_corpus")
+    if not table_name.replace("_", "").isalnum():
+        return None
+    return _postgres_scalar(f"SELECT COUNT(*) FROM {table_name} WHERE dense_embedding IS NOT NULL;")
+
+
+def _postgres_index_names() -> set[str]:
+    table_name = _env_value("CORPUSAGENT2_PG_TABLE", "article_corpus")
+    if not table_name.replace("_", "").isalnum():
+        return set()
+    try:
+        from psycopg import connect
+    except Exception:
+        return set()
+    try:
+        with connect(_pg_dsn()) as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT indexname
+                    FROM pg_indexes
+                    WHERE schemaname = current_schema() AND tablename = %s;
+                    """,
+                    (table_name,),
+                )
+                return {str(row[0]) for row in cursor.fetchall()}
+    except Exception:
+        return set()
 
 
 def _ensure_git_checkout() -> None:
@@ -381,6 +446,13 @@ def _pg_host_port() -> tuple[str, int]:
     return host, port
 
 
+def _pg_dsn() -> str:
+    return _env_value(
+        "CORPUSAGENT2_PG_DSN",
+        f"postgresql://corpus:corpus@{DEFAULT_PG_HOST}:{DEFAULT_PG_PORT}/corpus_db",
+    )
+
+
 def _opensearch_host_port() -> tuple[str, int]:
     parsed = urlparse(_env_value("CORPUSAGENT2_OPENSEARCH_URL", DEFAULT_OPENSEARCH_URL))
     host = parsed.hostname or "127.0.0.1"
@@ -521,6 +593,14 @@ def main(argv: Iterable[str] | None = None) -> None:
     pg_include_embeddings = _truthy(command_env.get("CORPUSAGENT2_PG_INCLUDE_EMBEDDINGS", "false"))
     if not args.skip_docker:
         _ensure_docker_services(with_dashboards=args.with_dashboards)
+        documents_parquet = REPO_ROOT / "data" / "processed" / "documents.parquet"
+        expected_documents = _documents_row_count(documents_parquet)
+        current_postgres_count = _postgres_table_row_count()
+        current_embedding_count = _postgres_embedding_row_count()
+        postgres_index_names = _postgres_index_names()
+        expected_ivfflat_index = f"idx_{_env_value('CORPUSAGENT2_PG_TABLE', 'article_corpus')}_embedding_ivfflat"
+        expected_hnsw_index = f"idx_{_env_value('CORPUSAGENT2_PG_TABLE', 'article_corpus')}_embedding_hnsw"
+
         _maybe_run_script(
             python_exe,
             "09_init_postgres_schema.py",
@@ -528,33 +608,55 @@ def main(argv: Iterable[str] | None = None) -> None:
             summary_path=postgres_schema_summary,
             force=args.refresh_postgres,
         )
+        postgres_needs_refresh = args.refresh_postgres
+        if not postgres_needs_refresh and not _summary_is_present(postgres_ingest_summary):
+            postgres_needs_refresh = True
+        if not postgres_needs_refresh and expected_documents is not None and current_postgres_count != expected_documents:
+            postgres_needs_refresh = True
+        if (
+            not postgres_needs_refresh
+            and pg_include_embeddings
+            and expected_documents is not None
+            and current_embedding_count != expected_documents
+        ):
+            postgres_needs_refresh = True
         _maybe_run_script(
             python_exe,
             "10_ingest_parquet_to_postgres.py",
             env=command_env,
             summary_path=postgres_ingest_summary,
-            force=args.refresh_postgres,
+            force=postgres_needs_refresh,
         )
 
+        pgvector_needs_refresh = args.refresh_postgres
+        if not pgvector_needs_refresh and not _summary_is_present(pgvector_index_summary):
+            pgvector_needs_refresh = True
+        if (
+            not pgvector_needs_refresh
+            and pg_include_embeddings
+            and expected_documents is not None
+            and current_embedding_count != expected_documents
+        ):
+            pgvector_needs_refresh = True
+        if (
+            not pgvector_needs_refresh
+            and pg_include_embeddings
+            and (
+                expected_ivfflat_index not in postgres_index_names
+                or expected_hnsw_index not in postgres_index_names
+            )
+        ):
+            pgvector_needs_refresh = True
         _maybe_run_script(
             python_exe,
             "11_build_pgvector_index.py",
             env=command_env,
             summary_path=pgvector_index_summary,
-            force=args.refresh_postgres,
+            force=pgvector_needs_refresh,
             should_skip=not pg_include_embeddings,
         )
 
-        documents_parquet = REPO_ROOT / "data" / "processed" / "documents.parquet"
         current_opensearch_count = _opensearch_count()
-        expected_documents = None
-        if documents_parquet.exists():
-            try:
-                import pyarrow.parquet as pq
-
-                expected_documents = int(pq.ParquetFile(documents_parquet).metadata.num_rows)
-            except Exception:
-                expected_documents = None
         opensearch_needs_refresh = args.refresh_opensearch
         if not opensearch_needs_refresh and not _summary_is_present(opensearch_summary):
             opensearch_needs_refresh = True

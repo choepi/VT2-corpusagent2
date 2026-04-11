@@ -1366,6 +1366,12 @@ class AgentRuntime:
                 "capability": str(payload.get("capability", "")),
                 "status": str(payload.get("status", "")),
             }
+            if payload.get("started_at_utc"):
+                entry["started_at_utc"] = str(payload["started_at_utc"])
+            if payload.get("finished_at_utc"):
+                entry["finished_at_utc"] = str(payload["finished_at_utc"])
+            if payload.get("duration_ms") is not None:
+                entry["duration_ms"] = float(payload["duration_ms"])
             if payload.get("error"):
                 entry["error"] = str(payload["error"])
             if event == "node_started":

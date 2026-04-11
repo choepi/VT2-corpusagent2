@@ -12,7 +12,7 @@ def test_app_config_loads_defaults_from_project_root() -> None:
     config = AppConfig.from_project_root(project_root)
 
     assert config.server.port == 8001
-    assert config.frontend.api_base_url == "http://127.0.0.1:8001"
+    assert config.frontend.api_base_url == "https://api.dongtse.com"
     assert config.llm.use_openai is True
     assert config.env_map["CORPUSAGENT2_USE_OPENAI"] == "True"
     assert config.env_map["CORPUSAGENT2_PG_TABLE"] == "article_corpus"
@@ -23,7 +23,7 @@ def test_frontend_runtime_payload_uses_app_config() -> None:
 
     payload = frontend_runtime_payload(project_root)
 
-    assert payload["apiBaseUrl"] == "http://127.0.0.1:8001"
+    assert payload["apiBaseUrl"] == "https://api.dongtse.com"
     assert "CorpusAgent2" in payload["title"]
     assert payload["useOpenAI"] is True
 
@@ -89,3 +89,26 @@ title = "CorpusAgent2 Prototype"
 
     assert payload["apiBaseUrl"] == "https://demo.example.com/api"
     assert payload["title"] == "CorpusAgent2 Demo"
+
+
+def test_frontend_runtime_payload_includes_access_gate(tmp_path, monkeypatch) -> None:
+    (tmp_path / "config").mkdir()
+    (tmp_path / "config" / "app_config.toml").write_text(
+        """
+[frontend]
+api_base_url = "https://api.dongtse.com"
+title = "CorpusAgent2 Prototype"
+        """.strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("CORPUSAGENT2_FRONTEND_ACCESS_GATE", "true")
+    monkeypatch.setenv("CORPUSAGENT2_FRONTEND_ACCESS_PASSWORD_SHA256", "abc123")
+    monkeypatch.setenv("CORPUSAGENT2_FRONTEND_ACCESS_TITLE", "Private Demo Access")
+    monkeypatch.setenv("CORPUSAGENT2_FRONTEND_ACCESS_SUBTITLE", "Enter the shared passphrase to continue.")
+
+    payload = frontend_runtime_payload(tmp_path)
+
+    assert payload["accessGate"]["enabled"] is True
+    assert payload["accessGate"]["passwordSha256"] == "abc123"
+    assert payload["accessGate"]["title"] == "Private Demo Access"
+    assert payload["accessGate"]["subtitle"] == "Enter the shared passphrase to continue."

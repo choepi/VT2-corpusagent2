@@ -12,6 +12,9 @@ Read this first
 - The passphrase gate in the GitHub Pages site is only a convenience barrier.
 - It is not real security because GitHub Pages is a static site and the browser receives the gate code.
 - Real protection should be added in Cloudflare Access in front of api.dongtse.com.
+- You do not need to move the frontend off GitHub Pages just because the API is behind Cloudflare Access.
+- GitHub Pages can stay public while Cloudflare protects only api.dongtse.com.
+- You would only need to move the frontend behind Cloudflare too if you want the page itself to require Cloudflare login before it loads.
 
 What you need before touching the dashboard
 

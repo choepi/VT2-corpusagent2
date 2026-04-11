@@ -88,6 +88,7 @@ class AsyncPlanExecutor:
                 "node_id": node.node_id,
                 "capability": node.capability,
                 "status": "running",
+                "started_at_utc": started_at,
             },
         )
 
@@ -108,6 +109,9 @@ class AsyncPlanExecutor:
                     "capability": node.capability,
                     "status": "failed",
                     "error": str(exc),
+                    "started_at_utc": started_at,
+                    "finished_at_utc": finished_at,
+                    "duration_ms": duration_ms,
                 },
             )
             failure = AgentFailure(
@@ -184,6 +188,9 @@ class AsyncPlanExecutor:
                     "capability": node.capability,
                     "status": "completed",
                     "cache_hit": True,
+                    "started_at_utc": started_at,
+                    "finished_at_utc": finished_at,
+                    "duration_ms": duration_ms,
                 },
             )
             return (
@@ -270,6 +277,9 @@ class AsyncPlanExecutor:
                         "capability": node.capability,
                         "status": "completed",
                         "cache_hit": False,
+                        "started_at_utc": started_at,
+                        "finished_at_utc": finished_at,
+                        "duration_ms": duration_ms,
                     },
                 )
                 return (
@@ -318,6 +328,9 @@ class AsyncPlanExecutor:
                 "capability": node.capability,
                 "status": "failed",
                 "error": last_error,
+                "started_at_utc": started_at,
+                "finished_at_utc": finished_at,
+                "duration_ms": duration_ms,
             },
         )
         failure = AgentFailure(
