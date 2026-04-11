@@ -40,6 +40,13 @@ jobs:
         with:
           python-version: "3.11"
 
+      - name: Validate frontend gate secret
+        run: |
+          if [ "${CORPUSAGENT2_FRONTEND_ACCESS_GATE}" = "true" ] && [ -z "${CORPUSAGENT2_FRONTEND_ACCESS_PASSWORD_SHA256}" ]; then
+            echo "CORPUSAGENT2_FRONTEND_ACCESS_PASSWORD_SHA256 GitHub secret is required when the frontend access gate is enabled." >&2
+            exit 1
+          fi
+
       - name: Generate frontend runtime config
         run: python scripts/13_write_frontend_config.py
 
