@@ -36,6 +36,16 @@ def parse_int_env(name: str, default: int) -> int:
     return value
 
 
+def parse_retrieval_mode() -> bool:
+    return parse_bool_env(
+        "CORPUSAGENT2_ENABLE_DENSE_RETRIEVAL",
+        parse_bool_env(
+            "CORPUSAGENT2_PG_INCLUDE_EMBEDDINGS",
+            parse_bool_env("CORPUSAGENT2_BUILD_DENSE_ASSETS", False),
+        ),
+    )
+
+
 if __name__ == "__main__":
     SEED = 42
 
@@ -49,6 +59,7 @@ if __name__ == "__main__":
     HNSW_EF_CONSTRUCTION = parse_int_env("CORPUSAGENT2_PG_HNSW_EF_CONSTRUCTION", 128)
     BUILD_IVFFLAT = parse_bool_env("CORPUSAGENT2_PG_BUILD_IVFFLAT", True)
     BUILD_HNSW = parse_bool_env("CORPUSAGENT2_PG_BUILD_HNSW", True)
+    ENABLE_DENSE_RETRIEVAL = parse_retrieval_mode()
 
     ensure_absolute(SUMMARY_PATH, "SUMMARY_PATH")
     set_global_seed(SEED)
@@ -69,52 +80,51 @@ if __name__ == "__main__":
     total_rows = 0
     built_indices: list[str] = []
 
-    with connect(dsn) as conn:
-        with conn.cursor() as cursor:
-            cursor.execute("CREATE EXTENSION IF NOT EXISTS vector;")
+    if ENABLE_DENSE_RETRIEVAL:
+        with connect(dsn) as conn:
+            with conn.cursor() as cursor:
+                cursor.execute("CREATE EXTENSION IF NOT EXISTS vector;")
 
-            cursor.execute(f"SELECT COUNT(*) FROM {table_name};")
-            total_rows = int(cursor.fetchone()[0])
+                cursor.execute(f"SELECT COUNT(*) FROM {table_name};")
+                total_rows = int(cursor.fetchone()[0])
 
-            cursor.execute(f"SELECT COUNT(*) FROM {table_name} WHERE dense_embedding IS NOT NULL;")
-            dense_rows = int(cursor.fetchone()[0])
+                cursor.execute(f"SELECT COUNT(*) FROM {table_name} WHERE dense_embedding IS NOT NULL;")
+                dense_rows = int(cursor.fetchone()[0])
 
-            if dense_rows == 0:
-                raise RuntimeError(
-                    f"No rows with dense_embedding found in {table_name}. "
-                    "Ingest embeddings first or disable embedding index build."
-                )
+                if dense_rows == 0:
+                    ENABLE_DENSE_RETRIEVAL = False
 
-            if BUILD_IVFFLAT:
-                cursor.execute(
-                    f"""
-                    CREATE INDEX IF NOT EXISTS {ivfflat_index_name}
-                    ON {table_name}
-                    USING ivfflat (dense_embedding vector_cosine_ops)
-                    WITH (lists = {IVF_LISTS});
-                    """
-                )
-                built_indices.append(ivfflat_index_name)
+                if ENABLE_DENSE_RETRIEVAL and BUILD_IVFFLAT:
+                    cursor.execute(
+                        f"""
+                        CREATE INDEX IF NOT EXISTS {ivfflat_index_name}
+                        ON {table_name}
+                        USING ivfflat (dense_embedding vector_cosine_ops)
+                        WITH (lists = {IVF_LISTS});
+                        """
+                    )
+                    built_indices.append(ivfflat_index_name)
 
-            if BUILD_HNSW:
-                cursor.execute(
-                    f"""
-                    CREATE INDEX IF NOT EXISTS {hnsw_index_name}
-                    ON {table_name}
-                    USING hnsw (dense_embedding vector_cosine_ops)
-                    WITH (m = {HNSW_M}, ef_construction = {HNSW_EF_CONSTRUCTION});
-                    """
-                )
-                built_indices.append(hnsw_index_name)
+                if ENABLE_DENSE_RETRIEVAL and BUILD_HNSW:
+                    cursor.execute(
+                        f"""
+                        CREATE INDEX IF NOT EXISTS {hnsw_index_name}
+                        ON {table_name}
+                        USING hnsw (dense_embedding vector_cosine_ops)
+                        WITH (m = {HNSW_M}, ef_construction = {HNSW_EF_CONSTRUCTION});
+                        """
+                    )
+                    built_indices.append(hnsw_index_name)
 
-            cursor.execute(f"ANALYZE {table_name};")
-        conn.commit()
+                cursor.execute(f"ANALYZE {table_name};")
+            conn.commit()
 
     summary = {
         "seed": SEED,
         "table_name": table_name,
         "total_rows": total_rows,
         "rows_with_dense_embedding": dense_rows,
+        "dense_retrieval_enabled": ENABLE_DENSE_RETRIEVAL,
         "build_ivfflat": BUILD_IVFFLAT,
         "build_hnsw": BUILD_HNSW,
         "ivf_lists": IVF_LISTS,
@@ -125,6 +135,9 @@ if __name__ == "__main__":
     }
     write_json(SUMMARY_PATH, summary)
 
-    print(f"Built pgvector indices on table: {table_name}")
-    print(f"Indices: {built_indices}")
+    if ENABLE_DENSE_RETRIEVAL:
+        print(f"Built pgvector indices on table: {table_name}")
+        print(f"Indices: {built_indices}")
+    else:
+        print(f"Skipped pgvector index build for table {table_name}; dense retrieval is disabled or embeddings are absent.")
     print(f"Summary: {SUMMARY_PATH}")

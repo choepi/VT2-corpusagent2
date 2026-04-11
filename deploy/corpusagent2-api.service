@@ -1,0 +1,16 @@
+[Unit]
+Description=CorpusAgent2 FastAPI backend
+After=network.target docker.service
+Wants=docker.service
+
+[Service]
+Type=simple
+User=dongtten
+WorkingDirectory=/home/dongtten/corpusagent2
+EnvironmentFile=/home/dongtten/corpusagent2/.env
+ExecStart=/home/dongtten/corpusagent2/.venv/bin/python /home/dongtten/corpusagent2/scripts/12_run_agent_api.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

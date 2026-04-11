@@ -1,0 +1,150 @@
+Cloudflare setup for CorpusAgent2 on dongtse.com
+
+Goal
+
+- GitHub Pages serves the static frontend.
+- Cloudflare Tunnel exposes the backend at https://api.dongtse.com.
+- The frontend defaults to https://api.dongtse.com automatically.
+- The GitHub Pages site shows a small passphrase gate before the UI opens.
+
+Read this first
+
+- The passphrase gate in the GitHub Pages site is only a convenience barrier.
+- It is not real security because GitHub Pages is a static site and the browser receives the gate code.
+- Real protection should be added in Cloudflare Access in front of api.dongtse.com.
+
+What you need before touching the dashboard
+
+- Your domain dongtse.com is already added to Cloudflare.
+- cloudflared is installed on the machine running the CorpusAgent2 backend.
+- The machine already has the tunnel credentials JSON from:
+  cloudflared tunnel create corpusagent2-api
+- The repo .env contains:
+  CORPUSAGENT2_CLOUDFLARED_HOSTNAME=api.dongtse.com
+  CORPUSAGENT2_CLOUDFLARED_TUNNEL_NAME=corpusagent2-api
+  CORPUSAGENT2_CLOUDFLARED_TUNNEL_ID=7df6c590-8627-44e7-89cb-341d6e76dd6d
+  CORPUSAGENT2_FRONTEND_API_BASE_URL=https://api.dongtse.com
+
+Part 1. Create or verify the tunnel in Cloudflare Zero Trust
+
+1. Log in to Cloudflare.
+2. Open the account that owns dongtse.com.
+3. In the left menu, open Zero Trust.
+4. In Zero Trust, open Networks.
+5. Open Tunnels.
+6. If you already created the tunnel with the CLI, check whether a tunnel named corpusagent2-api is listed.
+7. If it is missing, create it from the CLI on the backend machine instead of the dashboard:
+   cloudflared tunnel login
+   cloudflared tunnel create corpusagent2-api
+8. Keep the tunnel UUID and credentials JSON file. The repo is already configured to use them.
+
+Part 2. Point api.dongtse.com to the tunnel
+
+The easiest method is the CLI because it creates the DNS route correctly:
+
+1. On the backend machine, run:
+   cloudflared tunnel route dns corpusagent2-api api.dongtse.com
+2. In Cloudflare dashboard, open DNS.
+3. Verify that api.dongtse.com now exists.
+4. The record should be proxied by Cloudflare.
+
+If you prefer doing it manually in the dashboard:
+
+1. Open DNS.
+2. Click Add record.
+3. Create a CNAME record for:
+   Name: api
+4. Target it to the tunnel route Cloudflare created or to the tunnel-managed target shown in Zero Trust.
+5. Leave Proxy status enabled.
+
+Part 3. Configure the backend service on the VM
+
+1. On the backend machine, go to the repo root.
+2. Run:
+   ./.venv/bin/python ./scripts/24_configure_vm_services.py
+3. This writes the cloudflared config, sets the frontend API base URL, and installs systemd services.
+4. Start or restart the services:
+   sudo systemctl restart corpusagent2-api.service
+   sudo systemctl restart corpusagent2-cloudflared.service
+5. Check status:
+   systemctl status corpusagent2-api.service
+   systemctl status corpusagent2-cloudflared.service
+
+Part 4. Turn on real protection with Cloudflare Access
+
+This is the part that actually limits who can reach the backend.
+
+1. In Cloudflare dashboard, open Zero Trust.
+2. Open Access.
+3. Open Applications.
+4. Click Add an application.
+5. Choose Self-hosted.
+6. Fill in:
+   Application name: CorpusAgent2 API
+   Domain: api.dongtse.com
+7. Save and continue.
+8. Create a policy that allows only the people you choose.
+
+Simplest policy for a beginner:
+
+- Include: specific email addresses or an allowed email domain.
+- Action: Allow.
+
+If you want a shared one-time secret instead:
+
+- Use Cloudflare Access One-time PIN or another supported login method.
+- Do not rely on the GitHub Pages passphrase as your only protection.
+
+After saving, test in a private browser window:
+
+1. Visit https://api.dongtse.com/health or another lightweight endpoint.
+2. Cloudflare Access should ask you to authenticate before the backend responds.
+
+Part 5. Configure GitHub Pages to build the access gate
+
+The repo is already wired so GitHub Pages builds the frontend with:
+
+- API base URL set to https://api.dongtse.com
+- passphrase gate enabled
+
+You still must add one GitHub secret:
+
+1. Open the GitHub repository.
+2. Open Settings.
+3. Open Secrets and variables.
+4. Open Actions.
+5. Create a new repository secret named:
+   CORPUSAGENT2_FRONTEND_ACCESS_PASSWORD_SHA256
+6. Paste the SHA-256 hex digest of your shared passphrase as the value.
+
+How to generate the hash on Linux:
+
+  printf '%s' 'your-passphrase-here' | sha256sum
+
+Use only the hex digest, not the filename or trailing spaces.
+
+Part 6. Deploy the frontend
+
+1. Push the repo changes to the branch used by GitHub Pages.
+2. GitHub Actions runs the Pages workflow.
+3. The workflow generates web/config.js with:
+   apiBaseUrl = https://api.dongtse.com
+   accessGate.enabled = true
+   accessGate.passwordSha256 = your GitHub secret value
+4. Open the GitHub Pages site.
+5. You should see the passphrase gate before the app opens.
+
+Part 7. What the user experience should look like
+
+1. User opens the GitHub Pages frontend.
+2. User enters the shared passphrase to open the UI.
+3. Frontend sends API requests to https://api.dongtse.com.
+4. Cloudflare Access protects api.dongtse.com before traffic reaches the backend.
+
+Troubleshooting
+
+- If the frontend still calls localhost, regenerate web/config.js or redeploy GitHub Pages.
+- If api.dongtse.com does not resolve, fix the DNS route in Cloudflare.
+- If the tunnel is down, check the systemd service and the credentials JSON path.
+- If the browser shows CORS errors, verify the backend is reachable through Cloudflare first.
+- If the Pages site builds without the gate, check that the GitHub secret name is exactly CORPUSAGENT2_FRONTEND_ACCESS_PASSWORD_SHA256.

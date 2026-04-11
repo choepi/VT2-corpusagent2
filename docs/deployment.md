@@ -22,12 +22,19 @@ What that bootstrap does:
 - installs Python dependencies with `uv`
 - downloads provider assets
 - downloads and preprocesses the CC-News dataset when local data is missing
-- builds lexical + dense retrieval assets when needed
+- defaults to the stable `no-dense` VM profile: lexical retrieval via OpenSearch, Postgres document storage, no pgvector embedding dependency
+- builds lexical assets automatically and only builds dense assets when you explicitly switch to the `hybrid` profile
 - starts Docker services from [`deploy/docker-compose.yml`](../deploy/docker-compose.yml)
 - initializes Postgres + pgvector
 - ingests the corpus into Postgres
 - bulk-indexes the corpus into OpenSearch
 - writes `web/config.js`
+
+The default VM retrieval profile is `no-dense`. If you want the full hybrid path, run:
+
+```bash
+python3 scripts/22_prepare_vm_stack.py --install-system --retrieval-profile hybrid
+```
 
 It is idempotent, so rerunning it after updates is safe.
 
@@ -45,25 +52,36 @@ Recommended for real VM use:
 
 ## 3. Easy public access with Cloudflared
 
-Install `cloudflared` once on the VM, then run:
+Install `cloudflared` once on the VM, then run one of these:
 
 ```bash
 ./.venv/bin/python ./scripts/23_start_cloudflared_tunnel.py
 ```
 
-That helper starts a Cloudflare Quick Tunnel for `http://127.0.0.1:8001` and prints the public HTTPS URL.
+That helper still supports Quick Tunnel for temporary testing. For a stable deployment, configure a named tunnel once and install the persistent services:
+
+```bash
+./.venv/bin/python ./scripts/24_configure_vm_services.py
+```
+
+Expected `.env` values for the stable named-tunnel path:
+
+- `CORPUSAGENT2_CLOUDFLARED_TUNNEL_ID`
+- `CORPUSAGENT2_CLOUDFLARED_TUNNEL_NAME`
+- `CORPUSAGENT2_CLOUDFLARED_HOSTNAME`
+- optional `CORPUSAGENT2_CLOUDFLARED_CREDENTIALS_FILE`
+- optional `CORPUSAGENT2_FRONTEND_API_BASE_URL` if you want to override the inferred `https://<hostname>`
+
+That script writes the Cloudflare config, updates the frontend API base URL in `.env`, regenerates `web/config.js`, and installs reboot-safe systemd services for the API and named tunnel.
 
 Quick Tunnel notes:
 
 - easiest setup
 - good for demos and remote access
 - URL changes each time you restart the tunnel
+- do not use it as the long-term GitHub Pages API origin
 
-If you use GitHub Pages as the frontend:
-
-- open the Pages site
-- paste the printed HTTPS tunnel URL into the `API Base URL` field
-- the UI keeps that override in browser storage
+If you use GitHub Pages as the frontend, the stable path is a fixed hostname such as `https://api.example.com`. Set it once through `.env` plus `scripts/24_configure_vm_services.py` and stop pasting tunnel URLs into the browser UI.
 
 Official Cloudflare references:
 
@@ -91,7 +109,12 @@ git pull
 python3 scripts/22_prepare_vm_stack.py
 ```
 
-Then restart the backend process you are using.
+Then restart the backend process you are using, or if you installed services:
+
+```bash
+sudo systemctl restart corpusagent2-api.service
+sudo systemctl restart corpusagent2-cloudflared.service
+```
 
 If Docker volumes were wiped or you want a full rebuild:
 
@@ -107,7 +130,14 @@ python3 scripts/22_prepare_vm_stack.py --refresh-data --refresh-assets --refresh
 
 ## 6. Retrieval/backend shape
 
-The default retrieval backend is now `pgvector` + OpenSearch:
+Default VM profile: `no-dense`
+
+- lexical retrieval: OpenSearch
+- document storage / working set: Postgres
+- rerank / analysis: backend runtime
+- no pgvector embeddings required
+
+Optional VM profile: `hybrid`
 
 - dense retrieval: Postgres/pgvector
 - lexical retrieval: OpenSearch
@@ -118,4 +148,4 @@ The runtime stays strict about service-backed retrieval:
 - `CORPUSAGENT2_REQUIRE_BACKEND_SERVICES=true`
 - `CORPUSAGENT2_ALLOW_LOCAL_FALLBACK=false`
 
-That means the VM path matches the intended production architecture much more closely than the older local-fallback mode.
+That means the VM path is now internally consistent in either mode instead of half-requiring dense assets.

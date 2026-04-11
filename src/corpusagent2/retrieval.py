@@ -46,6 +46,25 @@ def resolve_retrieval_backend(default: str = "local") -> str:
     return "local"
 
 
+def _env_flag(name: str, default: bool) -> bool:
+    raw = os.getenv(name, "").strip().lower()
+    if not raw:
+        return default
+    return raw not in {"0", "false", "no", "off"}
+
+
+def dense_retrieval_enabled(default: bool = True) -> bool:
+    raw = os.getenv("CORPUSAGENT2_ENABLE_DENSE_RETRIEVAL", "").strip()
+    if raw:
+        return raw.lower() not in {"0", "false", "no", "off"}
+    build_dense_assets = _env_flag("CORPUSAGENT2_BUILD_DENSE_ASSETS", default)
+    include_pg_embeddings = _env_flag(
+        "CORPUSAGENT2_PG_INCLUDE_EMBEDDINGS",
+        build_dense_assets,
+    )
+    return build_dense_assets or include_pg_embeddings
+
+
 def pg_dsn_from_env(required: bool = True) -> str:
     dsn = os.getenv("CORPUSAGENT2_PG_DSN", "").strip()
     if required and not dsn:
