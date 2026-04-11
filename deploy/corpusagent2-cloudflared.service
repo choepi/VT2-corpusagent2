@@ -1,0 +1,14 @@
+[Unit]
+Description=CorpusAgent2 Cloudflare Tunnel
+After=network-online.target corpusagent2-api.service
+Wants=network-online.target corpusagent2-api.service
+
+[Service]
+Type=simple
+User=dongtten
+ExecStart=/usr/local/bin/cloudflared tunnel --config /home/dongtten/.cloudflared/config.yml run corpusagent2-api
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

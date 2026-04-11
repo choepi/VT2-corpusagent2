@@ -10,6 +10,7 @@ import httpx
 
 from .io_utils import write_json
 from .retrieval import (
+    dense_retrieval_enabled,
     RetrievalResult,
     reciprocal_rank_fusion,
     rerank_cross_encoder,
@@ -196,6 +197,8 @@ class LocalSearchBackend:
         )
 
     def dense_results(self, *, query: str, top_k: int) -> list[RetrievalResult]:
+        if not dense_retrieval_enabled(default=self.runtime.retrieval_backend == "pgvector"):
+            return []
         if self.runtime.retrieval_backend == "local":
             dense_assets = self.runtime.load_dense_assets()
             if dense_assets is None:

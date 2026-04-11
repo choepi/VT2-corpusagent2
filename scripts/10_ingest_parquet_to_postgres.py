@@ -49,7 +49,11 @@ if __name__ == "__main__":
 
     DEBUG_MAX_DOCS = 50_000
     BATCH_SIZE = 2_000
-    INCLUDE_EMBEDDINGS = parse_bool_env("CORPUSAGENT2_PG_INCLUDE_EMBEDDINGS", True)
+    INCLUDE_EMBEDDINGS = parse_bool_env(
+    	"CORPUSAGENT2_PG_INCLUDE_EMBEDDINGS",
+    	parse_bool_env("CORPUSAGENT2_BUILD_DENSE_ASSETS", False),
+    )
+
 
     load_project_configuration(PROJECT_ROOT)
 
@@ -57,11 +61,17 @@ if __name__ == "__main__":
     ensure_absolute(DENSE_EMBEDDINGS_PATH, "DENSE_EMBEDDINGS_PATH")
     ensure_absolute(DENSE_DOC_IDS_PATH, "DENSE_DOC_IDS_PATH")
     ensure_absolute(SUMMARY_PATH, "SUMMARY_PATH")
+ 
     ensure_exists(DOCUMENTS_PARQUET, "DOCUMENTS_PARQUET")
-    if INCLUDE_EMBEDDINGS:
-        ensure_exists(DENSE_EMBEDDINGS_PATH, "DENSE_EMBEDDINGS_PATH")
-        ensure_exists(DENSE_DOC_IDS_PATH, "DENSE_DOC_IDS_PATH")
+    if INCLUDE_EMBEDDINGS and (
+    	not DENSE_EMBEDDINGS_PATH.exists() or not DENSE_DOC_IDS_PATH.exists()
+    ):
+    	print("[warn] Dense assets missing; ingesting Postgres rows without embeddings.")
+    	INCLUDE_EMBEDDINGS = False
 
+    if INCLUDE_EMBEDDINGS:
+    	ensure_exists(DENSE_EMBEDDINGS_PATH, "DENSE_EMBEDDINGS_PATH")
+    	ensure_exists(DENSE_DOC_IDS_PATH, "DENSE_DOC_IDS_PATH")
     set_global_seed(SEED)
 
     dsn = pg_dsn_from_env(required=True)
