@@ -1,0 +1,898 @@
+CorpusAgent2 current state audit
+Snapshot date: 2026-04-13
+Repository root: /home/dongtten/corpusagent2
+Branch at audit time: master
+Remote at audit time: git@github.com:choepi/VT2-corpusagent2.git
+
+Audit method
+- Read the source tree under src/corpusagent2, all scripts under scripts, config files, deployment files, web frontend files, and test files.
+- Queried the live Postgres and OpenSearch services configured in the local environment instead of inferring their state from code.
+- Inspected on-disk raw, processed, index, config, and generated output files.
+- Ran verification commands, including pytest on the test suite and failure probes for the MCP server, main.py, framework, and agent runtime.
+- This is a current-state report. It describes what is actually present and working in this repo snapshot, not what the README/design docs intend.
+
+Working tree note
+- The repo is dirty from unrelated local changes that predate this report: deleted `..env.swp`, modified `src/corpusagent2/agent_models.py`, modified `src/corpusagent2/agent_runtime.py`, modified `web/app.js`, untracked `docs/masters_level_upgrade.md`, untracked `scripts/25_analyze_news_corpus.py`, and untracked `tests/test_agent_runtime_live_plan_dag.py`.
+- I did not normalize or revert those changes. The report should be treated as a snapshot taken on top of a dirty working tree.
+
+============================================================
+1. Executive summary
+============================================================
+
+Short version
+- This repo is no longer a toy. It contains a substantial agent runtime, a reproducible offline pipeline, a FastAPI backend, a static frontend, Dockerized Postgres and OpenSearch services, deployment scripts, and a reasonably large automated test suite.
+- The repo is also not one cleanly unified system. It currently contains three overlapping layers:
+  1. an offline preprocessing/evaluation pipeline,
+  2. an older deterministic framework/tool-registry stack,
+  3. a newer agent-runtime "magic box" stack.
+- The most advanced and actually live-usable subsystem right now is the newer agent runtime backed by OpenSearch and Postgres.
+- The older deterministic framework is code-rich and test-covered, but in this environment it is blocked by missing retrieval/NLP artifacts and therefore currently produces "unsupported/unavailable" answers instead of real analyses.
+- The current environment is not truly hybrid retrieval, despite the README/TOML language. Live retrieval is effectively lexical OpenSearch search plus Postgres document fetch plus rerank plus analysis nodes. Dense retrieval is not operational end to end.
+
+Most important verified facts
+- Postgres is live, healthy, and populated with 624,095 rows in `article_corpus`.
+- OpenSearch is live, healthy, and populated with 624,095 indexed documents in `article-corpus-opensearch`.
+- Postgres has zero dense embeddings populated in `article_corpus`.
+- The local lexical asset directory `data/indices/lexical/` is missing, which breaks `main.py` and `scripts/07_mcp_server.py`.
+- The local dense file `data/indices/dense/dense_embeddings.npy` exists, but it is not usable as a complete asset:
+  - `dense_doc_ids.joblib` is missing,
+  - the matrix shape is `(624095, 768)`,
+  - only the first 2,048 rows are non-zero,
+  - 622,047 rows are all-zero.
+- `pytest -q tests` passes: 71 passed, 1 skipped.
+- `pytest -q` from repo root fails locally because pytest descends into `deploy/data/pgdata` and hits permission issues. This is a local workspace hygiene problem, not necessarily a code failure.
+
+Bottom-line thesis assessment
+- There is enough here for a strong master's project, but the next phase should not be "add more tools first".
+- The highest-value next phase is to make one end-to-end operating mode coherent, reproducible, and evaluated:
+  - repair retrieval integrity,
+  - eliminate config/doc drift,
+  - build serious evaluation data,
+  - then run controlled experiments on the agent/runtime claims.
+
+============================================================
+2. Live verified repo state
+============================================================
+
+Git / branch / remote
+- Current branch: `master`
+- Remote: `origin git@github.com:choepi/VT2-corpusagent2.git`
+
+Live services
+- Docker container `corpus_postgres` is running and healthy.
+- Docker container `os_news` is running and healthy.
+- OpenSearch root responds successfully and reports version `2.15.0`.
+- Postgres has extensions `plpgsql` and `vector` installed.
+
+Live database state
+- Table `article_corpus` exists.
+- Working-store tables exist: `ca_agent_runs`, `ca_agent_run_documents`, `ca_agent_run_tool_calls`, `ca_agent_run_artifacts`, `ca_agent_run_outputs`.
+- `article_corpus` row count: 624,095
+- `article_corpus` rows with non-null `dense_embedding`: 0
+- `article_corpus` distinct `source` count: 8,692
+- `article_corpus` min/max `published_at`: `''` and `2019-08-25 20:17:00`
+- `article_corpus` rows with empty `published_at`: 63,715
+- `article_corpus` rows with non-empty `published_at`: 560,380
+- `article_corpus` rows with empty `title`: 227
+- `article_corpus` rows with empty `text`: 0
+- `article_corpus` rows with empty `source`: 0
+- Present indexes on `article_corpus`: primary key on `doc_id`, btree on `published_at`, btree on `source`
+- No pgvector IVFFlat/HNSW index was present at audit time.
+
+Schema quality implications
+- `published_at` is stored as TEXT, not as timestamp/timestamptz.
+- This is workable for already-normalized ISO-like strings, but it is not thesis-grade temporal schema design, especially with 63,715 blank values.
+
+Live OpenSearch state
+- Index `article-corpus-opensearch` exists.
+- Indexed document count: 624,095
+- Bulk-index summary file also reports 624,095 processed/final documents.
+- Ad hoc search queries return hits, so the service is operational.
+
+Raw and processed corpus state
+- `data/raw/incoming/cc_news.jsonl.gz`: 708,241 JSONL rows
+- `data/raw/ccnews_staged/cc_news.jsonl.gz`: 708,241 JSONL rows
+- Both raw files expose the same keys in sampled records: `date`, `description`, `domain`, `image_url`, `text`, `title`, `url`
+- `data/processed/documents.parquet`: 624,095 rows
+- `data/indices/doc_metadata.parquet`: 624,095 rows
+
+Exact preprocessing drop accounting
+- Raw rows scanned: 708,241
+- Rows dropped for empty text: 0
+- Rows removed as duplicate `doc_id` after normalization: 84,146
+- Rows kept: 624,095
+- So the raw-to-processed drop is entirely deduplication in the current corpus snapshot.
+
+Dense asset reality
+- `data/indices/dense/dense_embeddings.npy` exists and has apparent size about 1.8G.
+- Actual matrix shape: `(624095, 768)`, dtype `float32`.
+- The file behaves like an incomplete or sparse/interrupted streaming write:
+  - non-zero rows in first 50,000 entries: 2,048
+  - non-zero rows in all later chunks: 0
+  - total zero rows: 622,047
+- `data/indices/dense/dense_doc_ids.joblib` is missing.
+- Conclusion: the dense file should not be treated as a valid completed index artifact.
+
+Lexical asset reality
+- `data/indices/lexical/` is absent.
+- Required files such as `tfidf_vectorizer.joblib`, `tfidf_matrix.joblib`, and `tfidf_doc_ids.joblib` are absent.
+- Any code path that requires local lexical assets fails immediately.
+
+Effective retrieval mode right now
+- `config/app_config.toml` declares `pgvector` backend and `hybrid` default mode.
+- The local `.env` overrides runtime retrieval to `local` backend and `lexical` default mode, with backend services required and local fallback disabled.
+- Because Postgres has zero embeddings and local dense assets are incomplete, dense retrieval is not a real option in practice.
+- Therefore the live system should be described as:
+  - OpenSearch lexical retrieval,
+  - Postgres document fetch / working set persistence,
+  - optional reranking / downstream tool analysis,
+  - not true dense+lexical hybrid retrieval.
+
+============================================================
+3. Architectural state by subsystem
+============================================================
+
+3.1 Offline corpus pipeline
+Status: implemented and mostly real
+
+What exists
+- Raw staging, dataset normalization, retrieval-asset build, retrieval evaluation, faithfulness evaluation, NLP artifact build, framework execution, and DB/OpenSearch ingest/index scripts all exist.
+- The data pipeline has already been used to produce a full 624,095-document normalized corpus and to populate Postgres and OpenSearch.
+
+What is solid
+- Dataset preparation is real and verified on the current corpus.
+- Postgres ingest is real and verified.
+- OpenSearch bulk indexing is real and verified.
+
+What is weak
+- Retrieval asset generation is not coherent in the current snapshot:
+  - lexical assets missing,
+  - dense file incomplete,
+  - summary file says both lexical and dense builds were disabled.
+- Evaluation gold sets are tiny, so the pipeline exists but does not yet support strong thesis claims.
+
+3.2 Older deterministic framework stack
+Relevant files
+- `src/corpusagent2/planner.py`
+- `src/corpusagent2/execution_engine.py`
+- `src/corpusagent2/framework.py`
+- `src/corpusagent2/provider_adapters.py`
+- `src/corpusagent2/question_spec.py`
+- `src/corpusagent2/run_manifest.py`
+- `src/corpusagent2/provenance.py`
+- `src/corpusagent2/tool_registry.py`
+
+Status: code-complete baseline, but blocked in the current environment
+
+What is implemented
+- A deterministic planning/execution framework with typed tool specs, dependency handling, provenance, and run manifests.
+- A 49-capability adapter registry exists. Verified capability names:
+  `aggregate.findings`, `analyze.burst_events`, `analyze.entity_trend`, `analyze.keyphrases`, `analyze.sentiment_series`, `analyze.topics_over_time`, `classification.classical`, `classification.simple`, `corpora.access`, `embedding.contextual`, `embedding.training`, `filter.documents`, `nlp.dependency_parse`, `nlp.entity_linking`, `nlp.lemmatization`, `nlp.morphology`, `nlp.mwt`, `nlp.ner`, `nlp.noun_phrase_extraction`, `nlp.parsing`, `nlp.pos_tag`, `nlp.sentence_segmentation`, `nlp.tagging`, `nlp.text_classification`, `nlp.tokenize`, `nlp.vector_similarity`, `phrase_detection`, `retrieve.documents`, `sentiment.basic`, `sequence.labeling`, `similarity.indexing`, `synthesize.answer`, `text.acronyms`, `text.classification`, `text.cleaning`, `text.exploration`, `text.extraction`, `text.keyterms`, `text.lexical_diversity`, `text.ngrams`, `text.normalization`, `text.readability`, `text.svo_triples`, `text.topic_workflow`, `topic.hdp`, `topic.lda`, `topic.lsi`, `topic.tfidf`, `verify.claims`.
+
+What is actually happening now
+- Running `framework.run_workload_file(..., mode="debug")` completes structurally, but current outputs are "unsupported/unavailable" manifests, not successful research analyses.
+- The generated `reports.jsonl` explicitly says the current corpus assets cannot answer the workload questions reliably because retrieval assets are not ready and relevant capabilities lack either artifacts or retrieval-backed fallbacks.
+
+Conclusion
+- This stack is not dead code, but it is not operational in the current repo state.
+- It is best described as a maintained baseline architecture that currently lacks the asset substrate it expects.
+
+3.3 Newer agent runtime stack
+Relevant files
+- `src/corpusagent2/agent_runtime.py`
+- `src/corpusagent2/agent_executor.py`
+- `src/corpusagent2/agent_backends.py`
+- `src/corpusagent2/agent_capabilities.py`
+- `src/corpusagent2/agent_models.py`
+- `src/corpusagent2/agent_policy.py`
+- `src/corpusagent2/plan_graph.py`
+- `src/corpusagent2/api.py`
+- `src/corpusagent2/python_runner_service.py`
+
+Status: most advanced subsystem; live and substantially implemented
+
+What is implemented
+- FastAPI backend with runtime-info, settings, query, async submit/status, artifact retrieval, and abort endpoints.
+- Orchestrated planning/execution runtime with clarification handling, rewritten questions, node manifests, caveats, evidence tables, and artifact persistence.
+- A 39-capability registry exists. Verified capability names:
+  `build_evidence_table`, `burst_detect`, `change_point_detect`, `claim_span_extract`, `claim_strength_score`, `clean_normalize`, `create_working_set`, `db_search`, `dependency_parse`, `doc_embeddings`, `entity_link`, `extract_acronyms`, `extract_keyterms`, `extract_ngrams`, `extract_svo_triples`, `fetch_documents`, `join_external_series`, `lang_id`, `lemmatize`, `lexical_diversity`, `mwt_expand`, `ner`, `noun_chunks`, `plot_artifact`, `pos_morph`, `python_runner`, `quote_attribute`, `quote_extract`, `readability_stats`, `sentence_split`, `sentiment`, `similarity_index`, `similarity_pairwise`, `sql_query_search`, `text_classify`, `time_series_aggregate`, `tokenize`, `topic_model`, `word_embeddings`.
+- Runtime info confirms the local environment has all major provider families installed: `spacy`, `textacy`, `stanza`, `nltk`, `gensim`, `flair`, `textblob`, `torch`, `yfinance`.
+- Existing run manifests under `outputs/agent_runtime/` show that the runtime has already executed multi-node plans against the corpus.
+
+What is not yet robust
+- Crash cleanup is weak. A killed live test created a Postgres run row with status `started` that was never finalized.
+- Python sandbox execution can trigger Docker image pulls at runtime, which is operationally fragile.
+- Some planner behavior still depends on heuristic fallbacks when the LLM response is missing/invalid.
+
+Conclusion
+- This is the subsystem to build the thesis around if the goal is the current "magic box" direction.
+- It already has real operational substance.
+
+3.4 Frontend
+Relevant files
+- `web/index.html`
+- `web/app.js`
+- `web/styles.css`
+- generated `web/config.js`
+
+Status: functionally complete for current phase
+
+What is implemented
+- API base URL config and access gate.
+- Query input and run controls.
+- Clarification panel.
+- Runtime profile / model settings.
+- Live run status, answer view, planner DAG, raw traces, evidence view, artifact/plot rendering, and abort controls.
+
+Conclusion
+- The frontend is not a placeholder; it is a serious inspection UI for the runtime.
+- Its usefulness currently depends on the health of the backend/runtime path, not on missing frontend work.
+
+============================================================
+4. Fully implemented vs open vs placeholder
+============================================================
+
+4.1 Fully implemented and verified in this snapshot
+- Raw corpus staging from `data/raw/incoming` to `data/raw/ccnews_staged`
+- Corpus normalization to `data/processed/documents.parquet`
+- Deduplication-driven document preparation
+- Postgres schema creation
+- Postgres ingest of 624,095 documents
+- OpenSearch bulk indexing of 624,095 documents
+- FastAPI runtime endpoints
+- Static frontend for runtime inspection
+- Agent runtime planning/execution persistence, evidence tables, artifact serving, and abort paths
+- Dockerized Python sandbox implementation
+- Automated test suite over `tests/` excluding optional Docker contract test
+
+4.2 Implemented in code, but blocked or inconsistent in current environment
+- Local lexical retrieval path
+  - code exists,
+  - assets are missing,
+  - `main.py` and MCP server fail.
+- Local dense retrieval path
+  - code exists,
+  - dense artifact is incomplete,
+  - `dense_doc_ids.joblib` missing,
+  - not usable.
+- pgvector dense retrieval path
+  - schema column exists and vector extension exists,
+  - no embeddings are populated,
+  - no pgvector indexes are built,
+  - therefore dense DB retrieval is inactive.
+- Older deterministic framework
+  - code exists and tests pass,
+  - current runtime outputs show unsupported answers due missing assets.
+- Precomputed NLP artifact path
+  - `analysis_tools.py` and `scripts/05_run_nlp_tooling.py` exist,
+  - expected `outputs/nlp_tools/` is absent.
+
+4.3 Explicitly heuristic / prototype / placeholder-like behavior
+- `entity_link`
+  - current caveat says it uses a deterministic URI placeholder scheme unless a knowledge base is integrated.
+- `lang_id`
+  - caveat says language detection is lightweight lexical heuristics when no dedicated model is installed.
+- `claim_strength_score`
+  - heuristic.
+- `quote_attribute`
+  - heuristic.
+- `burst_detect`
+  - simple burst logic, not a rich event model.
+- Topic modeling / sentiment / parsing families
+  - real provider paths exist, but many fall back to heuristics depending on provider availability or runtime conditions.
+- Planner fallback behavior in `agent_runtime.py`
+  - if LLM planning or clarification fails, heuristic fallback plans are used.
+- `scripts/25_analyze_news_corpus.py`
+  - useful exploratory tool, but sample output shows noisy entity extraction (`The`, `It`, `He` appearing as top entities), so this is not thesis-grade evidence generation as-is.
+
+4.4 Open problems that are not placeholders, but are still unresolved
+- One coherent default operating mode is missing.
+- Retrieval/documentation/config drift is real.
+- Dense retrieval is not operational.
+- Evaluation data is too small for thesis claims.
+- Temporal schema/data quality needs hardening.
+- Runtime crash finalization needs hardening.
+
+============================================================
+5. Source-level capability audit
+============================================================
+
+Core configuration / utility layer
+- `src/corpusagent2/app_config.py`
+  - Central config loading from TOML plus environment overrides.
+  - Implemented and important.
+  - Current repo has meaningful TOML vs `.env` drift, so config loading works, but project configuration is not conceptually clean.
+- `src/corpusagent2/io_utils.py`
+  - Shared file/path IO helpers.
+  - Implemented and heavily used.
+- `src/corpusagent2/seed.py`
+  - Reproducibility/run-mode/device helpers.
+  - Implemented and widely used.
+- `src/corpusagent2/temporal.py`
+  - Granularity normalization and time handling support.
+  - Implemented.
+- `src/corpusagent2/metrics.py`
+  - Retrieval/evaluation metrics and statistics.
+  - Implemented and used by the evaluation scripts.
+- `src/corpusagent2/runtime_context.py`
+  - Runtime support/context object layer.
+  - Part of the runtime plumbing; appears implemented.
+
+Retrieval / analysis layer
+- `src/corpusagent2/retrieval.py`
+  - Implements TF-IDF retrieval, dense retrieval, fusion, rerank, pgvector access, and asset load/save functions.
+  - Code is substantial.
+  - Current repo problem is not missing code; it is missing/invalid assets and absent DB embeddings.
+- `src/corpusagent2/faithfulness.py`
+  - Implements NLI-based verification.
+  - Real code path exists using `roberta-large-mnli`.
+  - Evaluation harness exists but current benchmark file is tiny.
+- `src/corpusagent2/analysis_tools.py`
+  - Builds precomputed artifact tables such as entity trends, sentiment series, topics over time, bursts, keyphrases.
+  - Real implementation exists.
+  - Current environment does not contain the resulting `outputs/nlp_tools/` outputs.
+
+Older framework layer
+- `src/corpusagent2/tool_registry.py`
+  - Clean abstraction for registering and resolving tools/adapters.
+  - Not a placeholder except for abstract `NotImplementedError` methods in the base class.
+- `src/corpusagent2/provider_adapters.py`
+  - Large deterministic adapter registry with both precomputed-artifact and retrieval-window fallbacks.
+  - One of the strongest files in the repo from an architecture perspective.
+  - Operationally blocked by missing artifacts/assets in the current environment.
+- `src/corpusagent2/planner.py`
+  - Capability-aware planning/feasibility logic.
+  - Real logic exists; current framework failures come from feasibility checks and unavailable assets, not from the file being empty.
+- `src/corpusagent2/execution_engine.py`
+  - Dependency-aware execution.
+  - Implemented.
+- `src/corpusagent2/framework.py`
+  - High-level workload runner.
+  - Implemented and exercised in debug mode during this audit.
+- `src/corpusagent2/question_spec.py`
+  - Structured question spec model layer.
+  - Implemented.
+- `src/corpusagent2/run_manifest.py`
+  - Manifest schema/persistence for framework runs.
+  - Implemented.
+- `src/corpusagent2/provenance.py`
+  - Provenance capture contract.
+  - Implemented and conceptually strong.
+
+New agent-runtime layer
+- `src/corpusagent2/agent_capabilities.py`
+  - Largest capability registry for runtime tools.
+  - Real and broad.
+  - Also the main locus of heuristic caveats and fallback logic.
+- `src/corpusagent2/agent_backends.py`
+  - Connects runtime retrieval to OpenSearch/Postgres/local assets.
+  - Real code and central to current behavior.
+  - Current live mode effectively relies on the OpenSearch/DB path.
+- `src/corpusagent2/agent_executor.py`
+  - Node execution logic for runtime plans.
+  - Implemented and test-covered.
+- `src/corpusagent2/agent_runtime.py`
+  - Main orchestration file.
+  - Real and operational.
+  - Contains clarification logic, plan fallback logic, manifest persistence, runtime info, and run handling.
+  - Needs robustness work around interrupted runs.
+- `src/corpusagent2/agent_models.py`
+  - Runtime models / payload schemas.
+  - Implemented; currently locally modified in the dirty tree.
+- `src/corpusagent2/agent_policy.py`
+  - Policy layer.
+  - Present and appears part of runtime decision logic.
+- `src/corpusagent2/plan_graph.py`
+  - DAG/plan graph support for agent execution.
+  - Implemented.
+- `src/corpusagent2/api.py`
+  - FastAPI app wiring.
+  - Implemented and exercised by tests.
+- `src/corpusagent2/python_runner_service.py`
+  - Docker-based sandbox runner.
+  - Real and useful, but operationally should pre-pull images and improve failure handling.
+
+Other source files
+- `src/corpusagent2/llm_provider.py`
+  - Provider/model config and client support.
+  - Implemented and relevant to runtime model settings.
+- `src/corpusagent2/__init__.py`
+  - Package init; minimal.
+
+============================================================
+6. Script-by-script audit
+============================================================
+
+- `scripts/00_1_downlaod.py`
+  - Purpose: download CC-News from Hugging Face and write `data/raw/incoming/cc_news.jsonl.gz`.
+  - State: implemented; not needed for this local snapshot because the raw file already exists.
+  - Note: filename is misspelled (`downlaod`), which is minor but sloppy.
+
+- `scripts/00_stage_ccnews_files.py`
+  - Purpose: stage raw files into `data/raw/ccnews_staged` and write a SHA256 summary.
+  - State: implemented and verified.
+  - Current output: one file staged, 710,321,048 bytes.
+
+- `scripts/01_prepare_dataset.py`
+  - Purpose: normalize staged JSONL into parquet with `doc_id`, `title`, `text`, `published_at`, `source`.
+  - State: implemented and verified.
+  - Current result: 624,095 docs written from 708,241 raw rows; 84,146 duplicates removed; zero rows dropped for empty text.
+
+- `scripts/02_build_retrieval_assets.py`
+  - Purpose: build lexical TF-IDF assets, dense embeddings, and metadata parquet.
+  - State: code exists, but current artifact state is inconsistent.
+  - Current summary says `build_lexical_assets=false` and `build_dense_assets=false`, yet a partial dense `.npy` file exists and lexical assets are absent.
+  - Conclusion: this part of the repo needs a clean rebuild and stronger artifact validation.
+
+- `scripts/03_evaluate_retrieval.py`
+  - Purpose: compare TF-IDF, dense, fused, and reranked retrieval on benchmark queries.
+  - State: implemented, but not currently executable in a meaningful way because the required retrieval assets are not coherent and the query set is tiny.
+
+- `scripts/04_evaluate_faithfulness.py`
+  - Purpose: run NLI-based claim verification evaluation.
+  - State: implemented.
+  - Limitation: current benchmark file has only 4 claims, so this is a proof-of-plumbing, not a thesis-ready evaluation.
+
+- `scripts/05_run_nlp_tooling.py`
+  - Purpose: generate precomputed NLP outputs into `outputs/nlp_tools`.
+  - State: implemented in code.
+  - Current environment: expected output directory is absent, so this path has not been materialized here.
+
+- `scripts/06_run_framework.py`
+  - Purpose: run the older deterministic framework workload.
+  - State: implemented and executed in debug mode during this audit.
+  - Current behavior: produces unsupported/unavailable reports because prerequisite artifacts/assets are missing.
+
+- `scripts/07_mcp_server.py`
+  - Purpose: run an MCP server exposing corpus tools.
+  - State: code exists, but current environment is broken for it.
+  - Verified failure: `--self-test` crashes with `FileNotFoundError` for `data/indices/lexical/tfidf_vectorizer.joblib`.
+
+- `scripts/08_review_retrieval.py`
+  - Purpose: inspect retrieval outputs and create annotation templates/backtests.
+  - State: implemented utility.
+  - Practical status: useful once retrieval assets are coherent; not central until that is fixed.
+
+- `scripts/09_init_postgres_schema.py`
+  - Purpose: create Postgres schema and baseline indexes.
+  - State: implemented and verified.
+  - Design caveat: stores `published_at` as TEXT.
+
+- `scripts/10_ingest_parquet_to_postgres.py`
+  - Purpose: ingest documents (optionally with dense embeddings) into Postgres.
+  - State: implemented and verified.
+  - Current result: 624,095 rows ingested, 0 with embeddings.
+
+- `scripts/11_build_pgvector_index.py`
+  - Purpose: build IVFFlat/HNSW pgvector indexes when embeddings exist.
+  - State: implemented.
+  - Current live result: no dense rows, no vector indexes present.
+  - The existing summary file is stale/misleading because it reports `total_rows=0` while the live table now has 624,095 rows.
+
+- `scripts/12_run_agent_api.py`
+  - Purpose: start the FastAPI backend.
+  - State: implemented.
+  - Confidence: API endpoints are covered by tests and consistent with the current runtime direction.
+
+- `scripts/13_write_frontend_config.py`
+  - Purpose: generate `web/config.js` from runtime/environment config.
+  - State: implemented and used by the Pages deployment workflow.
+
+- `scripts/14_run_static_frontend.py`
+  - Purpose: serve the static frontend locally.
+  - State: implemented helper.
+
+- `scripts/15_start_local_stack.py`
+  - Purpose: convenience launcher for backend plus static frontend.
+  - State: implemented helper; not deeply audited live, but conceptually straightforward.
+
+- `scripts/16_print_effective_config.py`
+  - Purpose: print merged/effective configuration.
+  - State: implemented and useful.
+  - Recommendation: this should be used more often because the repo has real config drift.
+
+- `scripts/17_download_provider_assets.py`
+  - Purpose: download spaCy, stanza, NLTK, and TextBlob assets.
+  - State: implemented.
+  - Current runtime info suggests provider installations are present in this environment.
+
+- `scripts/18_verify_cuda118_env.py`
+  - Purpose: print CUDA/provider availability for environment verification.
+  - State: implemented diagnostic helper.
+
+- `scripts/19_rebuild_env_cuda118.sh`
+  - Purpose: rebuild a CUDA-oriented Python environment on Unix.
+  - State: implemented helper.
+  - Caveat: intentionally destructive to `.venv` and `uv.lock`.
+
+- `scripts/19_rebuild_env_cuda118.ps1`
+  - Purpose: Windows equivalent of the CUDA environment rebuild helper.
+  - State: implemented helper.
+
+- `scripts/20_capability_provenance_probe.py`
+  - Purpose: exploratory runtime/provenance probe script.
+  - State: not production-ready.
+  - Caveat: hardcodes a Windows path and forces heuristic planning. This is a personal/dev probe, not a portable project entrypoint.
+
+- `scripts/21_bulk_index_opensearch.py`
+  - Purpose: bulk-index the parquet corpus into OpenSearch.
+  - State: implemented and verified.
+  - Current result: 624,095 rows indexed.
+
+- `scripts/22_prepare_vm_stack.py`
+  - Purpose: VM bootstrap for venv, provider assets, data, Docker, Postgres, OpenSearch, ingest, and frontend config.
+  - State: ambitious and substantial.
+  - Current repo issue: docs/help/defaults are not perfectly aligned around the `no-dense` vs `hybrid` default story.
+  - Summary file indicates it has been used at least once in this repo snapshot.
+
+- `scripts/23_start_cloudflared_tunnel.py`
+  - Purpose: start Cloudflare Tunnel for temporary/public backend access.
+  - State: deployment helper present.
+  - Live audit status: not exercised during this audit.
+
+- `scripts/24_configure_vm_services.py`
+  - Purpose: configure persistent VM services and named tunnel/systemd setup.
+  - State: deployment helper present.
+  - Live audit status: not exercised during this audit.
+
+- `scripts/25_analyze_news_corpus.py`
+  - Purpose: run exploratory deep analysis for a corpus slice and emit CSV/JSON/Markdown outputs.
+  - State: implemented and already used locally.
+  - Current output quality: useful for exploratory corpus slicing, but entity/topic quality is still noisy and heuristic.
+
+- `scripts/bootstrap_ubuntu_vm.sh`
+  - Purpose: shell wrapper for VM bootstrap.
+  - State: present; not independently audited live.
+
+Top-level executable outside `scripts/`
+- `main.py`
+  - Purpose: simple interactive retrieval demo.
+  - State: broken in the current environment.
+  - Verified failure: `FileNotFoundError` for missing lexical TF-IDF assets.
+
+============================================================
+7. Data, config, and output artifact audit
+============================================================
+
+7.1 Config files
+
+- `config/app_config.toml`
+  - Role: baseline project/runtime configuration.
+  - Current issue: declares `pgvector` backend and `hybrid` default mode, while the local environment overrides runtime to `local` backend and `lexical` mode.
+  - This is one of the biggest sources of repo-state confusion.
+
+- `config/retrieval_queries.jsonl`
+  - Rows: 3
+  - Assessment: starter set only; not enough for thesis-grade retrieval evaluation.
+
+- `config/faithfulness_claims.jsonl`
+  - Rows: 4
+  - Assessment: starter set only; not enough for strong NLI/faithfulness claims.
+
+- `config/framework_workload.jsonl`
+  - Rows: 2
+  - Assessment: minimal smoke workload, not a broad benchmark.
+
+- `config/benchmark_question_specs.json`
+  - Rows: 11
+  - Assessment: useful starter evaluation/question pool, still too small for major claims.
+
+- `config/kpi_schema.json`
+  - Role: schema contract/documentation for output KPI types.
+  - Assessment: conceptually strong supporting artifact.
+
+7.2 Raw/processed/index data files
+
+- `data/README.md`
+  - Says `indices/lexical/` and `indices/dense/` should contain retrieval assets.
+  - Current reality only partially matches this description.
+
+- `data/raw/incoming/cc_news.jsonl.gz`
+  - Verified: present, 708,241 records.
+  - Role: source corpus.
+
+- `data/raw/ccnews_staged/cc_news.jsonl.gz`
+  - Verified: present, 708,241 records.
+  - Role: staged run copy.
+  - Observation: in this snapshot the staged file is effectively the full corpus, not a smaller subset.
+
+- `data/processed/documents.parquet`
+  - Verified: present, 624,095 rows.
+  - Columns: `doc_id`, `title`, `text`, `published_at`, `source`
+  - Assessment: core normalized dataset is real and substantial.
+
+- `data/indices/doc_metadata.parquet`
+  - Verified: present, 624,095 rows.
+  - Assessment: this is the most reliable retrieval-side metadata artifact in the repo right now.
+
+- `data/indices/dense/dense_embeddings.npy`
+  - Verified: present, but incomplete/unusable as a full index asset.
+  - Assessment: should be treated as a broken artifact until rebuilt.
+
+- `data/indices/dense/dense_doc_ids.joblib`
+  - Missing.
+  - Assessment: dense asset set is incomplete.
+
+- `data/indices/lexical/`
+  - Missing.
+  - Assessment: this breaks all local lexical retrieval consumers.
+
+7.3 Output files and directories
+
+- `outputs/stage_ccnews_summary.json`
+  - Valid and consistent with the staged raw file.
+
+- `outputs/prepare_dataset_summary.json`
+  - Valid but minimal.
+  - Gap: does not record dedup/drop reasons, which made current-state inspection harder than necessary.
+
+- `outputs/build_retrieval_assets_summary.json`
+  - Reports `build_lexical_assets=false` and `build_dense_assets=false`.
+  - Conflicts with the presence of a partial dense `.npy` file.
+  - Assessment: summary and artifacts are not coherent.
+
+- `outputs/postgres/init_schema_summary.json`
+  - Valid summary for schema initialization.
+
+- `outputs/postgres/ingest_summary.json`
+  - Valid and consistent with live DB state: 624,095 rows written without embeddings.
+
+- `outputs/postgres/build_index_summary.json`
+  - Stale/misleading in current context.
+  - Reports `total_rows=0`, but the live database now has 624,095 rows.
+  - This should not be used as the current truth.
+
+- `outputs/opensearch/bulk_index_summary.json`
+  - Valid and consistent with live OpenSearch count.
+
+- `outputs/deployment/prepare_vm_stack_summary.json`
+  - Indicates the VM bootstrap path has been executed at least once and points to Postgres/OpenSearch summaries.
+
+- `outputs/framework/run_222c18017962/`
+  - Verified framework smoke output.
+  - Important because it proves the framework runs structurally but currently fails semantically due asset unavailability.
+
+- `outputs/agent_runtime/agent_091ea18b8fee/`
+  - Completed run manifest with node outputs; shows live runtime execution.
+
+- `outputs/agent_runtime/agent_a0cb9e5241d9/`
+  - Completed run manifest with node outputs; shows time-series/sentiment style runtime execution.
+
+- `outputs/agent_runtime/agent_d6c1e4adeb1b/`
+  - Completed run manifest, but caveats indicate empty/sparse evidence issues.
+
+- `outputs/agent_runtime/agent_094bbf490206/`
+  - Aborted run manifest.
+
+- `outputs/agent_runtime/agent_f0f57b0016ab/`
+  - Partial output from a killed live validation attempt during this audit.
+  - Matching DB row remains `started`.
+  - This is evidence of incomplete crash cleanup.
+
+- `outputs/corpus_deep_analysis/trump_smoke/summary.json`
+  - Query slice: `Trump|Donald Trump`
+  - Matched documents: 46,452
+  - Unique sources: 2,895
+  - Date range: 2017-01-01 to 2018-08-06
+
+- `outputs/corpus_deep_analysis/trump_smoke/monthly_series.csv`
+  - 20 rows
+
+- `outputs/corpus_deep_analysis/trump_smoke/source_summary.csv`
+  - 2,895 rows
+
+- `outputs/corpus_deep_analysis/trump_smoke/top_entities.csv`
+  - 50 rows
+  - Quality caveat: contains obvious noise entities, showing the current heuristic/entity path is not yet clean.
+
+- `outputs/corpus_deep_analysis/trump_smoke/topic_terms.csv`
+  - 36 rows
+
+- `outputs/corpus_deep_analysis/trump_smoke/topic_shares_by_month.csv`
+  - 45 rows
+
+- `outputs/corpus_deep_analysis/trump_smoke/distinctive_terms_early_vs_late.csv`
+  - 30 rows
+
+- `outputs/corpus_deep_analysis/trump_smoke/top_unigrams.csv`
+  - 50 rows
+
+- `outputs/corpus_deep_analysis/trump_smoke/top_bigrams.csv`
+  - 50 rows
+
+- `outputs/corpus_deep_analysis/trump_smoke/report.md`
+  - Human-readable exploratory report.
+
+- `outputs/nlp_tools/`
+  - Absent.
+  - This matters because the old framework expects these artifacts or their equivalents.
+
+============================================================
+8. Tests, validation, and failure probes
+============================================================
+
+Automated tests
+- `pytest -q tests` result: 71 passed, 1 skipped, 6 warnings, runtime about 28 seconds.
+- Skipped test reason: Docker-based python runner contract test is gated behind `CORPUSAGENT2_RUN_DOCKER_TESTS=1`.
+- This is a healthy test surface for core logic.
+
+Important caveat about local test execution
+- Running `pytest -q` from repo root failed locally during collection because pytest recursed into `deploy/data/pgdata` and hit permission errors.
+- CI likely avoids this because a clean checkout should not contain the local Docker volume data.
+- Recommendation: explicitly exclude local Docker data paths from pytest discovery.
+
+Direct live failure probes run during this audit
+- `scripts/07_mcp_server.py --self-test`
+  - Fails immediately because local lexical TF-IDF assets are missing.
+- `main.py` retrieval probe
+  - Fails immediately for the same reason.
+- Older framework debug workload
+  - Runs, but only yields unsupported reports because assets are not ready.
+- Direct live `AgentRuntime.handle_query(...)` validation
+  - A test attempt was killed with exit 137 after invoking the Docker python runner path.
+  - Evidence left behind:
+    - partial output files,
+    - a DB run row with status `started`,
+    - several tool-call rows and artifact rows.
+  - Interpretation: runtime plumbing is real, but crash resilience is incomplete.
+
+Existing agent run evidence
+- Local output manifests show completed multi-node runs already exist.
+- DB run status distribution at audit time:
+  - `completed`: 3
+  - `aborted`: 1
+  - `started`: 1
+
+============================================================
+9. Documentation and repo-state drift
+============================================================
+
+Where drift is visible
+- `README.md` describes a more coherent hybrid/local retrieval story than the current artifacts support.
+- `config/app_config.toml` says `pgvector` + `hybrid`, while the effective runtime uses `.env` overrides for `local` + `lexical`.
+- `docs/deployment.md` says the VM default profile is `no-dense`, but `scripts/22_prepare_vm_stack.py` still contains `DEFAULT_RETRIEVAL_PROFILE = "hybrid"` while the help text claims `no-dense` is the default lightweight path.
+- `outputs/build_retrieval_assets_summary.json` says dense/lexical asset build was disabled, yet a partial dense file exists.
+- `outputs/postgres/build_index_summary.json` is stale relative to the live database.
+- `REPO_STATE_FOR_CHATGPT_PRO.md` is an old snapshot document and should not be treated as the current truth.
+
+What this means
+- The repo is advanced enough that stale summaries now actively mislead.
+- The next phase needs stronger "single source of truth" discipline.
+
+============================================================
+10. Thesis-relevant assessment
+============================================================
+
+What is already strong enough to build on
+- Large real corpus is present and normalized.
+- Two real backend services are populated and queryable.
+- Agent runtime is a substantive system, not a sketch.
+- Frontend/backend loop is good enough for demonstrations and iterative experimentation.
+- Test surface is meaningful.
+- Provenance and capability-centered architecture are genuinely interesting research assets.
+
+What is not yet strong enough for major claims
+- Retrieval integrity:
+  - dense path is not operational,
+  - local lexical asset path is broken,
+  - "hybrid retrieval" cannot currently be defended empirically from this environment.
+- Evaluation:
+  - retrieval queries = 3,
+  - faithfulness claims = 4,
+  - framework workload = 2,
+  - benchmark question specs = 11.
+  - This is not enough for credible ablation/error-analysis sections.
+- Temporal rigor:
+  - `published_at` is text,
+  - 63,715 rows are blank,
+  - any strong trend claims need explicit data quality handling.
+- Placeholder/heuristic tools:
+  - several capabilities still use heuristics or weak fallbacks,
+  - these should be clearly separated from the claims made in the thesis.
+
+============================================================
+11. Recommended next steps for the master's project
+============================================================
+
+Priority 1: make one operating mode coherent
+- Choose the thesis target explicitly:
+  - Option A: lexical OpenSearch + Postgres + agent-runtime tools
+  - Option B: true hybrid retrieval with dense + lexical + fusion + rerank
+- Do not keep both stories half-alive.
+- Right now the repo tells both stories simultaneously and neither is fully clean.
+
+Priority 2: repair retrieval end to end before deeper agent research
+- Rebuild lexical assets cleanly and verify they load.
+- Rebuild dense assets cleanly and verify:
+  - non-zero rows for all documents,
+  - presence of `dense_doc_ids.joblib`,
+  - reproducible summary output with timestamps and validation stats.
+- If using pgvector:
+  - ingest embeddings into Postgres,
+  - build IVFFlat/HNSW indexes,
+  - verify dense retrieval returns sane results.
+- Only after this should you run retrieval ablations.
+
+Priority 3: harden temporal data
+- Parse/store `published_at` in a real temporal type.
+- Add a data-quality report for blank/unparseable dates.
+- Decide how undated documents are handled in trend analyses.
+
+Priority 4: build serious evaluation sets
+- Expand retrieval queries far beyond 3 examples.
+- Expand faithfulness claims far beyond 4 examples.
+- Expand benchmark questions into a real evaluation set with categories, difficulties, and expected evidence characteristics.
+- Add manual annotation where necessary.
+
+Priority 5: decide the fate of the older framework
+- Either:
+  - fully restore its artifact path and keep it as a deterministic baseline,
+  - or officially demote/deprecate it and stop pretending it is the main path.
+- Right now it is architecturally interesting but operationally secondary.
+
+Priority 6: clean up heuristic boundaries
+- Explicitly mark which capabilities are thesis-core and which are convenience heuristics.
+- Candidate thesis-core components:
+  - retrieval,
+  - working-set creation,
+  - evidence table construction,
+  - grounded synthesis,
+  - provenance.
+- Candidate convenience/prototype components:
+  - entity linking placeholder,
+  - claim strength heuristic,
+  - quote attribution heuristic,
+  - weak exploratory topic/entity scripts.
+
+Priority 7: improve runtime robustness
+- Mark interrupted runs as failed/aborted on startup or heartbeat timeout.
+- Pre-pull the sandbox Docker image instead of pulling at query time.
+- Add stronger sandbox result/error capture.
+- Exclude Docker volume directories from pytest discovery.
+
+Priority 8: fix repo hygiene and drift
+- Rename `scripts/00_1_downlaod.py`.
+- Align `scripts/22_prepare_vm_stack.py`, `docs/deployment.md`, `README.md`, and `config/app_config.toml`.
+- Remove or clearly mark stale snapshot docs.
+- Add validation scripts that compare:
+  - config vs effective runtime,
+  - summary files vs live services,
+  - expected asset files vs actual asset files.
+
+Suggested next deep-research framing
+- The strongest next research contribution is not "more NLP tools".
+- The strongest next contribution is:
+  "Can a provenance-first agent runtime over a large news corpus deliver grounded longitudinal analysis, and what retrieval/verification design is actually necessary to make that reliable?"
+- To answer that well, the immediate next engineering milestone is a coherent evaluated evidence substrate.
+
+============================================================
+12. Final assessment
+============================================================
+
+Current state in one sentence
+- CorpusAgent2 is already a substantial, promising master's-project codebase, but it is currently a partially split system whose strongest live path is the agent runtime over OpenSearch/Postgres, while dense retrieval, local lexical assets, and the older deterministic framework remain incomplete or blocked in the present environment.
+
+If I had to summarize the exact status labels
+- Fully real and verified now:
+  - corpus preparation,
+  - Postgres ingest,
+  - OpenSearch indexing,
+  - agent runtime,
+  - backend API,
+  - frontend,
+  - tests.
+- Real code but currently blocked/incoherent:
+  - local lexical retrieval,
+  - local dense retrieval,
+  - pgvector dense retrieval,
+  - old framework operational path,
+  - MCP server,
+  - `main.py`.
+- Heuristic/prototype:
+  - some capability implementations around entity linking, claim strength, quote attribution, burst logic, and exploratory corpus-analysis outputs.
+- Open thesis work:
+  - retrieval integrity,
+  - evaluation depth,
+  - temporal rigor,
+  - system unification,
+  - documentation/config cleanup.
