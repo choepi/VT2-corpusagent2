@@ -28,6 +28,7 @@ const applyLlmSettingsButton = document.getElementById("applyLlmSettingsButton")
 const resetLlmSettingsButton = document.getElementById("resetLlmSettingsButton");
 const llmSettingsNote = document.getElementById("llmSettingsNote");
 const runtimeSummary = document.getElementById("runtimeSummary");
+const retrievalHealth = document.getElementById("retrievalHealth");
 const providersInstalled = document.getElementById("providersInstalled");
 const providerOrder = document.getElementById("providerOrder");
 const runtimeNotes = document.getElementById("runtimeNotes");
@@ -47,6 +48,8 @@ const claimVerdicts = document.getElementById("claimVerdicts");
 const plannerActions = document.getElementById("plannerActions");
 const planNodes = document.getElementById("planNodes");
 const llmTraces = document.getElementById("llmTraces");
+const toolCallSummary = document.getElementById("toolCallSummary");
+const toolCalls = document.getElementById("toolCalls");
 const evidenceTable = document.getElementById("evidenceTable");
 const selectedDocs = document.getElementById("selectedDocs");
 const artifactList = document.getElementById("artifactList");
@@ -286,6 +289,23 @@ function formatDurationMs(value) {
   return `${minutes}m ${remainderSeconds.toFixed(remainderSeconds >= 10 ? 0 : 1).replace(/\.?0+$/, "")}s`;
 }
 
+function formatCount(value) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) {
+    return "0";
+  }
+  return new Intl.NumberFormat("en-US").format(Math.round(numeric));
+}
+
+function renderMetricStrip(element, metrics) {
+  element.innerHTML = "";
+  metrics.forEach((metric) => {
+    const wrapper = document.createElement("div");
+    wrapper.innerHTML = `<span class="metric-label">${escapeHtml(metric.label)}</span><strong>${escapeHtml(metric.value)}</strong>`;
+    element.appendChild(wrapper);
+  });
+}
+
 function stepDurationLabel(row, { allowLiveElapsed = false } = {}) {
   const explicit = formatDurationMs(row?.duration_ms);
   if (explicit) {
@@ -314,6 +334,28 @@ function totalNodeDurationMs(nodeRecords) {
     const value = Number(row?.duration_ms);
     return Number.isFinite(value) && value >= 0 ? sum + value : sum;
   }, 0);
+}
+
+function collectToolCallTotals(rows) {
+  const totals = {
+    totalCalls: 0,
+    completedCalls: 0,
+    failedCalls: 0,
+    documentsProcessed: 0,
+    outputItems: 0,
+  };
+  (rows || []).forEach((row) => {
+    totals.totalCalls += 1;
+    if (row.status === "completed") {
+      totals.completedCalls += 1;
+    }
+    if (row.status === "failed") {
+      totals.failedCalls += 1;
+    }
+    totals.documentsProcessed += Number(row.documents_processed || row.summary?.documents_processed || 0) || 0;
+    totals.outputItems += Number(row.summary?.items_count || 0) || 0;
+  });
+  return totals;
 }
 
 function artifactUrl(runId, artifactPath) {
@@ -412,6 +454,10 @@ function renderRuntimeInfo(payload) {
   const llm = payload.llm || {};
   const device = payload.device || {};
   const retrieval = payload.retrieval || {};
+  const retrievalHealthPayload = retrieval.health || {};
+  const localLexical = retrievalHealthPayload.local_lexical || {};
+  const localDense = retrievalHealthPayload.local_dense || {};
+  const pgvector = retrievalHealthPayload.pgvector || {};
   providerDefaults = llm.available_defaults || {};
   providerBadge.textContent = `LLM: ${llm.provider_name || "unknown"}`;
   providerBadge.className = `pill ${llm.use_openai ? "openai" : "unclose"}`;
@@ -433,10 +479,26 @@ function renderRuntimeInfo(payload) {
       <div class="metric-row"><span>Startup planner</span><strong>${escapeHtml(llm.startup_defaults?.planner_model || "")}</strong></div>
       <div class="metric-row"><span>CUDA available</span><strong>${device.cuda_available ? "yes" : "no"}</strong></div>
       <div class="metric-row"><span>GPU count</span><strong>${escapeHtml(device.cuda_device_count ?? 0)}</strong></div>
-      <div class="metric-row"><span>Retrieval mode</span><strong>${escapeHtml(retrieval.default_mode || "unknown")}</strong></div>
+      <div class="metric-row"><span>Configured mode</span><strong>${escapeHtml(retrieval.configured_default_mode || retrieval.default_mode || "unknown")}</strong></div>
+      <div class="metric-row"><span>Effective mode</span><strong>${escapeHtml(retrieval.default_mode || "unknown")}</strong></div>
+      <div class="metric-row"><span>Dense strategy</span><strong>${escapeHtml(retrievalHealthPayload.dense_strategy || "unknown")}</strong></div>
       <div class="metric-row"><span>Re-rank</span><strong>${retrieval.rerank_enabled ? `on (top ${escapeHtml(retrieval.rerank_top_k ?? "")})` : "off"}</strong></div>
       <div class="metric-row"><span>Dense model</span><strong>${escapeHtml(retrieval.dense_model_id || "")}</strong></div>
     `;
+
+  retrievalHealth.innerHTML = `
+    <div class="metric-row"><span>Corpus docs</span><strong>${escapeHtml(formatCount(retrievalHealthPayload.document_count || 0))}</strong></div>
+    <div class="metric-row"><span>Local lexical assets</span><strong>${localLexical.ready ? "ready" : "missing"}</strong></div>
+    <div class="metric-row"><span>Local dense assets</span><strong>${localDense.ready ? "ready" : localDense.error ? "broken" : "missing"}</strong></div>
+    <div class="metric-row"><span>pgvector dense rows</span><strong>${escapeHtml(`${formatCount(pgvector.dense_rows || 0)} / ${formatCount(pgvector.total_rows || 0)}`)}</strong></div>
+    <div class="metric-row"><span>Full dense ready</span><strong>${retrievalHealthPayload.full_corpus_dense_ready ? "yes" : "no"}</strong></div>
+    <div class="metric-row"><span>Dense fallback</span><strong>${retrievalHealthPayload.dense_candidate_fallback_ready ? "candidate rerank ready" : "not ready"}</strong></div>
+    ${
+      localDense.error
+        ? `<div class="metric-row"><span>Dense asset issue</span><strong>${escapeHtml(localDense.error)}</strong></div>`
+        : ""
+    }
+  `;
 
   providersInstalled.innerHTML = "";
   Object.entries(payload.providers_installed || {}).forEach(([name, installed]) => {
@@ -454,7 +516,7 @@ function renderRuntimeInfo(payload) {
     providerOrder.appendChild(chip);
   });
 
-    renderList(runtimeNotes, [...(payload.analysis_notes || []), ...(llm.warnings || []), ...(device.warnings || [])], (row) => escapeHtml(row));
+  renderList(runtimeNotes, [...(payload.analysis_notes || []), ...(llm.warnings || []), ...(device.warnings || [])], (row) => escapeHtml(row));
   updateControlState();
   saveUiState();
 }
@@ -534,6 +596,69 @@ function renderLLMTraces(traces) {
     `;
   });
   renderStackPanel(llmTraces, blocks, "Planner and synthesis traces will appear here.");
+}
+
+function renderToolCalls(rows) {
+  const ordered = [...(rows || [])].sort((left, right) => {
+    const leftTime = parseUtcTimestamp(left.finished_at_utc || left.started_at_utc || "") || 0;
+    const rightTime = parseUtcTimestamp(right.finished_at_utc || right.started_at_utc || "") || 0;
+    return rightTime - leftTime;
+  });
+  const totals = collectToolCallTotals(ordered);
+  renderMetricStrip(toolCallSummary, [
+    { label: "Calls", value: formatCount(totals.totalCalls) },
+    { label: "Completed", value: formatCount(totals.completedCalls) },
+    { label: "Failed", value: formatCount(totals.failedCalls) },
+    { label: "Docs processed", value: formatCount(totals.documentsProcessed) },
+    { label: "Output items", value: formatCount(totals.outputItems) },
+  ]);
+  const blocks = ordered.map((row) => {
+    const summary = row.summary || {};
+    const itemsLabel = summary.items_count ? `${formatCount(summary.items_count)} ${summary.items_key || "items"}` : "no output yet";
+    const duration = stepDurationLabel(row, { allowLiveElapsed: row.status === "running" });
+    const artifacts = Array.isArray(row.artifacts) ? row.artifacts : [];
+    return `
+      <div class="trace-head">
+        <span class="pill ${row.status === "failed" ? "warn" : row.status === "completed" ? "subtle" : "openai"}">${escapeHtml(row.status || "unknown")}</span>
+        <strong>${escapeHtml(row.tool_name || row.capability || row.node_id || "tool")}</strong>
+      </div>
+      <p class="tool-call-signature">${escapeHtml(row.call_signature || `${row.tool_name || row.capability || "tool"}()`)} </p>
+      <div class="tool-metrics">
+        <span class="chip">${escapeHtml(row.provider || "provider?")}</span>
+        <span class="chip">${escapeHtml(itemsLabel)}</span>
+        <span class="chip">${escapeHtml(`${formatCount(row.documents_processed || summary.documents_processed || 0)} docs in`)}</span>
+        ${duration ? `<span class="chip">${escapeHtml(duration)}</span>` : ""}
+        ${row.cache_hit ? '<span class="chip ok">cache hit</span>' : ""}
+        ${summary.evidence_count ? `<span class="chip">${escapeHtml(`${formatCount(summary.evidence_count)} evidence`)}</span>` : ""}
+        ${summary.artifact_count ? `<span class="chip">${escapeHtml(`${formatCount(summary.artifact_count)} artifacts`)}</span>` : ""}
+      </div>
+      ${row.error ? `<p class="danger"><strong>Error:</strong> ${escapeHtml(row.error)}</p>` : ""}
+      ${row.tool_reason ? `<p><strong>Resolution:</strong> ${escapeHtml(row.tool_reason)}</p>` : ""}
+      <details>
+        <summary>Inputs</summary>
+        <pre>${formatJson(row.inputs || {})}</pre>
+      </details>
+      <details>
+        <summary>Output preview</summary>
+        <pre>${formatJson(summary.payload_preview || {})}</pre>
+      </details>
+      ${
+        artifacts.length
+          ? `<details><summary>Artifacts</summary><pre>${formatJson(artifacts)}</pre></details>`
+          : ""
+      }
+      ${
+        summary.stdout_preview || summary.stderr_preview
+          ? `<details><summary>Sandbox output</summary><pre>${escapeHtml(
+              [summary.stdout_preview ? `stdout:\n${summary.stdout_preview}` : "", summary.stderr_preview ? `stderr:\n${summary.stderr_preview}` : ""]
+                .filter(Boolean)
+                .join("\n\n")
+            )}</pre></details>`
+          : ""
+      }
+    `;
+  });
+  renderStackPanel(toolCalls, blocks, "Exact backend tool calls will appear here while the run executes.");
 }
 
 function renderSelectedDocs(rows) {
@@ -617,6 +742,7 @@ function renderManifest(manifest) {
   renderArtifacts(manifest);
   renderPlannerActions(manifest.planner_actions || []);
   renderPlanNodes(manifest.plan_dags || []);
+  renderToolCalls(manifest.tool_calls || []);
   renderLLMTraces(manifest.metadata?.llm_traces || []);
   renderList(assumptionsList, manifest.assumptions || [], (row) => escapeHtml(row));
 
@@ -663,6 +789,8 @@ function setStatus(payload) {
   );
   renderList(assumptionsList, payload.assumptions || [], (row) => escapeHtml(row));
   renderPlannerActions(payload.planner_actions || []);
+  renderPlanNodes(payload.plan_dags || []);
+  renderToolCalls(payload.tool_calls || []);
   renderLLMTraces(payload.llm_traces || []);
 
   const clarificationQuestions = payload.clarification_questions || [];
@@ -797,6 +925,7 @@ async function submitQuery({ preserveClarificationHistory = false } = {}) {
   renderArtifacts({ run_id: "", node_records: [], final_answer: { artifacts_used: [] } });
   renderPlannerActions([]);
   renderPlanNodes([]);
+  renderToolCalls([]);
   renderLLMTraces([]);
   setStatus({
     status: "running",
@@ -981,6 +1110,7 @@ window.addEventListener("keydown", (event) => {
 restoreUiState();
 closePlotModal();
 renderClarificationState();
+renderToolCalls([]);
 updateControlState();
 renderAccessGate();
 

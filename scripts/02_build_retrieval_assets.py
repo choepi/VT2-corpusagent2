@@ -51,10 +51,20 @@ def _build_dense_embeddings_streaming(
     doc_ids = df["doc_id"].astype(str).tolist()
     embeddings_path = index_dir / "dense_embeddings.npy"
     index_dir.mkdir(parents=True, exist_ok=True)
+    resume_existing = _env_flag("CORPUSAGENT2_RESUME_DENSE_ASSETS", True)
 
     total_rows = int(df.shape[0])
     if total_rows == 0:
         raise RuntimeError("Dense embedding build received an empty dataframe.")
+
+    def _first_zero_row_index(memmap: np.ndarray, scan_chunk: int = 2048) -> int:
+        for start in range(0, int(memmap.shape[0]), scan_chunk):
+            stop = min(start + scan_chunk, int(memmap.shape[0]))
+            chunk = np.asarray(memmap[start:stop], dtype=np.float32)
+            zero_rows = np.flatnonzero(~chunk.any(axis=1))
+            if zero_rows.size > 0:
+                return int(start + zero_rows[0])
+        return int(memmap.shape[0])
 
     first_stop = min(total_rows, chunk_size)
     first_texts = (
@@ -71,15 +81,37 @@ def _build_dense_embeddings_streaming(
     ).astype(np.float32)
 
     embedding_dim = int(first_batch.shape[1])
-    dense_memmap = np.lib.format.open_memmap(
-        embeddings_path,
-        mode="w+",
-        dtype=np.float32,
-        shape=(total_rows, embedding_dim),
-    )
-    dense_memmap[:first_stop] = first_batch
+    start_index = first_stop
+    if resume_existing and embeddings_path.exists():
+        try:
+            dense_memmap = np.load(embeddings_path, mmap_mode="r+")
+            if tuple(dense_memmap.shape) != (total_rows, embedding_dim):
+                raise RuntimeError(f"shape mismatch: existing={dense_memmap.shape}, expected={(total_rows, embedding_dim)}")
+            start_index = _first_zero_row_index(dense_memmap)
+            if start_index < first_stop:
+                dense_memmap[start_index:first_stop] = first_batch[start_index:first_stop]
+                start_index = first_stop
+        except Exception:
+            embeddings_path.unlink(missing_ok=True)
+            dense_memmap = np.lib.format.open_memmap(
+                embeddings_path,
+                mode="w+",
+                dtype=np.float32,
+                shape=(total_rows, embedding_dim),
+            )
+            dense_memmap[:first_stop] = first_batch
+            start_index = first_stop
+    else:
+        dense_memmap = np.lib.format.open_memmap(
+            embeddings_path,
+            mode="w+",
+            dtype=np.float32,
+            shape=(total_rows, embedding_dim),
+        )
+        dense_memmap[:first_stop] = first_batch
+        start_index = first_stop
 
-    for start in range(first_stop, total_rows, chunk_size):
+    for start in range(start_index, total_rows, chunk_size):
         stop = min(start + chunk_size, total_rows)
         texts = (
             (df.iloc[start:stop]["title"].fillna("") + " " + df.iloc[start:stop]["text"].fillna(""))

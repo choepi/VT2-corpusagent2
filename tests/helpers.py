@@ -144,6 +144,7 @@ def build_test_runtime(
     search_rows_by_query: dict[str, list[dict[str, Any]]],
     search_delay_s: float = 0.0,
     python_runner=None,
+    working_store=None,
 ):
     class FakeRuntime:
         def __init__(self, rows: list[dict[str, Any]]) -> None:
@@ -173,10 +174,24 @@ def build_test_runtime(
             wanted = {str(item) for item in doc_ids}
             return self._df[self._df["doc_id"].astype(str).isin(wanted)].reset_index(drop=True)
 
+        def retrieval_health(self):
+            count = int(self._df.shape[0])
+            return {
+                "document_count": count,
+                "backend": self.retrieval_backend,
+                "local_lexical": {"ready": True, "path": "memory://lexical"},
+                "local_dense": {"ready": False, "error": "dense assets not loaded in tests"},
+                "pgvector": {"configured": False, "table": "", "ready": False, "total_rows": 0, "dense_rows": 0, "indices": [], "error": ""},
+                "dense_strategy": "candidate_rerank_fallback",
+                "full_corpus_dense_ready": False,
+                "dense_candidate_fallback_ready": bool(count > 0),
+            }
+
     runtime = FakeRuntime(documents)
-    store = InMemoryWorkingSetStore()
-    for document in documents:
-        store.document_lookup[str(document["doc_id"])] = dict(document)
+    store = working_store or InMemoryWorkingSetStore()
+    if hasattr(store, "document_lookup"):
+        for document in documents:
+            store.document_lookup[str(document["doc_id"])] = dict(document)
     config = AgentRuntimeConfig(project_root=tmp_path, outputs_root=(tmp_path / "outputs" / "agent_runtime"))
     return AgentRuntime(
         config=config,

@@ -4,6 +4,7 @@ from pathlib import Path
 import time
 
 from corpusagent2 import agent_capabilities
+from corpusagent2.agent_backends import InMemoryWorkingSetStore
 from corpusagent2.api import build_app
 from corpusagent2.agent_executor import AgentExecutionSnapshot
 from corpusagent2.python_runner_service import PythonRunnerResult
@@ -307,6 +308,40 @@ def test_api_async_submission_exposes_live_status(tmp_path: Path) -> None:
     assert status_payload["run_id"] == run_id
     assert "completed_steps" in status_payload
     assert "llm_traces" in status_payload
+    assert "tool_calls" in status_payload
+    assert any(call.get("call_signature") for call in status_payload["tool_calls"])
+
+
+def test_runtime_manifest_persists_tool_call_transcript(tmp_path: Path) -> None:
+    docs = _sample_documents()
+    runtime = build_test_runtime(tmp_path=tmp_path, documents=docs, search_rows_by_query=_search_rows(docs))
+
+    manifest = runtime.handle_query("Which media predicted the outbreak of the Ukraine war in 2022?", no_cache=True)
+
+    assert manifest.tool_calls
+    assert any(call.get("tool_name") == "opensearch_db_search" for call in manifest.tool_calls)
+    assert any(call.get("summary", {}).get("items_count", 0) > 0 for call in manifest.tool_calls)
+
+
+def test_runtime_repairs_interrupted_runs_on_startup(tmp_path: Path) -> None:
+    docs = _sample_documents()
+    store = InMemoryWorkingSetStore()
+    store.create_run(
+        run_id="stale-run",
+        question="stale",
+        rewritten_question="",
+        force_answer=False,
+        no_cache=False,
+    )
+    runtime = build_test_runtime(
+        tmp_path=tmp_path,
+        documents=docs,
+        search_rows_by_query=_search_rows(docs),
+        working_store=store,
+    )
+
+    assert runtime._startup_repaired_runs == 1
+    assert store.runs["stale-run"]["status"] == "failed"
 
 
 def test_api_async_failure_persists_manifest_for_terminal_run(tmp_path: Path) -> None:

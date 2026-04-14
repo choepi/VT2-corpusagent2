@@ -1,26 +1,28 @@
 # CorpusAgent2
 
-CorpusAgent2 is a deterministic and reproducible research stack for longitudinal news analysis.
-It is designed for two execution modes:
+CorpusAgent2 is an evidence-first agent runtime for longitudinal news analysis over a large corpus.
+The active system surface is the FastAPI backend, the capability-first tool registry, the PlanDAG executor,
+the web inspector, and the retrieval stack behind them.
 
-- local prototyping on Windows/macOS/Linux
-- Slurm execution on GPU cluster with scratch staging
+Legacy deterministic framework files still exist as baseline material, but they are not the primary runtime path.
 
-## Research Focus
+## Runtime Focus
 
-- `RQ1`: Does hybrid retrieval (`TF-IDF + Dense + Fusion + Reranker`) improve evidence completeness vs lexical-only retrieval?
-- `RQ2`: Can LLM-heavy analysis be replaced by specialized measurable tools (NER, sentiment, topics, bursts, keyphrases) without losing interpretability?
-- `RQ3`: Does NLI-based verification (`roberta-large-mnli`) reduce hallucinations in final answers?
-- `RQ4`: Which index architecture yields best cost/recall tradeoff at scale (FAISS IVF-PQ vs HNSW vs pgvector)?
+- capability-first tool selection instead of library-specific planning
+- LLM planning for clarification, assumptions, PlanDAG generation, revision, and synthesis
+- lexical + dense + rerank retrieval with explicit runtime health reporting
+- evidence tables, artifacts, and provenance persisted per run
+- safe Python sandbox execution for bounded analysis/code paths
 
 ## Retrieval Stack
 
 `Lexical -> Dense -> Fusion (RRF) -> Cross-Encoder Rerank -> NLI Verification`
 
-Implemented baseline:
+Implemented runtime stack:
 
 - lexical retrieval via TF-IDF (`scripts/02_build_retrieval_assets.py` + `scripts/03_evaluate_retrieval.py`)
 - dense retrieval with `intfloat/e5-base-v2`
+- dense candidate rerank fallback when full-corpus dense assets are not ready yet
 - RRF fusion
 - cross-encoder reranking
 - NLI claim verification
@@ -38,7 +40,7 @@ Every tool call can be persisted with:
 - `outputs_ref`
 - `evidence` list of `{doc_id, chunk_id, score_components, span_offsets}`
 
-See `scripts/06_run_framework.py` and `src/corpusagent2/provenance.py`.
+See `src/corpusagent2/agent_runtime.py`, `src/corpusagent2/agent_executor.py`, and `src/corpusagent2/provenance.py`.
 
 ## KPI Schemas
 
@@ -103,7 +105,7 @@ uv sync
 
 2. Put CC-News source files (`.jsonl` or `.jsonl.gz`) into `data/raw/incoming/`.
 
-3. Run pipeline stages:
+3. Run data/retrieval stages:
 
 ```bash
 python scripts/00_stage_ccnews_files.py
@@ -112,7 +114,6 @@ python scripts/02_build_retrieval_assets.py
 python scripts/03_evaluate_retrieval.py
 python scripts/04_evaluate_faithfulness.py
 python scripts/05_run_nlp_tooling.py
-python scripts/06_run_framework.py
 ```
 
 4. Optional interactive prompt:
@@ -139,7 +140,7 @@ set CORPUSAGENT2_RETRIEVAL_BACKEND=pgvector
 
 ## Agent Runtime Quick Start
 
-The first-trial agent runtime uses `config/app_config.toml` as the default toggle file and lets `.env` override those values for machine-specific secrets.
+The agent runtime uses `config/app_config.toml` as the default toggle file and lets `.env` override those values for machine-specific secrets.
 
 Useful overrides include:
 
@@ -153,37 +154,47 @@ Useful overrides include:
 1. Inspect the effective config:
 
 ```bash
-python scripts/16_print_effective_config.py
+./.venv/bin/python scripts/16_print_effective_config.py
 ```
 
 2. Start backend + static frontend together:
 
 ```bash
-python scripts/15_start_local_stack.py
+./.venv/bin/python scripts/15_start_local_stack.py
 ```
 
 3. If you prefer to run them separately:
 
 ```bash
-python scripts/12_run_agent_api.py
-python scripts/13_write_frontend_config.py
-python scripts/14_run_static_frontend.py
+./.venv/bin/python scripts/12_run_agent_api.py
+./.venv/bin/python scripts/13_write_frontend_config.py
+./.venv/bin/python scripts/14_run_static_frontend.py
 ```
 
-4. Optional temporary public demo path:
+4. Repair or complete dense retrieval when needed:
+
+```bash
+./.venv/bin/python scripts/02_build_retrieval_assets.py
+./.venv/bin/python scripts/26_backfill_pgvector_embeddings.py
+./.venv/bin/python scripts/11_build_pgvector_index.py
+```
+
+`/runtime-info` and the frontend now show whether full-corpus dense retrieval is truly ready, whether the runtime is using pgvector, local dense assets, or the dense candidate-rerank fallback, and how many pgvector rows currently have embeddings.
+
+5. Optional temporary public demo path:
 
 - keep the static frontend on GitHub Pages
 - expose the FastAPI backend with Cloudflare Tunnel or a VM HTTPS endpoint
 - do not expose Postgres or OpenSearch directly
 - Quick Tunnels are for testing/development only
 
-5. Optional Ubuntu VM bootstrap:
+6. Optional Ubuntu VM bootstrap:
 
 ```bash
 bash scripts/bootstrap_ubuntu_vm.sh /home/$USER/corpusagent2
 ```
 
-6. Deployment notes:
+7. Deployment notes:
 
 - GitHub Pages deploys only `web/`
 - the Pages workflow generates `web/config.js` from `config/app_config.toml`
@@ -246,4 +257,5 @@ Gold files used by scripts:
 - deterministic seeds are set in all scripts (`SEED` constant)
 - all stages write machine-readable JSON summaries in `outputs/`
 - retrieval + verification outputs are tracked by run id
+- runtime manifests persist tool calls, selected documents, evidence tables, artifacts, and final outputs
 

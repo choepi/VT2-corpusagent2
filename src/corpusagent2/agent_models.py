@@ -278,6 +278,7 @@ class AgentRunManifest:
     assumptions: list[str]
     planner_actions: list[dict[str, Any]]
     plan_dags: list[dict[str, Any]]
+    tool_calls: list[dict[str, Any]]
     selected_docs: list[dict[str, Any]]
     node_records: list[AgentNodeExecutionRecord]
     provenance_records: list[dict[str, Any]]
@@ -299,6 +300,7 @@ class AgentRunManifest:
             "assumptions": list(self.assumptions),
             "planner_actions": _serialize(self.planner_actions),
             "plan_dags": _serialize(self.plan_dags),
+            "tool_calls": _serialize(self.tool_calls),
             "selected_docs": _serialize(self.selected_docs),
             "node_records": [item.to_dict() for item in self.node_records],
             "provenance_records": _serialize(self.provenance_records),
@@ -323,6 +325,8 @@ class LiveRunStatus:
     completed_steps: list[dict[str, Any]] = field(default_factory=list)
     failed_steps: list[dict[str, Any]] = field(default_factory=list)
     planner_actions: list[dict[str, Any]] = field(default_factory=list)
+    plan_dags: list[dict[str, Any]] = field(default_factory=list)
+    tool_calls: list[dict[str, Any]] = field(default_factory=list)
     llm_traces: list[dict[str, Any]] = field(default_factory=list)
     final_manifest_path: str = ""
     updated_at_utc: str = field(default_factory=lambda: datetime.now(UTC).isoformat())
@@ -340,6 +344,8 @@ class LiveRunStatus:
             "completed_steps": _serialize(self.completed_steps),
             "failed_steps": _serialize(self.failed_steps),
             "planner_actions": _serialize(self.planner_actions),
+            "plan_dags": _serialize(self.plan_dags),
+            "tool_calls": _serialize(self.tool_calls),
             "llm_traces": _serialize(self.llm_traces),
             "final_manifest_path": self.final_manifest_path,
             "updated_at_utc": self.updated_at_utc,

@@ -36,6 +36,65 @@ class RetrievalResult:
         }
 
 
+def dense_asset_health(index_dir: Path, expected_rows: int | None = None) -> dict[str, Any]:
+    embeddings_path = index_dir / "dense_embeddings.npy"
+    doc_ids_path = index_dir / "dense_doc_ids.joblib"
+    payload: dict[str, Any] = {
+        "ready": False,
+        "embeddings_path": str(embeddings_path),
+        "doc_ids_path": str(doc_ids_path),
+        "embeddings_exists": embeddings_path.exists(),
+        "doc_ids_exists": doc_ids_path.exists(),
+        "error": "",
+        "shape": [],
+        "sampled_rows": 0,
+        "sampled_zero_rows": 0,
+        "expected_rows": int(expected_rows) if expected_rows is not None else None,
+    }
+    if not embeddings_path.exists():
+        payload["error"] = "dense_embeddings.npy is missing."
+        return payload
+    if not doc_ids_path.exists():
+        payload["error"] = "dense_doc_ids.joblib is missing."
+        return payload
+    try:
+        embeddings = np.load(embeddings_path, mmap_mode="r")
+        doc_ids = joblib.load(doc_ids_path)
+        payload["shape"] = [int(embeddings.shape[0]), int(embeddings.shape[1])]
+        if len(doc_ids) != int(embeddings.shape[0]):
+            payload["error"] = (
+                f"dense_doc_ids length {len(doc_ids)} does not match embedding rows {int(embeddings.shape[0])}."
+            )
+            return payload
+        if expected_rows is not None and int(embeddings.shape[0]) != int(expected_rows):
+            payload["error"] = (
+                f"embedding rows {int(embeddings.shape[0])} do not match expected rows {int(expected_rows)}."
+            )
+            return payload
+        sample_cap = min(int(embeddings.shape[0]), 4096)
+        if sample_cap <= 0:
+            payload["error"] = "dense embedding matrix is empty."
+            return payload
+        if sample_cap <= 2048:
+            sample_indices = np.arange(sample_cap, dtype=np.int64)
+        else:
+            head = np.arange(2048, dtype=np.int64)
+            spread = np.linspace(2048, int(embeddings.shape[0]) - 1, num=sample_cap - 2048, dtype=np.int64)
+            sample_indices = np.unique(np.concatenate([head, spread]))
+        sampled = np.asarray(embeddings[sample_indices], dtype=np.float32)
+        zero_rows = int((~sampled.any(axis=1)).sum())
+        payload["sampled_rows"] = int(sampled.shape[0])
+        payload["sampled_zero_rows"] = zero_rows
+        if zero_rows > 0:
+            payload["error"] = f"dense embedding artifact contains {zero_rows} all-zero sampled rows."
+            return payload
+        payload["ready"] = True
+        return payload
+    except Exception as exc:
+        payload["error"] = str(exc)
+        return payload
+
+
 def resolve_retrieval_backend(default: str = "local") -> str:
     requested = os.getenv("CORPUSAGENT2_RETRIEVAL_BACKEND", "").strip().lower()
     if requested in _ALLOWED_RETRIEVAL_BACKENDS:
@@ -199,7 +258,10 @@ def save_dense_assets(index_dir: Path, embeddings: np.ndarray, doc_ids: list[str
     joblib.dump(doc_ids, index_dir / "dense_doc_ids.joblib")
 
 
-def load_dense_assets(index_dir: Path) -> tuple[np.ndarray, list[str]]:
+def load_dense_assets(index_dir: Path, *, expected_rows: int | None = None) -> tuple[np.ndarray, list[str]]:
+    health = dense_asset_health(index_dir, expected_rows=expected_rows)
+    if not health["ready"]:
+        raise RuntimeError(f"Dense retrieval assets are not usable: {health['error']}")
     embeddings = np.load(index_dir / "dense_embeddings.npy", mmap_mode="r")
     doc_ids = joblib.load(index_dir / "dense_doc_ids.joblib")
     return embeddings, doc_ids
@@ -292,6 +354,51 @@ def retrieve_dense(
             )
         )
     return results
+
+
+def retrieve_dense_from_texts(
+    query: str,
+    model_id: str,
+    texts: list[str],
+    doc_ids: list[str],
+    top_k: int,
+    *,
+    device: str | None = None,
+    component_name: str = "dense_candidate",
+    batch_size: int = 64,
+) -> list[RetrievalResult]:
+    if top_k <= 0 or not texts or not doc_ids:
+        return []
+    if len(texts) != len(doc_ids):
+        raise ValueError("texts and doc_ids must have identical lengths.")
+    model, _resolved_device = _load_sentence_transformer(model_id=model_id, device=device)
+    query_emb = model.encode(
+        [query],
+        batch_size=1,
+        convert_to_numpy=True,
+        normalize_embeddings=True,
+    ).astype(np.float32)
+    doc_embs = model.encode(
+        texts,
+        batch_size=max(int(batch_size), 1),
+        convert_to_numpy=True,
+        normalize_embeddings=True,
+    ).astype(np.float32)
+    scores = (query_emb @ doc_embs.T).ravel()
+    limit = min(int(top_k), int(scores.shape[0]))
+    if limit <= 0:
+        return []
+    best = np.argpartition(scores, -limit)[-limit:]
+    ranked_idx = best[np.argsort(scores[best])[::-1]]
+    return [
+        RetrievalResult(
+            doc_id=str(doc_ids[idx]),
+            rank=rank,
+            score=float(scores[idx]),
+            score_components={component_name: float(scores[idx])},
+        )
+        for rank, idx in enumerate(ranked_idx, start=1)
+    ]
 
 
 def retrieve_dense_pgvector(

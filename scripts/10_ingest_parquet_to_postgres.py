@@ -16,7 +16,7 @@ if str(SRC_ROOT) not in sys.path:
 
 from corpusagent2.io_utils import ensure_absolute, ensure_exists, read_documents, write_json
 from corpusagent2.app_config import load_project_configuration
-from corpusagent2.retrieval import pg_dsn_from_env, pg_table_from_env
+from corpusagent2.retrieval import dense_asset_health, pg_dsn_from_env, pg_table_from_env
 from corpusagent2.seed import resolve_run_mode, set_global_seed
 
 
@@ -63,11 +63,10 @@ if __name__ == "__main__":
     ensure_absolute(SUMMARY_PATH, "SUMMARY_PATH")
  
     ensure_exists(DOCUMENTS_PARQUET, "DOCUMENTS_PARQUET")
-    if INCLUDE_EMBEDDINGS and (
-    	not DENSE_EMBEDDINGS_PATH.exists() or not DENSE_DOC_IDS_PATH.exists()
-    ):
-    	print("[warn] Dense assets missing; ingesting Postgres rows without embeddings.")
-    	INCLUDE_EMBEDDINGS = False
+    dense_health = dense_asset_health(DENSE_EMBEDDINGS_PATH.parent) if INCLUDE_EMBEDDINGS else {"ready": False, "error": ""}
+    if INCLUDE_EMBEDDINGS and not dense_health.get("ready"):
+        print(f"[warn] Dense assets are not usable ({dense_health.get('error', 'unknown issue')}); ingesting Postgres rows without embeddings.")
+        INCLUDE_EMBEDDINGS = False
 
     if INCLUDE_EMBEDDINGS:
     	ensure_exists(DENSE_EMBEDDINGS_PATH, "DENSE_EMBEDDINGS_PATH")
