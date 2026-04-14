@@ -53,6 +53,75 @@ def _env_flag(name: str, default: bool) -> bool:
     return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _tool_call_signature(tool_name: str, inputs: dict[str, Any]) -> str:
+    if not tool_name:
+        return ""
+    if not inputs:
+        return f"{tool_name}()"
+    rendered: list[str] = []
+    for key, value in inputs.items():
+        compact = json.dumps(value, ensure_ascii=True, default=str)
+        if len(compact) > 100:
+            compact = compact[:97] + "..."
+        rendered.append(f"{key}={compact}")
+    return f"{tool_name}({', '.join(rendered)})"
+
+
+def _merge_tool_call_rows(existing_rows: list[dict[str, Any]], payload: dict[str, Any]) -> list[dict[str, Any]]:
+    node_id = str(payload.get("node_id", "")).strip()
+    event = str(payload.get("event", "")).strip()
+    started_at = str(payload.get("started_at_utc", "")).strip()
+    entry = None
+    if node_id:
+        if event == "node_started" and started_at:
+            entry = next(
+                (
+                    row
+                    for row in existing_rows
+                    if str(row.get("node_id", "")).strip() == node_id
+                    and str(row.get("started_at_utc", "")).strip() == started_at
+                ),
+                None,
+            )
+        else:
+            entry = next((row for row in reversed(existing_rows) if str(row.get("node_id", "")).strip() == node_id), None)
+    if entry is None:
+        entry = {
+            "node_id": node_id,
+            "capability": str(payload.get("capability", "")).strip(),
+        }
+        existing_rows.append(entry)
+    for key in (
+        "capability",
+        "status",
+        "tool_name",
+        "provider",
+        "tool_version",
+        "model_id",
+        "tool_reason",
+        "started_at_utc",
+        "finished_at_utc",
+        "duration_ms",
+        "documents_processed",
+        "cache_key",
+        "error",
+    ):
+        if payload.get(key) not in (None, ""):
+            entry[key] = payload[key]
+    if "inputs" in payload:
+        entry["inputs"] = dict(payload.get("inputs", {}))
+        entry["call_signature"] = _tool_call_signature(str(entry.get("tool_name", "")), entry["inputs"])
+    if "dependency_nodes" in payload:
+        entry["dependency_nodes"] = list(payload.get("dependency_nodes", []))
+    if "summary" in payload:
+        entry["summary"] = dict(payload.get("summary", {}))
+    if "artifacts" in payload:
+        entry["artifacts"] = list(payload.get("artifacts", []))
+    if "cache_hit" in payload:
+        entry["cache_hit"] = bool(payload.get("cache_hit"))
+    return existing_rows
+
+
 @dataclass(slots=True)
 class AgentRuntimeConfig:
     project_root: Path
@@ -471,6 +540,57 @@ class MagicBoxOrchestrator:
     def _heuristic_plan(self, state: AgentRunState) -> PlannerAction:
         rewritten = state.rewritten_question or self._question_with_clarifications(state)
         text = rewritten.lower()
+        trump_terms = ("trump", "donald trump", "president trump")
+        if any(term in text for term in trump_terms) and any(
+            term in text
+            for term in (
+                "sentiment",
+                "tone",
+                "coverage",
+                "framing",
+                "topic",
+                "topics",
+                "news",
+                "media",
+            )
+        ):
+            anchor_terms = self._query_anchor_terms(rewritten)
+            search_inputs: dict[str, Any] = {
+                "top_k": 120,
+                "retrieval_mode": "hybrid",
+                "use_rerank": True,
+                "rerank_top_k": 60,
+                "query": self._compact_query_terms(
+                    rewritten,
+                    anchor_terms + ["Trump", "Donald Trump", "sentiment", "coverage", "media", "news"],
+                ),
+            }
+            search_inputs.update(self._extract_date_window(rewritten))
+            dag = AgentPlanDAG(
+                nodes=[
+                    AgentPlanNode("search", "db_search", search_inputs),
+                    AgentPlanNode("fetch", "fetch_documents", depends_on=["search"]),
+                    AgentPlanNode("working_set", "create_working_set", depends_on=["fetch"]),
+                    AgentPlanNode("sentiment", "sentiment", depends_on=["fetch"]),
+                    AgentPlanNode("sentiment_series", "time_series_aggregate", {"granularity": "month"}, depends_on=["sentiment"]),
+                    AgentPlanNode("changes", "change_point_detect", depends_on=["sentiment_series"], optional=True),
+                    AgentPlanNode("entities", "ner", depends_on=["fetch"]),
+                    AgentPlanNode("entity_series", "time_series_aggregate", {"granularity": "month"}, depends_on=["entities"]),
+                    AgentPlanNode("keyterms", "extract_keyterms", depends_on=["fetch"]),
+                    AgentPlanNode("topics", "topic_model", {"num_topics": 6, "granularity": "month", "topics_per_bin": 2}, depends_on=["fetch"]),
+                    AgentPlanNode("pos", "pos_morph", depends_on=["fetch"]),
+                    AgentPlanNode("ngrams", "extract_ngrams", {"n": 2}, depends_on=["fetch"], optional=True),
+                    AgentPlanNode("lexdiv", "lexical_diversity", depends_on=["fetch"], optional=True),
+                    AgentPlanNode("plot_sentiment", "plot_artifact", {"plot_name": "trump_sentiment_series"}, depends_on=["sentiment_series"], optional=True),
+                    AgentPlanNode("plot_entities", "plot_artifact", {"plot_name": "trump_entity_series"}, depends_on=["entity_series"], optional=True),
+                ],
+                metadata={"question_family": "trump_media_analysis"},
+            )
+            return PlannerAction(
+                action="emit_plan_dag",
+                rewritten_question=state.rewritten_question or rewritten,
+                plan_dag=dag,
+            )
         if "distribution" in text and "noun" in text:
             dag = AgentPlanDAG(
                 nodes=[
@@ -1072,6 +1192,10 @@ class AgentRuntime:
         self._run_threads: dict[str, threading.Thread] = {}
         self._run_lock = threading.Lock()
         self._llm_override_active = False
+        try:
+            self._startup_repaired_runs = int(self.working_store.cleanup_interrupted_runs())
+        except Exception:
+            self._startup_repaired_runs = 0
 
     def _build_search_backend(self):
         lexical_backend = None
@@ -1174,11 +1298,15 @@ class AgentRuntime:
             for capability, value in os.environ.items()
             if capability.startswith("CORPUSAGENT2_PROVIDER_ORDER_")
         }
-        default_retrieval_mode = os.getenv("CORPUSAGENT2_DEFAULT_RETRIEVAL_MODE", "").strip().lower()
-        if not default_retrieval_mode:
-            default_retrieval_mode = (
+        retrieval_health = self.runtime.retrieval_health()
+        configured_default_mode = os.getenv("CORPUSAGENT2_DEFAULT_RETRIEVAL_MODE", "").strip().lower()
+        if not configured_default_mode:
+            configured_default_mode = (
                 "hybrid" if dense_retrieval_enabled(default=self.runtime.retrieval_backend == "pgvector") else "lexical"
             )
+        effective_default_mode = configured_default_mode
+        if configured_default_mode in {"hybrid", "dense"} and not retrieval_health["full_corpus_dense_ready"]:
+            effective_default_mode = "hybrid" if retrieval_health["dense_candidate_fallback_ready"] else "lexical"
         return {
             "llm": {
                 "use_openai": self.llm_config.use_openai,
@@ -1220,7 +1348,8 @@ class AgentRuntime:
             "capability_count": len(self.registry.list_tools()),
             "retrieval": {
                 "backend": self.runtime.retrieval_backend,
-                "default_mode": default_retrieval_mode,
+                "configured_default_mode": configured_default_mode,
+                "default_mode": effective_default_mode,
                 "rerank_enabled": os.getenv("CORPUSAGENT2_RETRIEVAL_USE_RERANK", "true").strip().lower()
                 not in {"0", "false", "no", "off"},
                 "rerank_top_k": int(os.getenv("CORPUSAGENT2_RETRIEVAL_RERANK_TOP_K", "25").strip() or "25"),
@@ -1230,6 +1359,7 @@ class AgentRuntime:
                 "require_backend_services": self.require_backend_services,
                 "allow_local_fallback": self.allow_local_fallback,
                 "time_granularity": os.getenv("CORPUSAGENT2_TIME_GRANULARITY", "month").strip() or "month",
+                "health": retrieval_health,
             },
             "analysis_notes": [
                 "UI model/provider changes are process-local runtime overrides. They affect future runs only and reset when the backend restarts unless you also update .env.",
@@ -1237,6 +1367,18 @@ class AgentRuntime:
                 "GPU is mainly relevant for torch- or Flair-backed models and only when those providers are selected.",
                 "Per-node provider choice and artifacts are captured in the run manifest so you can verify what really ran.",
                 "Some analytics remain heuristic by design in the prototype, especially claim scoring, quote attribution, and burst detection; check provenance and caveats per node.",
+                (
+                    f"Recovered {self._startup_repaired_runs} interrupted run(s) from 'started' to 'failed' on startup."
+                    if self._startup_repaired_runs
+                    else "No interrupted runs needed cleanup on startup."
+                ),
+                (
+                    f"Dense retrieval is using '{retrieval_health['dense_strategy']}' because full-corpus dense assets are not fully ready yet."
+                    if not retrieval_health["full_corpus_dense_ready"] and retrieval_health["dense_candidate_fallback_ready"]
+                    else "Full-corpus dense retrieval is ready."
+                    if retrieval_health["full_corpus_dense_ready"]
+                    else "Dense retrieval is unavailable until corpus metadata is loaded."
+                ),
             ],
             "active_run_ids": self._active_run_ids(),
         }
@@ -1256,6 +1398,16 @@ class AgentRuntime:
                     setattr(status, key, value)
             status.updated_at_utc = datetime.now(UTC).isoformat()
             return status
+
+    def _current_tool_calls(self, run_id: str) -> list[dict[str, Any]]:
+        with self._run_lock:
+            live = self._live_runs.get(run_id)
+            if live is not None and live.tool_calls:
+                return [dict(item) for item in live.tool_calls]
+        try:
+            return [dict(item) for item in self.working_store.read_tool_calls(run_id)]
+        except Exception:
+            return []
 
     def _register_cancel_event(self, run_id: str) -> threading.Event:
         with self._run_lock:
@@ -1300,6 +1452,7 @@ class AgentRuntime:
             assumptions=list(state.assumptions),
             planner_actions=list(state.planner_actions),
             plan_dags=list(plan_dags or []),
+            tool_calls=self._current_tool_calls(run_id),
             selected_docs=list(resolved_snapshot.selected_docs),
             node_records=list(resolved_snapshot.node_records),
             provenance_records=list(resolved_snapshot.provenance_records),
@@ -1374,24 +1527,33 @@ class AgentRuntime:
                 entry["duration_ms"] = float(payload["duration_ms"])
             if payload.get("error"):
                 entry["error"] = str(payload["error"])
+            status.tool_calls = _merge_tool_call_rows(status.tool_calls, payload)
+            tool_name = str(payload.get("tool_name", "")).strip()
+            call_signature = _tool_call_signature(tool_name, dict(payload.get("inputs", {})))
             if event == "node_started":
                 status.active_steps = [
                     item for item in status.active_steps if item.get("node_id") != entry["node_id"]
                 ] + [entry]
                 status.current_phase = "executing"
-                status.detail = f"Running {entry['capability']}"
+                status.detail = f"Running {tool_name or entry['capability']}"
             elif event == "node_completed":
                 status.active_steps = [
                     item for item in status.active_steps if item.get("node_id") != entry["node_id"]
                 ]
                 status.completed_steps.append(entry)
-                status.detail = f"Completed {entry['capability']}"
+                summary = payload.get("summary", {}) if isinstance(payload.get("summary"), dict) else {}
+                items_count = int(summary.get("items_count", 0) or 0)
+                items_key = str(summary.get("items_key", "") or "items")
+                suffix = f" -> {items_count} {items_key}" if items_count else ""
+                status.detail = f"Completed {tool_name or entry['capability']}{suffix}"
             elif event == "node_failed":
                 status.active_steps = [
                     item for item in status.active_steps if item.get("node_id") != entry["node_id"]
                 ]
                 status.failed_steps.append(entry)
-                status.detail = f"Failed {entry['capability']}"
+                status.detail = f"Failed {tool_name or entry['capability']}"
+            if call_signature:
+                status.detail = f"{status.detail} | {call_signature}"
             status.updated_at_utc = datetime.now(UTC).isoformat()
 
     def corpus_schema(self) -> dict[str, Any]:
@@ -1434,6 +1596,7 @@ class AgentRuntime:
             assumptions=assumptions,
             planner_actions=list(state.planner_actions),
             plan_dags=[],
+            tool_calls=self._current_tool_calls(run_id),
             selected_docs=[],
             node_records=[],
             provenance_records=[],
@@ -1481,6 +1644,7 @@ class AgentRuntime:
             assumptions=list(assumptions),
             planner_actions=planner_actions,
             plan_dags=[state.last_plan] if state is not None and state.last_plan else [],
+            tool_calls=self._current_tool_calls(run_id),
             selected_docs=[],
             node_records=[],
             provenance_records=[],
@@ -1584,6 +1748,7 @@ class AgentRuntime:
                 assumptions=list(state.assumptions),
                 planner_actions=list(state.planner_actions),
                 plan_dags=[],
+                tool_calls=self._current_tool_calls(run_id),
                 selected_docs=[],
                 node_records=[],
                 provenance_records=[],
@@ -1632,7 +1797,14 @@ class AgentRuntime:
         state.planner_actions.append(plan_action.to_dict())
         if plan_action.assumptions:
             state.assumptions = list(dict.fromkeys(state.assumptions + plan_action.assumptions))
-        self._set_live_status(run_id, planner_actions=list(state.planner_actions), llm_traces=list(state.llm_traces))
+        if plan_action.plan_dag is not None:
+            state.last_plan = plan_action.plan_dag.to_dict()
+        self._set_live_status(
+            run_id,
+            planner_actions=list(state.planner_actions),
+            plan_dags=[state.last_plan] if state.last_plan else [],
+            llm_traces=list(state.llm_traces),
+        )
         maybe_aborted = self._maybe_abort(
             run_id=run_id,
             question=question,
@@ -1706,7 +1878,12 @@ class AgentRuntime:
                 state.planner_actions.append(revised.to_dict())
                 if revised.assumptions:
                     state.assumptions = list(dict.fromkeys(state.assumptions + revised.assumptions))
-                self._set_live_status(run_id, planner_actions=list(state.planner_actions), llm_traces=list(state.llm_traces))
+                self._set_live_status(
+                    run_id,
+                    planner_actions=list(state.planner_actions),
+                    plan_dags=plan_dags + [revised.plan_dag.to_dict()],
+                    llm_traces=list(state.llm_traces),
+                )
                 revised_snapshot = asyncio.run(self.executor.execute(revised.plan_dag, context))
                 plan_dags.append(revised.plan_dag.to_dict())
                 snapshot = revised_snapshot
@@ -1744,6 +1921,7 @@ class AgentRuntime:
             assumptions=list(state.assumptions),
             planner_actions=list(state.planner_actions),
             plan_dags=plan_dags,
+            tool_calls=self._current_tool_calls(run_id),
             selected_docs=list(snapshot.selected_docs),
             node_records=list(snapshot.node_records),
             provenance_records=list(snapshot.provenance_records),
@@ -1869,6 +2047,8 @@ class AgentRuntime:
             detail="Run finished",
             assumptions=list(manifest.assumptions),
             planner_actions=list(manifest.planner_actions),
+            plan_dags=list(manifest.plan_dags),
+            tool_calls=list(manifest.tool_calls),
             llm_traces=list(manifest.metadata.get("llm_traces", [])),
             clarification_questions=list(manifest.clarification_questions),
             final_manifest_path=str(manifest_path),

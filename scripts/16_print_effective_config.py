@@ -12,10 +12,12 @@ if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
 from corpusagent2.app_config import AppConfig, load_project_configuration
+from corpusagent2.runtime_context import CorpusRuntime
 
 
 if __name__ == "__main__":
     config = load_project_configuration(REPO_ROOT)
+    runtime = CorpusRuntime.from_project_root(REPO_ROOT)
     payload = {
         "source_path": config.source_path,
         "server": {
@@ -42,5 +44,6 @@ if __name__ == "__main__":
             key: os.environ.get(key, "")
             for key in sorted(config.env_map.keys())
         },
+        "retrieval_health": runtime.retrieval_health(),
     }
     print(json.dumps(payload, indent=2, ensure_ascii=False))

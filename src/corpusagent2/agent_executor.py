@@ -24,6 +24,78 @@ def _utc_now() -> str:
     return datetime.now(UTC).isoformat()
 
 
+def _result_items(payload: Any) -> tuple[str, list[Any]]:
+    if not isinstance(payload, dict):
+        return "", []
+    for key in ("results", "documents", "rows", "evidence_items", "artifacts"):
+        value = payload.get(key)
+        if isinstance(value, list):
+            return key, list(value)
+    return "", []
+
+
+def _dependency_document_count(dependency_results: dict[str, ToolExecutionResult]) -> int:
+    doc_ids: set[str] = set()
+    for result in dependency_results.values():
+        payload = result.payload
+        if not isinstance(payload, dict):
+            continue
+        working_set_doc_ids = payload.get("working_set_doc_ids")
+        if isinstance(working_set_doc_ids, list):
+            doc_ids.update(str(item) for item in working_set_doc_ids if str(item).strip())
+        for key in ("documents", "results", "rows"):
+            value = payload.get(key)
+            if not isinstance(value, list):
+                continue
+            for item in value:
+                if isinstance(item, dict) and str(item.get("doc_id", "")).strip():
+                    doc_ids.add(str(item["doc_id"]))
+    return len(doc_ids)
+
+
+def _payload_preview(payload: Any) -> Any:
+    if isinstance(payload, dict):
+        preview: dict[str, Any] = {}
+        for key, value in payload.items():
+            if isinstance(value, list):
+                preview[key] = _safe_json(value[:2])
+            elif isinstance(value, dict):
+                preview[key] = {nested_key: _safe_json(nested_value) for nested_key, nested_value in list(value.items())[:4]}
+            elif isinstance(value, str):
+                preview[key] = value[:280]
+            else:
+                preview[key] = _safe_json(value)
+        return preview
+    if isinstance(payload, list):
+        return _safe_json(payload[:2])
+    return _safe_json(payload)
+
+
+def _summarize_tool_result(result: ToolExecutionResult, *, dependency_results: dict[str, ToolExecutionResult]) -> dict[str, Any]:
+    payload = result.payload
+    items_key, items = _result_items(payload)
+    summary = {
+        "items_key": items_key,
+        "items_count": len(items),
+        "documents_processed": _dependency_document_count(dependency_results),
+        "evidence_count": len(result.evidence_items),
+        "artifact_count": len(result.artifacts_used),
+        "caveat_count": len(result.caveats),
+        "unsupported_count": len(result.unsupported_parts),
+        "payload_preview": _payload_preview(payload),
+    }
+    if isinstance(payload, dict):
+        stdout = str(payload.get("stdout", "")).strip()
+        stderr = str(payload.get("stderr", "")).strip()
+        if stdout:
+            summary["stdout_preview"] = stdout[:280]
+        if stderr:
+            summary["stderr_preview"] = stderr[:280]
+        if payload.get("exit_code") is not None:
+            summary["exit_code"] = int(payload.get("exit_code", 0))
+    return summary
+
+
 @dataclass(slots=True)
 class AgentExecutionSnapshot:
     node_records: list[AgentNodeExecutionRecord]
@@ -81,16 +153,6 @@ class AsyncPlanExecutor:
         started_perf = time.perf_counter()
         attempts = 0
         last_error = ""
-        self._emit_event(
-            context,
-            {
-                "event": "node_started",
-                "node_id": node.node_id,
-                "capability": node.capability,
-                "status": "running",
-                "started_at_utc": started_at,
-            },
-        )
 
         try:
             resolution = self.registry.resolve(
@@ -138,6 +200,23 @@ class AsyncPlanExecutor:
             )
 
         cache_key = self._cache_key(node, resolution.spec.tool_name, dependency_results)
+        start_event_payload = {
+            "event": "node_started",
+            "node_id": node.node_id,
+            "capability": node.capability,
+            "status": "running",
+            "started_at_utc": started_at,
+            "tool_name": resolution.spec.tool_name,
+            "provider": resolution.spec.provider,
+            "tool_version": resolution.spec.tool_version,
+            "model_id": resolution.spec.model_id,
+            "tool_reason": resolution.reason,
+            "inputs": _safe_json(node.inputs),
+            "dependency_nodes": sorted(dependency_results.keys()),
+            "documents_processed": _dependency_document_count(dependency_results),
+            "cache_key": cache_key,
+        }
+        self._emit_event(context, start_event_payload)
         cache_hit = bool(not getattr(context.state, "no_cache", False) and node.cacheable and cache_key in self._cache)
         if cache_hit:
             context.working_store.record_tool_call(
@@ -146,7 +225,13 @@ class AsyncPlanExecutor:
                 node.capability,
                 resolution.spec.tool_name,
                 "running",
-                {"cache_lookup": True},
+                {
+                    "cache_lookup": True,
+                    "started_at_utc": started_at,
+                    "inputs": _safe_json(node.inputs),
+                    "dependency_nodes": sorted(dependency_results.keys()),
+                    "cache_key": cache_key,
+                },
             )
             result = self._cache[cache_key]
             resolved_tool_name = str(result.metadata.get("tool_name", resolution.spec.tool_name))
@@ -160,7 +245,16 @@ class AsyncPlanExecutor:
                 node.capability,
                 resolved_tool_name,
                 "completed",
-                {"cache_hit": True, "payload": _safe_json(result.payload)},
+                {
+                    "cache_hit": True,
+                    "started_at_utc": started_at,
+                    "finished_at_utc": _utc_now(),
+                    "inputs": _safe_json(node.inputs),
+                    "dependency_nodes": sorted(dependency_results.keys()),
+                    "cache_key": cache_key,
+                    "summary": _summarize_tool_result(result, dependency_results=dependency_results),
+                    "payload": _safe_json(result.payload),
+                },
             )
             context.working_store.record_artifact(
                 context.run_id,
@@ -188,6 +282,17 @@ class AsyncPlanExecutor:
                     "capability": node.capability,
                     "status": "completed",
                     "cache_hit": True,
+                    "tool_name": resolved_tool_name,
+                    "provider": resolved_provider,
+                    "tool_version": resolved_tool_version,
+                    "model_id": resolved_model_id,
+                    "tool_reason": resolution.reason,
+                    "inputs": _safe_json(node.inputs),
+                    "dependency_nodes": sorted(dependency_results.keys()),
+                    "documents_processed": _dependency_document_count(dependency_results),
+                    "cache_key": cache_key,
+                    "summary": _summarize_tool_result(result, dependency_results=dependency_results),
+                    "artifacts": list(result.artifacts_used) + [artifact_path],
                     "started_at_utc": started_at,
                     "finished_at_utc": finished_at,
                     "duration_ms": duration_ms,
@@ -228,7 +333,13 @@ class AsyncPlanExecutor:
                     node.capability,
                     resolution.spec.tool_name,
                     "running",
-                    {"attempt": attempts},
+                    {
+                        "attempt": attempts,
+                        "started_at_utc": started_at,
+                        "inputs": _safe_json(node.inputs),
+                        "dependency_nodes": sorted(dependency_results.keys()),
+                        "cache_key": cache_key,
+                    },
                 )
                 result = await asyncio.to_thread(
                     resolution.adapter.run,
@@ -245,7 +356,17 @@ class AsyncPlanExecutor:
                     node.capability,
                     str(result.metadata.get("tool_name", resolution.spec.tool_name)),
                     "completed",
-                    {"cache_hit": False, "payload": _safe_json(result.payload)},
+                    {
+                        "cache_hit": False,
+                        "attempt": attempts,
+                        "started_at_utc": started_at,
+                        "finished_at_utc": _utc_now(),
+                        "inputs": _safe_json(node.inputs),
+                        "dependency_nodes": sorted(dependency_results.keys()),
+                        "cache_key": cache_key,
+                        "summary": _summarize_tool_result(result, dependency_results=dependency_results),
+                        "payload": _safe_json(result.payload),
+                    },
                 )
                 context.working_store.record_artifact(
                     context.run_id,
@@ -277,6 +398,17 @@ class AsyncPlanExecutor:
                         "capability": node.capability,
                         "status": "completed",
                         "cache_hit": False,
+                        "tool_name": resolved_tool_name,
+                        "provider": resolved_provider,
+                        "tool_version": resolved_tool_version,
+                        "model_id": resolved_model_id,
+                        "tool_reason": resolution.reason,
+                        "inputs": _safe_json(node.inputs),
+                        "dependency_nodes": sorted(dependency_results.keys()),
+                        "documents_processed": _dependency_document_count(dependency_results),
+                        "cache_key": cache_key,
+                        "summary": _summarize_tool_result(result, dependency_results=dependency_results),
+                        "artifacts": list(result.artifacts_used) + [artifact_path],
                         "started_at_utc": started_at,
                         "finished_at_utc": finished_at,
                         "duration_ms": duration_ms,
@@ -315,7 +447,14 @@ class AsyncPlanExecutor:
                     node.capability,
                     resolution.spec.tool_name,
                     "failed",
-                    {"error": last_error, "attempt": attempts},
+                    {
+                        "error": last_error,
+                        "attempt": attempts,
+                        "started_at_utc": started_at,
+                        "inputs": _safe_json(node.inputs),
+                        "dependency_nodes": sorted(dependency_results.keys()),
+                        "cache_key": cache_key,
+                    },
                 )
 
         finished_at = _utc_now()
@@ -328,6 +467,15 @@ class AsyncPlanExecutor:
                 "capability": node.capability,
                 "status": "failed",
                 "error": last_error,
+                "tool_name": resolution.spec.tool_name,
+                "provider": resolution.spec.provider,
+                "tool_version": resolution.spec.tool_version,
+                "model_id": resolution.spec.model_id,
+                "tool_reason": resolution.reason,
+                "inputs": _safe_json(node.inputs),
+                "dependency_nodes": sorted(dependency_results.keys()),
+                "documents_processed": _dependency_document_count(dependency_results),
+                "cache_key": cache_key,
                 "started_at_utc": started_at,
                 "finished_at_utc": finished_at,
                 "duration_ms": duration_ms,

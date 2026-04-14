@@ -331,6 +331,10 @@ h3 {
   margin: 16px 0;
 }
 
+.transcript-strip {
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+}
+
 .metric-strip > div,
 .metric-row {
   background: rgba(255, 255, 255, 0.65);
@@ -409,6 +413,23 @@ h3 {
 .trace-card pre,
 .trace-card details {
   margin: 10px 0 0;
+}
+
+.tool-call-signature {
+  font-family: "SFMono-Regular", "Cascadia Code", "JetBrains Mono", monospace;
+  font-size: 0.92rem;
+  color: #21443d;
+  background: rgba(14, 107, 91, 0.08);
+  border: 1px solid rgba(14, 107, 91, 0.14);
+  border-radius: 12px;
+  padding: 10px 12px;
+}
+
+.tool-metrics {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 10px;
 }
 
 .trace-head {
@@ -624,6 +645,10 @@ th {
   .hero-badges {
     justify-content: flex-start;
   }
+
+  .transcript-strip {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
 }
 
 @media (max-width: 640px) {
@@ -636,6 +661,10 @@ th {
   }
 
   .metric-strip {
+    grid-template-columns: 1fr;
+  }
+
+  .transcript-strip {
     grid-template-columns: 1fr;
   }
 }

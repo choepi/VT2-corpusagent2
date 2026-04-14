@@ -10,6 +10,7 @@ import pandas as pd
 from .faithfulness import NLIVerifier
 from .io_utils import ensure_exists
 from .retrieval import (
+    dense_asset_health,
     load_dense_assets,
     load_lexical_assets,
     pg_dsn_from_env,
@@ -44,6 +45,7 @@ class CorpusRuntime:
     _lexical_assets: tuple[Any, Any, list[str]] | None = None
     _dense_assets: tuple[Any, list[str]] | None = None
     _metadata: pd.DataFrame | None = None
+    _doc_text_lookup: dict[str, str] | None = None
     _artifact_cache: dict[str, pd.DataFrame] = field(default_factory=dict)
     _summary_cache: dict[str, Any] = field(default_factory=dict)
     _verifier: NLIVerifier | None = None
@@ -52,8 +54,8 @@ class CorpusRuntime:
     def from_project_root(cls, project_root: Path) -> "CorpusRuntime":
         project_root = project_root.resolve()
         retrieval_backend = resolve_retrieval_backend("local")
-        pg_dsn = pg_dsn_from_env(required=retrieval_backend == "pgvector") if retrieval_backend == "pgvector" else ""
-        pg_table = pg_table_from_env() if retrieval_backend == "pgvector" else ""
+        pg_dsn = pg_dsn_from_env(required=False)
+        pg_table = pg_table_from_env() if pg_dsn else ""
         return cls(
             paths=RuntimePaths(
                 project_root=project_root,
@@ -75,7 +77,10 @@ class CorpusRuntime:
         if self.retrieval_backend != "local":
             return None
         if self._dense_assets is None:
-            self._dense_assets = load_dense_assets(self.paths.index_root / "dense")
+            self._dense_assets = load_dense_assets(
+                self.paths.index_root / "dense",
+                expected_rows=int(self.load_metadata().shape[0]),
+            )
         return self._dense_assets
 
     def load_metadata(self) -> pd.DataFrame:
@@ -86,11 +91,13 @@ class CorpusRuntime:
         return self._metadata.copy()
 
     def doc_text_by_id(self) -> dict[str, str]:
-        metadata = self.load_metadata()
-        return {
-            str(row.doc_id): f"{str(row.title)} {str(row.text)}".strip()
-            for row in metadata.itertuples(index=False)
-        }
+        if self._doc_text_lookup is None:
+            metadata = self.load_metadata()
+            self._doc_text_lookup = {
+                str(row.doc_id): f"{str(row.title)} {str(row.text)}".strip()
+                for row in metadata.itertuples(index=False)
+            }
+        return dict(self._doc_text_lookup)
 
     def doc_lookup(self) -> dict[str, dict[str, Any]]:
         metadata = self.load_metadata()
@@ -149,3 +156,71 @@ class CorpusRuntime:
 
     def device_report(self) -> dict[str, Any]:
         return runtime_device_report()
+
+    def retrieval_health(self) -> dict[str, Any]:
+        metadata_rows = int(self.load_metadata().shape[0])
+        lexical_dir = self.paths.index_root / "lexical"
+        local_lexical = {
+            "ready": all(
+                (lexical_dir / name).exists()
+                for name in ("tfidf_vectorizer.joblib", "tfidf_matrix.joblib", "tfidf_doc_ids.joblib")
+            ),
+            "path": str(lexical_dir),
+        }
+        local_dense = dense_asset_health(self.paths.index_root / "dense", expected_rows=metadata_rows)
+        pgvector: dict[str, Any] = {
+            "configured": bool(self.pg_dsn),
+            "table": self.pg_table,
+            "ready": False,
+            "total_rows": 0,
+            "dense_rows": 0,
+            "indices": [],
+            "error": "",
+        }
+        if self.pg_dsn:
+            try:
+                from psycopg import connect
+
+                with connect(self.pg_dsn) as conn:
+                    with conn.cursor() as cursor:
+                        cursor.execute(f"SELECT COUNT(*), COUNT(*) FILTER (WHERE dense_embedding IS NOT NULL) FROM {self.pg_table}")
+                        total_rows, dense_rows = cursor.fetchone()
+                        cursor.execute(
+                            """
+                            SELECT indexname
+                            FROM pg_indexes
+                            WHERE schemaname = ANY (current_schemas(false))
+                              AND tablename = %s
+                            ORDER BY indexname
+                            """,
+                            (self.pg_table,),
+                        )
+                        indices = [str(row[0]) for row in cursor.fetchall()]
+                pgvector["total_rows"] = int(total_rows)
+                pgvector["dense_rows"] = int(dense_rows)
+                pgvector["indices"] = indices
+                pgvector["ready"] = int(total_rows) > 0 and int(dense_rows) == int(total_rows)
+            except Exception as exc:
+                pgvector["error"] = str(exc)
+
+        dense_strategy = "candidate_rerank_fallback"
+        full_corpus_dense_ready = False
+        if self.retrieval_backend == "pgvector" and pgvector["ready"]:
+            dense_strategy = "pgvector"
+            full_corpus_dense_ready = True
+        elif self.retrieval_backend == "local" and local_dense["ready"]:
+            dense_strategy = "local_dense_assets"
+            full_corpus_dense_ready = True
+        elif not metadata_rows:
+            dense_strategy = "unavailable"
+
+        return {
+            "document_count": metadata_rows,
+            "backend": self.retrieval_backend,
+            "local_lexical": local_lexical,
+            "local_dense": local_dense,
+            "pgvector": pgvector,
+            "dense_strategy": dense_strategy,
+            "full_corpus_dense_ready": full_corpus_dense_ready,
+            "dense_candidate_fallback_ready": bool(metadata_rows > 0),
+        }
