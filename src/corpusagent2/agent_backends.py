@@ -15,6 +15,7 @@ from .retrieval import (
     reciprocal_rank_fusion,
     rerank_cross_encoder,
     retrieve_dense,
+    retrieve_dense_from_texts,
     retrieve_dense_pgvector,
     retrieve_tfidf,
 )
@@ -186,6 +187,35 @@ class LocalSearchBackend:
             )
         return filtered
 
+    def _dense_candidate_results(
+        self,
+        *,
+        query: str,
+        candidate_doc_ids: list[str],
+        top_k: int,
+        component_name: str = "dense_candidate",
+    ) -> list[RetrievalResult]:
+        if not candidate_doc_ids or top_k <= 0:
+            return []
+        unique_doc_ids = list(dict.fromkeys(str(doc_id) for doc_id in candidate_doc_ids if str(doc_id).strip()))
+        if not unique_doc_ids:
+            return []
+        docs = self.runtime.load_docs(unique_doc_ids)
+        text_by_id = {
+            str(row.doc_id): f"{str(getattr(row, 'title', ''))} {str(getattr(row, 'text', ''))}".strip()
+            for row in docs.itertuples(index=False)
+        }
+        doc_ids = [doc_id for doc_id in unique_doc_ids if text_by_id.get(doc_id)]
+        texts = [text_by_id[doc_id] for doc_id in doc_ids]
+        return retrieve_dense_from_texts(
+            query=query,
+            model_id=self.runtime.dense_model_id,
+            texts=texts,
+            doc_ids=doc_ids,
+            top_k=max(top_k, 1),
+            component_name=component_name,
+        )
+
     def lexical_results(self, *, query: str, top_k: int) -> list[RetrievalResult]:
         lexical_vectorizer, lexical_matrix, lexical_doc_ids = self.runtime.load_lexical_assets()
         return retrieve_tfidf(
@@ -200,7 +230,10 @@ class LocalSearchBackend:
         if not dense_retrieval_enabled(default=self.runtime.retrieval_backend == "pgvector"):
             return []
         if self.runtime.retrieval_backend == "local":
-            dense_assets = self.runtime.load_dense_assets()
+            try:
+                dense_assets = self.runtime.load_dense_assets()
+            except Exception:
+                return []
             if dense_assets is None:
                 return []
             dense_embeddings, dense_doc_ids = dense_assets
@@ -236,14 +269,22 @@ class LocalSearchBackend:
         mode = str(retrieval_mode or "hybrid").strip().lower()
         lexical_limit = int(lexical_top_k or max(top_k * 5, 50))
         dense_limit = int(dense_top_k or max(top_k * 5, 50))
+        dense_candidates = self.dense_results(query=query, top_k=dense_limit)
+        lexical_candidates: list[RetrievalResult] = []
+        if mode != "dense" or not dense_candidates:
+            lexical_candidates = self.lexical_results(query=query, top_k=lexical_limit)
+        if not dense_candidates and lexical_candidates:
+            dense_candidates = self._dense_candidate_results(
+                query=query,
+                candidate_doc_ids=[item.doc_id for item in lexical_candidates],
+                top_k=dense_limit,
+            )
         if mode == "lexical":
-            ranked = self.lexical_results(query=query, top_k=lexical_limit)[:top_k]
+            ranked = lexical_candidates[:top_k]
         elif mode == "dense":
-            ranked = self.dense_results(query=query, top_k=dense_limit)[:top_k]
+            ranked = dense_candidates[:top_k]
         else:
-            lexical = self.lexical_results(query=query, top_k=lexical_limit)
-            dense = self.dense_results(query=query, top_k=dense_limit)
-            ranked = reciprocal_rank_fusion({"lexical": lexical, "dense": dense}, k=fusion_k)[:top_k]
+            ranked = reciprocal_rank_fusion({"lexical": lexical_candidates, "dense": dense_candidates}, k=fusion_k)[:top_k]
 
         if use_rerank and ranked:
             rerank_limit = min(max(int(rerank_top_k or top_k), top_k), len(ranked))
@@ -288,6 +329,21 @@ class HybridSearchBackend:
             )
         return results
 
+    def _dense_candidate_results(
+        self,
+        *,
+        query: str,
+        candidate_results: list[RetrievalResult],
+        top_k: int,
+        component_name: str = "dense_candidate",
+    ) -> list[RetrievalResult]:
+        return self.local_backend._dense_candidate_results(
+            query=query,
+            candidate_doc_ids=[item.doc_id for item in candidate_results],
+            top_k=top_k,
+            component_name=component_name,
+        )
+
     def search(
         self,
         *,
@@ -326,13 +382,18 @@ class HybridSearchBackend:
                         raise
             return self.local_backend.lexical_results(query=query, top_k=lexical_limit)
 
-        if mode == "dense":
-            ranked = self.local_backend.dense_results(query=query, top_k=dense_limit)[:top_k]
-        elif mode == "lexical":
-            ranked = lexical_results()[:top_k]
-        else:
+        dense = self.local_backend.dense_results(query=query, top_k=dense_limit)
+        lexical: list[RetrievalResult] = []
+        if mode != "dense" or not dense:
             lexical = lexical_results()
-            dense = self.local_backend.dense_results(query=query, top_k=dense_limit)
+        if not dense and lexical:
+            dense = self._dense_candidate_results(query=query, candidate_results=lexical, top_k=dense_limit)
+
+        if mode == "dense":
+            ranked = dense[:top_k]
+        elif mode == "lexical":
+            ranked = lexical[:top_k]
+        else:
             ranked = reciprocal_rank_fusion({"lexical": lexical, "dense": dense}, k=fusion_k)[:top_k]
 
         if use_rerank and ranked:
@@ -374,6 +435,12 @@ class WorkingSetStore(Protocol):
         ...
 
     def finalize_run(self, run_id: str, status: str) -> None:
+        ...
+
+    def read_tool_calls(self, run_id: str) -> list[dict[str, Any]]:
+        ...
+
+    def cleanup_interrupted_runs(self) -> int:
         ...
 
 
@@ -434,6 +501,17 @@ class InMemoryWorkingSetStore:
     def finalize_run(self, run_id: str, status: str) -> None:
         if run_id in self.runs:
             self.runs[run_id]["status"] = status
+
+    def read_tool_calls(self, run_id: str) -> list[dict[str, Any]]:
+        return [dict(item) for item in self.tool_calls_by_run.get(run_id, [])]
+
+    def cleanup_interrupted_runs(self) -> int:
+        repaired = 0
+        for run in self.runs.values():
+            if str(run.get("status", "")) == "started":
+                run["status"] = "failed"
+                repaired += 1
+        return repaired
 
 
 class PostgresWorkingSetStore:
@@ -691,6 +769,46 @@ class PostgresWorkingSetStore:
                     (status, run_id),
                 )
             conn.commit()
+
+    def read_tool_calls(self, run_id: str) -> list[dict[str, Any]]:
+        self.ensure_schema()
+        with self._connect() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT node_id, capability, tool_name, status, payload
+                    FROM ca_agent_run_tool_calls
+                    WHERE run_id = %s
+                    ORDER BY node_id, tool_name, status
+                    """,
+                    (run_id,),
+                )
+                rows = cursor.fetchall()
+        return [
+            {
+                "node_id": str(row[0]),
+                "capability": str(row[1]),
+                "tool_name": str(row[2]),
+                "status": str(row[3]),
+                "payload": dict(row[4] or {}),
+            }
+            for row in rows
+        ]
+
+    def cleanup_interrupted_runs(self) -> int:
+        self.ensure_schema()
+        with self._connect() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    """
+                    UPDATE ca_agent_runs
+                    SET status = 'failed'
+                    WHERE status = 'started'
+                    """
+                )
+                repaired = int(cursor.rowcount or 0)
+            conn.commit()
+        return repaired
 
 
 def save_agent_manifest(path: Path, payload: dict[str, Any]) -> None:
