@@ -133,7 +133,7 @@ def pg_dsn_from_env(required: bool = True) -> str:
     return dsn
 
 
-def pg_table_from_env(default: str = "ca_documents") -> str:
+def pg_table_from_env(default: str = "article_corpus") -> str:
     table_name = os.getenv("CORPUSAGENT2_PG_TABLE", "").strip()
     if not table_name:
         table_name = default

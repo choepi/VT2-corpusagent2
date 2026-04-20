@@ -17,6 +17,9 @@ from corpusagent2.app_config import load_project_configuration
 from corpusagent2.retrieval import pg_dsn_from_env, pg_table_from_env
 from corpusagent2.seed import set_global_seed
 
+DEFAULT_HNSW_EF_CONSTRUCTION = 64
+DEFAULT_MAX_PARALLEL_MAINTENANCE_WORKERS = 6
+
 
 def parse_bool_env(name: str, default: bool) -> bool:
     value = os.getenv(name, "").strip().lower()
@@ -83,21 +86,24 @@ if __name__ == "__main__":
     load_project_configuration(PROJECT_ROOT)
 
     HNSW_M = parse_int_env("CORPUSAGENT2_PG_HNSW_M", 16)
-    HNSW_EF_CONSTRUCTION = parse_int_env("CORPUSAGENT2_PG_HNSW_EF_CONSTRUCTION", 64)
+    HNSW_EF_CONSTRUCTION = parse_int_env(
+        "CORPUSAGENT2_PG_HNSW_EF_CONSTRUCTION",
+        DEFAULT_HNSW_EF_CONSTRUCTION,
+    )
     BUILD_IVFFLAT = parse_bool_env("CORPUSAGENT2_PG_BUILD_IVFFLAT", True)
     BUILD_HNSW = parse_bool_env("CORPUSAGENT2_PG_BUILD_HNSW", True)
     ENABLE_DENSE_RETRIEVAL = parse_retrieval_mode()
     MAINTENANCE_WORK_MEM = parse_memory_env("CORPUSAGENT2_PG_MAINTENANCE_WORK_MEM", "512MB")
     PARALLEL_MAINTENANCE_WORKERS = parse_int_env(
         "CORPUSAGENT2_PG_MAX_PARALLEL_MAINTENANCE_WORKERS",
-        6,
+        DEFAULT_MAX_PARALLEL_MAINTENANCE_WORKERS,
     )
 
     ensure_absolute(SUMMARY_PATH, "SUMMARY_PATH")
     set_global_seed(SEED)
 
     dsn = pg_dsn_from_env(required=True)
-    table_name = pg_table_from_env(default="ca_documents")
+    table_name = pg_table_from_env(default="article_corpus")
     ivfflat_index_name = f"idx_{table_name}_embedding_ivfflat"
     hnsw_index_name = f"idx_{table_name}_embedding_hnsw"
 

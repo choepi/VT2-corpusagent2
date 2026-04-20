@@ -206,6 +206,7 @@ def _upsert_dotenv(path: Path, updates: dict[str, str]) -> None:
         if key not in seen:
             output.append(f"{key}={value}")
     path.write_text("\n".join(output).rstrip() + "\n", encoding="utf-8")
+    DOTENV_VALUES.update(updates)
 
 
 def _retrieval_profile_env(profile: str) -> dict[str, str]:
@@ -214,11 +215,16 @@ def _retrieval_profile_env(profile: str) -> dict[str, str]:
         return {
             "CORPUSAGENT2_VM_RETRIEVAL_PROFILE": "hybrid",
             "CORPUSAGENT2_BUILD_LEXICAL_ASSETS": "true",
-            "CORPUSAGENT2_BUILD_DENSE_ASSETS": "true",
-            "CORPUSAGENT2_PG_INCLUDE_EMBEDDINGS": "true",
+            "CORPUSAGENT2_BUILD_DENSE_ASSETS": "false",
+            "CORPUSAGENT2_PG_INCLUDE_EMBEDDINGS": "false",
             "CORPUSAGENT2_ENABLE_DENSE_RETRIEVAL": "true",
             "CORPUSAGENT2_RETRIEVAL_BACKEND": "pgvector",
             "CORPUSAGENT2_DEFAULT_RETRIEVAL_MODE": "hybrid",
+            "CORPUSAGENT2_PG_BACKFILL_FETCH_BATCH_SIZE": "128",
+            "CORPUSAGENT2_PG_BACKFILL_ENCODE_BATCH_SIZE": "16",
+            "CORPUSAGENT2_PG_BUILD_IVFFLAT": "true",
+            "CORPUSAGENT2_PG_BUILD_HNSW": "false",
+            "CORPUSAGENT2_PG_IVF_LISTS": "1024",
         }
     return {
         "CORPUSAGENT2_VM_RETRIEVAL_PROFILE": "no-dense",
@@ -229,6 +235,38 @@ def _retrieval_profile_env(profile: str) -> dict[str, str]:
         "CORPUSAGENT2_RETRIEVAL_BACKEND": "local",
         "CORPUSAGENT2_DEFAULT_RETRIEVAL_MODE": "lexical",
     }
+
+
+def _dense_retrieval_requested(env: dict[str, str]) -> bool:
+    raw = env.get(
+        "CORPUSAGENT2_ENABLE_DENSE_RETRIEVAL",
+        _env_value("CORPUSAGENT2_ENABLE_DENSE_RETRIEVAL", "false"),
+    )
+    return _truthy(raw)
+
+
+def _expected_pgvector_index_names(env: dict[str, str], *, table_name: str) -> set[str]:
+    names: set[str] = set()
+    if _truthy(env.get("CORPUSAGENT2_PG_BUILD_IVFFLAT", _env_value("CORPUSAGENT2_PG_BUILD_IVFFLAT", "true"))):
+        names.add(f"idx_{table_name}_embedding_ivfflat")
+    if _truthy(env.get("CORPUSAGENT2_PG_BUILD_HNSW", _env_value("CORPUSAGENT2_PG_BUILD_HNSW", "true"))):
+        names.add(f"idx_{table_name}_embedding_hnsw")
+    return names
+
+
+def _pgvector_backfill_complete(
+    *,
+    expected_documents: int | None,
+    current_postgres_count: int | None,
+    current_embedding_count: int | None,
+) -> bool:
+    if current_postgres_count is None or current_embedding_count is None:
+        return False
+    if current_postgres_count <= 0 or current_embedding_count != current_postgres_count:
+        return False
+    if expected_documents is not None and current_postgres_count != expected_documents:
+        return False
+    return True
 
 
 def _venv_python() -> Path:
@@ -612,7 +650,7 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
         "--retrieval-profile",
         choices=["no-dense", "hybrid"],
         default=_env_value("CORPUSAGENT2_VM_RETRIEVAL_PROFILE", DEFAULT_RETRIEVAL_PROFILE),
-        help="Choose a stable VM retrieval profile. 'no-dense' is the default lightweight path.",
+        help="Choose a stable VM retrieval profile. 'hybrid' is the default service-backed path.",
     )
     return parser.parse_args(argv)
 
@@ -639,10 +677,11 @@ def main(argv: Iterable[str] | None = None) -> None:
 
     postgres_schema_summary = REPO_ROOT / "outputs" / "postgres" / "init_schema_summary.json"
     postgres_ingest_summary = REPO_ROOT / "outputs" / "postgres" / "ingest_summary.json"
+    pgvector_backfill_summary = REPO_ROOT / "outputs" / "postgres" / "backfill_dense_embeddings_summary.json"
     pgvector_index_summary = REPO_ROOT / "outputs" / "postgres" / "build_index_summary.json"
     opensearch_summary = REPO_ROOT / "outputs" / "opensearch" / "bulk_index_summary.json"
 
-    pg_include_embeddings = _truthy(command_env.get("CORPUSAGENT2_PG_INCLUDE_EMBEDDINGS", "false"))
+    dense_retrieval_requested = _dense_retrieval_requested(command_env)
     if not args.skip_docker:
         _ensure_docker_services(with_dashboards=args.with_dashboards)
         documents_parquet = REPO_ROOT / "data" / "processed" / "documents.parquet"
@@ -650,8 +689,8 @@ def main(argv: Iterable[str] | None = None) -> None:
         current_postgres_count = _postgres_table_row_count()
         current_embedding_count = _postgres_embedding_row_count()
         postgres_index_names = _postgres_index_names()
-        expected_ivfflat_index = f"idx_{_env_value('CORPUSAGENT2_PG_TABLE', 'article_corpus')}_embedding_ivfflat"
-        expected_hnsw_index = f"idx_{_env_value('CORPUSAGENT2_PG_TABLE', 'article_corpus')}_embedding_hnsw"
+        table_name = command_env.get("CORPUSAGENT2_PG_TABLE", _env_value("CORPUSAGENT2_PG_TABLE", "article_corpus"))
+        expected_pgvector_indices = _expected_pgvector_index_names(command_env, table_name=table_name)
 
         _maybe_run_script(
             python_exe,
@@ -665,13 +704,6 @@ def main(argv: Iterable[str] | None = None) -> None:
             postgres_needs_refresh = True
         if not postgres_needs_refresh and expected_documents is not None and current_postgres_count != expected_documents:
             postgres_needs_refresh = True
-        if (
-            not postgres_needs_refresh
-            and pg_include_embeddings
-            and expected_documents is not None
-            and current_embedding_count != expected_documents
-        ):
-            postgres_needs_refresh = True
         _maybe_run_script(
             python_exe,
             "10_ingest_parquet_to_postgres.py",
@@ -680,32 +712,65 @@ def main(argv: Iterable[str] | None = None) -> None:
             force=postgres_needs_refresh,
         )
 
+        current_postgres_count = _postgres_table_row_count()
+        current_embedding_count = _postgres_embedding_row_count()
+        postgres_index_names = _postgres_index_names()
+
+        pgvector_backfill_needs_refresh = args.refresh_postgres
+        if not pgvector_backfill_needs_refresh and not _summary_is_present(pgvector_backfill_summary):
+            pgvector_backfill_needs_refresh = True
+        if (
+            not pgvector_backfill_needs_refresh
+            and dense_retrieval_requested
+            and not _pgvector_backfill_complete(
+                expected_documents=expected_documents,
+                current_postgres_count=current_postgres_count,
+                current_embedding_count=current_embedding_count,
+            )
+        ):
+            pgvector_backfill_needs_refresh = True
+        _maybe_run_script(
+            python_exe,
+            "26_backfill_pgvector_embeddings.py",
+            env=command_env,
+            summary_path=pgvector_backfill_summary,
+            force=pgvector_backfill_needs_refresh,
+            should_skip=not dense_retrieval_requested,
+        )
+
+        current_postgres_count = _postgres_table_row_count()
+        current_embedding_count = _postgres_embedding_row_count()
+        postgres_index_names = _postgres_index_names()
+        pgvector_ready = _pgvector_backfill_complete(
+            expected_documents=expected_documents,
+            current_postgres_count=current_postgres_count,
+            current_embedding_count=current_embedding_count,
+        )
+
         pgvector_needs_refresh = args.refresh_postgres
         if not pgvector_needs_refresh and not _summary_is_present(pgvector_index_summary):
             pgvector_needs_refresh = True
         if (
             not pgvector_needs_refresh
-            and pg_include_embeddings
-            and expected_documents is not None
-            and current_embedding_count != expected_documents
+            and dense_retrieval_requested
+            and expected_pgvector_indices
+            and not expected_pgvector_indices.issubset(postgres_index_names)
         ):
             pgvector_needs_refresh = True
-        if (
-            not pgvector_needs_refresh
-            and pg_include_embeddings
-            and (
-                expected_ivfflat_index not in postgres_index_names
-                or expected_hnsw_index not in postgres_index_names
+        if dense_retrieval_requested and not pgvector_ready:
+            expected_total = expected_documents if expected_documents is not None else current_postgres_count or 0
+            ready_count = current_embedding_count or 0
+            print(
+                "[skip] 11_build_pgvector_index.py waiting for full dense backfill "
+                f"({ready_count}/{expected_total} rows ready)."
             )
-        ):
-            pgvector_needs_refresh = True
         _maybe_run_script(
             python_exe,
             "11_build_pgvector_index.py",
             env=command_env,
             summary_path=pgvector_index_summary,
             force=pgvector_needs_refresh,
-            should_skip=not pg_include_embeddings,
+            should_skip=not dense_retrieval_requested or not pgvector_ready or not expected_pgvector_indices,
         )
 
         current_opensearch_count = _opensearch_count()
@@ -733,6 +798,8 @@ def main(argv: Iterable[str] | None = None) -> None:
             "data_prepared": not args.skip_data,
             "docker_prepared": not args.skip_docker,
             "postgres_summary": str(postgres_ingest_summary) if postgres_ingest_summary.exists() else "",
+            "pgvector_backfill_summary": str(pgvector_backfill_summary) if pgvector_backfill_summary.exists() else "",
+            "pgvector_index_summary": str(pgvector_index_summary) if pgvector_index_summary.exists() else "",
             "opensearch_summary": str(opensearch_summary) if opensearch_summary.exists() else "",
         }
     )

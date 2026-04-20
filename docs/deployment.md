@@ -22,19 +22,23 @@ What that bootstrap does:
 - installs Python dependencies with `uv`
 - downloads provider assets
 - downloads and preprocesses the CC-News dataset when local data is missing
-- defaults to the stable `no-dense` VM profile: lexical retrieval via OpenSearch, Postgres document storage, no pgvector embedding dependency
-- builds lexical assets automatically and only builds dense assets when you explicitly switch to the `hybrid` profile
+- defaults to the `hybrid` VM profile: dense retrieval via Postgres/pgvector plus lexical retrieval via OpenSearch
+- builds lexical assets automatically
 - starts Docker services from [`deploy/docker-compose.yml`](../deploy/docker-compose.yml)
 - initializes Postgres + pgvector
 - ingests the corpus into Postgres
+- in `hybrid` mode, backfills pgvector embeddings directly in Postgres with the resumable `scripts/26_backfill_pgvector_embeddings.py` path instead of requiring full local dense assets
+- in `hybrid` mode, builds the pgvector ANN index after the dense backfill is complete
 - bulk-indexes the corpus into OpenSearch
 - writes `web/config.js`
 
-The default VM retrieval profile is `no-dense`. If you want the full hybrid path, run:
+The default VM retrieval profile is `hybrid`. If you want the lighter lexical-only path, run:
 
 ```bash
-python3 scripts/22_prepare_vm_stack.py --install-system --retrieval-profile hybrid
+python3 scripts/22_prepare_vm_stack.py --install-system --retrieval-profile no-dense
 ```
+
+For CPU-only VMs with roughly 16 GB RAM, the hybrid profile now uses conservative pgvector backfill defaults and builds only the IVFFlat ANN index by default. The pgvector index builder also defaults HNSW `ef_construction` to `64` and requests up to `6` parallel maintenance workers when the server allows it, which helps reduce prep time versus the older `128`/`2` settings. The first run can take a long time, but it is resumable: rerun the same command after any interruption.
 
 It is idempotent, so rerunning it after updates is safe.
 
@@ -130,18 +134,20 @@ python3 scripts/22_prepare_vm_stack.py --refresh-data --refresh-assets --refresh
 
 ## 6. Retrieval/backend shape
 
-Default VM profile: `no-dense`
+Default VM profile: `hybrid`
+
+- dense retrieval: Postgres/pgvector
+- lexical retrieval: OpenSearch
+- fusion/rerank: backend runtime
+- local lexical assets are still built for health checks and local repair paths
+- the deployment path no longer depends on shipping prebuilt local dense artifacts to the VM
+
+Optional VM profile: `no-dense`
 
 - lexical retrieval: OpenSearch
 - document storage / working set: Postgres
 - rerank / analysis: backend runtime
 - no pgvector embeddings required
-
-Optional VM profile: `hybrid`
-
-- dense retrieval: Postgres/pgvector
-- lexical retrieval: OpenSearch
-- fusion/rerank: backend runtime
 
 The runtime stays strict about service-backed retrieval:
 
