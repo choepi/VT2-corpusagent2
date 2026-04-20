@@ -89,7 +89,7 @@ Retrieval backend selection:
 - default is local file-based retrieval assets
 - set `CORPUSAGENT2_RETRIEVAL_BACKEND=pgvector` to use Postgres/pgvector for dense retrieval
 - required for pgvector mode: `CORPUSAGENT2_PG_DSN`
-- optional: `CORPUSAGENT2_PG_TABLE` (default: `ca_documents`)
+- optional: `CORPUSAGENT2_PG_TABLE` (default: `article_corpus`)
 
 Temporal KPI aggregation:
 
@@ -127,14 +127,23 @@ python main.py
 ```bash
 python scripts/09_init_postgres_schema.py
 python scripts/10_ingest_parquet_to_postgres.py
+python scripts/26_backfill_pgvector_embeddings.py
 python scripts/11_build_pgvector_index.py
 ```
+
+For a fresh Ubuntu VM, prefer the single bootstrap:
+
+```bash
+python3 scripts/22_prepare_vm_stack.py --install-system
+```
+
+`hybrid` is the default VM profile. That path builds lexical assets locally, ingests the corpus into Postgres, backfills pgvector embeddings directly in the database, bulk-indexes OpenSearch, and then builds the pgvector ANN index once the backfill is complete. Pass `--retrieval-profile no-dense` if you want the lighter lexical-only VM path.
 
 Example environment variables (Windows cmd):
 
 ```bash
 set CORPUSAGENT2_PG_DSN=postgresql://USER:PASSWORD@HOST:5432/DBNAME
-set CORPUSAGENT2_PG_TABLE=ca_documents
+set CORPUSAGENT2_PG_TABLE=article_corpus
 set CORPUSAGENT2_RETRIEVAL_BACKEND=pgvector
 ```
 
@@ -173,8 +182,15 @@ Useful overrides include:
 
 4. Repair or complete dense retrieval when needed:
 
+Preferred VM path:
+
 ```bash
-./.venv/bin/python scripts/02_build_retrieval_assets.py
+./.venv/bin/python scripts/22_prepare_vm_stack.py
+```
+
+Manual repair path:
+
+```bash
 ./.venv/bin/python scripts/26_backfill_pgvector_embeddings.py
 ./.venv/bin/python scripts/11_build_pgvector_index.py
 ```

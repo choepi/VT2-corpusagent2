@@ -53,3 +53,6 @@ explicit = true
 torch = { index = "pytorch-cu118", marker = "sys_platform == 'linux' or sys_platform == 'win32'" }
 torchvision = { index = "pytorch-cu118", marker = "sys_platform == 'linux' or sys_platform == 'win32'" }
 torchaudio = { index = "pytorch-cu118", marker = "sys_platform == 'linux' or sys_platform == 'win32'" }
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

@@ -515,7 +515,7 @@ class InMemoryWorkingSetStore:
 
 
 class PostgresWorkingSetStore:
-    def __init__(self, *, dsn: str, documents_table: str = "ca_documents") -> None:
+    def __init__(self, *, dsn: str, documents_table: str = "article_corpus") -> None:
         self.dsn = dsn
         self.documents_table = documents_table
         self._schema_ready = False
