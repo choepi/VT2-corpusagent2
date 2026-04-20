@@ -83,11 +83,15 @@ if __name__ == "__main__":
     load_project_configuration(PROJECT_ROOT)
 
     HNSW_M = parse_int_env("CORPUSAGENT2_PG_HNSW_M", 16)
-    HNSW_EF_CONSTRUCTION = parse_int_env("CORPUSAGENT2_PG_HNSW_EF_CONSTRUCTION", 128)
+    HNSW_EF_CONSTRUCTION = parse_int_env("CORPUSAGENT2_PG_HNSW_EF_CONSTRUCTION", 64)
     BUILD_IVFFLAT = parse_bool_env("CORPUSAGENT2_PG_BUILD_IVFFLAT", True)
     BUILD_HNSW = parse_bool_env("CORPUSAGENT2_PG_BUILD_HNSW", True)
     ENABLE_DENSE_RETRIEVAL = parse_retrieval_mode()
     MAINTENANCE_WORK_MEM = parse_memory_env("CORPUSAGENT2_PG_MAINTENANCE_WORK_MEM", "512MB")
+    PARALLEL_MAINTENANCE_WORKERS = parse_int_env(
+        "CORPUSAGENT2_PG_MAX_PARALLEL_MAINTENANCE_WORKERS",
+        6,
+    )
 
     ensure_absolute(SUMMARY_PATH, "SUMMARY_PATH")
     set_global_seed(SEED)
@@ -127,6 +131,10 @@ if __name__ == "__main__":
                     if MAINTENANCE_WORK_MEM:
                         # Use a larger session-local budget for ANN index creation on full-corpus builds.
                         cursor.execute(f"SET maintenance_work_mem = '{MAINTENANCE_WORK_MEM}';")
+                    # Request more workers for pgvector ANN index builds when the server allows it.
+                    cursor.execute(
+                        f"SET max_parallel_maintenance_workers = {PARALLEL_MAINTENANCE_WORKERS};"
+                    )
 
                 if ENABLE_DENSE_RETRIEVAL and BUILD_IVFFLAT:
                     cursor.execute(
@@ -165,6 +173,7 @@ if __name__ == "__main__":
         "hnsw_m": HNSW_M,
         "hnsw_ef_construction": HNSW_EF_CONSTRUCTION,
         "maintenance_work_mem": MAINTENANCE_WORK_MEM or "",
+        "max_parallel_maintenance_workers": PARALLEL_MAINTENANCE_WORKERS,
         "built_indices": built_indices,
         "created_at_utc": datetime.now(timezone.utc).isoformat(),
     }
