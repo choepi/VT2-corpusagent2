@@ -31,6 +31,10 @@ DEFAULT_OPENSEARCH_VERIFY_SSL = False
 DEFAULT_RETRIEVAL_PROFILE = "hybrid"
 
 
+class BootstrapError(RuntimeError):
+    pass
+
+
 def _load_dotenv(path: Path) -> dict[str, str]:
     values: dict[str, str] = {}
     if not path.exists():
@@ -112,7 +116,7 @@ def _docker_compose_command() -> list[str]:
     docker_compose = shutil.which("docker-compose")
     if docker_compose:
         return _sudo_prefix() + [docker_compose]
-    raise RuntimeError(
+    raise BootstrapError(
         "Docker Compose is not available. Install docker + docker compose plugin first."
     )
 
@@ -126,6 +130,53 @@ def _docker_runtime_is_available() -> bool:
         return False
     compose_probe = _capture([docker, "compose", "version"])
     return compose_probe.returncode == 0
+
+
+def _docker_active_context() -> str | None:
+    docker = shutil.which("docker")
+    if not docker:
+        return None
+    probe = _capture([docker, "context", "show"])
+    if probe.returncode != 0:
+        return None
+    value = probe.stdout.strip()
+    return value or None
+
+
+def _ensure_docker_engine_ready() -> None:
+    docker = shutil.which("docker")
+    if not docker:
+        return
+    probe = _capture([docker, "info"])
+    if probe.returncode == 0:
+        return
+
+    active_context = _docker_active_context()
+    details = probe.stderr.strip() or probe.stdout.strip()
+    message_lines = ["Docker is installed, but the Docker engine is not reachable."]
+    if active_context:
+        message_lines.append(f"Active Docker context: {active_context}.")
+    if os.name == "nt":
+        if active_context and active_context != "desktop-linux":
+            message_lines.append(
+                "This stack expects Docker Desktop to be running with the Linux container engine."
+            )
+        else:
+            message_lines.append(
+                "Start Docker Desktop and wait until the Linux engine reports healthy before rerunning this bootstrap."
+            )
+        if "dockerDesktopLinuxEngine" in details:
+            message_lines.append(
+                "The Docker Desktop Linux engine pipe (`//./pipe/dockerDesktopLinuxEngine`) is missing, which usually means Docker Desktop is not running yet."
+            )
+        message_lines.append(
+            "If you only want to finish the Python/data setup right now, rerun with `--skip-docker`."
+        )
+    else:
+        message_lines.append("Start the Docker daemon/service and rerun.")
+    if details:
+        message_lines.append(f"Docker reported: {details}")
+    raise BootstrapError("\n".join(message_lines))
 
 
 def _project_env() -> dict[str, str]:
@@ -505,6 +556,7 @@ def _opensearch_count() -> int | None:
 
 def _ensure_docker_services(*, with_dashboards: bool) -> None:
     compose_command = _docker_compose_command()
+    _ensure_docker_engine_ready()
     env = _project_env()
     services = ["postgres", "opensearch"]
     if with_dashboards:
@@ -695,4 +747,8 @@ def main(argv: Iterable[str] | None = None) -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except BootstrapError as exc:
+        print(f"[error] {exc}", file=sys.stderr)
+        raise SystemExit(1)
