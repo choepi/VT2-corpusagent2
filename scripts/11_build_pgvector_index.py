@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import math
 import os
+import re
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -36,6 +38,17 @@ def parse_int_env(name: str, default: int) -> int:
     return value
 
 
+def parse_memory_env(name: str, default: str | None = None) -> str | None:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    if not re.fullmatch(r"\d+\s*(?:[kKmMgGtT]?B)", raw):
+        raise ValueError(
+            f"Environment variable {name} must look like '512MB' or '2GB', got: {raw}"
+        )
+    return raw.replace(" ", "")
+
+
 def parse_retrieval_mode() -> bool:
     return parse_bool_env(
         "CORPUSAGENT2_ENABLE_DENSE_RETRIEVAL",
@@ -46,6 +59,21 @@ def parse_retrieval_mode() -> bool:
     )
 
 
+def recommended_ivfflat_lists(total_rows: int) -> int:
+    if total_rows <= 0:
+        return 1
+    if total_rows <= 1_000_000:
+        return max(1, total_rows // 1_000)
+    return max(1, int(math.sqrt(total_rows)))
+
+
+def resolve_ivfflat_lists(total_rows: int) -> int:
+    raw = os.getenv("CORPUSAGENT2_PG_IVF_LISTS", "").strip()
+    if raw:
+        return parse_int_env("CORPUSAGENT2_PG_IVF_LISTS", 2048)
+    return recommended_ivfflat_lists(total_rows)
+
+
 if __name__ == "__main__":
     SEED = 42
 
@@ -54,12 +82,12 @@ if __name__ == "__main__":
 
     load_project_configuration(PROJECT_ROOT)
 
-    IVF_LISTS = parse_int_env("CORPUSAGENT2_PG_IVF_LISTS", 2048)
     HNSW_M = parse_int_env("CORPUSAGENT2_PG_HNSW_M", 16)
     HNSW_EF_CONSTRUCTION = parse_int_env("CORPUSAGENT2_PG_HNSW_EF_CONSTRUCTION", 128)
     BUILD_IVFFLAT = parse_bool_env("CORPUSAGENT2_PG_BUILD_IVFFLAT", True)
     BUILD_HNSW = parse_bool_env("CORPUSAGENT2_PG_BUILD_HNSW", True)
     ENABLE_DENSE_RETRIEVAL = parse_retrieval_mode()
+    MAINTENANCE_WORK_MEM = parse_memory_env("CORPUSAGENT2_PG_MAINTENANCE_WORK_MEM", "512MB")
 
     ensure_absolute(SUMMARY_PATH, "SUMMARY_PATH")
     set_global_seed(SEED)
@@ -79,6 +107,7 @@ if __name__ == "__main__":
     dense_rows = 0
     total_rows = 0
     built_indices: list[str] = []
+    ivf_lists = 0
 
     if ENABLE_DENSE_RETRIEVAL:
         with connect(dsn) as conn:
@@ -93,6 +122,11 @@ if __name__ == "__main__":
 
                 if dense_rows == 0:
                     ENABLE_DENSE_RETRIEVAL = False
+                else:
+                    ivf_lists = resolve_ivfflat_lists(dense_rows)
+                    if MAINTENANCE_WORK_MEM:
+                        # Use a larger session-local budget for ANN index creation on full-corpus builds.
+                        cursor.execute(f"SET maintenance_work_mem = '{MAINTENANCE_WORK_MEM}';")
 
                 if ENABLE_DENSE_RETRIEVAL and BUILD_IVFFLAT:
                     cursor.execute(
@@ -100,7 +134,7 @@ if __name__ == "__main__":
                         CREATE INDEX IF NOT EXISTS {ivfflat_index_name}
                         ON {table_name}
                         USING ivfflat (dense_embedding vector_cosine_ops)
-                        WITH (lists = {IVF_LISTS});
+                        WITH (lists = {ivf_lists});
                         """
                     )
                     built_indices.append(ivfflat_index_name)
@@ -127,9 +161,10 @@ if __name__ == "__main__":
         "dense_retrieval_enabled": ENABLE_DENSE_RETRIEVAL,
         "build_ivfflat": BUILD_IVFFLAT,
         "build_hnsw": BUILD_HNSW,
-        "ivf_lists": IVF_LISTS,
+        "ivf_lists": ivf_lists,
         "hnsw_m": HNSW_M,
         "hnsw_ef_construction": HNSW_EF_CONSTRUCTION,
+        "maintenance_work_mem": MAINTENANCE_WORK_MEM or "",
         "built_indices": built_indices,
         "created_at_utc": datetime.now(timezone.utc).isoformat(),
     }
