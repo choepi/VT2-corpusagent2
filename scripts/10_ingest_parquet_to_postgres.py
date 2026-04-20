@@ -74,7 +74,7 @@ if __name__ == "__main__":
     set_global_seed(SEED)
 
     dsn = pg_dsn_from_env(required=True)
-    table_name = pg_table_from_env(default="ca_documents")
+    table_name = pg_table_from_env(default="article_corpus")
 
     try:
         from psycopg import connect
