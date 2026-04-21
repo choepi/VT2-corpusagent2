@@ -326,7 +326,7 @@ h3 {
 
 .metric-strip {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
   gap: 10px;
   margin: 16px 0;
 }
@@ -413,6 +413,18 @@ h3 {
 .trace-card pre,
 .trace-card details {
   margin: 10px 0 0;
+}
+
+.trace-field {
+  margin-top: 10px;
+}
+
+.trace-field-label {
+  margin: 0 0 6px;
+}
+
+.trace-inline-pre {
+  margin-top: 0 !important;
 }
 
 .tool-call-signature {

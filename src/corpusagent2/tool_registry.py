@@ -113,17 +113,33 @@ class ToolRegistry:
             return specs
         return [spec for spec in specs if capability in spec.capabilities]
 
+    def get_tool(self, tool_name: str) -> ToolSpec | None:
+        requested = str(tool_name).strip()
+        if not requested:
+            return None
+        for adapter in self._adapters:
+            if adapter.spec.tool_name == requested:
+                return adapter.spec
+        return None
+
     def resolve(
         self,
         capability: str,
         context: Any,
         params: dict[str, Any] | None = None,
+        requested_tool_name: str = "",
     ) -> ToolResolution:
         params = params or {}
         candidates: list[tuple[CapabilityToolAdapter, list[str]]] = []
         reasons: list[str] = []
+        explicit_tool = str(requested_tool_name or "").strip()
+        matching_tool_registered = False
 
         for adapter in self._adapters:
+            if explicit_tool and adapter.spec.tool_name != explicit_tool:
+                continue
+            if explicit_tool:
+                matching_tool_registered = True
             if capability not in adapter.spec.capabilities:
                 continue
             available, details = adapter.is_available(context=context, params=params)
@@ -134,8 +150,17 @@ class ToolRegistry:
                 reasons.append(f"{adapter.spec.tool_name}: {reason}")
 
         if not candidates:
+            if explicit_tool and not matching_tool_registered:
+                raise LookupError(
+                    f"Requested tool '{explicit_tool}' is not registered for capability '{capability}'."
+                )
             suffix = f" Unavailable candidates: {', '.join(reasons)}." if reasons else ""
-            raise LookupError(f"No tool available for capability '{capability}'.{suffix}")
+            prefix = (
+                f"Requested tool '{explicit_tool}' is unavailable for capability '{capability}'."
+                if explicit_tool
+                else f"No tool available for capability '{capability}'."
+            )
+            raise LookupError(f"{prefix}{suffix}")
 
         cost_rank = {"low": 0, "medium": 1, "high": 2}
         ranked = sorted(
@@ -155,12 +180,18 @@ class ToolRegistry:
             if adapter.spec.fallback_of
             else ""
         )
-        reason = (
-            f"Selected {adapter.spec.tool_name} for capability '{capability}' "
-            f"because it is {'deterministic' if adapter.spec.deterministic else 'non-deterministic'}, "
-            f"cost_class={adapter.spec.cost_class}, priority={adapter.spec.priority}. "
-            f"Availability notes: {detail_text}.{fallback_text}"
-        )
+        if explicit_tool:
+            reason = (
+                f"Selected explicitly requested tool {adapter.spec.tool_name} for capability '{capability}'. "
+                f"Availability notes: {detail_text}.{fallback_text}"
+            )
+        else:
+            reason = (
+                f"Selected {adapter.spec.tool_name} for capability '{capability}' "
+                f"because it is {'deterministic' if adapter.spec.deterministic else 'non-deterministic'}, "
+                f"cost_class={adapter.spec.cost_class}, priority={adapter.spec.priority}. "
+                f"Availability notes: {detail_text}.{fallback_text}"
+            )
         if alternatives:
             reason += f" Other available implementations: {alternatives}."
         return ToolResolution(

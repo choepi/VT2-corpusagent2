@@ -159,6 +159,7 @@ class AsyncPlanExecutor:
                 capability=node.capability,
                 context=context,
                 params=node.inputs,
+                requested_tool_name=node.tool_name,
             )
         except Exception as exc:
             finished_at = _utc_now()
@@ -188,6 +189,7 @@ class AsyncPlanExecutor:
                     node_id=node.node_id,
                     capability=node.capability,
                     status="failed",
+                    tool_name=node.tool_name,
                     started_at_utc=started_at,
                     finished_at_utc=finished_at,
                     duration_ms=duration_ms,
@@ -216,6 +218,8 @@ class AsyncPlanExecutor:
             "documents_processed": _dependency_document_count(dependency_results),
             "cache_key": cache_key,
         }
+        if node.tool_name:
+            start_event_payload["requested_tool_name"] = node.tool_name
         self._emit_event(context, start_event_payload)
         cache_hit = bool(not getattr(context.state, "no_cache", False) and node.cacheable and cache_key in self._cache)
         if cache_hit:
@@ -296,6 +300,7 @@ class AsyncPlanExecutor:
                     "started_at_utc": started_at,
                     "finished_at_utc": finished_at,
                     "duration_ms": duration_ms,
+                    "requested_tool_name": node.tool_name,
                 },
             )
             return (
@@ -412,6 +417,7 @@ class AsyncPlanExecutor:
                         "started_at_utc": started_at,
                         "finished_at_utc": finished_at,
                         "duration_ms": duration_ms,
+                        "requested_tool_name": node.tool_name,
                     },
                 )
                 return (
@@ -479,6 +485,7 @@ class AsyncPlanExecutor:
                 "started_at_utc": started_at,
                 "finished_at_utc": finished_at,
                 "duration_ms": duration_ms,
+                "requested_tool_name": node.tool_name,
             },
         )
         failure = AgentFailure(
@@ -494,6 +501,7 @@ class AsyncPlanExecutor:
                 node_id=node.node_id,
                 capability=node.capability,
                 status=status,
+                tool_name=node.tool_name or resolution.spec.tool_name,
                 started_at_utc=started_at,
                 finished_at_utc=finished_at,
                 duration_ms=duration_ms,

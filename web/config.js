@@ -1,5 +1,5 @@
 window.CORPUSAGENT2_CONFIG = {
-  "apiBaseUrl": "https://api.dongtse.com",
+  "apiBaseUrl": "http://127.0.0.1:8001",
   "title": "CorpusAgent2 Prototype",
   "useOpenAI": true,
   "accessGate": {

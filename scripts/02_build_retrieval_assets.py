@@ -141,7 +141,7 @@ if __name__ == "__main__":
     SUMMARY_PATH = (PROJECT_ROOT / "outputs" / "build_retrieval_assets_summary.json").resolve()
 
     DENSE_MODEL_ID = "intfloat/e5-base-v2"
-    DENSE_BATCH_SIZE = _env_int("CORPUSAGENT2_DENSE_BATCH_SIZE", 64)
+    DENSE_BATCH_SIZE = _env_int("CORPUSAGENT2_DENSE_BATCH_SIZE", 128)
     DENSE_CHUNK_SIZE = _env_int("CORPUSAGENT2_DENSE_CHUNK_SIZE", 2048)
     DENSE_DEVICE = None
     TFIDF_MAX_FEATURES = _env_int("CORPUSAGENT2_TFIDF_MAX_FEATURES", 250_000)
