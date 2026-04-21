@@ -5,6 +5,7 @@ from dataclasses import dataclass
 import os
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 import joblib
 import numpy as np
@@ -124,13 +125,60 @@ def dense_retrieval_enabled(default: bool = True) -> bool:
     return build_dense_assets or include_pg_embeddings
 
 
+def _normalize_pg_dsn_for_windows(dsn: str) -> str:
+    if os.name != "nt":
+        return dsn
+    text = str(dsn or "").strip()
+    if not text:
+        return text
+    try:
+        from psycopg.conninfo import conninfo_to_dict
+    except Exception:
+        conninfo_to_dict = None
+    if conninfo_to_dict is not None:
+        try:
+            params = conninfo_to_dict(text)
+        except Exception:
+            params = None
+        if params and str(params.get("host", "")).strip().lower() == "localhost":
+            params["host"] = "127.0.0.1"
+            parts: list[str] = []
+            for key in ("dbname", "user", "password", "host", "port", "hostaddr"):
+                value = params.get(key)
+                if value not in (None, ""):
+                    parts.append(f"{key}={quote(str(value), safe='')}")
+            for key, value in params.items():
+                if key in {"dbname", "user", "password", "host", "port", "hostaddr"}:
+                    continue
+                if value not in (None, ""):
+                    parts.append(f"{key}={quote(str(value), safe='')}")
+            if parts:
+                return " ".join(parts)
+    lowered = text.lower()
+    if "localhost" not in lowered:
+        return text
+    replacements = [
+        ("@localhost:", "@127.0.0.1:"),
+        ("@localhost/", "@127.0.0.1/"),
+        ("://localhost:", "://127.0.0.1:"),
+        ("://localhost/", "://127.0.0.1/"),
+        (" host=localhost ", " host=127.0.0.1 "),
+        (" host='localhost' ", " host='127.0.0.1' "),
+        (' host="localhost" ', ' host="127.0.0.1" '),
+    ]
+    normalized = f" {text} "
+    for source, target in replacements:
+        normalized = normalized.replace(source, target)
+    return normalized.strip()
+
+
 def pg_dsn_from_env(required: bool = True) -> str:
     dsn = os.getenv("CORPUSAGENT2_PG_DSN", "").strip()
     if required and not dsn:
         raise RuntimeError(
             "CORPUSAGENT2_PG_DSN is required for Postgres/pgvector operations."
         )
-    return dsn
+    return _normalize_pg_dsn_for_windows(dsn)
 
 
 def pg_table_from_env(default: str = "article_corpus") -> str:
