@@ -4,6 +4,7 @@ import base64
 import json
 from pathlib import Path
 
+import corpusagent2.retrieval as retrieval
 import pandas as pd
 
 from corpusagent2 import agent_capabilities
@@ -105,6 +106,25 @@ class _FakePythonRunner:
             bytes_b64=base64.b64encode(json.dumps(payload).encode("utf-8")).decode("ascii"),
         )
         return PythonRunnerResult(stdout="", stderr="", artifacts=[artifact], exit_code=0)
+
+
+def test_sql_fallback_store_normalizes_windows_pg_dsn(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(retrieval.os, "name", "nt", raising=False)
+    monkeypatch.setenv("CORPUSAGENT2_PG_DSN", "postgresql://corpus:corpus@localhost:5432/corpus_db")
+
+    context = AgentExecutionContext(
+        run_id="run",
+        artifacts_dir=tmp_path,
+        search_backend=None,
+        working_store=_ExplodingStore(),
+        runtime=None,
+    )
+
+    store = agent_capabilities._sql_fallback_store(context)
+
+    assert store is not None
+    assert "localhost" not in store.dsn.lower()
+    assert "127.0.0.1" in store.dsn
 
 
 def test_fetch_documents_skips_store_when_no_doc_ids() -> None:

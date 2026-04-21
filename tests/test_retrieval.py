@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import corpusagent2.retrieval as retrieval
 import pandas as pd
 
 from corpusagent2.retrieval import build_lexical_assets, dense_retrieval_enabled, retrieve_tfidf
@@ -39,3 +40,13 @@ def test_dense_retrieval_enabled_falls_back_to_asset_flags(monkeypatch) -> None:
     monkeypatch.setenv("CORPUSAGENT2_PG_INCLUDE_EMBEDDINGS", "false")
 
     assert dense_retrieval_enabled(default=False) is False
+
+
+def test_pg_dsn_from_env_normalizes_localhost_on_windows(monkeypatch) -> None:
+    monkeypatch.setattr(retrieval.os, "name", "nt", raising=False)
+    monkeypatch.setenv("CORPUSAGENT2_PG_DSN", "postgresql://corpus:corpus@localhost:5432/corpus_db")
+
+    dsn = retrieval.pg_dsn_from_env(required=False)
+
+    assert "localhost" not in dsn.lower()
+    assert "127.0.0.1" in dsn
