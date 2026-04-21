@@ -1,9 +1,10 @@
 #!/bin/bash -l
 #SBATCH --job-name=ca2_bundle
-#SBATCH --partition=gpu_top
+#SBATCH --partition=gpu
+#SBATCH --nodelist=sacramento
 #SBATCH --gres=gpu:1
-#SBATCH --cpus-per-task=16
-#SBATCH --mem=64G
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=32G
 #SBATCH --time=24:00:00
 #SBATCH --account=cai_nlp
 
