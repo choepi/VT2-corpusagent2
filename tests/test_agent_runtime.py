@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import base64
+import json
 from pathlib import Path
 import time
 
@@ -7,10 +9,10 @@ from corpusagent2 import agent_capabilities
 from corpusagent2.agent_backends import InMemoryWorkingSetStore
 from corpusagent2.api import build_app
 from corpusagent2.agent_executor import AgentExecutionSnapshot
-from corpusagent2.python_runner_service import PythonRunnerResult
-from corpusagent2.tool_registry import ToolExecutionResult
+from corpusagent2.python_runner_service import PythonRunnerResult, SandboxArtifact
+from corpusagent2.tool_registry import ToolExecutionResult, ToolRegistry
 
-from .helpers import StaticLLMClient, build_test_runtime
+from .helpers import StaticAdapter, StaticLLMClient, build_test_runtime
 
 
 def _sample_documents() -> list[dict]:
@@ -282,6 +284,64 @@ def test_capability_catalog_contains_full_first_trial_surface(tmp_path: Path) ->
     assert {"lang_id", "entity_link", "similarity_pairwise", "join_external_series"}.issubset(capabilities)
 
 
+def test_planner_trace_includes_tool_catalog_for_concrete_tool_selection(tmp_path: Path) -> None:
+    docs = _sample_documents()
+    llm = StaticLLMClient(
+        [
+            {
+                "action": "accept_with_assumptions",
+                "rewritten_question": "Find the relevant Ukraine documents.",
+                "assumptions": [],
+                "clarification_question": "",
+                "rejection_reason": "",
+                "message": "",
+            },
+            {
+                "action": "emit_plan_dag",
+                "rewritten_question": "Find the relevant Ukraine documents.",
+                "plan_dag": {
+                    "nodes": [
+                        {
+                            "node_id": "search",
+                            "capability": "db_search",
+                            "tool_name": "opensearch_db_search",
+                            "inputs": {"query": "Ukraine", "top_k": 5},
+                        }
+                    ]
+                },
+                "assumptions": [],
+                "clarification_question": "",
+                "rejection_reason": "",
+                "message": "",
+            },
+            {
+                "answer_text": "done",
+                "caveats": [],
+                "unsupported_parts": [],
+                "claim_verdicts": [],
+                "evidence_items": [],
+                "artifacts_used": [],
+            },
+        ]
+    )
+    runtime = build_test_runtime(
+        tmp_path=tmp_path,
+        documents=docs,
+        search_rows_by_query=_search_rows(docs),
+        llm_client=llm,
+    )
+
+    manifest = runtime.handle_query("Find the relevant Ukraine documents.", no_cache=True)
+
+    assert manifest.status in {"completed", "partial"}
+    plan_trace = next(trace for trace in manifest.metadata["llm_traces"] if trace.get("stage") == "plan")
+    payload = json.loads(plan_trace["messages"][-1]["content"])
+    assert payload["available_capabilities"]
+    assert payload["tool_catalog"]
+    assert any(item.get("tool_name") == "opensearch_db_search" for item in payload["tool_catalog"])
+    assert any(item.get("tool_name") == "python_runner" for item in payload["tool_catalog"])
+
+
 def test_api_async_submission_exposes_live_status(tmp_path: Path) -> None:
     docs = _sample_documents()
     runtime = build_test_runtime(tmp_path=tmp_path, documents=docs, search_rows_by_query=_search_rows(docs))
@@ -306,6 +366,7 @@ def test_api_async_submission_exposes_live_status(tmp_path: Path) -> None:
         time.sleep(0.05)
 
     assert status_payload["run_id"] == run_id
+    assert status_payload["started_at_utc"]
     assert "completed_steps" in status_payload
     assert "llm_traces" in status_payload
     assert "tool_calls" in status_payload
@@ -505,6 +566,84 @@ def test_force_answer_ignores_clarification_loop(tmp_path: Path) -> None:
 
     assert manifest.status in {"completed", "partial"}
     assert "Which sources?" not in manifest.rewritten_question
+
+
+def test_explicit_tool_name_overrides_registry_priority(tmp_path: Path) -> None:
+    docs = _sample_documents()
+    executed_tools: list[str] = []
+    registry = ToolRegistry()
+    registry.register(
+        StaticAdapter(
+            tool_name="high_priority_tool",
+            capability="custom_capability",
+            priority=100,
+            run_fn=lambda params, deps, context: (
+                executed_tools.append("high_priority_tool") or ToolExecutionResult(payload={"tool": "high"})
+            ),
+        )
+    )
+    registry.register(
+        StaticAdapter(
+            tool_name="requested_tool",
+            capability="custom_capability",
+            priority=1,
+            run_fn=lambda params, deps, context: (
+                executed_tools.append("requested_tool") or ToolExecutionResult(payload={"tool": "requested"})
+            ),
+        )
+    )
+    llm = StaticLLMClient(
+        [
+            {
+                "action": "accept_with_assumptions",
+                "rewritten_question": "Use the requested tool.",
+                "assumptions": [],
+                "clarification_question": "",
+                "rejection_reason": "",
+                "message": "",
+            },
+            {
+                "action": "emit_plan_dag",
+                "rewritten_question": "Use the requested tool.",
+                "plan_dag": {
+                    "nodes": [
+                        {
+                            "node_id": "custom",
+                            "capability": "custom_capability",
+                            "tool_name": "requested_tool",
+                            "inputs": {"query": "anything"},
+                        }
+                    ]
+                },
+                "assumptions": [],
+                "clarification_question": "",
+                "rejection_reason": "",
+                "message": "",
+            },
+            {
+                "answer_text": "done",
+                "caveats": [],
+                "unsupported_parts": [],
+                "claim_verdicts": [],
+                "evidence_items": [],
+                "artifacts_used": [],
+            },
+        ]
+    )
+    runtime = build_test_runtime(
+        tmp_path=tmp_path,
+        documents=docs,
+        search_rows_by_query=_search_rows(docs),
+        llm_client=llm,
+        registry=registry,
+    )
+
+    manifest = runtime.handle_query("Use the requested tool.", force_answer=True, no_cache=True)
+
+    assert manifest.status in {"completed", "partial"}
+    assert executed_tools == ["requested_tool"]
+    assert any(record.tool_name == "requested_tool" for record in manifest.node_records)
+    assert any(call.get("requested_tool_name") == "requested_tool" for call in manifest.tool_calls)
 
 
 def test_empty_planner_payload_uses_heuristic_plan_without_scary_error(tmp_path: Path) -> None:
@@ -979,6 +1118,153 @@ def test_planner_can_route_fetched_documents_into_python_runner(tmp_path: Path) 
     assert any(record.capability == "python_runner" for record in manifest.node_records)
     assert isinstance(fake_runner.last_inputs, dict)
     assert "fetch" in fake_runner.last_inputs
+
+
+def test_failed_typed_tool_revises_to_structured_python_fallback(tmp_path: Path) -> None:
+    docs = _sample_documents()
+
+    class _ArtifactPythonRunner:
+        def __init__(self) -> None:
+            self.last_code = ""
+            self.last_inputs = None
+
+        def run(self, code: str, inputs_json: dict):
+            self.last_code = str(code)
+            self.last_inputs = dict(inputs_json)
+            payload = {
+                "rows": [
+                    {
+                        "doc_id": "seed-1",
+                        "outlet": "Corpus Source",
+                        "date": "2024-01",
+                        "excerpt": "Fallback summary of the available corpus slice.",
+                        "score": 1.0,
+                    }
+                ],
+                "highlights": ["Python fallback summarized the intermediate rows."],
+                "analysis": {
+                    "failed_capability": str(inputs_json.get("failed_capability", "")),
+                    "document_count": len(inputs_json.get("candidate_rows", [])),
+                },
+                "caveats": ["Fallback stayed within the intermediate rows passed to the sandbox."],
+            }
+            artifact = SandboxArtifact(
+                name="result.json",
+                mime="application/json",
+                bytes_b64=base64.b64encode(json.dumps(payload).encode("utf-8")).decode("ascii"),
+            )
+            return PythonRunnerResult(stdout="ok", stderr="", artifacts=[artifact], exit_code=0)
+
+    registry = agent_capabilities.build_agent_registry()
+    registry.register(
+        StaticAdapter(
+            tool_name="seed_rows_tool",
+            capability="seed_rows",
+            priority=5,
+            run_fn=lambda params, deps, context: ToolExecutionResult(
+                payload={
+                    "rows": [
+                        {
+                            "doc_id": "seed-1",
+                            "title": "Corpus document one",
+                            "text": "A long fallback candidate row from the corpus.",
+                            "outlet": "Corpus Source",
+                            "date": "2024-01-15",
+                            "score": 0.9,
+                        },
+                        {
+                            "doc_id": "seed-2",
+                            "title": "Corpus document two",
+                            "text": "Another intermediate row that should reach the sandbox fallback.",
+                            "outlet": "Corpus Source",
+                            "date": "2024-01-20",
+                            "score": 0.8,
+                        },
+                    ]
+                }
+            ),
+        )
+    )
+
+    def _raise_failure(params, deps, context):
+        raise RuntimeError("synthetic typed-tool failure")
+
+    registry.register(
+        StaticAdapter(
+            tool_name="always_fail_tool",
+            capability="custom_fail",
+            priority=5,
+            run_fn=_raise_failure,
+        )
+    )
+    llm = StaticLLMClient(
+        [
+            {
+                "action": "accept_with_assumptions",
+                "rewritten_question": "Trigger a typed tool failure and recover with python.",
+                "assumptions": [],
+                "clarification_question": "",
+                "rejection_reason": "",
+                "message": "",
+            },
+            {
+                "action": "emit_plan_dag",
+                "rewritten_question": "Trigger a typed tool failure and recover with python.",
+                "plan_dag": {
+                    "nodes": [
+                        {"node_id": "seed", "capability": "seed_rows", "tool_name": "seed_rows_tool"},
+                        {
+                            "node_id": "fail",
+                            "capability": "custom_fail",
+                            "tool_name": "always_fail_tool",
+                            "depends_on": ["seed"],
+                        },
+                    ]
+                },
+                "assumptions": [],
+                "clarification_question": "",
+                "rejection_reason": "",
+                "message": "",
+            },
+            {
+                "answer_text": "Recovered with the python fallback.",
+                "caveats": [],
+                "unsupported_parts": [],
+                "claim_verdicts": [],
+                "evidence_items": [],
+                "artifacts_used": [],
+            },
+        ]
+    )
+    fake_runner = _ArtifactPythonRunner()
+    runtime = build_test_runtime(
+        tmp_path=tmp_path,
+        documents=docs,
+        search_rows_by_query=_search_rows(docs),
+        llm_client=llm,
+        registry=registry,
+        python_runner=fake_runner,
+    )
+
+    manifest = runtime.handle_query(
+        "Trigger a typed tool failure and recover with python.",
+        force_answer=True,
+        no_cache=True,
+    )
+
+    assert manifest.status == "partial"
+    assert len(manifest.plan_dags) == 2
+    assert manifest.plan_dags[1]["nodes"][0]["capability"] == "python_runner"
+    assert manifest.plan_dags[1]["nodes"][0]["tool_name"] == "python_runner"
+    assert fake_runner.last_inputs is not None
+    assert fake_runner.last_inputs["failed_capability"] == "custom_fail"
+    assert fake_runner.last_inputs["candidate_rows"]
+    assert "Counter" in fake_runner.last_code
+    assert any(record.capability == "python_runner" and record.tool_name == "python_runner" for record in manifest.node_records)
+    assert any(call.get("requested_tool_name") == "python_runner" for call in manifest.tool_calls)
+    assert manifest.evidence_table
+    assert manifest.evidence_table[0]["doc_id"] == "seed-1"
+    assert any(failure.capability == "custom_fail" for failure in manifest.failures)
 
 
 def test_api_runtime_info_reports_provider_and_device(tmp_path: Path) -> None:

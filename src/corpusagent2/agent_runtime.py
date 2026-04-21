@@ -67,6 +67,45 @@ def _tool_call_signature(tool_name: str, inputs: dict[str, Any]) -> str:
     return f"{tool_name}({', '.join(rendered)})"
 
 
+def _candidate_payload_rows(snapshot: AgentExecutionSnapshot) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for result in snapshot.node_results.values():
+        payload = result.payload if isinstance(result.payload, dict) else {}
+        for key in ("documents", "results", "rows", "evidence_items"):
+            value = payload.get(key)
+            if isinstance(value, list):
+                for item in value:
+                    if isinstance(item, dict):
+                        rows.append(dict(item))
+                if rows:
+                    return rows[:50]
+    return [dict(item) for item in snapshot.selected_docs[:50] if isinstance(item, dict)]
+
+
+def _merge_execution_snapshots(
+    primary: AgentExecutionSnapshot,
+    fallback: AgentExecutionSnapshot,
+) -> AgentExecutionSnapshot:
+    combined_results = dict(primary.node_results)
+    combined_results.update(fallback.node_results)
+    combined_failures = list(primary.failures) + list(fallback.failures)
+    selected_docs = list(primary.selected_docs) if primary.selected_docs else list(fallback.selected_docs)
+    if primary.status == "aborted" or fallback.status == "aborted":
+        status = "aborted"
+    elif combined_failures:
+        status = "partial"
+    else:
+        status = "completed"
+    return AgentExecutionSnapshot(
+        node_records=list(primary.node_records) + list(fallback.node_records),
+        node_results=combined_results,
+        failures=combined_failures,
+        provenance_records=list(primary.provenance_records) + list(fallback.provenance_records),
+        selected_docs=selected_docs,
+        status=status,
+    )
+
+
 def _merge_tool_call_rows(existing_rows: list[dict[str, Any]], payload: dict[str, Any]) -> list[dict[str, Any]]:
     node_id = str(payload.get("node_id", "")).strip()
     event = str(payload.get("event", "")).strip()
@@ -95,6 +134,7 @@ def _merge_tool_call_rows(existing_rows: list[dict[str, Any]], payload: dict[str
         "capability",
         "status",
         "tool_name",
+        "requested_tool_name",
         "provider",
         "tool_version",
         "model_id",
@@ -280,6 +320,7 @@ class MagicBoxOrchestrator:
                 AgentPlanNode(
                     node_id=node.node_id,
                     capability=node.capability,
+                    tool_name=node.tool_name,
                     inputs=dict(node.inputs),
                     depends_on=list(dict.fromkeys(depends_on)),
                     optional=node.optional,
@@ -473,10 +514,11 @@ class MagicBoxOrchestrator:
             {
                 "role": "system",
                 "content": (
-                    "You are the rephrasing and clarification module for a corpus-analysis agent. "
+                    "You are the rephrasing and clarification module for a corpus agent operating over a user-provided corpus. "
                     "Return JSON with keys action, rewritten_question, clarification_question, assumptions, rejection_reason, message. "
                     "Allowed actions: ask_clarification, accept_with_assumptions, grounded_rejection. "
-                    "Reject hidden-motive questions. Ask clarification only if workflow changes materially."
+                    "Reject hidden-motive questions. Ask clarification only if workflow changes materially. "
+                    "Do not assume the corpus is news, media, finance, or any specific domain unless the question or corpus schema indicates that."
                 ),
             },
             {
@@ -568,21 +610,21 @@ class MagicBoxOrchestrator:
             search_inputs.update(self._extract_date_window(rewritten))
             dag = AgentPlanDAG(
                 nodes=[
-                    AgentPlanNode("search", "db_search", search_inputs),
+                    AgentPlanNode("search", "db_search", inputs=search_inputs),
                     AgentPlanNode("fetch", "fetch_documents", depends_on=["search"]),
                     AgentPlanNode("working_set", "create_working_set", depends_on=["fetch"]),
                     AgentPlanNode("sentiment", "sentiment", depends_on=["fetch"]),
-                    AgentPlanNode("sentiment_series", "time_series_aggregate", {"granularity": "month"}, depends_on=["sentiment"]),
+                    AgentPlanNode("sentiment_series", "time_series_aggregate", inputs={"granularity": "month"}, depends_on=["sentiment"]),
                     AgentPlanNode("changes", "change_point_detect", depends_on=["sentiment_series"], optional=True),
                     AgentPlanNode("entities", "ner", depends_on=["fetch"]),
-                    AgentPlanNode("entity_series", "time_series_aggregate", {"granularity": "month"}, depends_on=["entities"]),
+                    AgentPlanNode("entity_series", "time_series_aggregate", inputs={"granularity": "month"}, depends_on=["entities"]),
                     AgentPlanNode("keyterms", "extract_keyterms", depends_on=["fetch"]),
-                    AgentPlanNode("topics", "topic_model", {"num_topics": 6, "granularity": "month", "topics_per_bin": 2}, depends_on=["fetch"]),
+                    AgentPlanNode("topics", "topic_model", inputs={"num_topics": 6, "granularity": "month", "topics_per_bin": 2}, depends_on=["fetch"]),
                     AgentPlanNode("pos", "pos_morph", depends_on=["fetch"]),
-                    AgentPlanNode("ngrams", "extract_ngrams", {"n": 2}, depends_on=["fetch"], optional=True),
+                    AgentPlanNode("ngrams", "extract_ngrams", inputs={"n": 2}, depends_on=["fetch"], optional=True),
                     AgentPlanNode("lexdiv", "lexical_diversity", depends_on=["fetch"], optional=True),
-                    AgentPlanNode("plot_sentiment", "plot_artifact", {"plot_name": "trump_sentiment_series"}, depends_on=["sentiment_series"], optional=True),
-                    AgentPlanNode("plot_entities", "plot_artifact", {"plot_name": "trump_entity_series"}, depends_on=["entity_series"], optional=True),
+                    AgentPlanNode("plot_sentiment", "plot_artifact", inputs={"plot_name": "trump_sentiment_series"}, depends_on=["sentiment_series"], optional=True),
+                    AgentPlanNode("plot_entities", "plot_artifact", inputs={"plot_name": "trump_entity_series"}, depends_on=["entity_series"], optional=True),
                 ],
                 metadata={"question_family": "trump_media_analysis"},
             )
@@ -594,12 +636,12 @@ class MagicBoxOrchestrator:
         if "distribution" in text and "noun" in text:
             dag = AgentPlanDAG(
                 nodes=[
-                    AgentPlanNode("search", "db_search", {"top_k": 40, "retrieval_mode": "hybrid", "use_rerank": False}),
+                    AgentPlanNode("search", "db_search", inputs={"top_k": 40, "retrieval_mode": "hybrid", "use_rerank": False}),
                     AgentPlanNode("fetch", "fetch_documents", depends_on=["search"]),
                     AgentPlanNode("working_set", "create_working_set", depends_on=["fetch"]),
                     AgentPlanNode("pos", "pos_morph", depends_on=["fetch"]),
                     AgentPlanNode("lemmas", "lemmatize", depends_on=["fetch"]),
-                    AgentPlanNode("plot", "plot_artifact", {"plot_name": "noun_distribution"}, depends_on=["pos"], optional=True),
+                    AgentPlanNode("plot", "plot_artifact", inputs={"plot_name": "noun_distribution"}, depends_on=["pos"], optional=True),
                 ],
                 metadata={"question_family": "noun_distribution"},
             )
@@ -607,13 +649,13 @@ class MagicBoxOrchestrator:
         if "named entit" in text or ("climate" in text and "entity" in text):
             dag = AgentPlanDAG(
                 nodes=[
-                    AgentPlanNode("search", "db_search", {"top_k": 60, "retrieval_mode": "hybrid", "use_rerank": True, "rerank_top_k": 30}),
+                    AgentPlanNode("search", "db_search", inputs={"top_k": 60, "retrieval_mode": "hybrid", "use_rerank": True, "rerank_top_k": 30}),
                     AgentPlanNode("fetch", "fetch_documents", depends_on=["search"]),
                     AgentPlanNode("working_set", "create_working_set", depends_on=["fetch"]),
                     AgentPlanNode("ner", "ner", depends_on=["fetch"]),
                     AgentPlanNode("series", "time_series_aggregate", depends_on=["ner"]),
                     AgentPlanNode("changes", "change_point_detect", depends_on=["series"], optional=True),
-                    AgentPlanNode("plot", "plot_artifact", {"plot_name": "entity_trend"}, depends_on=["series"], optional=True),
+                    AgentPlanNode("plot", "plot_artifact", inputs={"plot_name": "entity_trend"}, depends_on=["series"], optional=True),
                 ],
                 metadata={"question_family": "entity_trend"},
             )
@@ -621,7 +663,7 @@ class MagicBoxOrchestrator:
         if "ukraine" in text and "predict" in text:
             dag = AgentPlanDAG(
                 nodes=[
-                    AgentPlanNode("search", "db_search", {"top_k": 80, "date_to": "2022-02-23", "retrieval_mode": "hybrid", "use_rerank": True, "rerank_top_k": 40}),
+                    AgentPlanNode("search", "db_search", inputs={"top_k": 80, "date_to": "2022-02-23", "retrieval_mode": "hybrid", "use_rerank": True, "rerank_top_k": 40}),
                     AgentPlanNode("fetch", "fetch_documents", depends_on=["search"]),
                     AgentPlanNode("working_set", "create_working_set", depends_on=["fetch"]),
                     AgentPlanNode("claim_spans", "claim_span_extract", depends_on=["fetch"]),
@@ -634,7 +676,7 @@ class MagicBoxOrchestrator:
         if "similar" in text or "semantically" in text:
             dag = AgentPlanDAG(
                 nodes=[
-                    AgentPlanNode("search", "db_search", {"top_k": 50, "retrieval_mode": "hybrid", "use_rerank": True, "rerank_top_k": 25}),
+                    AgentPlanNode("search", "db_search", inputs={"top_k": 50, "retrieval_mode": "hybrid", "use_rerank": True, "rerank_top_k": 25}),
                     AgentPlanNode("fetch", "fetch_documents", depends_on=["search"]),
                     AgentPlanNode("working_set", "create_working_set", depends_on=["fetch"]),
                     AgentPlanNode("doc_embeddings", "doc_embeddings", depends_on=["fetch"]),
@@ -669,16 +711,16 @@ class MagicBoxOrchestrator:
             search_inputs.update(self._extract_date_window(rewritten))
             market_ticker = self._infer_market_ticker(rewritten)
             nodes = [
-                AgentPlanNode("search", "db_search", search_inputs),
+                AgentPlanNode("search", "db_search", inputs=search_inputs),
                 AgentPlanNode("fetch", "fetch_documents", depends_on=["search"]),
                 AgentPlanNode("working_set", "create_working_set", depends_on=["fetch"]),
                 AgentPlanNode("keyterms", "extract_keyterms", depends_on=["fetch"]),
-                AgentPlanNode("topics", "topic_model", {"num_topics": 6}, depends_on=["fetch"]),
+                AgentPlanNode("topics", "topic_model", inputs={"num_topics": 6}, depends_on=["fetch"]),
                 AgentPlanNode("sentiment", "sentiment", depends_on=["fetch"]),
                 AgentPlanNode("series", "time_series_aggregate", depends_on=["sentiment"]),
                 AgentPlanNode("changes", "change_point_detect", depends_on=["series"], optional=True),
-                AgentPlanNode("plot_sentiment", "plot_artifact", {"plot_name": "framing_sentiment_series"}, depends_on=["series"], optional=True),
-                AgentPlanNode("plot_topics", "plot_artifact", {"plot_name": "framing_topics"}, depends_on=["topics"], optional=True),
+                AgentPlanNode("plot_sentiment", "plot_artifact", inputs={"plot_name": "framing_sentiment_series"}, depends_on=["series"], optional=True),
+                AgentPlanNode("plot_topics", "plot_artifact", inputs={"plot_name": "framing_topics"}, depends_on=["topics"], optional=True),
             ]
             assumptions: list[str] = []
             if any(term in text for term in ["stock", "drawdown", "share price", "market", "valuation"]):
@@ -687,7 +729,7 @@ class MagicBoxOrchestrator:
                         AgentPlanNode(
                             "market_series",
                             "join_external_series",
-                            {
+                            inputs={
                                 "ticker": market_ticker,
                                 "date_from": search_inputs.get("date_from", ""),
                                 "date_to": search_inputs.get("date_to", ""),
@@ -702,7 +744,7 @@ class MagicBoxOrchestrator:
                         AgentPlanNode(
                             "plot_market",
                             "plot_artifact",
-                            {"plot_name": f"{market_ticker.lower()}_market_overlay"},
+                            inputs={"plot_name": f"{market_ticker.lower()}_market_overlay"},
                             depends_on=["market_series"],
                             optional=True,
                         )
@@ -727,7 +769,7 @@ class MagicBoxOrchestrator:
             )
         dag = AgentPlanDAG(
             nodes=[
-                AgentPlanNode("search", "db_search", {"top_k": 40, "retrieval_mode": "hybrid", "use_rerank": True, "rerank_top_k": 25}),
+                AgentPlanNode("search", "db_search", inputs={"top_k": 40, "retrieval_mode": "hybrid", "use_rerank": True, "rerank_top_k": 25}),
                 AgentPlanNode("fetch", "fetch_documents", depends_on=["search"]),
                 AgentPlanNode("working_set", "create_working_set", depends_on=["fetch"]),
                 AgentPlanNode("keyterms", "extract_keyterms", depends_on=["fetch"], optional=True),
@@ -749,12 +791,17 @@ class MagicBoxOrchestrator:
             {
                 "role": "system",
                 "content": (
-                    "You are the planning module for a corpus-analysis agent. "
+                    "You are the planning module for a corpus agent operating over a user-provided corpus. "
                     "Return JSON with keys action, rewritten_question, assumptions, clarification_question, rejection_reason, message, plan_dag. "
                     "Allowed actions: ask_clarification, emit_plan_dag, grounded_rejection. "
-                    "Choose capabilities, not libraries. Keep plans compact and parallel where possible. "
+                    "Keep plans compact and parallel where possible. "
+                    "Each plan node must include node_id, capability, optional tool_name, inputs, and depends_on. "
+                    "Use the provided tool_catalog to choose concrete repo tools when that improves control or fallback behavior. "
+                    "Prefer typed repo tools before python_runner. "
+                    "Use python_runner only as a bounded last-resort fallback when no typed tool fits or a typed tool has already failed. "
                     "Prefer db_search plus fetch_documents for normal retrieval. "
-                    "Use sql_query_search when hybrid retrieval is sparse, off-target, or entity coverage is poor."
+                    "Use sql_query_search when hybrid retrieval is sparse, off-target, or entity coverage is poor. "
+                    "Do not assume the corpus is news unless the question or corpus schema indicates that."
                 ),
             },
             {
@@ -765,6 +812,7 @@ class MagicBoxOrchestrator:
                         "rewritten_question": state.rewritten_question,
                         "clarification_history": list(state.clarification_history),
                         "available_capabilities": state.available_capabilities,
+                        "tool_catalog": state.tool_catalog,
                         "corpus_schema": state.corpus_schema,
                         "failures": state.failures,
                     },
@@ -773,10 +821,10 @@ class MagicBoxOrchestrator:
             },
         ]
         repair_system_message = (
-            "You previously returned an invalid or empty plan for a corpus-analysis agent. "
+            "You previously returned an invalid or empty plan for a corpus agent operating over a user-provided corpus. "
             "Return valid JSON with keys action, rewritten_question, assumptions, clarification_question, rejection_reason, message, plan_dag. "
             "Allowed actions: ask_clarification, emit_plan_dag, grounded_rejection. "
-            "If action is emit_plan_dag, plan_dag.nodes must contain at least one executable node with node_id, capability, inputs, and depends_on."
+            "If action is emit_plan_dag, plan_dag.nodes must contain at least one executable node with node_id, capability, optional tool_name, inputs, and depends_on."
         )
         try:
             trace = self.llm_client.complete_json_trace(
@@ -798,6 +846,7 @@ class MagicBoxOrchestrator:
                                 "question": state.question,
                                 "rewritten_question": state.rewritten_question,
                                 "available_capabilities": state.available_capabilities,
+                                "tool_catalog": state.tool_catalog,
                                 "corpus_schema": state.corpus_schema,
                                 "previous_invalid_output": trace.get("raw_text", ""),
                             },
@@ -859,23 +908,123 @@ class MagicBoxOrchestrator:
             )
             return self._heuristic_plan(state)
 
-    def revise_after_failure(self, state: AgentRunState, failure: AgentFailure) -> PlannerAction | None:
+    def revise_after_failure(
+        self,
+        state: AgentRunState,
+        failure: AgentFailure,
+        snapshot: AgentExecutionSnapshot,
+    ) -> PlannerAction | None:
         if failure.capability == "python_runner":
             return None
+        candidate_rows = _candidate_payload_rows(snapshot)
+        evidence_rows = self._extract_evidence(snapshot)
+        summary = self._derive_summary(snapshot)
         code = (
+            "from collections import Counter\n"
             "from pathlib import Path\n"
             "import json\n"
-            "summary = {'received_keys': sorted(INPUTS_JSON.keys())}\n"
+            "import re\n"
+            "\n"
+            "STOPWORDS = {\n"
+            "    'the', 'and', 'for', 'that', 'with', 'from', 'this', 'have', 'were', 'been', 'will', 'into',\n"
+            "    'their', 'about', 'which', 'what', 'when', 'where', 'would', 'could', 'should', 'using', 'within',\n"
+            "    'document', 'documents', 'corpus', 'article', 'articles', 'report', 'reports', 'coverage', 'content'\n"
+            "}\n"
+            "\n"
+            "def _text(row):\n"
+            "    for key in ('text', 'body', 'content', 'snippet', 'excerpt', 'title'):\n"
+            "        value = str(row.get(key, '')).strip()\n"
+            "        if value:\n"
+            "            return value\n"
+            "    return ''\n"
+            "\n"
+            "def _outlet(row):\n"
+            "    for key in ('outlet', 'source', 'publisher', 'source_domain'):\n"
+            "        value = str(row.get(key, '')).strip()\n"
+            "        if value:\n"
+            "            return value\n"
+            "    return ''\n"
+            "\n"
+            "def _date(row):\n"
+            "    for key in ('date', 'published_at', 'time_bin', 'year'):\n"
+            "        value = str(row.get(key, '')).strip()\n"
+            "        if value:\n"
+            "            return value\n"
+            "    return ''\n"
+            "\n"
+            "payload = INPUTS_JSON\n"
+            "rows = [dict(item) for item in payload.get('candidate_rows', []) if isinstance(item, dict)]\n"
+            "question = str(payload.get('question', '')).strip()\n"
+            "failed_capability = str(payload.get('failed_capability', '')).strip()\n"
+            "tokens = [\n"
+            "    token.lower()\n"
+            "    for token in re.findall(r\"[A-Za-z][A-Za-z0-9\\-]+\", ' '.join(_text(row) for row in rows))\n"
+            "    if len(token) >= 4 and token.lower() not in STOPWORDS\n"
+            "]\n"
+            "top_terms = Counter(tokens).most_common(12)\n"
+            "source_counts = Counter(_outlet(row) for row in rows if _outlet(row)).most_common(8)\n"
+            "time_counts = Counter(_date(row)[:7] for row in rows if _date(row)).most_common(8)\n"
+            "evidence_rows = []\n"
+            "for row in rows[:10]:\n"
+            "    text = _text(row).replace('\\n', ' ').strip()\n"
+            "    excerpt = text[:277].rstrip() + '...' if len(text) > 280 else text\n"
+            "    evidence_rows.append(\n"
+            "        {\n"
+            "            'doc_id': str(row.get('doc_id', '')),\n"
+            "            'outlet': _outlet(row),\n"
+            "            'date': _date(row),\n"
+            "            'excerpt': excerpt,\n"
+            "            'score': float(row.get('score', 0.0) or 0.0),\n"
+            "        }\n"
+            "    )\n"
+            "highlights = []\n"
+            "if source_counts:\n"
+            "    highlights.append('Most frequent sources in the available slice: ' + ', '.join(f'{name} ({count})' for name, count in source_counts[:5]))\n"
+            "if top_terms:\n"
+            "    highlights.append('Most repeated content terms: ' + ', '.join(f'{term} ({count})' for term, count in top_terms[:8]))\n"
+            "if time_counts:\n"
+            "    highlights.append('Most represented time bins: ' + ', '.join(f'{name} ({count})' for name, count in time_counts[:5]))\n"
+            "if not highlights and payload.get('summary'):\n"
+            "    highlights.append('Python fallback summarized the available intermediate outputs after a typed tool failure.')\n"
+            "result = {\n"
+            "    'rows': evidence_rows,\n"
+            "    'highlights': highlights,\n"
+            "    'analysis': {\n"
+            "        'question': question,\n"
+            "        'failed_capability': failed_capability,\n"
+            "        'document_count': len(rows),\n"
+            "        'top_sources': source_counts,\n"
+            "        'top_terms': top_terms,\n"
+            "        'time_bins': time_counts,\n"
+            "        'received_summary_keys': sorted(str(key) for key in payload.get('summary', {}).keys()),\n"
+            "    },\n"
+            "    'caveats': [\n"
+            "        f\"Primary capability '{failed_capability}' failed, so a bounded python fallback summarized the available intermediate corpus slice.\",\n"
+            "        'The python fallback is descriptive and limited to the rows passed into the sandbox.',\n"
+            "    ],\n"
+            "}\n"
             "Path(OUTPUT_DIR).mkdir(parents=True, exist_ok=True)\n"
-            "Path(OUTPUT_DIR, 'fallback_summary.json').write_text(json.dumps(summary), encoding='utf-8')\n"
-            "print(json.dumps(summary))\n"
+            "Path(OUTPUT_DIR, 'result.json').write_text(json.dumps(result), encoding='utf-8')\n"
+            "print(json.dumps({'highlights': highlights[:2], 'rows': len(evidence_rows)}))\n"
         )
+        inputs_json = {
+            "question": state.question,
+            "rewritten_question": state.rewritten_question,
+            "failed_capability": failure.capability,
+            "failure_message": failure.message,
+            "candidate_rows": candidate_rows,
+            "evidence_rows": evidence_rows,
+            "summary": summary,
+            "corpus_schema": state.corpus_schema,
+        }
         dag = AgentPlanDAG(
             nodes=[
                 AgentPlanNode(
                     "python_fallback",
                     "python_runner",
-                    {"code": code},
+                    tool_name="python_runner",
+                    inputs={"code": code, "inputs_json": inputs_json},
+                    description="Summarize available intermediate corpus outputs with a bounded python fallback.",
                 )
             ],
             metadata={"revision_for": failure.capability},
@@ -906,7 +1055,7 @@ class MagicBoxOrchestrator:
             {
                 "role": "system",
                 "content": (
-                    "You are the grounded synthesis module for a corpus-analysis agent. "
+                    "You are the grounded synthesis module for a corpus agent operating over a user-provided corpus. "
                     "Return JSON with keys answer_text, evidence_items, artifacts_used, unsupported_parts, caveats, claim_verdicts. "
                     "Use only the provided summaries, tool outputs, and evidence. "
                     "Do not claim direct correspondence to stock-price moves or external market behavior unless an external series was explicitly attached."
@@ -1224,7 +1373,11 @@ class AgentRuntime:
         return store
 
     def capability_catalog(self) -> list[dict[str, Any]]:
-        return [spec.to_dict() for spec in self.registry.list_tools()]
+        specs = sorted(
+            self.registry.list_tools(),
+            key=lambda spec: (spec.capabilities[0] if spec.capabilities else "", spec.tool_name),
+        )
+        return [spec.to_dict() for spec in specs]
 
     def _active_run_ids(self) -> list[str]:
         with self._run_lock:
@@ -1565,12 +1718,14 @@ class AgentRuntime:
         }
 
     def _build_state(self, question: str, force_answer: bool, no_cache: bool) -> AgentRunState:
+        tool_catalog = self.capability_catalog()
         return AgentRunState(
             question=question,
             force_answer=force_answer,
             available_capabilities=sorted(
                 {capability for spec in self.registry.list_tools() for capability in spec.capabilities}
             ),
+            tool_catalog=tool_catalog,
             corpus_schema=self.corpus_schema(),
             planner_calls_max=self.config.planner_calls_max,
             no_cache=no_cache,
@@ -1872,7 +2027,7 @@ class AgentRuntime:
         if snapshot.failures:
             state.failures = [item.to_dict() for item in snapshot.failures]
             self._set_live_status(run_id, current_phase="revising_after_failure", detail="Revising plan after failure")
-            revised = self.orchestrator.revise_after_failure(state, snapshot.failures[0])
+            revised = self.orchestrator.revise_after_failure(state, snapshot.failures[0], snapshot)
             if revised is not None and revised.plan_dag is not None:
                 state.planner_calls_used += 1
                 state.planner_actions.append(revised.to_dict())
@@ -1886,7 +2041,7 @@ class AgentRuntime:
                 )
                 revised_snapshot = asyncio.run(self.executor.execute(revised.plan_dag, context))
                 plan_dags.append(revised.plan_dag.to_dict())
-                snapshot = revised_snapshot
+                snapshot = _merge_execution_snapshots(snapshot, revised_snapshot)
                 maybe_aborted = self._maybe_abort(
                     run_id=run_id,
                     question=question,

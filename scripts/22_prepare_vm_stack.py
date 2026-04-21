@@ -79,6 +79,18 @@ def _run(
     subprocess.run(command, cwd=str(cwd), env=env, check=True)
 
 
+def _format_duration(seconds: float) -> str:
+    if seconds < 60:
+        return f"{seconds:.1f}s"
+    minutes = int(seconds // 60)
+    remainder = seconds - minutes * 60
+    if minutes < 60:
+        return f"{minutes}m {remainder:.1f}s"
+    hours = minutes // 60
+    minute_remainder = minutes % 60
+    return f"{hours}h {minute_remainder}m {remainder:.0f}s"
+
+
 def _capture(
     command: list[str],
     *,
@@ -507,7 +519,7 @@ def _ensure_data_pipeline(
         asset_env["CORPUSAGENT2_BUILD_LEXICAL_ASSETS"] = "true" if build_lexical_assets else "false"
         asset_env["CORPUSAGENT2_BUILD_DENSE_ASSETS"] = "true" if build_dense_assets else "false"
         asset_env.setdefault("CORPUSAGENT2_STREAM_DENSE_ASSETS", "true")
-        asset_env.setdefault("CORPUSAGENT2_DENSE_BATCH_SIZE", "64")
+        asset_env.setdefault("CORPUSAGENT2_DENSE_BATCH_SIZE", "128")
         asset_env.setdefault("CORPUSAGENT2_DENSE_CHUNK_SIZE", "2048")
         _run([str(python_exe), str(REPO_ROOT / "scripts" / "02_build_retrieval_assets.py")], env=asset_env)
 
@@ -646,6 +658,7 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--refresh-postgres", action="store_true", help="Re-run Postgres schema, ingest, and pgvector indexing.")
     parser.add_argument("--refresh-opensearch", action="store_true", help="Re-run full OpenSearch bulk indexing.")
     parser.add_argument("--with-dashboards", action="store_true", help="Start OpenSearch Dashboards as well.")
+    parser.add_argument("--start-api", action="store_true", help="Start the FastAPI backend after preparation completes.")
     parser.add_argument(
         "--retrieval-profile",
         choices=["no-dense", "hybrid"],
@@ -656,6 +669,7 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
 
 
 def main(argv: Iterable[str] | None = None) -> None:
+    started = time.perf_counter()
     args = parse_args(argv)
     _ensure_git_checkout()
     if args.install_system:
@@ -788,6 +802,7 @@ def main(argv: Iterable[str] | None = None) -> None:
             should_skip=not opensearch_needs_refresh,
         )
 
+    elapsed_s = time.perf_counter() - started
     summary_path = _write_summary(
         {
             "repo_root": str(REPO_ROOT),
@@ -801,16 +816,22 @@ def main(argv: Iterable[str] | None = None) -> None:
             "pgvector_backfill_summary": str(pgvector_backfill_summary) if pgvector_backfill_summary.exists() else "",
             "pgvector_index_summary": str(pgvector_index_summary) if pgvector_index_summary.exists() else "",
             "opensearch_summary": str(opensearch_summary) if opensearch_summary.exists() else "",
+            "total_elapsed_seconds": round(elapsed_s, 3),
         }
     )
     print("")
     print("VM stack preparation complete.")
+    print(f"Total time: {_format_duration(elapsed_s)}")
     print(f"Summary: {summary_path}")
     print(f"Backend start: {python_exe} {REPO_ROOT / 'scripts' / '12_run_agent_api.py'}")
     print(f"Frontend config: {REPO_ROOT / 'web' / 'config.js'}")
     print(
         f"Cloudflared helper: {python_exe} {REPO_ROOT / 'scripts' / '23_start_cloudflared_tunnel.py'}"
     )
+    if args.start_api:
+        print("")
+        print("[run] starting API backend")
+        _run([str(python_exe), str(REPO_ROOT / "scripts" / "12_run_agent_api.py")], env=command_env)
 
 
 if __name__ == "__main__":

@@ -2456,13 +2456,29 @@ def _python_runner(params: dict[str, Any], deps: dict[str, ToolExecutionResult],
     import base64
 
     artifacts = []
+    structured_payload: dict[str, Any] | None = None
     for artifact in result.artifacts:
         artifact_path = context.artifacts_dir / "python_runner" / artifact.name
         artifact_path.parent.mkdir(parents=True, exist_ok=True)
-        artifact_path.write_bytes(base64.b64decode(artifact.bytes_b64.encode("ascii")))
+        decoded_bytes = base64.b64decode(artifact.bytes_b64.encode("ascii"))
+        artifact_path.write_bytes(decoded_bytes)
+        if artifact.mime == "application/json":
+            try:
+                parsed = json.loads(decoded_bytes.decode("utf-8"))
+            except Exception:
+                parsed = None
+            if structured_payload is None and isinstance(parsed, dict):
+                structured_payload = dict(parsed)
         artifacts.append(str(artifact_path))
+    payload = result.to_dict()
+    if structured_payload is not None:
+        payload = dict(structured_payload)
+        payload.setdefault("stdout", result.stdout)
+        payload.setdefault("stderr", result.stderr)
+        payload.setdefault("exit_code", int(result.exit_code))
+        payload.setdefault("artifacts", [item.to_dict() for item in result.artifacts])
     return ToolExecutionResult(
-        payload=result.to_dict(),
+        payload=payload,
         artifacts=artifacts,
         caveats=[] if result.exit_code == 0 else ["Python fallback returned non-zero exit code."],
     )

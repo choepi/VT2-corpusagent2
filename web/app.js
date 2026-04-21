@@ -37,6 +37,7 @@ const detailText = document.getElementById("detailText");
 const activeCount = document.getElementById("activeCount");
 const completedCount = document.getElementById("completedCount");
 const failedCount = document.getElementById("failedCount");
+const totalTimeCount = document.getElementById("totalTimeCount");
 const activeSteps = document.getElementById("activeSteps");
 const completedSteps = document.getElementById("completedSteps");
 const failedSteps = document.getElementById("failedSteps");
@@ -64,8 +65,12 @@ let clarificationHistory = [];
 let pendingClarificationQuestion = "";
 let currentRunId = "";
 let currentStatus = "idle";
+let currentRunStartedAtUtc = "";
+let currentRunFinishedAtUtc = "";
 let latestRuntimeInfo = null;
 let providerDefaults = {};
+let submissionInFlight = false;
+let activePollSessionId = 0;
 const POLL_INTERVAL_MS = 250;
 const MANIFEST_FETCH_RETRY_DELAY_MS = 400;
 const MANIFEST_FETCH_MAX_ATTEMPTS = 5;
@@ -153,6 +158,7 @@ function saveUiState() {
     pendingClarificationQuestion,
     currentRunId,
     currentStatus,
+    currentRunStartedAtUtc,
   };
   window.localStorage.setItem(UI_STATE_KEY, JSON.stringify(payload));
 }
@@ -175,6 +181,7 @@ function restoreUiState() {
     pendingClarificationQuestion = payload.pendingClarificationQuestion || "";
     currentRunId = payload.currentRunId || "";
     currentStatus = payload.currentStatus || "idle";
+    currentRunStartedAtUtc = payload.currentRunStartedAtUtc || "";
   } catch (error) {
     console.warn("Could not restore UI state", error);
   }
@@ -185,9 +192,13 @@ function hasActiveRun() {
 }
 
 function updateControlState() {
+  runButton.disabled = submissionInFlight || hasActiveRun();
   abortButton.disabled = !hasActiveRun();
-  applyLlmSettingsButton.disabled = hasActiveRun();
-  resetLlmSettingsButton.disabled = hasActiveRun();
+  continueButton.disabled = submissionInFlight || !pendingClarificationQuestion;
+  applyLlmSettingsButton.disabled = submissionInFlight || hasActiveRun();
+  resetLlmSettingsButton.disabled = submissionInFlight || hasActiveRun();
+  runButton.textContent = submissionInFlight ? "Submitting..." : hasActiveRun() ? "Run In Progress" : "Run Query";
+  continueButton.textContent = submissionInFlight ? "Submitting..." : "Continue With Clarification";
 }
 
 function defaultModelsForProvider(providerName) {
@@ -247,6 +258,70 @@ function setMetricText(element, label, value) {
 
 function formatJson(value) {
   return escapeHtml(JSON.stringify(value ?? {}, null, 2));
+}
+
+function compactJson(value) {
+  return JSON.stringify(value ?? {});
+}
+
+function isEmptyJsonValue(value) {
+  if (value === null || value === undefined) {
+    return true;
+  }
+  if (typeof value === "string") {
+    return value.trim().length === 0;
+  }
+  if (Array.isArray(value)) {
+    return value.length === 0;
+  }
+  if (typeof value === "object") {
+    return Object.keys(value).length === 0;
+  }
+  return false;
+}
+
+function renderJsonPanel(label, value, { threshold = 200, emptyLabel = "none" } = {}) {
+  if (isEmptyJsonValue(value)) {
+    return `<p class="muted"><strong>${escapeHtml(label)}:</strong> ${escapeHtml(emptyLabel)}</p>`;
+  }
+  const compact = compactJson(value);
+  const formatted = formatJson(value);
+  if (compact.length <= threshold) {
+    return `
+      <div class="trace-field">
+        <p class="trace-field-label"><strong>${escapeHtml(label)}</strong></p>
+        <pre class="trace-inline-pre">${formatted}</pre>
+      </div>
+    `;
+  }
+  return `
+    <details>
+      <summary>${escapeHtml(`${label} (${formatCount(compact.length)} chars)`)}</summary>
+      <pre>${formatted}</pre>
+    </details>
+  `;
+}
+
+function renderTextPanel(label, value, { threshold = 200, emptyLabel = "none" } = {}) {
+  const text = String(value ?? "");
+  if (!text.trim()) {
+    return `<p class="muted"><strong>${escapeHtml(label)}:</strong> ${escapeHtml(emptyLabel)}</p>`;
+  }
+  const escaped = escapeHtml(text);
+  if (text.length <= threshold) {
+    return `
+      <div class="trace-field">
+        <p class="trace-field-label"><strong>${escapeHtml(label)}</strong></p>
+        <pre class="trace-inline-pre">${escaped}</pre>
+      </div>
+    `;
+  }
+  return `
+    <details>
+      <summary>${escapeHtml(`${label} (${formatCount(text.length)} chars)`)}</summary>
+      <pre>${escaped}</pre>
+    </details>
+  `;
 }
 
 function formatScore(value) {
@@ -334,6 +409,21 @@ function totalNodeDurationMs(nodeRecords) {
     const value = Number(row?.duration_ms);
     return Number.isFinite(value) && value >= 0 ? sum + value : sum;
   }, 0);
+}
+
+function updateRunTotalTimeDisplay() {
+  const startedAt = parseUtcTimestamp(currentRunStartedAtUtc);
+  if (startedAt === null) {
+    totalTimeCount.textContent = "n/a";
+    return;
+  }
+  const isTerminal = ["completed", "partial", "failed", "rejected", "needs_clarification", "aborted"].includes(currentStatus);
+  const finishedAt = isTerminal ? parseUtcTimestamp(currentRunFinishedAtUtc || "") : Date.now();
+  if (finishedAt === null || finishedAt < startedAt) {
+    totalTimeCount.textContent = "n/a";
+    return;
+  }
+  totalTimeCount.textContent = formatDurationMs(finishedAt - startedAt) || "n/a";
 }
 
 function collectToolCallTotals(rows) {
@@ -427,6 +517,23 @@ function renderEvidence(rows) {
   `;
 }
 
+function resetManifestPanels(answerMessage = "Waiting for result...") {
+  renderAnswerPayload({
+    answer_text: answerMessage,
+    caveats: [],
+    unsupported_parts: [],
+    claim_verdicts: [],
+  });
+  renderEvidence([]);
+  renderSelectedDocs([]);
+  renderArtifacts({ run_id: "", node_records: [], final_answer: { artifacts_used: [] } });
+  renderPlannerActions([]);
+  renderPlanNodes([]);
+  renderToolCalls([]);
+  renderLLMTraces([]);
+  renderList(assumptionsList, [], (row) => escapeHtml(row));
+}
+
 function renderClarificationState() {
   clarificationPanel.classList.toggle("hidden", !pendingClarificationQuestion);
   clarificationPrompt.textContent = pendingClarificationQuestion || "The backend has not requested a clarification yet.";
@@ -443,9 +550,12 @@ function resetClarificationState() {
 function clearRestoredRunState() {
   currentRunId = "";
   currentStatus = "idle";
+  currentRunStartedAtUtc = "";
+  currentRunFinishedAtUtc = "";
   pendingClarificationQuestion = "";
   saveUiState();
   renderClarificationState();
+  updateRunTotalTimeDisplay();
   updateControlState();
 }
 
@@ -554,10 +664,7 @@ function renderPlanNodes(planDagList) {
         </div>
         <p><strong>Node:</strong> ${escapeHtml(node.node_id || node.id || "")}</p>
         <p><strong>Depends on:</strong> ${escapeHtml((node.depends_on || []).join(", ") || "none")}</p>
-        <details>
-          <summary>Inputs</summary>
-          <pre>${formatJson(node.inputs || {})}</pre>
-        </details>
+        ${renderJsonPanel("Inputs", node.inputs || {})}
       `
     )
   );
@@ -581,18 +688,9 @@ function renderLLMTraces(traces) {
       <p><strong>Model:</strong> ${escapeHtml(trace.model || "")}</p>
       ${trace.error ? `<p class="${errorClass}"><strong>${trace.used_fallback ? "Fallback reason" : "Error"}:</strong> ${escapeHtml(trace.error)}</p>` : ""}
       ${trace.note ? `<p><strong>Note:</strong> ${escapeHtml(trace.note)}</p>` : ""}
-      <details>
-        <summary>Prompt messages</summary>
-        <pre>${escapeHtml(messagePreview)}</pre>
-      </details>
-      <details>
-        <summary>Raw output</summary>
-        <pre>${escapeHtml(trace.raw_text || "")}</pre>
-      </details>
-      <details>
-        <summary>Parsed JSON</summary>
-        <pre>${formatJson(trace.parsed_json || {})}</pre>
-      </details>
+      ${renderTextPanel("Prompt messages", messagePreview)}
+      ${renderTextPanel("Raw output", trace.raw_text || "")}
+      ${renderJsonPanel("Parsed JSON", trace.parsed_json || {})}
     `;
   });
   renderStackPanel(llmTraces, blocks, "Planner and synthesis traces will appear here.");
@@ -634,14 +732,13 @@ function renderToolCalls(rows) {
       </div>
       ${row.error ? `<p class="danger"><strong>Error:</strong> ${escapeHtml(row.error)}</p>` : ""}
       ${row.tool_reason ? `<p><strong>Resolution:</strong> ${escapeHtml(row.tool_reason)}</p>` : ""}
-      <details>
-        <summary>Inputs</summary>
-        <pre>${formatJson(row.inputs || {})}</pre>
-      </details>
-      <details>
-        <summary>Output preview</summary>
-        <pre>${formatJson(summary.payload_preview || {})}</pre>
-      </details>
+      ${
+        Array.isArray(row.dependency_nodes) && row.dependency_nodes.length
+          ? `<p><strong>Dependency nodes:</strong> ${escapeHtml(row.dependency_nodes.join(", "))}</p>`
+          : ""
+      }
+      ${renderJsonPanel("Inputs", row.inputs || {})}
+      ${renderJsonPanel("Output preview", summary.payload_preview || {})}
       ${
         artifacts.length
           ? `<details><summary>Artifacts</summary><pre>${formatJson(artifacts)}</pre></details>`
@@ -755,11 +852,20 @@ function renderManifest(manifest) {
       detailText.textContent = `${detailText.textContent} Total executor step time: ${totalDuration}.`;
     }
   }
+  updateRunTotalTimeDisplay();
 }
 
 function setStatus(payload) {
   const status = payload.status || "unknown";
   currentStatus = status;
+  if (payload.started_at_utc) {
+    currentRunStartedAtUtc = String(payload.started_at_utc);
+  }
+  if (["completed", "partial", "failed", "rejected", "needs_clarification", "aborted"].includes(status)) {
+    currentRunFinishedAtUtc = String(payload.updated_at_utc || new Date().toISOString());
+  } else {
+    currentRunFinishedAtUtc = "";
+  }
   const liveActiveSteps = Array.isArray(payload.active_steps) ? payload.active_steps : [];
   const derivedActiveSteps =
     liveActiveSteps.length > 0
@@ -792,6 +898,7 @@ function setStatus(payload) {
   renderPlanNodes(payload.plan_dags || []);
   renderToolCalls(payload.tool_calls || []);
   renderLLMTraces(payload.llm_traces || []);
+  updateRunTotalTimeDisplay();
 
   const clarificationQuestions = payload.clarification_questions || [];
   if (status === "needs_clarification" && clarificationQuestions.length > 0) {
@@ -908,7 +1015,16 @@ async function abortAllRuns() {
 }
 
 async function submitQuery({ preserveClarificationHistory = false } = {}) {
-  await loadRuntimeInfo();
+  if (submissionInFlight) {
+    return;
+  }
+  submissionInFlight = true;
+  activePollSessionId += 1;
+  const pollSessionId = activePollSessionId;
+  currentRunStartedAtUtc = "";
+  currentRunFinishedAtUtc = "";
+  updateRunTotalTimeDisplay();
+  updateControlState();
   if (pollTimer) {
     clearInterval(pollTimer);
     pollTimer = null;
@@ -919,14 +1035,8 @@ async function submitQuery({ preserveClarificationHistory = false } = {}) {
   if (!preserveClarificationHistory) {
     resetClarificationState();
   }
-  answerText.textContent = "Waiting for result...";
-  renderEvidence([]);
-  renderSelectedDocs([]);
-  renderArtifacts({ run_id: "", node_records: [], final_answer: { artifacts_used: [] } });
-  renderPlannerActions([]);
-  renderPlanNodes([]);
-  renderToolCalls([]);
-  renderLLMTraces([]);
+  resetManifestPanels("Waiting for result...");
+  currentRunId = "";
   setStatus({
     status: "running",
     current_phase: "submitting",
@@ -941,25 +1051,44 @@ async function submitQuery({ preserveClarificationHistory = false } = {}) {
   });
 
   const base = apiBaseInput.value.replace(/\/$/, "");
-  const payload = await fetchJson(`${base}/query/submit`, {
-    method: "POST",
-    body: JSON.stringify({
-      question: questionInput.value,
-      force_answer: forceAnswerInput.checked,
-      no_cache: noCacheInput.checked,
-      clarification_history: clarificationHistory,
-    }),
-  });
-  currentRunId = payload.run_id || "";
-  setStatus(payload);
-  pollTimer = setInterval(() => pollRun(payload.run_id), POLL_INTERVAL_MS);
-  await pollRun(payload.run_id);
+  void loadRuntimeInfo();
+  try {
+    const payload = await fetchJson(`${base}/query/submit`, {
+      method: "POST",
+      body: JSON.stringify({
+        question: questionInput.value,
+        force_answer: forceAnswerInput.checked,
+        no_cache: noCacheInput.checked,
+        clarification_history: clarificationHistory,
+      }),
+    });
+    if (pollSessionId !== activePollSessionId) {
+      return;
+    }
+    currentRunId = payload.run_id || "";
+    setStatus(payload);
+    pollTimer = setInterval(() => {
+      void pollRun(payload.run_id, pollSessionId);
+    }, POLL_INTERVAL_MS);
+    await pollRun(payload.run_id, pollSessionId);
+  } finally {
+    if (pollSessionId === activePollSessionId) {
+      submissionInFlight = false;
+      updateControlState();
+    }
+  }
 }
 
-async function pollRun(runId) {
+async function pollRun(runId, pollSessionId = activePollSessionId) {
+  if (pollSessionId !== activePollSessionId) {
+    return;
+  }
   try {
     const base = apiBaseInput.value.replace(/\/$/, "");
     const statusPayload = await fetchJson(`${base}/runs/${runId}/status`);
+    if (pollSessionId !== activePollSessionId) {
+      return;
+    }
     currentRunId = runId;
     setStatus(statusPayload);
 
@@ -967,6 +1096,9 @@ async function pollRun(runId) {
       clearInterval(pollTimer);
       pollTimer = null;
       const manifest = await fetchManifestWithRetry(base, runId);
+      if (pollSessionId !== activePollSessionId) {
+        return;
+      }
       renderManifest(manifest);
       const manifestHistory = manifest.metadata?.clarification_history || [];
       if (Array.isArray(manifestHistory) && manifestHistory.length > 0) {
@@ -993,8 +1125,17 @@ async function pollRun(runId) {
           manifest.status === "needs_clarification" && pendingClarificationQuestion ? [pendingClarificationQuestion] : [],
         detail: manifest.status === "needs_clarification" ? pendingClarificationQuestion : statusPayload.detail,
       });
+      if (Array.isArray(manifest.node_records) && manifest.node_records.length > 0) {
+        const totalDuration = formatDurationMs(totalNodeDurationMs(manifest.node_records));
+        if (totalDuration) {
+          detailText.textContent = `${detailText.textContent} Total executor step time: ${totalDuration}.`;
+        }
+      }
     }
   } catch (error) {
+    if (pollSessionId !== activePollSessionId) {
+      return;
+    }
     clearInterval(pollTimer);
     pollTimer = null;
     if (String(error.message || "").includes("404")) {
@@ -1009,6 +1150,9 @@ async function pollRun(runId) {
 }
 
 runButton.addEventListener("click", async () => {
+  if (submissionInFlight || hasActiveRun()) {
+    return;
+  }
   try {
     await submitQuery({ preserveClarificationHistory: false });
   } catch (error) {
@@ -1060,6 +1204,9 @@ continueButton.addEventListener("click", async () => {
   const text = clarificationInput.value.trim();
   if (!text) {
     detailText.textContent = "Please type a clarification before continuing.";
+    return;
+  }
+  if (submissionInFlight) {
     return;
   }
   clarificationHistory = [...clarificationHistory, text];
