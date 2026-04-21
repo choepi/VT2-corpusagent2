@@ -14,8 +14,8 @@ def _load_build_pgvector_index():
     return module
 
 
-def test_pgvector_index_build_defaults_favor_faster_vm_prep() -> None:
+def test_pgvector_index_build_defaults_match_current_cluster_oriented_tuning() -> None:
     module = _load_build_pgvector_index()
 
-    assert module.DEFAULT_HNSW_EF_CONSTRUCTION == 64
+    assert module.DEFAULT_HNSW_EF_CONSTRUCTION == 128
     assert module.DEFAULT_MAX_PARALLEL_MAINTENANCE_WORKERS == 6

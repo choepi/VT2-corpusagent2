@@ -17,7 +17,7 @@ from corpusagent2.app_config import load_project_configuration
 from corpusagent2.retrieval import pg_dsn_from_env, pg_table_from_env
 from corpusagent2.seed import set_global_seed
 
-DEFAULT_HNSW_EF_CONSTRUCTION = 64
+DEFAULT_HNSW_EF_CONSTRUCTION = 128
 DEFAULT_MAX_PARALLEL_MAINTENANCE_WORKERS = 6
 
 

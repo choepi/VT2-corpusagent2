@@ -53,6 +53,7 @@ class EvidenceRow:
 class AgentPlanNode:
     node_id: str
     capability: str
+    tool_name: str = ""
     inputs: dict[str, Any] = field(default_factory=dict)
     depends_on: list[str] = field(default_factory=list)
     optional: bool = False
@@ -172,6 +173,7 @@ class PlannerAction:
                     AgentPlanNode(
                         node_id=node_id,
                         capability=capability,
+                        tool_name=str(item.get("tool_name", item.get("tool", ""))).strip(),
                         inputs=inputs,
                         depends_on=deduped_depends_on,
                         optional=bool(item.get("optional", False)),
@@ -253,6 +255,7 @@ class AgentRunState:
     assumptions: list[str] = field(default_factory=list)
     force_answer: bool = False
     available_capabilities: list[str] = field(default_factory=list)
+    tool_catalog: list[dict[str, Any]] = field(default_factory=list)
     corpus_schema: dict[str, Any] = field(default_factory=dict)
     working_set_doc_ids: list[str] = field(default_factory=list)
     artifacts: dict[str, str] = field(default_factory=dict)
@@ -317,6 +320,7 @@ class LiveRunStatus:
     run_id: str
     question: str
     status: str
+    started_at_utc: str = field(default_factory=lambda: datetime.now(UTC).isoformat())
     current_phase: str = ""
     detail: str = ""
     clarification_questions: list[str] = field(default_factory=list)
@@ -336,6 +340,7 @@ class LiveRunStatus:
             "run_id": self.run_id,
             "question": self.question,
             "status": self.status,
+            "started_at_utc": self.started_at_utc,
             "current_phase": self.current_phase,
             "detail": self.detail,
             "clarification_questions": list(self.clarification_questions),

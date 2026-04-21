@@ -143,6 +143,8 @@ def build_test_runtime(
     documents: list[dict[str, Any]],
     search_rows_by_query: dict[str, list[dict[str, Any]]],
     search_delay_s: float = 0.0,
+    llm_client=None,
+    registry=None,
     python_runner=None,
     working_store=None,
 ):
@@ -196,7 +198,8 @@ def build_test_runtime(
     return AgentRuntime(
         config=config,
         runtime=runtime,
-        llm_client=FailingLLMClient(),
+        llm_client=llm_client or FailingLLMClient(),
+        registry=registry,
         search_backend=FakeSearchBackend(search_rows_by_query, delay_s=search_delay_s),
         working_store=store,
         python_runner=python_runner,
