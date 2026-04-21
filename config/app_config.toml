@@ -32,7 +32,7 @@ default_time_granularity = "month"
 device = "auto"
 
 [postgres]
-dsn = "postgresql://corpus:corpus@localhost:5432/corpus_db"
+dsn = "postgresql://corpus:corpus@127.0.0.1:5432/corpus_db"
 table = "article_corpus"
 
 [opensearch]

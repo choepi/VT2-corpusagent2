@@ -19,7 +19,7 @@ from .agent_models import EvidenceRow
 from .analysis_tools import textrank_keywords
 from .io_utils import sentence_split as simple_sentence_split
 from .python_runner_service import DockerPythonRunnerService
-from .retrieval import _load_sentence_transformer
+from .retrieval import _load_sentence_transformer, pg_dsn_from_env
 from .seed import resolve_device
 from .tool_registry import CapabilityToolAdapter, SchemaDescriptor, ToolExecutionResult, ToolRegistry, ToolSpec
 
@@ -317,7 +317,7 @@ MARKET_TICKER_ALIASES = {
 def _sql_fallback_store(context: "AgentExecutionContext") -> PostgresWorkingSetStore | None:
     if isinstance(context.working_store, PostgresWorkingSetStore):
         return context.working_store
-    dsn = os.getenv("CORPUSAGENT2_PG_DSN", "").strip()
+    dsn = pg_dsn_from_env(required=False)
     if not dsn:
         return None
     table = os.getenv("CORPUSAGENT2_PG_TABLE", "article_corpus").strip() or "article_corpus"
