@@ -1,0 +1,132 @@
+ssh dongtten@dallas.zhaw.ch
+
+givemeagpushell sanfrancisco  
+squeue -u dongtten
+scancel -u dongtten
+
+cd /cluster/home/dongtten/VT1/experimentalscripts/
+
+sbatch /cluster/home/dongtten/VT1/run_cluster/submit.sh
+
+sbatch --export=ALL,PY_FILE=experiment.py /cluster/home/dongtten/VT1/run_cluster/submit.sh
+
+
+# print file size
+du -h --max-depth=1 | sort -h
+
+#get log file path of a job
+scontrol show job 73869 | grep -E 'StdOut|StdErr'
+
+#watch output
+watch -n 2 'tail -n 100 73806.out'
+watch -n 2 'squeue --me'
+
+
+# find available gpu Nodes 
+sinfo -h -p gpu,gpu_ia,gpu_top -N -o '%N|%P' \
+| while IFS='|' read -r node part; do
+  scontrol show node "$node" | awk -v node="$node" -v part="$part" '
+    /Gres=/ {
+      # find the field that starts with Gres=
+      for (i = 1; i <= NF; i++) {
+        if ($i ~ /^Gres=/) {
+          gres = $i
+          sub(/^Gres=/, "", gres)
+        }
+      }
+    }
+    /AllocTRES=/ {
+      # capture full AllocTRES=... string
+      for (i = 1; i <= NF; i++) {
+        if ($i ~ /^AllocTRES=/) {
+          alloc = $i
+        }
+      }
+    }
+    END {
+      # ---- parse GPU model + total count ----
+      total = 0
+      model_str = ""
+
+      n = split(gres, garr, ",")
+      for (i = 1; i <= n; i++) {
+        if (garr[i] ~ /^gpu:/) {
+          # e.g. gpu:v100sxm:8 or gpu:a100pcie:3
+          split(garr[i], b, ":")
+          # b[2] = model, b[3] = count
+          if (model_str == "")
+            model_str = b[2]
+          else
+            model_str = model_str "," b[2]
+
+          if (b[3] != "")
+            total += b[3] + 0
+        }
+      }
+
+      # ---- parse allocated GPUs from AllocTRES= ----
+      alloc_gpu = 0
+      sub(/^AllocTRES=/, "", alloc)
+      m = split(alloc, aarr, ",")
+      for (i = 1; i <= m; i++) {
+        # look for gres/gpu=X
+        if (aarr[i] ~ /^gres\/gpu=/) {
+          split(aarr[i], c, "=")
+          alloc_gpu += c[2] + 0
+        }
+      }
+
+      free = total - alloc_gpu
+
+      printf "%-12s %-10s %-20s total=%2d alloc=%2d free=%2d\n",
+             node, part, model_str, total, alloc_gpu, free
+    }'
+done
+
+# See your jobs (IDs in 1st column)
+squeue -u $USER -o "%.18i %.20j %.8T %.10M %.10l %N %R"
+squeue -w trinity -o "%.7i %.10u %.10P %.2t %.10M %.4D %.30R %.30b"
+
+# Kill one job
+scancel <JOBID>
+
+# Kill all your jobs
+scancel -u $USER
+
+# Kill only PENDING jobs
+scancel -u $USER -t PENDING
+
+# Kill by name (pattern)
+scancel -u $USER -n run_dummy_py_script*
+
+
+# check info on finished jobs
+sacct -j 64070 --format=JobID,JobName,Partition,State,Elapsed,Start,End,NodeList,ExitCode
+sacct -u $USER --name=ws_small_fullscope -S $(date -d '7 days ago' +%Y-%m-%d)
+
+
+module load python/3.10.14
+env_name="vt1"
+
+# do not place your venv in your home dir - this will be very slow! 
+# Use the persistent scratch directory instead:
+venv_base_dir="/raid/persistent_scratch/dongtten/venvs/"
+venv_path="$venv_base_dir/$env_name"
+
+# create venv base dir
+mkdir -p $venv_base_dir
+
+# create env and activate it
+virtualenv $venv_path
+source "$venv_path/bin/activate"
+
+
+/cluster/home/dongtten/VT1/activeft/requirements.txt
+
+
+salloc --job-name=debugging \
+       --partition=cpu_ia \
+       --account=<slurm-account> \
+       --time=2:00:00 \
+       --cpus-per-task=16 \
+       --mem=32G
