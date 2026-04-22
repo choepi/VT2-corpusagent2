@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 import json
 import os
 from pathlib import Path
+import re
 from typing import Any, Protocol
 
 import httpx
@@ -91,6 +92,54 @@ class OpenSearchBackend:
             "score": float(hit.get("_score", 0.0)),
         }
 
+    def _looks_structured_query(self, query: str) -> bool:
+        return bool(re.search(r"\b(?:AND|OR|NOT)\b|[()\"]", str(query), flags=re.IGNORECASE))
+
+    def _query_clause(self, query: str, *, structured: bool) -> dict[str, Any]:
+        if structured:
+            return {
+                "query_string": {
+                    "query": query,
+                    "fields": ["title^4", "text", "body", "content"],
+                    "default_operator": "AND",
+                    "lenient": True,
+                }
+            }
+        return {
+            "multi_match": {
+                "query": query,
+                "fields": ["title^3", "text", "body", "content"],
+                "type": "best_fields",
+            }
+        }
+
+    def _request_payload(
+        self,
+        *,
+        query: str,
+        limit: int,
+        date_from: str,
+        date_to: str,
+        structured: bool,
+    ) -> dict[str, Any]:
+        filters: list[dict[str, Any]] = []
+        if date_from or date_to:
+            range_body: dict[str, Any] = {}
+            if date_from:
+                range_body["gte"] = date_from
+            if date_to:
+                range_body["lte"] = date_to
+            filters.append({"range": {"published_at": range_body}})
+        return {
+            "size": limit,
+            "query": {
+                "bool": {
+                    "must": [self._query_clause(query, structured=structured)],
+                    "filter": filters,
+                }
+            },
+        }
+
     def search(
         self,
         *,
@@ -106,39 +155,37 @@ class OpenSearchBackend:
         fusion_k: int = 60,
     ) -> list[dict[str, Any]]:
         limit = int(lexical_top_k or top_k)
-        clauses: list[dict[str, Any]] = [
-            {
-                "multi_match": {
-                    "query": query,
-                    "fields": ["title^3", "text", "body", "content"],
-                    "type": "best_fields",
-                }
-            }
-        ]
-        filters: list[dict[str, Any]] = []
-        if date_from or date_to:
-            range_body: dict[str, Any] = {}
-            if date_from:
-                range_body["gte"] = date_from
-            if date_to:
-                range_body["lte"] = date_to
-            filters.append({"range": {"published_at": range_body}})
-        payload = {
-            "size": limit,
-            "query": {
-                "bool": {
-                    "must": clauses,
-                    "filter": filters,
-                }
-            },
-        }
+        structured = self._looks_structured_query(query)
+        payload = self._request_payload(
+            query=query,
+            limit=limit,
+            date_from=date_from,
+            date_to=date_to,
+            structured=structured,
+        )
         with httpx.Client(timeout=self.config.timeout_s, verify=self.config.verify_ssl) as client:
-            response = client.post(
-                f"{self.config.base_url.rstrip('/')}/{self.config.index_name}/_search",
-                auth=self._auth(),
-                json=payload,
-            )
-            response.raise_for_status()
+            try:
+                response = client.post(
+                    f"{self.config.base_url.rstrip('/')}/{self.config.index_name}/_search",
+                    auth=self._auth(),
+                    json=payload,
+                )
+                response.raise_for_status()
+            except httpx.HTTPStatusError as exc:
+                if not structured or exc.response.status_code != 400:
+                    raise
+                response = client.post(
+                    f"{self.config.base_url.rstrip('/')}/{self.config.index_name}/_search",
+                    auth=self._auth(),
+                    json=self._request_payload(
+                        query=query,
+                        limit=limit,
+                        date_from=date_from,
+                        date_to=date_to,
+                        structured=False,
+                    ),
+                )
+                response.raise_for_status()
             hits = response.json().get("hits", {}).get("hits", [])
         return [self._normalize_hit(hit) for hit in hits]
 

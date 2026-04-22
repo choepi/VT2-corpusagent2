@@ -6,6 +6,8 @@ from pathlib import Path
 import time
 
 from corpusagent2 import agent_capabilities
+from corpusagent2.agent_models import AgentRunState
+from corpusagent2.agent_runtime import MagicBoxOrchestrator
 from corpusagent2.agent_backends import InMemoryWorkingSetStore
 from corpusagent2.api import build_app
 from corpusagent2.agent_executor import AgentExecutionSnapshot
@@ -691,6 +693,25 @@ def test_empty_planner_payload_uses_heuristic_plan_without_scary_error(tmp_path:
     assert fallback_traces
     assert fallback_traces[-1]["error"] == ""
     assert "heuristic planning fallback used" in fallback_traces[-1]["note"]
+
+
+def test_noun_distribution_heuristic_plan_uses_broad_retrieval_and_aggregate_nodes() -> None:
+    orchestrator = MagicBoxOrchestrator(llm_client=None)
+    state = AgentRunState(
+        question="What is the distribution of nouns in all football reports?",
+        rewritten_question="What is the distribution of nouns in all football reports?",
+    )
+
+    action = orchestrator.plan(state)
+
+    assert action.action == "emit_plan_dag"
+    assert action.plan_dag is not None
+    node_map = {node.node_id: node for node in action.plan_dag.nodes}
+    assert node_map["search"].inputs["top_k"] > 40
+    assert "football" in str(node_map["search"].inputs.get("query", "")).lower()
+    assert any(node.capability == "build_evidence_table" for node in action.plan_dag.nodes)
+    assert node_map["plot"].depends_on == ["noun_distribution"]
+    assert any("higher-recall retrieval budget" in item for item in action.assumptions)
 
 
 def test_clarification_history_allows_follow_up_run(tmp_path: Path) -> None:
