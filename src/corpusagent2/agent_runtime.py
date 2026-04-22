@@ -402,6 +402,48 @@ class MagicBoxOrchestrator:
                 return ticker
         return ""
 
+    def _requests_all_records(self, text: str) -> bool:
+        lowered = str(text or "").lower()
+        return any(
+            phrase in lowered
+            for phrase in (
+                "all reports",
+                "all records",
+                "all documents",
+                "across all",
+                "entire corpus",
+                "all football",
+                "report all",
+                "use all",
+            )
+        )
+
+    def _noun_distribution_search_inputs(self, rewritten: str) -> tuple[dict[str, Any], list[str]]:
+        lowered = str(rewritten or "").lower()
+        broad_scope = self._requests_all_records(rewritten)
+        search_inputs: dict[str, Any] = {
+            "top_k": 200 if broad_scope else 80,
+            "retrieval_mode": "hybrid",
+            "use_rerank": False,
+        }
+        if broad_scope:
+            search_inputs["lexical_top_k"] = 1600
+            search_inputs["dense_top_k"] = 800
+        assumptions: list[str] = []
+        if "football" in lowered and "american football" not in lowered:
+            search_inputs["query"] = (
+                '(football OR soccer OR FIFA OR UEFA OR "Premier League" OR "World Cup" '
+                'OR "Champions League" OR "match report" OR "game report") '
+                'AND NOT ("American football" OR NFL OR NCAA OR quarterback OR touchdown)'
+            )
+            assumptions.append("Interpret 'football' as soccer unless the question explicitly says American football.")
+        else:
+            search_inputs["query"] = self._compact_query_terms(rewritten, self._query_anchor_terms(rewritten))
+        if broad_scope:
+            assumptions.append("Use a higher-recall retrieval budget for broad all-reports aggregation requests.")
+        search_inputs.update(self._extract_date_window(rewritten))
+        return search_inputs, assumptions
+
     def _broad_scope_clarification_is_sufficient(self, state: AgentRunState) -> tuple[bool, list[str]]:
         question_text = f"{state.question}\n" + "\n".join(state.clarification_history)
         lowered = question_text.lower()
@@ -634,18 +676,49 @@ class MagicBoxOrchestrator:
                 plan_dag=dag,
             )
         if "distribution" in text and "noun" in text:
+            search_inputs, assumptions = self._noun_distribution_search_inputs(rewritten)
             dag = AgentPlanDAG(
                 nodes=[
-                    AgentPlanNode("search", "db_search", inputs={"top_k": 40, "retrieval_mode": "hybrid", "use_rerank": False}),
+                    AgentPlanNode("search", "db_search", inputs=search_inputs),
                     AgentPlanNode("fetch", "fetch_documents", depends_on=["search"]),
                     AgentPlanNode("working_set", "create_working_set", depends_on=["fetch"]),
                     AgentPlanNode("pos", "pos_morph", depends_on=["fetch"]),
                     AgentPlanNode("lemmas", "lemmatize", depends_on=["fetch"]),
-                    AgentPlanNode("plot", "plot_artifact", inputs={"plot_name": "noun_distribution"}, depends_on=["pos"], optional=True),
+                    AgentPlanNode(
+                        "noun_distribution",
+                        "build_evidence_table",
+                        inputs={
+                            "task": "noun_frequency_distribution",
+                            "filters": {"upos": ["NOUN", "PROPN"]},
+                            "top_k": 100,
+                        },
+                        depends_on=["fetch", "pos", "lemmas"],
+                    ),
+                    AgentPlanNode(
+                        "summary",
+                        "build_evidence_table",
+                        inputs={
+                            "task": "summary_stats",
+                            "include": ["matched_document_count", "total_noun_tokens", "unique_noun_lemmas", "top_nouns"],
+                        },
+                        depends_on=["fetch", "noun_distribution"],
+                    ),
+                    AgentPlanNode(
+                        "plot",
+                        "plot_artifact",
+                        inputs={"plot_name": "noun_distribution", "x": "lemma", "y": "count", "title": "Top noun lemmas", "top_k": 30},
+                        depends_on=["noun_distribution"],
+                        optional=True,
+                    ),
                 ],
                 metadata={"question_family": "noun_distribution"},
             )
-            return PlannerAction(action="emit_plan_dag", rewritten_question=state.rewritten_question, plan_dag=dag)
+            return PlannerAction(
+                action="emit_plan_dag",
+                rewritten_question=state.rewritten_question,
+                assumptions=assumptions,
+                plan_dag=dag,
+            )
         if "named entit" in text or ("climate" in text and "entity" in text):
             dag = AgentPlanDAG(
                 nodes=[
