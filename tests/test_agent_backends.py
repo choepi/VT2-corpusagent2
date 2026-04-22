@@ -3,7 +3,7 @@ from __future__ import annotations
 import pandas as pd
 
 import corpusagent2.agent_backends as agent_backends
-from corpusagent2.agent_backends import LocalSearchBackend
+from corpusagent2.agent_backends import LocalSearchBackend, OpenSearchBackend, OpenSearchConfig
 from corpusagent2.retrieval import RetrievalResult, build_lexical_assets
 
 
@@ -70,3 +70,72 @@ def test_local_search_backend_uses_dense_candidate_fallback(monkeypatch) -> None
 
     assert [row["doc_id"] for row in rows] == ["a", "b"]
     assert rows[0]["score_components"]["dense_candidate"] == 0.91
+
+
+def test_opensearch_backend_uses_query_string_for_structured_queries(monkeypatch) -> None:
+    seen_payloads: list[dict] = []
+
+    class _FakeResponse:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict:
+            return {"hits": {"hits": []}}
+
+    class _FakeClient:
+        def __init__(self, *args, **kwargs) -> None:
+            return None
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb) -> None:
+            return None
+
+        def post(self, url, auth=None, json=None):
+            seen_payloads.append(dict(json))
+            return _FakeResponse()
+
+    monkeypatch.setattr(agent_backends.httpx, "Client", _FakeClient)
+    backend = OpenSearchBackend(OpenSearchConfig())
+
+    backend.search(query='(soccer OR football) AND NOT (NFL OR touchdown)', top_k=5)
+
+    assert seen_payloads
+    clause = seen_payloads[0]["query"]["bool"]["must"][0]
+    assert "query_string" in clause
+    assert clause["query_string"]["query"] == '(soccer OR football) AND NOT (NFL OR touchdown)'
+
+
+def test_opensearch_backend_uses_multi_match_for_plain_queries(monkeypatch) -> None:
+    seen_payloads: list[dict] = []
+
+    class _FakeResponse:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict:
+            return {"hits": {"hits": []}}
+
+    class _FakeClient:
+        def __init__(self, *args, **kwargs) -> None:
+            return None
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb) -> None:
+            return None
+
+        def post(self, url, auth=None, json=None):
+            seen_payloads.append(dict(json))
+            return _FakeResponse()
+
+    monkeypatch.setattr(agent_backends.httpx, "Client", _FakeClient)
+    backend = OpenSearchBackend(OpenSearchConfig())
+
+    backend.search(query="football reports", top_k=5)
+
+    assert seen_payloads
+    clause = seen_payloads[0]["query"]["bool"]["must"][0]
+    assert "multi_match" in clause
