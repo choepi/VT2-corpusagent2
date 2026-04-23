@@ -15,6 +15,7 @@ from .analysis_tools import (
     run_topics_over_time,
 )
 from .faithfulness import evaluate_claims_with_nli
+from .retrieval_budgeting import infer_retrieval_budget
 from .retrieval import (
     reciprocal_rank_fusion,
     rerank_cross_encoder,
@@ -191,7 +192,8 @@ class HybridRetrievalTool(CapabilityToolAdapter):
         if not query:
             raise ValueError("Retrieval query is required.")
 
-        top_k = int(params.get("top_k", 12))
+        budget = infer_retrieval_budget(query, inputs=params, lightweight=bool(params.get("lightweight", False)))
+        top_k = budget.top_k
         lightweight = bool(params.get("lightweight", False))
         fusion_top_k = max(top_k * 10, 50) if not lightweight else max(top_k * 3, 15)
         lexical_vectorizer, lexical_matrix, lexical_doc_ids = runtime.load_lexical_assets()

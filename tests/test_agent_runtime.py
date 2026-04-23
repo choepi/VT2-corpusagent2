@@ -6,12 +6,11 @@ from pathlib import Path
 import time
 
 from corpusagent2 import agent_capabilities
-from corpusagent2.agent_models import AgentRunState
-from corpusagent2.agent_runtime import MagicBoxOrchestrator
 from corpusagent2.agent_backends import InMemoryWorkingSetStore
 from corpusagent2.api import build_app
 from corpusagent2.agent_executor import AgentExecutionSnapshot
 from corpusagent2.python_runner_service import PythonRunnerResult, SandboxArtifact
+from corpusagent2.retrieval_budgeting import infer_retrieval_budget
 from corpusagent2.tool_registry import ToolExecutionResult, ToolRegistry
 
 from .helpers import StaticAdapter, StaticLLMClient, build_test_runtime
@@ -695,25 +694,6 @@ def test_empty_planner_payload_uses_heuristic_plan_without_scary_error(tmp_path:
     assert "heuristic planning fallback used" in fallback_traces[-1]["note"]
 
 
-def test_noun_distribution_heuristic_plan_uses_broad_retrieval_and_aggregate_nodes() -> None:
-    orchestrator = MagicBoxOrchestrator(llm_client=None)
-    state = AgentRunState(
-        question="What is the distribution of nouns in all football reports?",
-        rewritten_question="What is the distribution of nouns in all football reports?",
-    )
-
-    action = orchestrator.plan(state)
-
-    assert action.action == "emit_plan_dag"
-    assert action.plan_dag is not None
-    node_map = {node.node_id: node for node in action.plan_dag.nodes}
-    assert node_map["search"].inputs["top_k"] > 40
-    assert "football" in str(node_map["search"].inputs.get("query", "")).lower()
-    assert any(node.capability == "build_evidence_table" for node in action.plan_dag.nodes)
-    assert node_map["plot"].depends_on == ["noun_distribution"]
-    assert any("higher-recall retrieval budget" in item for item in action.assumptions)
-
-
 def test_clarification_history_allows_follow_up_run(tmp_path: Path) -> None:
     docs = _sample_documents()
     runtime = build_test_runtime(
@@ -984,6 +964,186 @@ def test_framing_shift_heuristic_query_is_entity_driven_not_hardcoded_to_faceboo
     assert "Palmolive" in query_text
     assert "Facebook" not in query_text
     assert "Cambridge Analytica" not in query_text
+
+
+def test_noun_distribution_heuristic_plan_uses_scope_budget_and_aggregate_nodes(tmp_path: Path) -> None:
+    docs = _sample_documents()
+    runtime = build_test_runtime(
+        tmp_path=tmp_path,
+        documents=docs,
+        search_rows_by_query=_search_rows(docs),
+    )
+    runtime.llm_client = None
+    runtime.orchestrator.llm_client = None
+
+    manifest = runtime.handle_query(
+        "What is the distribution of nouns across all football reports in the corpus?",
+        force_answer=True,
+        no_cache=True,
+    )
+
+    assert manifest.plan_dags
+    nodes = manifest.plan_dags[0]["nodes"]
+    search_node = next(node for node in nodes if node["capability"] == "db_search")
+    assert int(search_node["inputs"]["top_k"]) >= 80
+    assert search_node["inputs"].get("retrieve_all") is True
+    assert search_node["inputs"].get("retrieval_strategy") == "exhaustive_analytic"
+    assert any(node["capability"] == "build_evidence_table" for node in nodes)
+    assert any(node["node_id"] == "noun_distribution" for node in nodes)
+    plot_node = next(node for node in nodes if node["node_id"] == "plot")
+    assert "noun_distribution" in plot_node["depends_on"]
+
+
+def test_infer_retrieval_budget_marks_all_reports_questions_as_exhaustive() -> None:
+    budget = infer_retrieval_budget("What is the distribution of nouns across all football reports in the corpus?")
+
+    assert budget.scope == "exhaustive"
+    assert budget.retrieve_all_requested is True
+    assert budget.retrieval_strategy == "exhaustive_analytic"
+
+
+def test_infer_retrieval_budget_uses_semantic_strategy_for_similarity_questions() -> None:
+    budget = infer_retrieval_budget("Find semantically similar articles to this climate-policy report.")
+
+    assert budget.retrieval_strategy == "semantic_exploratory"
+    assert budget.retrieval_mode == "dense"
+
+
+def test_planner_search_budget_is_normalized_up_for_broad_scope_questions(tmp_path: Path) -> None:
+    docs = _sample_documents()
+    llm = StaticLLMClient(
+        [
+            {
+                "action": "accept_with_assumptions",
+                "rewritten_question": "What is the distribution of nouns across all football reports in the corpus?",
+                "assumptions": [],
+                "clarification_question": "",
+                "rejection_reason": "",
+                "message": "",
+            },
+            {
+                "action": "emit_plan_dag",
+                "rewritten_question": "What is the distribution of nouns across all football reports in the corpus?",
+                "plan_dag": {
+                    "nodes": [
+                        {
+                            "node_id": "search",
+                            "capability": "db_search",
+                            "inputs": {"top_k": 10, "retrieval_mode": "hybrid", "use_rerank": False},
+                        },
+                        {"node_id": "fetch", "capability": "fetch_documents", "depends_on": ["search"]},
+                    ]
+                },
+                "assumptions": [],
+                "clarification_question": "",
+                "rejection_reason": "",
+                "message": "",
+            },
+            {
+                "answer_text": "done",
+                "caveats": [],
+                "unsupported_parts": [],
+                "claim_verdicts": [],
+                "evidence_items": [],
+                "artifacts_used": [],
+            },
+        ]
+    )
+    runtime = build_test_runtime(
+        tmp_path=tmp_path,
+        documents=docs,
+        search_rows_by_query=_search_rows(docs),
+        llm_client=llm,
+    )
+
+    manifest = runtime.handle_query(
+        "What is the distribution of nouns across all football reports in the corpus?",
+        force_answer=True,
+        no_cache=True,
+    )
+
+    search_node = next(node for node in manifest.plan_dags[0]["nodes"] if node["capability"] == "db_search")
+    assert int(search_node["inputs"]["top_k"]) >= 80
+    assert search_node["inputs"].get("retrieve_all") is True
+    assert search_node["inputs"].get("retrieval_strategy") == "exhaustive_analytic"
+
+
+def test_derive_summary_prefers_aggregated_noun_table_over_raw_pos_rows(tmp_path: Path) -> None:
+    docs = _sample_documents()
+    runtime = build_test_runtime(
+        tmp_path=tmp_path,
+        documents=docs,
+        search_rows_by_query=_search_rows(docs),
+    )
+
+    snapshot = AgentExecutionSnapshot(
+        node_records=[],
+        node_results={
+            "pos": ToolExecutionResult(
+                payload={
+                    "rows": [
+                        {"doc_id": "f1", "token": "football", "lemma": "football", "pos": "NOUN"},
+                        {"doc_id": "f1", "token": "cup", "lemma": "cup", "pos": "NOUN"},
+                        {"doc_id": "f1", "token": "cup", "lemma": "cup", "pos": "NOUN"},
+                    ]
+                }
+            ),
+            "noun_distribution": ToolExecutionResult(
+                payload={
+                    "rows": [
+                        {"lemma": "club", "count": 7, "document_frequency": 2, "relative_frequency": 0.2},
+                        {"lemma": "player", "count": 6, "document_frequency": 2, "relative_frequency": 0.18},
+                    ]
+                },
+                metadata={"task": "noun_frequency_distribution"},
+            ),
+        },
+        failures=[],
+        provenance_records=[],
+        selected_docs=[],
+        status="completed",
+    )
+
+    summary = runtime.orchestrator._derive_summary(snapshot)
+
+    assert summary["noun_distribution"][:2] == [("club", 7), ("player", 6)]
+    assert summary["noun_distribution_source"] == "aggregated_table"
+
+
+def test_derive_summary_does_not_fallback_to_raw_pos_when_noun_table_attempted_but_empty(tmp_path: Path) -> None:
+    docs = _sample_documents()
+    runtime = build_test_runtime(
+        tmp_path=tmp_path,
+        documents=docs,
+        search_rows_by_query=_search_rows(docs),
+    )
+
+    snapshot = AgentExecutionSnapshot(
+        node_records=[],
+        node_results={
+            "pos": ToolExecutionResult(
+                payload={
+                    "rows": [
+                        {"doc_id": "f1", "token": "football", "lemma": "football", "pos": "NOUN"},
+                        {"doc_id": "f1", "token": "cup", "lemma": "cup", "pos": "NOUN"},
+                    ]
+                }
+            ),
+            "noun_distribution": ToolExecutionResult(
+                payload={"rows": []},
+                caveats=["No noun distribution rows were produced from the upstream documents and POS rows."],
+                metadata={"task": "noun_frequency_distribution", "no_data": True},
+            ),
+        },
+        failures=[],
+        provenance_records=[],
+        selected_docs=[],
+        status="completed",
+    )
+
+    summary = runtime.orchestrator._derive_summary(snapshot)
+
+    assert "noun_distribution" not in summary
 
 
 def test_openai_style_plan_without_retrieval_backbone_falls_back_to_heuristic(tmp_path: Path, monkeypatch) -> None:

@@ -6,7 +6,7 @@ from pathlib import Path
 
 from corpusagent2.agent_backends import InMemoryWorkingSetStore
 from corpusagent2.agent_capabilities import AgentExecutionContext
-from corpusagent2.agent_executor import AsyncPlanExecutor
+from corpusagent2.agent_executor import AsyncPlanExecutor, _summarize_tool_result
 from corpusagent2.agent_models import AgentPlanDAG, AgentPlanNode
 from corpusagent2.tool_registry import ToolExecutionResult, ToolRegistry
 
@@ -56,3 +56,28 @@ def test_async_executor_runs_independent_nodes_in_parallel(tmp_path: Path) -> No
 
     assert snapshot.status == "completed"
     assert duration < 0.5
+
+
+def test_summarize_tool_result_distinguishes_input_docs_and_no_data() -> None:
+    dependency_results = {
+        "fetch": ToolExecutionResult(
+            payload={
+                "documents": [
+                    {"doc_id": "doc-1", "text": "Alpha"},
+                    {"doc_id": "doc-2", "text": "Beta"},
+                ]
+            }
+        )
+    }
+    result = ToolExecutionResult(
+        payload={"rows": []},
+        caveats=["No rows available for plotting."],
+        metadata={"no_data": True, "no_data_reason": "No rows available for plotting."},
+    )
+
+    summary = _summarize_tool_result(result, dependency_results=dependency_results)
+
+    assert summary["input_documents_seen"] == 2
+    assert summary["output_documents"] == 0
+    assert summary["no_data"] is True
+    assert summary["no_data_reason"] == "No rows available for plotting."

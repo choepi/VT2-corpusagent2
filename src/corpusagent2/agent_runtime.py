@@ -36,6 +36,7 @@ from .agent_models import (
 from .agent_policy import rejection_reason_for_question, rewrite_special_cases
 from .app_config import load_project_configuration
 from .llm_provider import LLMClient, LLMProviderConfig, OpenAICompatibleLLMClient
+from .retrieval_budgeting import infer_requested_output_limit, infer_retrieval_budget
 from .retrieval import dense_retrieval_enabled, pg_dsn_from_env, pg_table_from_env
 from .run_manifest import FinalAnswerPayload
 from .runtime_context import CorpusRuntime
@@ -245,8 +246,7 @@ class MagicBoxOrchestrator:
             return True
         return False
 
-    def _normalize_plan_dag(self, dag: AgentPlanDAG) -> AgentPlanDAG:
-        rewritten = ""
+    def _normalize_plan_dag(self, dag: AgentPlanDAG, question_text: str = "") -> AgentPlanDAG:
         existing_ids = {node.node_id for node in dag.nodes}
 
         def unique_node_id(preferred: str) -> str:
@@ -271,18 +271,16 @@ class MagicBoxOrchestrator:
         if requires_retrieval_backbone and not fetch_node_id:
             fetch_node_id = unique_node_id("fetch")
 
-        search_inputs: dict[str, Any] = {
-            "top_k": 80,
-            "retrieval_mode": "hybrid",
-            "use_rerank": True,
-            "rerank_top_k": 40,
-        }
+        dag_text = " ".join(
+            part
+            for part in [question_text, dag.metadata.get("question_family", "")]
+            if part
+        ).strip()
+        search_inputs = infer_retrieval_budget(
+            dag_text,
+            configured_mode=os.getenv("CORPUSAGENT2_DEFAULT_RETRIEVAL_MODE", "hybrid"),
+        ).to_inputs()
         if requires_retrieval_backbone:
-            dag_text = " ".join(
-                part
-                for part in [rewritten, dag.metadata.get("question_family", "")]
-                if part
-            ).strip()
             search_inputs.update(self._extract_date_window(dag_text))
 
         normalized_nodes: list[AgentPlanNode] = []
@@ -306,6 +304,17 @@ class MagicBoxOrchestrator:
 
         for node in dag.nodes:
             depends_on = list(node.depends_on)
+            node_inputs = dict(node.inputs)
+            if node.capability in self._SEARCH_BACKBONE_CAPABILITIES:
+                normalized_search_inputs = infer_retrieval_budget(
+                    dag_text,
+                    inputs=node_inputs,
+                    configured_mode=os.getenv("CORPUSAGENT2_DEFAULT_RETRIEVAL_MODE", "hybrid"),
+                ).to_inputs()
+                for key in ("query", "date_from", "date_to", "year_balance", "retrieve_all", "retrieval_strategy"):
+                    if key in node_inputs and node_inputs.get(key) not in (None, ""):
+                        normalized_search_inputs[key] = node_inputs[key]
+                node_inputs = normalized_search_inputs
             if node.capability == "fetch_documents" and search_node_id and not depends_on:
                 depends_on = [search_node_id]
             elif (
@@ -321,7 +330,7 @@ class MagicBoxOrchestrator:
                     node_id=node.node_id,
                     capability=node.capability,
                     tool_name=node.tool_name,
-                    inputs=dict(node.inputs),
+                    inputs=node_inputs,
                     depends_on=list(dict.fromkeys(depends_on)),
                     optional=node.optional,
                     cacheable=node.cacheable,
@@ -402,47 +411,32 @@ class MagicBoxOrchestrator:
                 return ticker
         return ""
 
-    def _requests_all_records(self, text: str) -> bool:
-        lowered = str(text or "").lower()
-        return any(
-            phrase in lowered
-            for phrase in (
-                "all reports",
-                "all records",
-                "all documents",
-                "across all",
-                "entire corpus",
-                "all football",
-                "report all",
-                "use all",
-            )
+    def _search_inputs_for_question(
+        self,
+        question_text: str,
+        *,
+        overrides: dict[str, Any] | None = None,
+        query_text: str = "",
+        lightweight: bool = False,
+    ) -> dict[str, Any]:
+        merged_inputs = dict(overrides or {})
+        budget = infer_retrieval_budget(
+            question_text,
+            inputs=merged_inputs,
+            configured_mode=os.getenv("CORPUSAGENT2_DEFAULT_RETRIEVAL_MODE", "hybrid"),
+            lightweight=lightweight,
         )
-
-    def _noun_distribution_search_inputs(self, rewritten: str) -> tuple[dict[str, Any], list[str]]:
-        lowered = str(rewritten or "").lower()
-        broad_scope = self._requests_all_records(rewritten)
-        search_inputs: dict[str, Any] = {
-            "top_k": 200 if broad_scope else 80,
-            "retrieval_mode": "hybrid",
-            "use_rerank": False,
-        }
-        if broad_scope:
-            search_inputs["lexical_top_k"] = 1600
-            search_inputs["dense_top_k"] = 800
-        assumptions: list[str] = []
-        if "football" in lowered and "american football" not in lowered:
-            search_inputs["query"] = (
-                '(football OR soccer OR FIFA OR UEFA OR "Premier League" OR "World Cup" '
-                'OR "Champions League" OR "match report" OR "game report") '
-                'AND NOT ("American football" OR NFL OR NCAA OR quarterback OR touchdown)'
-            )
-            assumptions.append("Interpret 'football' as soccer unless the question explicitly says American football.")
-        else:
-            search_inputs["query"] = self._compact_query_terms(rewritten, self._query_anchor_terms(rewritten))
-        if broad_scope:
-            assumptions.append("Use a higher-recall retrieval budget for broad all-reports aggregation requests.")
-        search_inputs.update(self._extract_date_window(rewritten))
-        return search_inputs, assumptions
+        search_inputs = budget.to_inputs()
+        if query_text:
+            search_inputs["query"] = query_text
+        elif "query" in merged_inputs and str(merged_inputs.get("query", "")).strip():
+            search_inputs["query"] = merged_inputs["query"]
+        for key in ("date_from", "date_to", "year_balance", "retrieve_all", "retrieval_strategy"):
+            if key in merged_inputs and merged_inputs.get(key) not in (None, ""):
+                search_inputs[key] = merged_inputs[key]
+        if "date_from" not in search_inputs and "date_to" not in search_inputs:
+            search_inputs.update(self._extract_date_window(question_text))
+        return search_inputs
 
     def _broad_scope_clarification_is_sufficient(self, state: AgentRunState) -> tuple[bool, list[str]]:
         question_text = f"{state.question}\n" + "\n".join(state.clarification_history)
@@ -560,6 +554,8 @@ class MagicBoxOrchestrator:
                     "Return JSON with keys action, rewritten_question, clarification_question, assumptions, rejection_reason, message. "
                     "Allowed actions: ask_clarification, accept_with_assumptions, grounded_rejection. "
                     "Reject hidden-motive questions. Ask clarification only if workflow changes materially. "
+                    "Treat clarification_history as authoritative user follow-up memory. "
+                    "If prior follow-up answers resolve part of a multi-part clarification, ask only for the remaining unresolved detail instead of repeating the whole clarification prompt. "
                     "Do not assume the corpus is news, media, finance, or any specific domain unless the question or corpus schema indicates that."
                 ),
             },
@@ -624,59 +620,30 @@ class MagicBoxOrchestrator:
     def _heuristic_plan(self, state: AgentRunState) -> PlannerAction:
         rewritten = state.rewritten_question or self._question_with_clarifications(state)
         text = rewritten.lower()
-        trump_terms = ("trump", "donald trump", "president trump")
-        if any(term in text for term in trump_terms) and any(
-            term in text
-            for term in (
-                "sentiment",
-                "tone",
-                "coverage",
-                "framing",
-                "topic",
-                "topics",
-                "news",
-                "media",
+        anchor_terms = self._query_anchor_terms(rewritten)
+        compact_query = self._compact_query_terms(rewritten, anchor_terms)
+        query_text = compact_query or rewritten
+        inferred_budget = infer_retrieval_budget(
+            rewritten,
+            configured_mode=os.getenv("CORPUSAGENT2_DEFAULT_RETRIEVAL_MODE", "hybrid"),
+        )
+        heuristic_assumptions: list[str] = []
+        if inferred_budget.retrieval_strategy == "exhaustive_analytic":
+            heuristic_assumptions.append(
+                "This question calls for exhaustive corpus analysis, so retrieval will materialize the full lexical match set before downstream analysis."
             )
-        ):
-            anchor_terms = self._query_anchor_terms(rewritten)
-            search_inputs: dict[str, Any] = {
-                "top_k": 120,
-                "retrieval_mode": "hybrid",
-                "use_rerank": True,
-                "rerank_top_k": 60,
-                "query": self._compact_query_terms(
-                    rewritten,
-                    anchor_terms + ["Trump", "Donald Trump", "sentiment", "coverage", "media", "news"],
-                ),
-            }
-            search_inputs.update(self._extract_date_window(rewritten))
-            dag = AgentPlanDAG(
-                nodes=[
-                    AgentPlanNode("search", "db_search", inputs=search_inputs),
-                    AgentPlanNode("fetch", "fetch_documents", depends_on=["search"]),
-                    AgentPlanNode("working_set", "create_working_set", depends_on=["fetch"]),
-                    AgentPlanNode("sentiment", "sentiment", depends_on=["fetch"]),
-                    AgentPlanNode("sentiment_series", "time_series_aggregate", inputs={"granularity": "month"}, depends_on=["sentiment"]),
-                    AgentPlanNode("changes", "change_point_detect", depends_on=["sentiment_series"], optional=True),
-                    AgentPlanNode("entities", "ner", depends_on=["fetch"]),
-                    AgentPlanNode("entity_series", "time_series_aggregate", inputs={"granularity": "month"}, depends_on=["entities"]),
-                    AgentPlanNode("keyterms", "extract_keyterms", depends_on=["fetch"]),
-                    AgentPlanNode("topics", "topic_model", inputs={"num_topics": 6, "granularity": "month", "topics_per_bin": 2}, depends_on=["fetch"]),
-                    AgentPlanNode("pos", "pos_morph", depends_on=["fetch"]),
-                    AgentPlanNode("ngrams", "extract_ngrams", inputs={"n": 2}, depends_on=["fetch"], optional=True),
-                    AgentPlanNode("lexdiv", "lexical_diversity", depends_on=["fetch"], optional=True),
-                    AgentPlanNode("plot_sentiment", "plot_artifact", inputs={"plot_name": "trump_sentiment_series"}, depends_on=["sentiment_series"], optional=True),
-                    AgentPlanNode("plot_entities", "plot_artifact", inputs={"plot_name": "trump_entity_series"}, depends_on=["entity_series"], optional=True),
-                ],
-                metadata={"question_family": "trump_media_analysis"},
+        elif inferred_budget.retrieval_strategy == "semantic_exploratory":
+            heuristic_assumptions.append(
+                "This question is semantically open-ended, so retrieval will favor exploratory semantic recall over a tiny exact-match evidence set."
             )
-            return PlannerAction(
-                action="emit_plan_dag",
-                rewritten_question=state.rewritten_question or rewritten,
-                plan_dag=dag,
+        elif inferred_budget.scope in {"comparative", "broad", "exhaustive"}:
+            heuristic_assumptions.append(
+                "Heuristic fallback increased retrieval budget to improve recall for this broad analytical question."
             )
         if "distribution" in text and "noun" in text:
-            search_inputs, assumptions = self._noun_distribution_search_inputs(rewritten)
+            noun_top_k = infer_requested_output_limit(rewritten, default=100, minimum=20, maximum=500)
+            plot_top_k = min(noun_top_k, infer_requested_output_limit(rewritten, default=30, minimum=10, maximum=120))
+            search_inputs = self._search_inputs_for_question(rewritten, query_text=query_text)
             dag = AgentPlanDAG(
                 nodes=[
                     AgentPlanNode("search", "db_search", inputs=search_inputs),
@@ -689,40 +656,38 @@ class MagicBoxOrchestrator:
                         "build_evidence_table",
                         inputs={
                             "task": "noun_frequency_distribution",
+                            "top_k": noun_top_k,
                             "filters": {"upos": ["NOUN", "PROPN"]},
-                            "top_k": 100,
                         },
                         depends_on=["fetch", "pos", "lemmas"],
                     ),
                     AgentPlanNode(
-                        "summary",
-                        "build_evidence_table",
-                        inputs={
-                            "task": "summary_stats",
-                            "include": ["matched_document_count", "total_noun_tokens", "unique_noun_lemmas", "top_nouns"],
-                        },
-                        depends_on=["fetch", "noun_distribution"],
-                    ),
-                    AgentPlanNode(
                         "plot",
                         "plot_artifact",
-                        inputs={"plot_name": "noun_distribution", "x": "lemma", "y": "count", "title": "Top noun lemmas", "top_k": 30},
+                        inputs={"plot_name": "noun_distribution", "x": "lemma", "y": "count", "top_k": plot_top_k},
                         depends_on=["noun_distribution"],
                         optional=True,
+                    ),
+                    AgentPlanNode(
+                        "summary",
+                        "build_evidence_table",
+                        inputs={"task": "summary_stats"},
+                        depends_on=["fetch", "noun_distribution"],
                     ),
                 ],
                 metadata={"question_family": "noun_distribution"},
             )
             return PlannerAction(
                 action="emit_plan_dag",
-                rewritten_question=state.rewritten_question,
-                assumptions=assumptions,
+                rewritten_question=state.rewritten_question or rewritten,
+                assumptions=list(heuristic_assumptions),
                 plan_dag=dag,
             )
-        if "named entit" in text or ("climate" in text and "entity" in text):
+        if "named entit" in text or ("entity" in text and any(term in text for term in ("dominate", "dominant", "trend", "over time", "across", "coverage"))):
+            search_inputs = self._search_inputs_for_question(rewritten, query_text=query_text)
             dag = AgentPlanDAG(
                 nodes=[
-                    AgentPlanNode("search", "db_search", inputs={"top_k": 60, "retrieval_mode": "hybrid", "use_rerank": True, "rerank_top_k": 30}),
+                    AgentPlanNode("search", "db_search", inputs=search_inputs),
                     AgentPlanNode("fetch", "fetch_documents", depends_on=["search"]),
                     AgentPlanNode("working_set", "create_working_set", depends_on=["fetch"]),
                     AgentPlanNode("ner", "ner", depends_on=["fetch"]),
@@ -732,11 +697,17 @@ class MagicBoxOrchestrator:
                 ],
                 metadata={"question_family": "entity_trend"},
             )
-            return PlannerAction(action="emit_plan_dag", rewritten_question=state.rewritten_question, plan_dag=dag)
-        if "ukraine" in text and "predict" in text:
+            return PlannerAction(
+                action="emit_plan_dag",
+                rewritten_question=state.rewritten_question or rewritten,
+                assumptions=list(heuristic_assumptions),
+                plan_dag=dag,
+            )
+        if any(term in text for term in ("predict", "predicted", "prediction", "warn", "warning", "warned", "forecast", "anticipated", "foresaw")):
+            search_inputs = self._search_inputs_for_question(rewritten, query_text=query_text)
             dag = AgentPlanDAG(
                 nodes=[
-                    AgentPlanNode("search", "db_search", inputs={"top_k": 80, "date_to": "2022-02-23", "retrieval_mode": "hybrid", "use_rerank": True, "rerank_top_k": 40}),
+                    AgentPlanNode("search", "db_search", inputs=search_inputs),
                     AgentPlanNode("fetch", "fetch_documents", depends_on=["search"]),
                     AgentPlanNode("working_set", "create_working_set", depends_on=["fetch"]),
                     AgentPlanNode("claim_spans", "claim_span_extract", depends_on=["fetch"]),
@@ -745,11 +716,17 @@ class MagicBoxOrchestrator:
                 ],
                 metadata={"question_family": "prediction_evidence"},
             )
-            return PlannerAction(action="emit_plan_dag", rewritten_question=state.rewritten_question, plan_dag=dag)
+            return PlannerAction(
+                action="emit_plan_dag",
+                rewritten_question=state.rewritten_question or rewritten,
+                assumptions=list(heuristic_assumptions),
+                plan_dag=dag,
+            )
         if "similar" in text or "semantically" in text:
+            search_inputs = self._search_inputs_for_question(rewritten, query_text=query_text)
             dag = AgentPlanDAG(
                 nodes=[
-                    AgentPlanNode("search", "db_search", inputs={"top_k": 50, "retrieval_mode": "hybrid", "use_rerank": True, "rerank_top_k": 25}),
+                    AgentPlanNode("search", "db_search", inputs=search_inputs),
                     AgentPlanNode("fetch", "fetch_documents", depends_on=["search"]),
                     AgentPlanNode("working_set", "create_working_set", depends_on=["fetch"]),
                     AgentPlanNode("doc_embeddings", "doc_embeddings", depends_on=["fetch"]),
@@ -757,31 +734,21 @@ class MagicBoxOrchestrator:
                 ],
                 metadata={"question_family": "similarity_analysis"},
             )
-            return PlannerAction(action="emit_plan_dag", rewritten_question=state.rewritten_question, plan_dag=dag)
-        framing_terms = ["framing", "frame", "privacy", "regulation", "innovation", "growth", "scandal"]
-        if any(term in text for term in framing_terms) and any(term in text for term in ["shift", "changed", "change", "correspond", "over time"]):
-            anchor_terms = self._query_anchor_terms(rewritten)
-            search_inputs: dict[str, Any] = {
-                "top_k": 100,
-                "retrieval_mode": "hybrid",
-                "use_rerank": True,
-                "rerank_top_k": 50,
-                "query": self._compact_query_terms(
-                    rewritten,
-                    anchor_terms
-                    + [
-                        "privacy",
-                        "regulation",
-                        "innovation",
-                        "growth",
-                        "stock",
-                        "drawdown",
-                        "media",
-                        "coverage",
-                    ],
-                ),
-            }
-            search_inputs.update(self._extract_date_window(rewritten))
+            return PlannerAction(
+                action="emit_plan_dag",
+                rewritten_question=state.rewritten_question or rewritten,
+                assumptions=list(heuristic_assumptions),
+                plan_dag=dag,
+            )
+        asks_media_shift = any(
+            term in text
+            for term in ("sentiment", "tone", "coverage", "framing", "topic", "topics", "media", "news", "keyterm", "keyterms")
+        ) and any(
+            term in text
+            for term in ("shift", "shifted", "changed", "change", "trend", "over time", "evolve", "evolution", "compare", "comparison", "correspond")
+        )
+        if asks_media_shift:
+            search_inputs = self._search_inputs_for_question(rewritten, query_text=query_text)
             market_ticker = self._infer_market_ticker(rewritten)
             nodes = [
                 AgentPlanNode("search", "db_search", inputs=search_inputs),
@@ -837,19 +804,25 @@ class MagicBoxOrchestrator:
             return PlannerAction(
                 action="emit_plan_dag",
                 rewritten_question=state.rewritten_question or rewritten,
-                assumptions=assumptions,
+                assumptions=list(dict.fromkeys(heuristic_assumptions + assumptions)),
                 plan_dag=dag,
             )
+        generic_search_inputs = self._search_inputs_for_question(rewritten, query_text=query_text)
         dag = AgentPlanDAG(
             nodes=[
-                AgentPlanNode("search", "db_search", inputs={"top_k": 40, "retrieval_mode": "hybrid", "use_rerank": True, "rerank_top_k": 25}),
+                AgentPlanNode("search", "db_search", inputs=generic_search_inputs),
                 AgentPlanNode("fetch", "fetch_documents", depends_on=["search"]),
                 AgentPlanNode("working_set", "create_working_set", depends_on=["fetch"]),
                 AgentPlanNode("keyterms", "extract_keyterms", depends_on=["fetch"], optional=True),
             ],
             metadata={"question_family": "generic"},
         )
-        return PlannerAction(action="emit_plan_dag", rewritten_question=state.rewritten_question, plan_dag=dag)
+        return PlannerAction(
+            action="emit_plan_dag",
+            rewritten_question=state.rewritten_question or rewritten,
+            assumptions=list(heuristic_assumptions),
+            plan_dag=dag,
+        )
 
     def plan(self, state: AgentRunState) -> PlannerAction:
         if self.llm_client is None:
@@ -874,6 +847,14 @@ class MagicBoxOrchestrator:
                     "Use python_runner only as a bounded last-resort fallback when no typed tool fits or a typed tool has already failed. "
                     "Prefer db_search plus fetch_documents for normal retrieval. "
                     "Use sql_query_search when hybrid retrieval is sparse, off-target, or entity coverage is poor. "
+                    "Choose an explicit retrieval_strategy when planning retrieval-backed work. "
+                    "Use retrieval_strategy='exhaustive_analytic' for corpus-wide aggregates, distributions, trends, comparisons, and questions that ask for all relevant records; in that mode the goal is to materialize the full candidate working set before analysis rather than relying on a tiny ranked slice. "
+                    "Use retrieval_strategy='precision_ranked' for targeted evidence lookups where the best supporting documents matter more than full-population coverage. "
+                    "Use retrieval_strategy='semantic_exploratory' for similarity, thematic, or concept-discovery questions where semantic closeness matters more than exact lexical overlap. "
+                    "Size retrieval budgets to the question, and never use tiny default retrieval budgets for broad analytical questions. "
+                    "When using db_search, set top_k and, when helpful, lexical_top_k, dense_top_k, rerank_top_k, use_rerank, retrieve_all, and retrieval_strategy based on the scope needed to answer the question faithfully. "
+                    "When the user specifies an output limit such as 'top 20', pass that through to the relevant aggregation or plot node instead of hardcoding your own. "
+                    "Treat clarification_history as authoritative user follow-up memory. If prior follow-up answers only resolve part of an ambiguity, ask only for the missing remainder instead of repeating the full earlier clarification prompt. "
                     "Do not assume the corpus is news unless the question or corpus schema indicates that."
                 ),
             },
@@ -897,7 +878,8 @@ class MagicBoxOrchestrator:
             "You previously returned an invalid or empty plan for a corpus agent operating over a user-provided corpus. "
             "Return valid JSON with keys action, rewritten_question, assumptions, clarification_question, rejection_reason, message, plan_dag. "
             "Allowed actions: ask_clarification, emit_plan_dag, grounded_rejection. "
-            "If action is emit_plan_dag, plan_dag.nodes must contain at least one executable node with node_id, capability, optional tool_name, inputs, and depends_on."
+            "If action is emit_plan_dag, plan_dag.nodes must contain at least one executable node with node_id, capability, optional tool_name, inputs, and depends_on. "
+            "Choose retrieval budgets and retrieval_strategy values that match question scope instead of relying on tiny generic defaults."
         )
         try:
             trace = self.llm_client.complete_json_trace(
@@ -942,7 +924,10 @@ class MagicBoxOrchestrator:
             if action is None:
                 raise ValueError("Planner returned no executable nodes.")
             if action.action == "emit_plan_dag" and action.plan_dag is not None:
-                action.plan_dag = self._normalize_plan_dag(action.plan_dag)
+                action.plan_dag = self._normalize_plan_dag(
+                    action.plan_dag,
+                    question_text=action.rewritten_question or state.rewritten_question or state.question,
+                )
             if action.action == "ask_clarification" and state.force_answer:
                 heuristic = self._heuristic_plan(state)
                 heuristic.assumptions = list(
@@ -1227,13 +1212,37 @@ class MagicBoxOrchestrator:
 
     def _derive_summary(self, snapshot: AgentExecutionSnapshot) -> dict[str, Any]:
         summary: dict[str, Any] = {}
+        noun_distribution_attempted = any(
+            node_id == "noun_distribution"
+            or str((result.metadata if isinstance(result.metadata, dict) else {}).get("task", "")).strip().lower()
+            == "noun_frequency_distribution"
+            for node_id, result in snapshot.node_results.items()
+        )
         for node_id, result in snapshot.node_results.items():
             payload = result.payload if isinstance(result.payload, dict) else {}
+            metadata = result.metadata if isinstance(result.metadata, dict) else {}
             rows = list(payload.get("rows", []))
             if not rows:
                 continue
             first = rows[0]
-            if "pos" in first and "lemma" in first:
+            if (
+                "lemma" in first
+                and "count" in first
+                and ("document_frequency" in first or "relative_frequency" in first)
+            ):
+                summary["noun_distribution"] = [
+                    (str(row.get("lemma", "")).lower(), int(row.get("count", 0) or 0))
+                    for row in rows
+                    if str(row.get("lemma", "")).strip()
+                ][:15]
+                summary["noun_distribution_source"] = "aggregated_table"
+            elif "metric" in first and "value" in first:
+                summary["summary_stats"] = {
+                    str(row.get("metric", "")).strip(): row.get("value")
+                    for row in rows
+                    if str(row.get("metric", "")).strip()
+                }
+            elif "pos" in first and "lemma" in first and "noun_distribution" not in summary and not noun_distribution_attempted:
                 counts: dict[str, int] = {}
                 for row in rows:
                     if str(row.get("pos", "")) not in {"NOUN", "PROPN"}:
@@ -1243,6 +1252,7 @@ class MagicBoxOrchestrator:
                         continue
                     counts[lemma] = counts.get(lemma, 0) + 1
                 summary["noun_distribution"] = sorted(counts.items(), key=lambda item: item[1], reverse=True)[:15]
+                summary["noun_distribution_source"] = "raw_pos_fallback"
             elif "entity" in first and "time_bin" in first:
                 grouped: dict[str, int] = {}
                 for row in rows:

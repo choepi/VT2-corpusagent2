@@ -53,6 +53,26 @@ def _dependency_document_count(dependency_results: dict[str, ToolExecutionResult
     return len(doc_ids)
 
 
+def _result_document_count(payload: Any) -> int:
+    if not isinstance(payload, dict):
+        return 0
+    document_count = payload.get("document_count")
+    if isinstance(document_count, int) and document_count >= 0:
+        return document_count
+    doc_ids: set[str] = set()
+    working_set_doc_ids = payload.get("working_set_doc_ids")
+    if isinstance(working_set_doc_ids, list):
+        doc_ids.update(str(item) for item in working_set_doc_ids if str(item).strip())
+    for key in ("documents", "results", "rows"):
+        value = payload.get(key)
+        if not isinstance(value, list):
+            continue
+        for item in value:
+            if isinstance(item, dict) and str(item.get("doc_id", "")).strip():
+                doc_ids.add(str(item["doc_id"]))
+    return len(doc_ids)
+
+
 def _payload_preview(payload: Any) -> Any:
     if isinstance(payload, dict):
         preview: dict[str, Any] = {}
@@ -74,16 +94,31 @@ def _payload_preview(payload: Any) -> Any:
 def _summarize_tool_result(result: ToolExecutionResult, *, dependency_results: dict[str, ToolExecutionResult]) -> dict[str, Any]:
     payload = result.payload
     items_key, items = _result_items(payload)
+    input_documents_seen = _dependency_document_count(dependency_results)
+    output_documents = _result_document_count(payload)
+    no_data_reason = ""
+    if result.metadata.get("no_data_reason") not in (None, ""):
+        no_data_reason = str(result.metadata.get("no_data_reason", "")).strip()
+    elif result.caveats:
+        no_data_reason = str(result.caveats[0]).strip()
+    no_data = bool(result.metadata.get("no_data")) or (
+        isinstance(payload, dict) and items_key in {"documents", "results", "rows"} and len(items) == 0
+    )
     summary = {
         "items_key": items_key,
         "items_count": len(items),
-        "documents_processed": _dependency_document_count(dependency_results),
+        "documents_processed": input_documents_seen,
+        "input_documents_seen": input_documents_seen,
+        "output_documents": output_documents,
         "evidence_count": len(result.evidence_items),
         "artifact_count": len(result.artifacts_used),
         "caveat_count": len(result.caveats),
         "unsupported_count": len(result.unsupported_parts),
+        "no_data": no_data,
         "payload_preview": _payload_preview(payload),
     }
+    if no_data_reason:
+        summary["no_data_reason"] = no_data_reason
     if isinstance(payload, dict):
         stdout = str(payload.get("stdout", "")).strip()
         stderr = str(payload.get("stderr", "")).strip()

@@ -245,6 +245,12 @@ sbatch /home/$USER/corpusagent2/slurm/run_evaluation.sbatch
 sbatch /home/$USER/corpusagent2/slurm/run_framework.sbatch
 ```
 
+If you want a best-effort recommendation for backfill-friendly GPU submit parameters before submitting, run:
+
+```bash
+python scripts/29_advise_slurm_submit.py --profile prebuilt_bundle
+```
+
 Each Slurm script:
 
 - uses `#!/bin/bash -l`

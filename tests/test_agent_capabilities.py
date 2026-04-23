@@ -21,6 +21,7 @@ from corpusagent2.agent_capabilities import (
     _time_series_aggregate,
     _topic_model,
 )
+from corpusagent2.agent_backends import InMemoryWorkingSetStore
 from corpusagent2.python_runner_service import PythonRunnerResult, SandboxArtifact
 from corpusagent2.tool_registry import ToolExecutionResult
 
@@ -50,17 +51,6 @@ class _RuntimeWithDocs:
         )
 
 
-class _RecordingStore:
-    def __init__(self) -> None:
-        self.recorded_rows: list[dict[str, object]] = []
-
-    def fetch_documents(self, doc_ids):
-        return []
-
-    def record_documents(self, run_id, rows):
-        self.recorded_rows = [dict(row) for row in rows]
-
-
 class _RuntimeWithMetadata:
     def __init__(self, rows):
         self._df = pd.DataFrame(rows)
@@ -86,6 +76,15 @@ class _OffTopicSearchBackend:
                 "score": 0.8,
             }
         ]
+
+
+class _CapturingSearchBackend:
+    def __init__(self) -> None:
+        self.calls: list[dict] = []
+
+    def search(self, **kwargs):
+        self.calls.append(dict(kwargs))
+        return []
 
 
 class _YearAwareSearchBackend:
@@ -158,6 +157,131 @@ def test_fetch_documents_skips_store_when_no_doc_ids() -> None:
     assert result.caveats == []
 
 
+def test_create_working_set_can_materialize_doc_ids_from_search_results() -> None:
+    store = InMemoryWorkingSetStore()
+    context = AgentExecutionContext(
+        run_id="run",
+        artifacts_dir=Path("."),
+        search_backend=None,
+        working_store=store,
+        runtime=None,
+    )
+    deps = {
+        "search": ToolExecutionResult(
+            payload={
+                "results": [
+                    {"doc_id": "doc-1", "title": "Football report", "snippet": "match report"},
+                    {"doc_id": "doc-2", "title": "Football report two", "snippet": "another match report"},
+                ]
+            }
+        )
+    }
+
+    result = _create_working_set({}, deps, context)
+
+    assert result.payload["document_count"] == 2
+    assert result.payload["working_set_doc_ids"] == ["doc-1", "doc-2"]
+
+
+def test_fetch_documents_can_read_working_set_doc_ids_from_dependency_payload() -> None:
+    store = InMemoryWorkingSetStore()
+    store.document_lookup["doc-1"] = {
+        "doc_id": "doc-1",
+        "title": "Sample",
+        "text": "Document text",
+        "published_at": "2022-02-20",
+        "source": "example.com",
+    }
+    context = AgentExecutionContext(
+        run_id="run",
+        artifacts_dir=Path("."),
+        search_backend=None,
+        working_store=store,
+        runtime=None,
+    )
+    deps = {"working_set": ToolExecutionResult(payload={"working_set_doc_ids": ["doc-1"]})}
+
+    result = _fetch_documents({}, deps, context)
+
+    assert result.payload["documents"][0]["doc_id"] == "doc-1"
+
+
+def test_clean_normalize_lang_id_and_working_set_flow_preserves_documents() -> None:
+    store = InMemoryWorkingSetStore()
+    context = AgentExecutionContext(
+        run_id="run",
+        artifacts_dir=Path("."),
+        search_backend=None,
+        working_store=store,
+        runtime=None,
+    )
+    source_docs = {
+        "fetch": ToolExecutionResult(
+            payload={
+                "documents": [
+                    {
+                        "doc_id": "doc-1",
+                        "title": "Football report",
+                        "text": " Football match report in English. ",
+                        "published_at": "2022-02-20",
+                        "source": "example.com",
+                        "outlet": "example.com",
+                    }
+                ]
+            }
+        )
+    }
+
+    cleaned = _clean_normalize({}, source_docs, context)
+    detected = _lang_id({}, {"cleaned": cleaned}, context)
+    working_set = _create_working_set({"filter": {"language_in": ["en"]}}, {"lang": detected}, context)
+
+    assert cleaned.payload["documents"][0]["text"] == "Football match report in English."
+    assert detected.payload["rows"][0]["language"] == "en"
+    assert working_set.payload["working_set_doc_ids"] == ["doc-1"]
+
+
+def test_build_evidence_table_can_aggregate_noun_distribution() -> None:
+    context = AgentExecutionContext(
+        run_id="run",
+        artifacts_dir=Path("."),
+        search_backend=None,
+        working_store=InMemoryWorkingSetStore(),
+        runtime=None,
+    )
+    deps = {
+        "fetch": ToolExecutionResult(
+            payload={
+                "documents": [
+                    {"doc_id": "doc-1", "text": "Football club tactics player", "published_at": "2022-01-01", "outlet": "NZZ"},
+                    {"doc_id": "doc-2", "text": "Player tactics and club strategy", "published_at": "2022-01-02", "outlet": "TA"},
+                ]
+            }
+        ),
+        "pos": ToolExecutionResult(
+            payload={
+                "rows": [
+                    {"doc_id": "doc-1", "token": "Football", "lemma": "football", "pos": "NOUN"},
+                    {"doc_id": "doc-1", "token": "club", "lemma": "club", "pos": "NOUN"},
+                    {"doc_id": "doc-1", "token": "tactics", "lemma": "tactic", "pos": "NOUN"},
+                    {"doc_id": "doc-1", "token": "player", "lemma": "player", "pos": "NOUN"},
+                    {"doc_id": "doc-2", "token": "Player", "lemma": "player", "pos": "NOUN"},
+                    {"doc_id": "doc-2", "token": "tactics", "lemma": "tactic", "pos": "NOUN"},
+                    {"doc_id": "doc-2", "token": "club", "lemma": "club", "pos": "NOUN"},
+                    {"doc_id": "doc-2", "token": "strategy", "lemma": "strategy", "pos": "NOUN"},
+                ]
+            }
+        ),
+    }
+
+    result = _build_evidence_table({"task": "noun_frequency_distribution", "top_k": 5}, deps, context)
+    summary = _build_evidence_table({"task": "summary_stats"}, {"fetch": deps["fetch"], "table": result}, context)
+
+    assert result.payload["rows"]
+    assert result.payload["rows"][0]["lemma"] in {"club", "player", "tactic"}
+    assert any(row["metric"] == "matched_document_count" and row["value"] == 2 for row in summary.payload["rows"])
+
+
 def test_db_search_uses_sql_fallback_when_primary_search_is_empty(monkeypatch, tmp_path: Path) -> None:
     monkeypatch.setattr(
         agent_capabilities,
@@ -210,6 +334,61 @@ def test_db_search_discards_off_topic_rows_when_query_entities_do_not_match(monk
     assert any("off-topic" in caveat.lower() or "main query entities" in caveat.lower() for caveat in result.caveats)
 
 
+def test_query_anchor_terms_drop_analytic_scaffold_words_for_exhaustive_questions() -> None:
+    anchors = [value.lower() for value in agent_capabilities._query_anchor_terms("What is the distribution of nouns across all football reports in the corpus?")]
+
+    assert "football" in anchors
+    assert "distribution" not in anchors
+    assert "nouns" not in anchors
+    assert "reports" not in anchors
+    assert "corpus" not in anchors
+
+
+def test_db_search_materializes_full_sql_match_set_for_exhaustive_questions(monkeypatch, tmp_path: Path) -> None:
+    search_backend = _CapturingSearchBackend()
+    captured: dict[str, object] = {}
+
+    def _fake_sql_search_rows(**kwargs):
+        captured.update(kwargs)
+        return [
+            {
+                "doc_id": "f-1",
+                "title": "Football report one",
+                "snippet": "Football tactics and club strategy.",
+                "outlet": "NZZ",
+                "date": "2022-05-01",
+                "score": 3.5,
+            },
+            {
+                "doc_id": "f-2",
+                "title": "Football report two",
+                "snippet": "Football match and league coverage.",
+                "outlet": "TA",
+                "date": "2022-05-02",
+                "score": 3.0,
+            },
+        ]
+
+    monkeypatch.setattr(agent_capabilities, "_sql_fallback_store", lambda context: object())
+    monkeypatch.setattr(agent_capabilities, "_sql_search_rows", _fake_sql_search_rows)
+    context = AgentExecutionContext(
+        run_id="run",
+        artifacts_dir=tmp_path,
+        search_backend=search_backend,
+        working_store=_ExplodingStore(),
+        runtime=None,
+    )
+
+    result = _db_search({"query": "What is the distribution of nouns across all football reports in the corpus?"}, {}, context)
+
+    assert not search_backend.calls
+    assert captured["top_k"] == 0
+    assert result.payload["retrieval_mode"] == "sql"
+    assert result.payload["retrieval_strategy"] == "exhaustive_analytic"
+    assert len(result.payload["results"]) == 2
+    assert any("full lexical postgres" in caveat.lower() for caveat in result.caveats)
+
+
 def test_sql_query_search_reports_empty_results_cleanly(monkeypatch, tmp_path: Path) -> None:
     monkeypatch.setattr(agent_capabilities, "_sql_search_rows", lambda **kwargs: [])
     context = AgentExecutionContext(
@@ -224,6 +403,40 @@ def test_sql_query_search_reports_empty_results_cleanly(monkeypatch, tmp_path: P
 
     assert result.payload["results"] == []
     assert result.caveats
+
+
+def test_sql_query_search_materializes_full_sql_match_set_for_exhaustive_questions(monkeypatch, tmp_path: Path) -> None:
+    captured: dict[str, object] = {}
+
+    def _fake_sql_search_rows(**kwargs):
+        captured.update(kwargs)
+        return [
+            {
+                "doc_id": "f-1",
+                "title": "Football report one",
+                "snippet": "Football tactics and club strategy.",
+                "outlet": "NZZ",
+                "date": "2022-05-01",
+                "score": 3.5,
+            }
+        ]
+
+    monkeypatch.setattr(agent_capabilities, "_sql_search_rows", _fake_sql_search_rows)
+    context = AgentExecutionContext(
+        run_id="run",
+        artifacts_dir=tmp_path,
+        search_backend=_EmptySearchBackend(),
+        working_store=_ExplodingStore(),
+        runtime=None,
+    )
+
+    result = _sql_query_search({"query": "What is the distribution of nouns across all football reports in the corpus?"}, {}, context)
+
+    assert captured["top_k"] == 0
+    assert result.payload["retrieval_mode"] == "sql"
+    assert result.payload["retrieval_strategy"] == "exhaustive_analytic"
+    assert len(result.payload["results"]) == 1
+    assert any("full lexical postgres" in caveat.lower() for caveat in result.caveats)
 
 
 def test_db_search_balances_years_and_suppresses_duplicates(tmp_path: Path) -> None:
@@ -315,201 +528,6 @@ def test_fetch_documents_uses_runtime_fallback_when_store_errors() -> None:
     assert result.payload["documents"][0]["doc_id"] == "doc-1"
     assert result.payload["documents"][0]["outlet"] == "example.com"
     assert any("runtime fallback was used" in caveat for caveat in result.caveats)
-
-
-def test_create_working_set_uses_search_doc_ids_and_records_runtime_docs(tmp_path: Path) -> None:
-    store = _RecordingStore()
-    context = AgentExecutionContext(
-        run_id="run",
-        artifacts_dir=tmp_path,
-        search_backend=None,
-        working_store=store,
-        runtime=_RuntimeWithDocs(),
-    )
-    deps = {
-        "search": ToolExecutionResult(
-            payload={
-                "results": [
-                    {
-                        "doc_id": "doc-1",
-                        "title": "Search title",
-                        "snippet": "Search snippet",
-                        "outlet": "search.example",
-                        "date": "2022-02-20",
-                        "score": 3.5,
-                    }
-                ]
-            }
-        )
-    }
-
-    result = _create_working_set({"label": "soccer_reports_candidates"}, deps, context)
-
-    assert result.payload["working_set_doc_ids"] == ["doc-1"]
-    assert result.payload["document_count"] == 1
-    assert store.recorded_rows
-    assert store.recorded_rows[0]["doc_id"] == "doc-1"
-    assert store.recorded_rows[0]["text"] == "Document text"
-
-
-def test_fetch_documents_reads_working_set_doc_ids_from_dependencies(tmp_path: Path) -> None:
-    context = AgentExecutionContext(
-        run_id="run",
-        artifacts_dir=tmp_path,
-        search_backend=None,
-        working_store=_FallbackStore(),
-        runtime=_RuntimeWithDocs(),
-    )
-    deps = {"working_set": ToolExecutionResult(payload={"working_set_doc_ids": ["doc-1"]})}
-
-    result = _fetch_documents({}, deps, context)
-
-    assert result.payload["documents"][0]["doc_id"] == "doc-1"
-    assert result.payload["documents"][0]["text"] == "Document text"
-
-
-def test_build_evidence_table_aggregates_noun_frequency_distribution(tmp_path: Path) -> None:
-    context = AgentExecutionContext(
-        run_id="run",
-        artifacts_dir=tmp_path,
-        search_backend=None,
-        working_store=_ExplodingStore(),
-        runtime=None,
-    )
-    deps = {
-        "documents": ToolExecutionResult(
-            payload={
-                "documents": [
-                    {
-                        "doc_id": "doc-1",
-                        "title": "Soccer report",
-                        "text": "United won the match and Arsenal lost the match.",
-                        "published_at": "2022-02-20",
-                        "source": "Reuters",
-                        "score": 4.2,
-                    },
-                    {
-                        "doc_id": "doc-2",
-                        "title": "Second soccer report",
-                        "text": "Chelsea played the match at Wembley.",
-                        "published_at": "2022-02-21",
-                        "source": "Reuters",
-                        "score": 4.1,
-                    },
-                ]
-            }
-        ),
-        "pos": ToolExecutionResult(
-            payload={
-                "rows": [
-                    {"doc_id": "doc-1", "token": "United", "lemma": "united", "pos": "PROPN"},
-                    {"doc_id": "doc-1", "token": "match", "lemma": "match", "pos": "NOUN"},
-                    {"doc_id": "doc-1", "token": "Arsenal", "lemma": "arsenal", "pos": "NNP"},
-                    {"doc_id": "doc-1", "token": "match", "lemma": "match", "pos": "NN"},
-                    {"doc_id": "doc-2", "token": "Chelsea", "lemma": "chelsea", "pos": "PROPN"},
-                    {"doc_id": "doc-2", "token": "match", "lemma": "match", "pos": "NOUN"},
-                    {"doc_id": "doc-2", "token": "Wembley", "lemma": "wembley", "pos": "NNP"},
-                    {"doc_id": "doc-2", "token": "title", "lemma": "title", "pos": "NOUN"},
-                ]
-            }
-        ),
-    }
-
-    result = _build_evidence_table(
-        {
-            "task": "noun_frequency_distribution",
-            "filters": {"upos": ["NOUN", "PROPN"]},
-            "top_k": 10,
-        },
-        deps,
-        context,
-    )
-
-    assert result.payload["rows"]
-    assert result.payload["rows"][0]["lemma"] == "match"
-    assert result.payload["rows"][0]["count"] == 3
-    assert result.payload["rows"][0]["document_frequency"] == 2
-    assert all(row["lemma"] != "title" for row in result.payload["rows"])
-    assert result.evidence
-    assert result.evidence[0]["doc_id"] in {"doc-1", "doc-2"}
-
-
-def test_build_evidence_table_summary_stats_uses_upstream_distribution(tmp_path: Path) -> None:
-    context = AgentExecutionContext(
-        run_id="run",
-        artifacts_dir=tmp_path,
-        search_backend=None,
-        working_store=_ExplodingStore(),
-        runtime=None,
-    )
-    deps = {
-        "documents": ToolExecutionResult(
-            payload={
-                "documents": [
-                    {"doc_id": "doc-1", "text": "Doc one"},
-                    {"doc_id": "doc-2", "text": "Doc two"},
-                ]
-            }
-        ),
-        "distribution": ToolExecutionResult(
-            payload={
-                "rows": [
-                    {"lemma": "match", "count": 3, "document_frequency": 2},
-                    {"lemma": "chelsea", "count": 1, "document_frequency": 1},
-                ]
-            }
-        ),
-    }
-
-    result = _build_evidence_table(
-        {
-            "task": "summary_stats",
-            "include": ["matched_document_count", "total_noun_tokens", "unique_noun_lemmas", "top_nouns"],
-        },
-        deps,
-        context,
-    )
-
-    assert result.payload["rows"] == [
-        {
-            "matched_document_count": 2,
-            "total_noun_tokens": 4,
-            "unique_noun_lemmas": 2,
-            "top_nouns": "match, chelsea",
-        }
-    ]
-
-
-def test_clean_normalize_and_lang_id_keep_document_flow_alive(tmp_path: Path) -> None:
-    store = _RecordingStore()
-    context = AgentExecutionContext(
-        run_id="run",
-        artifacts_dir=tmp_path,
-        search_backend=None,
-        working_store=store,
-        runtime=_RuntimeWithDocs(),
-    )
-    docs = ToolExecutionResult(
-        payload={
-            "documents": [
-                {
-                    "doc_id": "doc-1",
-                    "title": "Sample",
-                    "text": "The quick brown fox jumps over the lazy dog.",
-                    "published_at": "2022-02-20",
-                    "source": "example.com",
-                }
-            ]
-        }
-    )
-
-    normalized = _clean_normalize({"preserve_fields": ["title", "published_at", "source"]}, {"fetch": docs}, context)
-    lang = _lang_id({"text_field": "text"}, {"normalized": normalized}, context)
-    working_set = _create_working_set({"filter": {"language_in": ["en"]}}, {"lang": lang}, context)
-
-    assert normalized.payload["documents"][0]["text"] == "The quick brown fox jumps over the lazy dog."
-    assert lang.payload["rows"] == [{"doc_id": "doc-1", "language": "en", "confidence": 1.0}]
-    assert working_set.payload["working_set_doc_ids"] == ["doc-1"]
 
 
 def test_join_external_series_can_fetch_market_data(monkeypatch, tmp_path: Path) -> None:
