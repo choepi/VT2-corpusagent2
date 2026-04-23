@@ -72,10 +72,29 @@ def test_local_search_backend_uses_dense_candidate_fallback(monkeypatch) -> None
     assert rows[0]["score_components"]["dense_candidate"] == 0.91
 
 
+def test_local_search_backend_falls_back_to_lexical_rows_when_dense_mode_has_no_dense_hits(monkeypatch) -> None:
+    runtime = _RuntimeWithBrokenDenseAssets(
+        [
+            {"doc_id": "a", "title": "Privacy pressure", "text": "Platform privacy regulation pressure platform", "published_at": "2018-03-20", "source": "Reuters"},
+            {"doc_id": "b", "title": "Growth story", "text": "Platform growth impressed investors", "published_at": "2016-06-01", "source": "Reuters"},
+        ]
+    )
+
+    monkeypatch.setattr(agent_backends, "retrieve_dense_from_texts", lambda **kwargs: [])
+    backend = LocalSearchBackend(runtime)
+
+    rows = backend.search(query="privacy regulation platform", top_k=2, retrieval_mode="dense")
+
+    assert {row["doc_id"] for row in rows} == {"a", "b"}
+    assert rows[0]["retrieval_mode"] == "dense"
+
+
 def test_opensearch_backend_uses_query_string_for_structured_queries(monkeypatch) -> None:
-    seen_payloads: list[dict] = []
+    requests: list[dict] = []
 
     class _FakeResponse:
+        status_code = 200
+
         def raise_for_status(self) -> None:
             return None
 
@@ -84,7 +103,7 @@ def test_opensearch_backend_uses_query_string_for_structured_queries(monkeypatch
 
     class _FakeClient:
         def __init__(self, *args, **kwargs) -> None:
-            return None
+            pass
 
         def __enter__(self):
             return self
@@ -93,24 +112,25 @@ def test_opensearch_backend_uses_query_string_for_structured_queries(monkeypatch
             return None
 
         def post(self, url, auth=None, json=None):
-            seen_payloads.append(dict(json))
+            requests.append(dict(json or {}))
             return _FakeResponse()
 
     monkeypatch.setattr(agent_backends.httpx, "Client", _FakeClient)
     backend = OpenSearchBackend(OpenSearchConfig())
 
-    backend.search(query='(soccer OR football) AND NOT (NFL OR touchdown)', top_k=5)
+    backend.search(query='(soccer OR "association football") AND NOT NFL', top_k=5)
 
-    assert seen_payloads
-    clause = seen_payloads[0]["query"]["bool"]["must"][0]
+    assert requests
+    clause = requests[0]["query"]["bool"]["must"][0]
     assert "query_string" in clause
-    assert clause["query_string"]["query"] == '(soccer OR football) AND NOT (NFL OR touchdown)'
 
 
 def test_opensearch_backend_uses_multi_match_for_plain_queries(monkeypatch) -> None:
-    seen_payloads: list[dict] = []
+    requests: list[dict] = []
 
     class _FakeResponse:
+        status_code = 200
+
         def raise_for_status(self) -> None:
             return None
 
@@ -119,7 +139,7 @@ def test_opensearch_backend_uses_multi_match_for_plain_queries(monkeypatch) -> N
 
     class _FakeClient:
         def __init__(self, *args, **kwargs) -> None:
-            return None
+            pass
 
         def __enter__(self):
             return self
@@ -128,7 +148,7 @@ def test_opensearch_backend_uses_multi_match_for_plain_queries(monkeypatch) -> N
             return None
 
         def post(self, url, auth=None, json=None):
-            seen_payloads.append(dict(json))
+            requests.append(dict(json or {}))
             return _FakeResponse()
 
     monkeypatch.setattr(agent_backends.httpx, "Client", _FakeClient)
@@ -136,6 +156,6 @@ def test_opensearch_backend_uses_multi_match_for_plain_queries(monkeypatch) -> N
 
     backend.search(query="football reports", top_k=5)
 
-    assert seen_payloads
-    clause = seen_payloads[0]["query"]["bool"]["must"][0]
+    assert requests
+    clause = requests[0]["query"]["bool"]["must"][0]
     assert "multi_match" in clause

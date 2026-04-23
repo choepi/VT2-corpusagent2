@@ -19,6 +19,7 @@ from .agent_models import EvidenceRow
 from .analysis_tools import textrank_keywords
 from .io_utils import sentence_split as simple_sentence_split
 from .python_runner_service import DockerPythonRunnerService
+from .retrieval_budgeting import infer_retrieval_budget
 from .retrieval import _load_sentence_transformer, pg_dsn_from_env
 from .seed import resolve_device
 from .tool_registry import CapabilityToolAdapter, SchemaDescriptor, ToolExecutionResult, ToolRegistry, ToolSpec
@@ -38,11 +39,6 @@ STOPWORDS = {
     "over", "under", "between", "across", "relationship", "systematic", "movements", "movement",
     "coverage", "media", "sentiment", "price", "prices", "analysis",
 }
-STRUCTURAL_TERM_STOPWORDS = {
-    "title", "url", "name", "description", "author", "image", "thumbnail", "content", "article",
-    "video", "published", "metadata", "caption", "source", "href", "type", "schema", "json",
-    "width", "height", "slug", "tags", "photo", "gallery", "page", "pages", "copyright", "id",
-}
 POSITIVE_WORDS = {"good", "strong", "gain", "improve", "success", "positive", "optimistic"}
 NEGATIVE_WORDS = {"bad", "weak", "loss", "drop", "risk", "fear", "negative", "warn", "crisis"}
 CLAIM_KEYWORDS = {
@@ -54,6 +50,33 @@ LANGUAGE_HINTS = {
     "fr": {"le", "la", "les", "des", "une", "est", "avec", "dans"},
     "it": {"il", "lo", "la", "gli", "che", "con", "per", "non"},
     "en": {"the", "and", "with", "from", "that", "this", "have", "will"},
+}
+STRUCTURAL_TERM_STOPWORDS = {
+    "title",
+    "url",
+    "description",
+    "author",
+    "authors",
+    "content",
+    "article",
+    "articles",
+    "report",
+    "reports",
+    "document",
+    "documents",
+    "source",
+    "sources",
+    "image",
+    "images",
+    "caption",
+    "tags",
+    "news",
+    "reuters",
+    "said",
+    "say",
+    "id",
+    "data",
+    "json",
 }
 
 
@@ -70,6 +93,18 @@ def _default_time_granularity() -> str:
 
 QUERY_ANCHOR_STOPWORDS = STOPWORDS.union(
     {
+        "aggregate",
+        "aggregated",
+        "analysis",
+        "analyze",
+        "analysed",
+        "analyzed",
+        "article",
+        "articles",
+        "breakdown",
+        "collection",
+        "corpus",
+        "dataset",
         "how",
         "did",
         "does",
@@ -89,12 +124,33 @@ QUERY_ANCHOR_STOPWORDS = STOPWORDS.union(
         "innovation",
         "privacy",
         "regulation",
+        "distribution",
+        "document",
+        "documents",
         "drawdown",
         "drawdowns",
+        "frequency",
+        "frequencies",
+        "lemma",
+        "lemmas",
+        "noun",
+        "nouns",
         "stock",
         "stocks",
         "overall",
         "monthly",
+        "record",
+        "records",
+        "related",
+        "relevant",
+        "report",
+        "reports",
+        "result",
+        "results",
+        "row",
+        "rows",
+        "story",
+        "stories",
         "weekly",
         "daily",
         "yearly",
@@ -132,6 +188,136 @@ def _query_anchor_terms(query: str) -> list[str]:
         if token not in fallback:
             fallback.append(token)
     return fallback[:8]
+
+
+def _payload_or_params(params: dict[str, Any]) -> dict[str, Any]:
+    payload = params.get("payload")
+    if not isinstance(payload, dict):
+        return dict(params)
+    merged = dict(payload)
+    for key, value in params.items():
+        if key == "payload" or key in merged:
+            continue
+        merged[key] = value
+    return merged
+
+
+def _dependency_rows(dependency_results: dict[str, ToolExecutionResult]) -> list[dict[str, Any]]:
+    for result in dependency_results.values():
+        payload = result.payload
+        if not isinstance(payload, dict):
+            continue
+        for key in ("documents", "results", "rows"):
+            value = payload.get(key)
+            if isinstance(value, list):
+                return [dict(item) for item in value if isinstance(item, dict)]
+    return []
+
+
+def _text_rows(dependency_results: dict[str, ToolExecutionResult]) -> list[dict[str, Any]]:
+    direct = _doc_rows(dependency_results)
+    if direct:
+        return direct
+    rows: list[dict[str, Any]] = []
+    for row in _dependency_rows(dependency_results):
+        text = str(row.get("text", row.get("cleaned_text", ""))).strip()
+        if not text and not str(row.get("title", "")).strip():
+            continue
+        copy = dict(row)
+        if "text" not in copy and text:
+            copy["text"] = text
+        rows.append(copy)
+    return rows
+
+
+def _working_set_doc_ids(dependency_results: dict[str, ToolExecutionResult]) -> list[str]:
+    for result in dependency_results.values():
+        payload = result.payload
+        if not isinstance(payload, dict):
+            continue
+        ids = payload.get("working_set_doc_ids")
+        if isinstance(ids, list):
+            return [str(item).strip() for item in ids if str(item).strip()]
+    return []
+
+
+def _dedupe_doc_ids(doc_ids: list[str]) -> list[str]:
+    ordered: list[str] = []
+    seen: set[str] = set()
+    for doc_id in doc_ids:
+        normalized = str(doc_id).strip()
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        ordered.append(normalized)
+    return ordered
+
+
+def _normalized_pos_label(value: Any) -> str:
+    label = str(value or "").strip().upper()
+    if not label:
+        return ""
+    if label in {"NN", "NNS"}:
+        return "NOUN"
+    if label in {"NNP", "NNPS"}:
+        return "PROPN"
+    return label
+
+
+def _noun_frequency_rows(
+    documents: list[dict[str, Any]],
+    pos_rows: list[dict[str, Any]],
+    *,
+    top_k: int,
+) -> list[dict[str, Any]]:
+    if not pos_rows:
+        return []
+    doc_counts: defaultdict[str, set[str]] = defaultdict(set)
+    counts: Counter[str] = Counter()
+    for row in pos_rows:
+        label = _normalized_pos_label(row.get("pos"))
+        if label not in {"NOUN", "PROPN"}:
+            continue
+        lemma = str(row.get("lemma", row.get("token", ""))).strip().lower()
+        if not lemma or len(lemma) < 2:
+            continue
+        if lemma in STOPWORDS or lemma in STRUCTURAL_TERM_STOPWORDS:
+            continue
+        doc_id = str(row.get("doc_id", "")).strip()
+        counts[lemma] += 1
+        if doc_id:
+            doc_counts[lemma].add(doc_id)
+    total = sum(counts.values())
+    rows: list[dict[str, Any]] = []
+    for rank, (lemma, count) in enumerate(counts.most_common(max(1, top_k)), start=1):
+        rows.append(
+            {
+                "lemma": lemma,
+                "count": int(count),
+                "relative_frequency": round(count / max(total, 1), 6),
+                "document_frequency": len(doc_counts.get(lemma, set())),
+                "rank": rank,
+            }
+        )
+    return rows
+
+
+def _summary_stat_rows(
+    documents: list[dict[str, Any]],
+    upstream_rows: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    total_noun_tokens = sum(int(row.get("count", 0) or 0) for row in upstream_rows)
+    top_nouns = ", ".join(
+        f"{row.get('lemma', '')} ({int(row.get('count', 0) or 0)})"
+        for row in upstream_rows[:10]
+        if str(row.get("lemma", "")).strip()
+    )
+    return [
+        {"metric": "matched_document_count", "value": len(documents)},
+        {"metric": "total_noun_tokens", "value": total_noun_tokens},
+        {"metric": "unique_noun_lemmas", "value": len(upstream_rows)},
+        {"metric": "top_nouns", "value": top_nouns},
+    ]
 
 
 def _rows_match_query_anchor_terms(rows: list[dict[str, Any]], query: str) -> bool:
@@ -252,8 +438,10 @@ def _dedupe_wire_rows(rows: list[dict[str, Any]]) -> tuple[list[dict[str, Any]],
 
 
 def _round_robin_year_balance(rows: list[dict[str, Any]], years: list[int], top_k: int) -> list[dict[str, Any]]:
-    if not rows or not years or top_k <= 0:
-        return rows[:top_k]
+    if not rows or not years:
+        return rows[:top_k] if top_k > 0 else list(rows)
+    if top_k <= 0:
+        return list(rows)
     buckets: dict[int, list[dict[str, Any]]] = {year: [] for year in years}
     leftovers: list[dict[str, Any]] = []
     for row in sorted(rows, key=lambda item: _coerce_score(item.get("score", 0.0)), reverse=True):
@@ -295,6 +483,8 @@ def _prepare_result_rows(
     years: list[int] | None = None,
 ) -> tuple[list[dict[str, Any]], int]:
     deduped, duplicates_removed = _dedupe_wire_rows(rows)
+    if top_k <= 0:
+        return _normalize_result_rows(deduped, retrieval_mode), duplicates_removed
     selected = _round_robin_year_balance(deduped, list(years or []), top_k) if years else deduped[:top_k]
     return _normalize_result_rows(selected[:top_k], retrieval_mode), duplicates_removed
 
@@ -390,8 +580,11 @@ def _sql_search_rows(
     )
     if date_clauses:
         sql += f" AND {' AND '.join(date_clauses)}"
-    sql += " ORDER BY score DESC LIMIT %s"
-    params: list[Any] = [query_text, query_text, *date_params, int(top_k)]
+    sql += " ORDER BY score DESC"
+    params: list[Any] = [query_text, query_text, *date_params]
+    if top_k > 0:
+        sql += " LIMIT %s"
+        params.append(int(top_k))
     try:
         with store._connect() as conn:
             with conn.cursor() as cursor:
@@ -423,10 +616,14 @@ def _sql_search_rows(
         )
         if date_clauses:
             fallback_sql += f" AND {' AND '.join(date_clauses)}"
-        fallback_sql += " ORDER BY score DESC LIMIT %s"
+        fallback_sql += " ORDER BY score DESC"
+        fallback_params: list[Any] = like_params + date_params
+        if top_k > 0:
+            fallback_sql += " LIMIT %s"
+            fallback_params.append(int(top_k))
         with store._connect() as conn:
             with conn.cursor() as cursor:
-                cursor.execute(fallback_sql, tuple(like_params + date_params + [int(top_k)]))
+                cursor.execute(fallback_sql, tuple(fallback_params))
                 rows = cursor.fetchall()
     if not rows:
         return []
@@ -687,18 +884,6 @@ def _heuristic_pos(token: str) -> str:
     return "NOUN"
 
 
-def _payload_or_params(params: dict[str, Any]) -> dict[str, Any]:
-    payload = params.get("payload")
-    if not isinstance(payload, dict):
-        return dict(params)
-    merged = dict(payload)
-    for key, value in params.items():
-        if key == "payload" or key in merged:
-            continue
-        merged[key] = value
-    return merged
-
-
 def _doc_rows(dependency_results: dict[str, ToolExecutionResult]) -> list[dict[str, Any]]:
     for result in dependency_results.values():
         payload = result.payload
@@ -710,88 +895,12 @@ def _doc_rows(dependency_results: dict[str, ToolExecutionResult]) -> list[dict[s
     return []
 
 
-def _dependency_rows(dependency_results: dict[str, ToolExecutionResult]) -> list[dict[str, Any]]:
-    for result in dependency_results.values():
-        payload = result.payload
-        if isinstance(payload, dict) and isinstance(payload.get("rows"), list):
-            return list(payload["rows"])
-    return []
-
-
-def _text_rows(
-    dependency_results: dict[str, ToolExecutionResult],
-    *,
-    text_field: str = "text",
-) -> list[dict[str, Any]]:
-    rows = _doc_rows(dependency_results)
-    if rows:
-        return rows
-    for result in dependency_results.values():
-        payload = result.payload
-        if not isinstance(payload, dict) or not isinstance(payload.get("rows"), list):
-            continue
-        candidate_rows = []
-        for row in payload["rows"]:
-            if not isinstance(row, dict):
-                continue
-            if text_field in row or "text" in row or "cleaned_text" in row:
-                candidate_rows.append(dict(row))
-        if candidate_rows:
-            return candidate_rows
-    return []
-
-
 def _search_rows(dependency_results: dict[str, ToolExecutionResult]) -> list[dict[str, Any]]:
     for result in dependency_results.values():
         payload = result.payload
         if isinstance(payload, dict) and "results" in payload:
             return list(payload["results"])
     return []
-
-
-def _working_set_doc_ids(dependency_results: dict[str, ToolExecutionResult]) -> list[str]:
-    for result in dependency_results.values():
-        payload = result.payload
-        if isinstance(payload, dict) and isinstance(payload.get("working_set_doc_ids"), list):
-            return [str(item) for item in payload["working_set_doc_ids"] if str(item).strip()]
-    return []
-
-
-def _dedupe_doc_ids(doc_ids: list[str]) -> list[str]:
-    return list(dict.fromkeys(str(doc_id).strip() for doc_id in doc_ids if str(doc_id).strip()))
-
-
-def _materialize_runtime_documents(
-    context: AgentExecutionContext,
-    doc_ids: list[str],
-    *,
-    search_lookup: dict[str, dict[str, Any]] | None = None,
-) -> list[dict[str, Any]]:
-    if context.runtime is None or not doc_ids:
-        return []
-    search_lookup = search_lookup or {}
-    df = context.runtime.load_docs(doc_ids)
-    rows: list[dict[str, Any]] = []
-    for row in df.itertuples(index=False):
-        doc_id = str(row.doc_id)
-        merged = dict(search_lookup.get(doc_id, {}))
-        merged.update(
-            {
-                "doc_id": doc_id,
-                "title": str(getattr(row, "title", "")),
-                "text": str(getattr(row, "text", "")),
-                "published_at": str(getattr(row, "published_at", "")),
-                "date": str(getattr(row, "published_at", "")),
-                "outlet": str(getattr(row, "source", "")),
-                "source": str(getattr(row, "source", "")),
-            }
-        )
-        if "score_components" in merged and not isinstance(merged.get("score_components"), dict):
-            merged.pop("score_components", None)
-        merged["score"] = _coerce_score(merged.get("score", 0.0))
-        merged["score_display"] = str(merged.get("score_display") or _score_display(merged["score"]))
-        rows.append(merged)
-    return rows
 
 
 def _coerce_score(value: Any) -> float:
@@ -983,15 +1092,21 @@ def _db_search(params: dict[str, Any], deps: dict[str, ToolExecutionResult], con
         or getattr(context.state, "rewritten_question", "")
         or getattr(context.state, "question", "")
     ).strip()
-    top_k = int(params.get("top_k", 20))
+    budget = infer_retrieval_budget(
+        query,
+        inputs=params,
+        configured_mode=os.getenv("CORPUSAGENT2_DEFAULT_RETRIEVAL_MODE", "hybrid"),
+    )
+    retrieval_strategy = budget.retrieval_strategy
+    top_k = budget.top_k
     date_from = str(params.get("date_from", "")).strip()
     date_to = str(params.get("date_to", "")).strip()
-    retrieval_mode = str(params.get("retrieval_mode", os.getenv("CORPUSAGENT2_DEFAULT_RETRIEVAL_MODE", "hybrid"))).strip().lower() or "hybrid"
-    lexical_top_k = int(params.get("lexical_top_k", top_k * 5 or 50))
-    dense_top_k = int(params.get("dense_top_k", top_k * 5 or 50))
-    use_rerank = str(params.get("use_rerank", os.getenv("CORPUSAGENT2_RETRIEVAL_USE_RERANK", "true"))).strip().lower() not in {"0", "false", "no", "off"}
-    rerank_top_k = int(params.get("rerank_top_k", os.getenv("CORPUSAGENT2_RETRIEVAL_RERANK_TOP_K", "25")))
-    fusion_k = int(params.get("fusion_k", os.getenv("CORPUSAGENT2_RETRIEVAL_FUSION_K", "60")))
+    retrieval_mode = budget.retrieval_mode
+    lexical_top_k = budget.lexical_top_k
+    dense_top_k = budget.dense_top_k
+    use_rerank = budget.use_rerank
+    rerank_top_k = budget.rerank_top_k
+    fusion_k = budget.fusion_k
     year_balance_mode = str(params.get("year_balance", "auto")).strip().lower() or "auto"
     allow_local_fallback = _env_flag("CORPUSAGENT2_ALLOW_LOCAL_FALLBACK", True)
     require_backend_services = _env_flag("CORPUSAGENT2_REQUIRE_BACKEND_SERVICES", False)
@@ -1004,6 +1119,43 @@ def _db_search(params: dict[str, Any], deps: dict[str, ToolExecutionResult], con
     use_year_balance = bool(years) and year_balance_mode not in {"0", "false", "no", "off"}
     if year_balance_mode == "auto":
         use_year_balance = len(years) >= 2
+    sql_store_available = _sql_fallback_store(context) is not None
+
+    if retrieval_strategy == "exhaustive_analytic" and sql_store_available:
+        rows, duplicates_removed = _prepare_result_rows(
+            _sql_search_rows(
+                query=query,
+                top_k=0,
+                date_from=date_from,
+                date_to=date_to,
+                context=context,
+            ),
+            top_k=0,
+            retrieval_mode="sql",
+        )
+        if rows:
+            caveats.append(
+                f"Exhaustive analytical retrieval used full lexical Postgres materialization and returned {len(rows)} matching documents."
+            )
+            if duplicates_removed > 0:
+                caveats.append(f"Suppressed {duplicates_removed} near-duplicate SQL retrieval hits.")
+        else:
+            caveats.append("Exhaustive SQL retrieval did not find documents matching the main query entities.")
+        return ToolExecutionResult(
+            payload={
+                "results": rows,
+                "query": query,
+                "retrieval_mode": "sql",
+                "retrieval_strategy": retrieval_strategy,
+                "result_count": len(rows),
+            },
+            evidence=list(rows),
+            caveats=caveats,
+        )
+    if retrieval_strategy == "exhaustive_analytic" and not sql_store_available:
+        caveats.append(
+            "Exhaustive retrieval was requested, but the Postgres corpus store is unavailable, so ranked retrieval was used instead."
+        )
 
     def _primary_search_once(window_from: str, window_to: str, limit: int) -> list[dict[str, Any]]:
         return context.search_backend.search(
@@ -1120,7 +1272,13 @@ def _db_search(params: dict[str, Any], deps: dict[str, ToolExecutionResult], con
         caveats.append("Retrieved documents did not match the main query entities closely enough, so no evidence rows were kept.")
         rows = []
     return ToolExecutionResult(
-        payload={"results": rows, "query": query, "retrieval_mode": retrieval_mode},
+        payload={
+            "results": rows,
+            "query": query,
+            "retrieval_mode": retrieval_mode,
+            "retrieval_strategy": retrieval_strategy,
+            "result_count": len(rows),
+        },
         evidence=list(rows),
         caveats=caveats,
     )
@@ -1132,9 +1290,45 @@ def _sql_query_search(params: dict[str, Any], deps: dict[str, ToolExecutionResul
         or getattr(context.state, "rewritten_question", "")
         or getattr(context.state, "question", "")
     ).strip()
-    top_k = int(params.get("top_k", 20))
+    budget = infer_retrieval_budget(
+        query,
+        inputs=params,
+        configured_mode=os.getenv("CORPUSAGENT2_DEFAULT_RETRIEVAL_MODE", "hybrid"),
+    )
+    retrieval_strategy = budget.retrieval_strategy
+    top_k = budget.top_k
     date_from = str(params.get("date_from", "")).strip()
     date_to = str(params.get("date_to", "")).strip()
+    if retrieval_strategy == "exhaustive_analytic":
+        rows, duplicates_removed = _prepare_result_rows(
+            _sql_search_rows(
+                query=query,
+                top_k=0,
+                date_from=date_from,
+                date_to=date_to,
+                context=context,
+            ),
+            top_k=0,
+            retrieval_mode="sql",
+        )
+        caveats = [] if rows else ["Exhaustive SQL retrieval did not find documents matching the main query entities."]
+        if rows:
+            caveats.append(
+                f"Exhaustive analytical retrieval used full lexical Postgres materialization and returned {len(rows)} matching documents."
+            )
+        if duplicates_removed > 0:
+            caveats.append(f"Suppressed {duplicates_removed} near-duplicate SQL retrieval hits.")
+        return ToolExecutionResult(
+            payload={
+                "results": rows,
+                "query": query,
+                "retrieval_mode": "sql",
+                "retrieval_strategy": retrieval_strategy,
+                "result_count": len(rows),
+            },
+            evidence=list(rows),
+            caveats=caveats,
+        )
     years = _year_range(date_from, date_to)
     if years:
         combined: list[dict[str, Any]] = []
@@ -1175,7 +1369,13 @@ def _sql_query_search(params: dict[str, Any], deps: dict[str, ToolExecutionResul
     if duplicates_removed > 0:
         caveats.append(f"Suppressed {duplicates_removed} near-duplicate SQL retrieval hits.")
     return ToolExecutionResult(
-        payload={"results": rows, "query": query, "retrieval_mode": "sql"},
+        payload={
+            "results": rows,
+            "query": query,
+            "retrieval_mode": "sql",
+            "retrieval_strategy": retrieval_strategy,
+            "result_count": len(rows),
+        },
         evidence=list(rows),
         caveats=caveats,
     )
@@ -1193,9 +1393,9 @@ def _fetch_documents(params: dict[str, Any], deps: dict[str, ToolExecutionResult
         doc_ids = _working_set_doc_ids(deps)
     if not doc_ids:
         doc_ids = [str(row.get("doc_id", "")) for row in search_rows if str(row.get("doc_id", "")).strip()]
+    doc_ids = _dedupe_doc_ids(doc_ids)
     if not doc_ids:
         return ToolExecutionResult(payload={"documents": []}, evidence=[])
-    doc_ids = _dedupe_doc_ids(doc_ids)
     allow_local_fallback = _env_flag("CORPUSAGENT2_ALLOW_LOCAL_FALLBACK", True)
     require_backend_services = _env_flag("CORPUSAGENT2_REQUIRE_BACKEND_SERVICES", False)
     if require_backend_services:
@@ -1223,12 +1423,23 @@ def _fetch_documents(params: dict[str, Any], deps: dict[str, ToolExecutionResult
             raise
         rows = []
         caveats.append(f"Working-set document fetch failed and runtime fallback was used: {exc}")
-    need_runtime_refresh = bool(rows) and any(not str(row.get("text", "")).strip() for row in rows)
-    if (not rows or need_runtime_refresh) and context.runtime is not None and allow_local_fallback:
+    if not rows and context.runtime is not None and allow_local_fallback:
         try:
-            rows = [_merge_document(row) for row in _materialize_runtime_documents(context, doc_ids, search_lookup=search_lookup)]
-            if need_runtime_refresh:
-                caveats.append("Working-set rows were missing full text, so runtime document lookup was used to hydrate them.")
+            df = context.runtime.load_docs(doc_ids)
+            rows = [
+                _merge_document(
+                    {
+                        "doc_id": str(row.doc_id),
+                        "title": str(getattr(row, "title", "")),
+                        "text": str(getattr(row, "text", "")),
+                        "published_at": str(getattr(row, "published_at", "")),
+                        "date": str(getattr(row, "published_at", "")),
+                        "outlet": str(getattr(row, "source", "")),
+                        "source": str(getattr(row, "source", "")),
+                    }
+                )
+                for row in df.itertuples(index=False)
+            ]
         except Exception as exc:
             caveats.append(f"Runtime document lookup fallback failed: {exc}")
     else:
@@ -1241,62 +1452,20 @@ def _fetch_documents(params: dict[str, Any], deps: dict[str, ToolExecutionResult
 
 
 def _create_working_set(params: dict[str, Any], deps: dict[str, ToolExecutionResult], context: AgentExecutionContext) -> ToolExecutionResult:
-    full_rows = _doc_rows(deps)
-    search_rows = _search_rows(deps)
-    analysis_rows = _dependency_rows(deps)
-    filter_payload = params.get("filter", {}) if isinstance(params.get("filter"), dict) else {}
-    allowed_languages = {
-        str(item).strip().lower()
-        for item in filter_payload.get("language_in", [])
-        if str(item).strip()
-    }
-
-    if full_rows:
-        doc_ids = _dedupe_doc_ids([str(row.get("doc_id", "")) for row in full_rows])
-    elif search_rows:
-        doc_ids = _dedupe_doc_ids([str(row.get("doc_id", "")) for row in search_rows])
-    else:
-        doc_ids = []
-        for row in analysis_rows:
-            doc_id = str(row.get("doc_id", "")).strip()
-            if not doc_id:
-                continue
-            language = str(row.get("language", "")).strip().lower()
-            if allowed_languages and language and language not in allowed_languages:
-                continue
-            if allowed_languages and "language" in row and not language:
-                continue
-            doc_ids.append(doc_id)
-        doc_ids = _dedupe_doc_ids(doc_ids)
-
-    if allowed_languages and full_rows:
-        row_languages = {
-            str(row.get("doc_id", "")).strip(): str(row.get("language", "")).strip().lower()
-            for row in analysis_rows
-            if str(row.get("doc_id", "")).strip()
-        }
-        doc_ids = [
-            doc_id
-            for doc_id in doc_ids
-            if row_languages.get(doc_id, "") in allowed_languages
-        ] or doc_ids
-
-    rows = [row for row in full_rows if str(row.get("doc_id", "")).strip() in set(doc_ids)]
-    if not rows and doc_ids:
-        try:
-            rows = context.working_store.fetch_documents(doc_ids)
-        except Exception:
-            rows = []
-    if (not rows or any(not str(row.get("text", "")).strip() for row in rows)) and doc_ids:
-        search_lookup = {
-            str(row.get("doc_id", "")).strip(): dict(row)
-            for row in search_rows
-            if str(row.get("doc_id", "")).strip()
-        }
-        rows = _materialize_runtime_documents(context, doc_ids, search_lookup=search_lookup) or rows
-
+    filters = dict(params.get("filter", {})) if isinstance(params.get("filter"), dict) else {}
+    rows = _text_rows(deps)
     if rows:
         context.working_store.record_documents(context.run_id, rows)
+    doc_ids = _working_set_doc_ids(deps)
+    if not doc_ids:
+        filtered_rows = _dependency_rows(deps)
+        if filters.get("language_in"):
+            allowed = {str(item).strip().lower() for item in filters.get("language_in", []) if str(item).strip()}
+            filtered_rows = [
+                row for row in filtered_rows if str(row.get("language", "")).strip().lower() in allowed
+            ]
+        doc_ids = [str(row.get("doc_id", "")) for row in filtered_rows if str(row.get("doc_id", "")).strip()]
+    doc_ids = _dedupe_doc_ids(doc_ids or [str(row.get("doc_id", "")) for row in rows if str(row.get("doc_id", "")).strip()])
     if context.state is not None:
         context.state.working_set_doc_ids = list(doc_ids)
     return ToolExecutionResult(
@@ -1308,12 +1477,11 @@ def _create_working_set(params: dict[str, Any], deps: dict[str, ToolExecutionRes
 
 
 def _lang_id(params: dict[str, Any], deps: dict[str, ToolExecutionResult], context: AgentExecutionContext) -> ToolExecutionResult:
-    text_field = str(params.get("text_field", "text")).strip() or "text"
-    rows = _text_rows(deps, text_field=text_field)
+    rows = _text_rows(deps)
     detected = []
     for row in rows:
-        sample = str(row.get(text_field, row.get("text", row.get("cleaned_text", ""))))
-        language, confidence = _infer_language(sample)
+        text = str(row.get("text", row.get("cleaned_text", "")))
+        language, confidence = _infer_language(text)
         detected.append(
             {
                 "doc_id": str(row.get("doc_id", "")),
@@ -1329,26 +1497,20 @@ def _lang_id(params: dict[str, Any], deps: dict[str, ToolExecutionResult], conte
 
 def _clean_normalize(params: dict[str, Any], deps: dict[str, ToolExecutionResult], context: AgentExecutionContext) -> ToolExecutionResult:
     rows = _doc_rows(deps)
-    preserve_fields = [str(field).strip() for field in params.get("preserve_fields", []) if str(field).strip()]
-    cleaned = []
-    for row in rows:
-        cleaned_text = " ".join(str(row.get("text", "")).split()).strip()
-        record = {"doc_id": row["doc_id"], "text": cleaned_text, "cleaned_text": cleaned_text}
-        for field in preserve_fields:
-            if field in row:
-                record[field] = row.get(field)
-        if "title" in row and "title" not in record:
-            record["title"] = row.get("title", "")
-        if "published_at" in row and "published_at" not in record:
-            record["published_at"] = row.get("published_at", "")
-        if "source" in row and "source" not in record:
-            record["source"] = row.get("source", "")
-        if "outlet" in row and "outlet" not in record:
-            record["outlet"] = row.get("outlet", "")
-        if "date" in row and "date" not in record:
-            record["date"] = row.get("date", "")
-        cleaned.append(record)
-    return ToolExecutionResult(payload={"rows": cleaned, "documents": cleaned})
+    cleaned = [
+        {
+            "doc_id": row["doc_id"],
+            "title": str(row.get("title", "")),
+            "text": " ".join(str(row.get("text", "")).split()).strip(),
+            "cleaned_text": " ".join(str(row.get("text", "")).split()).strip(),
+            "published_at": str(row.get("published_at", row.get("date", ""))),
+            "date": str(row.get("date", row.get("published_at", ""))),
+            "source": str(row.get("source", row.get("outlet", ""))),
+            "outlet": str(row.get("outlet", row.get("source", ""))),
+        }
+        for row in rows
+    ]
+    return ToolExecutionResult(payload={"documents": cleaned, "rows": cleaned})
 
 
 def _tokenize_docs(params: dict[str, Any], deps: dict[str, ToolExecutionResult], context: AgentExecutionContext) -> ToolExecutionResult:
@@ -2293,147 +2455,55 @@ def _quote_attribute(params: dict[str, Any], deps: dict[str, ToolExecutionResult
     return ToolExecutionResult(payload={"rows": attributed})
 
 
-def _normalized_pos_label(value: Any) -> str:
-    label = str(value or "").strip().upper()
-    if not label:
-        return ""
-    if label.startswith("NNP"):
-        return "PROPN"
-    if label.startswith("NN"):
-        return "NOUN"
-    return label
-
-
-def _doc_evidence_rows(
-    docs: list[dict[str, Any]],
-    *,
-    search_score_lookup: dict[str, float] | None = None,
-    limit: int = 8,
-) -> list[dict[str, Any]]:
-    search_score_lookup = search_score_lookup or {}
-    ranked_docs = sorted(
-        docs,
-        key=lambda row: _coerce_score(row.get("score", search_score_lookup.get(str(row.get("doc_id", "")), 0.0))),
-        reverse=True,
-    )
-    evidence: list[dict[str, Any]] = []
-    for rank, row in enumerate(ranked_docs[:limit], start=1):
-        doc_id = str(row.get("doc_id", "")).strip()
-        if not doc_id:
-            continue
-        excerpt_source = str(row.get("snippet", "") or row.get("text", "")).strip()
-        excerpt = excerpt_source[:320]
-        score = _coerce_score(row.get("score", search_score_lookup.get(doc_id, 0.0)))
-        evidence.append(
-            {
-                "doc_id": doc_id,
-                "outlet": str(row.get("outlet", row.get("source", ""))),
-                "date": str(row.get("date", row.get("published_at", ""))),
-                "excerpt": excerpt,
-                "score": score,
-                "score_display": _score_display(score),
-                "rank": rank,
-            }
-        )
-    return evidence
-
-
-def _noun_frequency_rows(
-    params: dict[str, Any],
-    deps: dict[str, ToolExecutionResult],
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    docs = _doc_rows(deps)
-    total_docs = len({str(row.get("doc_id", "")).strip() for row in docs if str(row.get("doc_id", "")).strip()})
-    pos_rows: list[dict[str, Any]] = []
-    for result in deps.values():
-        payload = result.payload
-        if isinstance(payload, dict) and isinstance(payload.get("rows"), list) and payload["rows"]:
-            first = payload["rows"][0]
-            if isinstance(first, dict) and "pos" in first:
-                pos_rows = list(payload["rows"])
-                break
-    filters = params.get("filters", {}) if isinstance(params.get("filters"), dict) else {}
-    allowed_upos = {
-        str(item).strip().upper()
-        for item in filters.get("upos", [])
-        if str(item).strip()
-    }
-    counts: Counter[str] = Counter()
-    doc_freq: defaultdict[str, set[str]] = defaultdict(set)
-    for row in pos_rows:
-        doc_id = str(row.get("doc_id", "")).strip()
-        if not doc_id:
-            continue
-        normalized_pos = _normalized_pos_label(row.get("pos", ""))
-        if allowed_upos and normalized_pos not in allowed_upos:
-            continue
-        lemma = str(row.get("lemma", row.get("token", ""))).strip().lower()
-        if not lemma or TOKEN_PATTERN.fullmatch(lemma) is None or lemma in STRUCTURAL_TERM_STOPWORDS:
-            continue
-        counts[lemma] += 1
-        doc_freq[lemma].add(doc_id)
-    total_noun_tokens = sum(counts.values())
-    top_k = max(int(params.get("top_k", 100)), 1)
-    rows: list[dict[str, Any]] = []
-    for lemma, count in counts.most_common(top_k):
-        doc_count = len(doc_freq[lemma])
-        rows.append(
-            {
-                "lemma": lemma,
-                "term": lemma,
-                "entity": lemma,
-                "count": int(count),
-                "relative_frequency": round(count / max(total_noun_tokens, 1), 6),
-                "document_frequency": int(doc_count),
-                "document_share": round(doc_count / max(total_docs, 1), 6) if total_docs else 0.0,
-                "score": float(count),
-            }
-        )
-    return rows, docs
-
-
-def _summary_stat_rows(params: dict[str, Any], deps: dict[str, ToolExecutionResult]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    docs = _doc_rows(deps)
-    doc_ids = {str(row.get("doc_id", "")).strip() for row in docs if str(row.get("doc_id", "")).strip()}
-    noun_rows: list[dict[str, Any]] = []
-    for result in deps.values():
-        payload = result.payload
-        if isinstance(payload, dict) and isinstance(payload.get("rows"), list) and payload["rows"]:
-            first = payload["rows"][0]
-            if isinstance(first, dict) and "count" in first and ("lemma" in first or "term" in first):
-                noun_rows = list(payload["rows"])
-                break
-    include = [str(item).strip() for item in params.get("include", []) if str(item).strip()]
-    if not include:
-        include = ["matched_document_count", "total_noun_tokens", "unique_noun_lemmas", "top_nouns"]
-    top_nouns = [str(row.get("lemma", row.get("term", ""))) for row in noun_rows[:10] if str(row.get("lemma", row.get("term", ""))).strip()]
-    summary_values = {
-        "matched_document_count": int(len(doc_ids)),
-        "total_noun_tokens": int(sum(int(row.get("count", 0) or 0) for row in noun_rows)),
-        "unique_noun_lemmas": int(len(noun_rows)),
-        "top_nouns": ", ".join(top_nouns),
-    }
-    summary_row = {key: summary_values.get(key, "") for key in include}
-    return [summary_row], docs
-
-
 def _build_evidence_table(params: dict[str, Any], deps: dict[str, ToolExecutionResult], context: AgentExecutionContext) -> ToolExecutionResult:
     task = str(params.get("task", "")).strip().lower()
+    if task == "noun_frequency_distribution":
+        top_k = int(params.get("top_k", 100) or 100)
+        documents = _text_rows(deps)
+        pos_rows = []
+        for result in deps.values():
+            payload = result.payload if isinstance(result.payload, dict) else {}
+            rows = payload.get("rows")
+            if not isinstance(rows, list) or not rows:
+                continue
+            first = rows[0]
+            if isinstance(first, dict) and ("pos" in first or "lemma" in first):
+                pos_rows = [dict(item) for item in rows if isinstance(item, dict)]
+                break
+        noun_rows = _noun_frequency_rows(documents, pos_rows, top_k=top_k)
+        caveats = [] if noun_rows else ["No noun distribution rows were produced from the upstream documents and POS rows."]
+        return ToolExecutionResult(
+            payload={"rows": noun_rows},
+            evidence=[],
+            caveats=caveats,
+            metadata={"no_data": not noun_rows, "task": task},
+        )
+    if task == "summary_stats":
+        documents = _text_rows(deps)
+        upstream_rows = []
+        for result in deps.values():
+            payload = result.payload if isinstance(result.payload, dict) else {}
+            rows = payload.get("rows")
+            if not isinstance(rows, list) or not rows:
+                continue
+            first = rows[0]
+            if isinstance(first, dict) and "lemma" in first and "count" in first:
+                upstream_rows = [dict(item) for item in rows if isinstance(item, dict)]
+                break
+        summary_rows = _summary_stat_rows(documents, upstream_rows)
+        caveats = [] if summary_rows else ["No summary statistics rows were produced from the upstream aggregation."]
+        return ToolExecutionResult(
+            payload={"rows": summary_rows},
+            evidence=[],
+            caveats=caveats,
+            metadata={"no_data": not summary_rows, "task": task},
+        )
+    rows = []
     search_score_lookup = {
         str(row.get("doc_id", "")).strip(): _coerce_score(row.get("score", 0.0))
         for row in _search_rows(deps)
         if str(row.get("doc_id", "")).strip()
     }
-    if task == "noun_frequency_distribution":
-        rows, docs = _noun_frequency_rows(params, deps)
-        evidence = _doc_evidence_rows(docs, search_score_lookup=search_score_lookup)
-        return ToolExecutionResult(payload={"rows": rows}, evidence=evidence)
-    if task == "summary_stats":
-        rows, docs = _summary_stat_rows(params, deps)
-        evidence = _doc_evidence_rows(docs, search_score_lookup=search_score_lookup)
-        return ToolExecutionResult(payload={"rows": rows}, evidence=evidence)
-
-    rows: list[dict[str, Any]] = []
     for result in deps.values():
         payload = result.payload
         if isinstance(payload, dict) and "rows" in payload:
@@ -2462,9 +2532,7 @@ def _build_evidence_table(params: dict[str, Any], deps: dict[str, ToolExecutionR
         payload["score_display"] = _score_display(item.score)
         payload["rank"] = rank
         evidence.append(payload)
-    if evidence:
-        return ToolExecutionResult(payload={"rows": evidence}, evidence=evidence)
-    return ToolExecutionResult(payload={"rows": rows}, evidence=[])
+    return ToolExecutionResult(payload={"rows": evidence}, evidence=evidence)
 
 
 def _fetch_yfinance_series_rows(
@@ -2605,7 +2673,11 @@ def _plot_artifact(params: dict[str, Any], deps: dict[str, ToolExecutionResult],
         matplotlib.use("Agg", force=True)
         import matplotlib.pyplot as plt
     except Exception as exc:
-        return ToolExecutionResult(payload={"rows": []}, caveats=[f"matplotlib unavailable: {exc}"])
+        return ToolExecutionResult(
+            payload={"rows": []},
+            caveats=[f"matplotlib unavailable: {exc}"],
+            metadata={"no_data": True, "no_data_reason": f"matplotlib unavailable: {exc}"},
+        )
     rows = []
     for result in deps.values():
         payload = result.payload
@@ -2614,17 +2686,18 @@ def _plot_artifact(params: dict[str, Any], deps: dict[str, ToolExecutionResult],
             if rows:
                 break
     if not rows:
-        return ToolExecutionResult(payload={"rows": []}, caveats=["No rows available for plotting."])
+        return ToolExecutionResult(
+            payload={"rows": []},
+            caveats=["No rows available for plotting."],
+            metadata={"no_data": True, "no_data_reason": "No rows available for plotting."},
+        )
     plot_dir = context.artifacts_dir / "plots"
     plot_dir.mkdir(parents=True, exist_ok=True)
     target = plot_dir / f"{params.get('plot_name', 'plot')}.png"
     plt.style.use("seaborn-v0_8-whitegrid")
     figure, axis = plt.subplots(figsize=(12.5, 6.6), dpi=180)
-    plot_name = str(params.get("title") or params.get("plot_name", "plot")).replace("_", " ").title()
-    top_k = max(int(params.get("top_k", 16)), 1)
-    first = rows[:top_k]
-    x_key = str(params.get("x", "")).strip()
-    y_key = str(params.get("y", "")).strip()
+    plot_name = str(params.get("plot_name", "plot")).replace("_", " ").title()
+    first = rows[:16]
     unique_time_bins = {
         str(item.get("time_bin", "unknown"))
         for item in first
@@ -2701,22 +2774,19 @@ def _plot_artifact(params: dict[str, Any], deps: dict[str, ToolExecutionResult],
         if handles:
             axis.legend(loc="best", fontsize=8, frameon=True)
     else:
+        x_key = str(params.get("x", "")).strip()
+        y_key = str(params.get("y", "")).strip()
         labels = [
             str(
                 item.get(
                     x_key,
-                    item.get("entity", item.get("term", item.get("doc_id", item.get("time_bin", "row")))),
+                    item.get("lemma", item.get("entity", item.get("term", item.get("doc_id", item.get("time_bin", "row"))))),
                 )
             )
             for item in first
         ]
         values = [
-            float(
-                item.get(
-                    y_key,
-                    item.get("count", item.get("score", item.get("weight", item.get("intensity", 0.0)))),
-                )
-            )
+            float(item.get(y_key, item.get("count", item.get("score", item.get("weight", item.get("intensity", 0.0))))))
             for item in first
         ]
         colors = ["#0f766e" if value >= 0 else "#be123c" for value in values]
