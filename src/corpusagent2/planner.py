@@ -17,6 +17,7 @@ from .question_spec import (
     normalize_question_text,
     parse_time_range,
 )
+from .retrieval_budgeting import infer_requested_output_limit, infer_retrieval_budget
 from .tool_registry import ToolRegistry
 
 
@@ -240,7 +241,8 @@ class QuestionPlanner:
                 details={"skipped": True},
             )
         try:
-            params = {"query": raw_question, "top_k": 5, "lightweight": True}
+            budget = infer_retrieval_budget(raw_question, inputs={"lightweight": True}, lightweight=True)
+            params = {"query": raw_question, "top_k": budget.top_k, "lightweight": True}
             resolution = self.registry.resolve("retrieve.documents", context={"question_class": question_class, "planning_probe": True}, params=params)
             result = resolution.adapter.run(params=params, dependency_results={}, context={"question_class": question_class, "planning_probe": True})
         except Exception as exc:
@@ -290,9 +292,28 @@ class QuestionPlanner:
                 metadata={"question_class": question_spec.question_class},
             )
 
+        retrieval_budget = infer_retrieval_budget(question_spec.raw_question)
+        output_limit = infer_requested_output_limit(question_spec.raw_question, default=12, minimum=8, maximum=100)
         nodes = [
-            PlanNode("retrieve_support", NodeType.RETRIEVE.value, "retrieve.documents", "retrieval_results", params={"query": question_spec.raw_question, "top_k": 12}),
-            PlanNode("filter_support", NodeType.FILTER.value, "filter.documents", "filtered_results", dependencies=["retrieve_support"], params={"entities": list(question_spec.entities), "time_range": question_spec.time_range.to_dict(), "max_results": 8}),
+            PlanNode(
+                "retrieve_support",
+                NodeType.RETRIEVE.value,
+                "retrieve.documents",
+                "retrieval_results",
+                params={"query": question_spec.raw_question, "top_k": retrieval_budget.top_k},
+            ),
+            PlanNode(
+                "filter_support",
+                NodeType.FILTER.value,
+                "filter.documents",
+                "filtered_results",
+                dependencies=["retrieve_support"],
+                params={
+                    "entities": list(question_spec.entities),
+                    "time_range": question_spec.time_range.to_dict(),
+                    "max_results": output_limit,
+                },
+            ),
         ]
         analysis_nodes: list[str] = []
         for capability, output_key in (("analyze.entity_trend", "entity_trend"), ("analyze.sentiment_series", "sentiment_series"), ("analyze.topics_over_time", "topics_over_time"), ("analyze.keyphrases", "keyphrases")):

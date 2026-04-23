@@ -431,10 +431,11 @@ function collectToolCallTotals(rows) {
     totalCalls: 0,
     completedCalls: 0,
     failedCalls: 0,
-    documentsProcessed: 0,
+    inputDocumentsSeen: 0,
     outputItems: 0,
   };
   (rows || []).forEach((row) => {
+    const summary = row.summary || {};
     totals.totalCalls += 1;
     if (row.status === "completed") {
       totals.completedCalls += 1;
@@ -442,8 +443,8 @@ function collectToolCallTotals(rows) {
     if (row.status === "failed") {
       totals.failedCalls += 1;
     }
-    totals.documentsProcessed += Number(row.documents_processed || row.summary?.documents_processed || 0) || 0;
-    totals.outputItems += Number(row.summary?.items_count || 0) || 0;
+    totals.inputDocumentsSeen += Number(summary.input_documents_seen || row.documents_processed || 0) || 0;
+    totals.outputItems += Number(summary.items_count || 0) || 0;
   });
   return totals;
 }
@@ -538,6 +539,15 @@ function renderClarificationState() {
   clarificationPanel.classList.toggle("hidden", !pendingClarificationQuestion);
   clarificationPrompt.textContent = pendingClarificationQuestion || "The backend has not requested a clarification yet.";
   renderList(clarificationHistoryList, clarificationHistory, (row) => escapeHtml(row));
+}
+
+function clarificationHistoryEntry(question, response) {
+  const prompt = String(question || "").trim();
+  const answer = String(response || "").trim();
+  if (!prompt) {
+    return answer;
+  }
+  return `Prompt: ${prompt}\nAnswer: ${answer}`;
 }
 
 function resetClarificationState() {
@@ -707,12 +717,18 @@ function renderToolCalls(rows) {
     { label: "Calls", value: formatCount(totals.totalCalls) },
     { label: "Completed", value: formatCount(totals.completedCalls) },
     { label: "Failed", value: formatCount(totals.failedCalls) },
-    { label: "Docs processed", value: formatCount(totals.documentsProcessed) },
+    { label: "Input docs seen", value: formatCount(totals.inputDocumentsSeen) },
     { label: "Output items", value: formatCount(totals.outputItems) },
   ]);
   const blocks = ordered.map((row) => {
     const summary = row.summary || {};
-    const itemsLabel = summary.items_count ? `${formatCount(summary.items_count)} ${summary.items_key || "items"}` : "no output yet";
+    const itemsLabel = summary.no_data
+      ? "no data returned"
+      : summary.items_count
+        ? `${formatCount(summary.items_count)} ${summary.items_key || "items"}`
+        : "no output yet";
+    const inputDocsSeen = Number(summary.input_documents_seen || row.documents_processed || 0) || 0;
+    const outputDocs = Number(summary.output_documents || 0) || 0;
     const duration = stepDurationLabel(row, { allowLiveElapsed: row.status === "running" });
     const artifacts = Array.isArray(row.artifacts) ? row.artifacts : [];
     return `
@@ -724,7 +740,8 @@ function renderToolCalls(rows) {
       <div class="tool-metrics">
         <span class="chip">${escapeHtml(row.provider || "provider?")}</span>
         <span class="chip">${escapeHtml(itemsLabel)}</span>
-        <span class="chip">${escapeHtml(`${formatCount(row.documents_processed || summary.documents_processed || 0)} docs in`)}</span>
+        ${inputDocsSeen ? `<span class="chip">${escapeHtml(`${formatCount(inputDocsSeen)} input docs`)}</span>` : ""}
+        ${outputDocs ? `<span class="chip">${escapeHtml(`${formatCount(outputDocs)} output docs`)}</span>` : ""}
         ${duration ? `<span class="chip">${escapeHtml(duration)}</span>` : ""}
         ${row.cache_hit ? '<span class="chip ok">cache hit</span>' : ""}
         ${summary.evidence_count ? `<span class="chip">${escapeHtml(`${formatCount(summary.evidence_count)} evidence`)}</span>` : ""}
@@ -732,6 +749,7 @@ function renderToolCalls(rows) {
       </div>
       ${row.error ? `<p class="danger"><strong>Error:</strong> ${escapeHtml(row.error)}</p>` : ""}
       ${row.tool_reason ? `<p><strong>Resolution:</strong> ${escapeHtml(row.tool_reason)}</p>` : ""}
+      ${summary.no_data_reason ? `<p class="muted"><strong>No data:</strong> ${escapeHtml(summary.no_data_reason)}</p>` : ""}
       ${
         Array.isArray(row.dependency_nodes) && row.dependency_nodes.length
           ? `<p><strong>Dependency nodes:</strong> ${escapeHtml(row.dependency_nodes.join(", "))}</p>`
@@ -903,6 +921,8 @@ function setStatus(payload) {
   const clarificationQuestions = payload.clarification_questions || [];
   if (status === "needs_clarification" && clarificationQuestions.length > 0) {
     pendingClarificationQuestion = clarificationQuestions[0];
+  } else if (status !== "needs_clarification") {
+    pendingClarificationQuestion = "";
   }
   renderClarificationState();
   updateControlState();
@@ -1034,6 +1054,10 @@ async function submitQuery({ preserveClarificationHistory = false } = {}) {
   }
   if (!preserveClarificationHistory) {
     resetClarificationState();
+  } else {
+    pendingClarificationQuestion = "";
+    renderClarificationState();
+    saveUiState();
   }
   resetManifestPanels("Waiting for result...");
   currentRunId = "";
@@ -1047,7 +1071,7 @@ async function submitQuery({ preserveClarificationHistory = false } = {}) {
     assumptions: [],
     planner_actions: [],
     llm_traces: [],
-    clarification_questions: preserveClarificationHistory && pendingClarificationQuestion ? [pendingClarificationQuestion] : [],
+    clarification_questions: [],
   });
 
   const base = apiBaseInput.value.replace(/\/$/, "");
@@ -1209,7 +1233,7 @@ continueButton.addEventListener("click", async () => {
   if (submissionInFlight) {
     return;
   }
-  clarificationHistory = [...clarificationHistory, text];
+  clarificationHistory = [...clarificationHistory, clarificationHistoryEntry(pendingClarificationQuestion, text)];
   clarificationInput.value = "";
   try {
     await submitQuery({ preserveClarificationHistory: true });
