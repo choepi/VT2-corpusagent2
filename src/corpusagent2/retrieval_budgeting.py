@@ -63,13 +63,15 @@ class RetrievalBudget:
     def to_inputs(self) -> dict[str, Any]:
         payload = {
             "retrieval_strategy": self.retrieval_strategy,
-            "top_k": self.top_k,
+            "top_k": 0 if self.retrieve_all_requested else self.top_k,
             "retrieval_mode": self.retrieval_mode,
             "lexical_top_k": self.lexical_top_k,
             "dense_top_k": self.dense_top_k,
             "use_rerank": self.use_rerank,
             "fusion_k": self.fusion_k,
         }
+        if self.retrieve_all_requested:
+            payload["fallback_top_k"] = self.top_k
         if self.use_rerank:
             payload["rerank_top_k"] = self.rerank_top_k
         else:
