@@ -300,6 +300,7 @@ def test_db_search_uses_sql_fallback_when_primary_search_is_empty(monkeypatch, t
             }
         ],
     )
+    monkeypatch.setattr(agent_capabilities, "_queryable_sql_store", lambda context: (object(), ""))
     context = AgentExecutionContext(
         run_id="run",
         artifacts_dir=tmp_path,
@@ -344,6 +345,17 @@ def test_query_anchor_terms_drop_analytic_scaffold_words_for_exhaustive_question
     assert "corpus" not in anchors
 
 
+def test_query_anchor_terms_split_hyphenated_topic_terms_and_drop_filler() -> None:
+    query = (
+        "What is the frequency distribution of individual noun lemmas across "
+        "soccer-related reports in the corpus, such as the most common nouns?"
+    )
+
+    anchors = agent_capabilities._query_anchor_terms(query)
+
+    assert anchors == ["soccer"]
+
+
 def test_db_search_materializes_full_sql_match_set_for_exhaustive_questions(monkeypatch, tmp_path: Path) -> None:
     search_backend = _CapturingSearchBackend()
     captured: dict[str, object] = {}
@@ -369,7 +381,7 @@ def test_db_search_materializes_full_sql_match_set_for_exhaustive_questions(monk
             },
         ]
 
-    monkeypatch.setattr(agent_capabilities, "_sql_fallback_store", lambda context: object())
+    monkeypatch.setattr(agent_capabilities, "_queryable_sql_store", lambda context: (object(), ""))
     monkeypatch.setattr(agent_capabilities, "_sql_search_rows", _fake_sql_search_rows)
     context = AgentExecutionContext(
         run_id="run",
@@ -387,6 +399,48 @@ def test_db_search_materializes_full_sql_match_set_for_exhaustive_questions(monk
     assert result.payload["retrieval_strategy"] == "exhaustive_analytic"
     assert len(result.payload["results"]) == 2
     assert any("full lexical postgres" in caveat.lower() for caveat in result.caveats)
+
+
+def test_db_search_uses_local_exhaustive_materialization_when_sql_store_is_unavailable(monkeypatch, tmp_path: Path) -> None:
+    search_backend = _CapturingSearchBackend()
+    runtime = _RuntimeWithMetadata(
+        [
+            {
+                "doc_id": "f-1",
+                "title": "Football tactics report",
+                "text": "Football tactics and league analysis.",
+                "published_at": "2022-05-01",
+                "source": "NZZ",
+            },
+            {
+                "doc_id": "f-2",
+                "title": "Soccer match report",
+                "text": "Soccer match coverage and football strategy.",
+                "published_at": "2022-05-02",
+                "source": "TA",
+            },
+        ]
+    )
+    monkeypatch.setattr(
+        agent_capabilities,
+        "_queryable_sql_store",
+        lambda context: (None, "Table 'article_corpus' was not found in the configured Postgres database."),
+    )
+    context = AgentExecutionContext(
+        run_id="run",
+        artifacts_dir=tmp_path,
+        search_backend=search_backend,
+        working_store=_ExplodingStore(),
+        runtime=runtime,
+    )
+
+    result = _db_search({"query": "What is the distribution of nouns across all football reports in the corpus?"}, {}, context)
+
+    assert not search_backend.calls
+    assert result.payload["retrieval_mode"] == "local_exhaustive"
+    assert result.payload["retrieval_strategy"] == "exhaustive_analytic"
+    assert len(result.payload["results"]) == 2
+    assert any("full local lexical materialization" in caveat.lower() for caveat in result.caveats)
 
 
 def test_sql_query_search_reports_empty_results_cleanly(monkeypatch, tmp_path: Path) -> None:
@@ -422,6 +476,7 @@ def test_sql_query_search_materializes_full_sql_match_set_for_exhaustive_questio
         ]
 
     monkeypatch.setattr(agent_capabilities, "_sql_search_rows", _fake_sql_search_rows)
+    monkeypatch.setattr(agent_capabilities, "_queryable_sql_store", lambda context: (object(), ""))
     context = AgentExecutionContext(
         run_id="run",
         artifacts_dir=tmp_path,
@@ -437,6 +492,39 @@ def test_sql_query_search_materializes_full_sql_match_set_for_exhaustive_questio
     assert result.payload["retrieval_strategy"] == "exhaustive_analytic"
     assert len(result.payload["results"]) == 1
     assert any("full lexical postgres" in caveat.lower() for caveat in result.caveats)
+
+
+def test_sql_query_search_uses_local_exhaustive_materialization_when_sql_store_is_unavailable(monkeypatch, tmp_path: Path) -> None:
+    runtime = _RuntimeWithMetadata(
+        [
+            {
+                "doc_id": "f-1",
+                "title": "Football tactics report",
+                "text": "Football tactics and league analysis.",
+                "published_at": "2022-05-01",
+                "source": "NZZ",
+            }
+        ]
+    )
+    monkeypatch.setattr(
+        agent_capabilities,
+        "_queryable_sql_store",
+        lambda context: (None, "Table 'article_corpus' was not found in the configured Postgres database."),
+    )
+    context = AgentExecutionContext(
+        run_id="run",
+        artifacts_dir=tmp_path,
+        search_backend=_EmptySearchBackend(),
+        working_store=_ExplodingStore(),
+        runtime=runtime,
+    )
+
+    result = _sql_query_search({"query": "What is the distribution of nouns across all football reports in the corpus?"}, {}, context)
+
+    assert result.payload["retrieval_mode"] == "local_exhaustive"
+    assert result.payload["retrieval_strategy"] == "exhaustive_analytic"
+    assert len(result.payload["results"]) == 1
+    assert any("full local lexical materialization" in caveat.lower() for caveat in result.caveats)
 
 
 def test_db_search_balances_years_and_suppresses_duplicates(tmp_path: Path) -> None:

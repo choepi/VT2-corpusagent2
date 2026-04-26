@@ -985,8 +985,9 @@ def test_noun_distribution_heuristic_plan_uses_scope_budget_and_aggregate_nodes(
     assert manifest.plan_dags
     nodes = manifest.plan_dags[0]["nodes"]
     search_node = next(node for node in nodes if node["capability"] == "db_search")
-    assert int(search_node["inputs"]["top_k"]) >= 80
     assert search_node["inputs"].get("retrieve_all") is True
+    assert int(search_node["inputs"]["top_k"]) == 0
+    assert int(search_node["inputs"]["fallback_top_k"]) >= 80
     assert search_node["inputs"].get("retrieval_strategy") == "exhaustive_analytic"
     assert any(node["capability"] == "build_evidence_table" for node in nodes)
     assert any(node["node_id"] == "noun_distribution" for node in nodes)
@@ -1063,8 +1064,9 @@ def test_planner_search_budget_is_normalized_up_for_broad_scope_questions(tmp_pa
     )
 
     search_node = next(node for node in manifest.plan_dags[0]["nodes"] if node["capability"] == "db_search")
-    assert int(search_node["inputs"]["top_k"]) >= 80
     assert search_node["inputs"].get("retrieve_all") is True
+    assert int(search_node["inputs"]["top_k"]) == 0
+    assert int(search_node["inputs"]["fallback_top_k"]) >= 80
     assert search_node["inputs"].get("retrieval_strategy") == "exhaustive_analytic"
 
 

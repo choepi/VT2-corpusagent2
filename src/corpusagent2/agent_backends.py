@@ -280,13 +280,16 @@ class LocalSearchBackend:
                 doc_ids=dense_doc_ids,
                 top_k=max(top_k, 1),
             )
-        return retrieve_dense_pgvector(
-            query=query,
-            model_id=self.runtime.dense_model_id,
-            dsn=self.runtime.pg_dsn,
-            table_name=self.runtime.pg_table,
-            top_k=max(top_k, 1),
-        )
+        try:
+            return retrieve_dense_pgvector(
+                query=query,
+                model_id=self.runtime.dense_model_id,
+                dsn=self.runtime.pg_dsn,
+                table_name=self.runtime.pg_table,
+                top_k=max(top_k, 1),
+            )
+        except Exception:
+            return []
 
     def search(
         self,
@@ -635,6 +638,17 @@ class PostgresWorkingSetStore:
             with conn.cursor() as cursor:
                 cursor.execute(
                     """
+                    SELECT EXISTS (
+                        SELECT 1
+                        FROM information_schema.tables
+                        WHERE table_name = %s
+                    )
+                    """,
+                    (table_name,),
+                )
+                table_exists = bool(cursor.fetchone()[0])
+                cursor.execute(
+                    """
                     SELECT column_name
                     FROM information_schema.columns
                     WHERE table_name = %s
@@ -660,11 +674,15 @@ class PostgresWorkingSetStore:
                 if "source" in columns
                 else "outlet"
                 if "outlet" in columns
-                else "source_domain"
-                if "source_domain" in columns
-                else ""
-            ),
-        }
+                  else "source_domain"
+                  if "source_domain" in columns
+                  else ""
+              ),
+          }
+        if not table_exists:
+            raise RuntimeError(
+                f"Table '{table_name}' was not found in the configured Postgres database."
+            )
         if not mapping["doc_id"] or not mapping["text"]:
             raise RuntimeError(
                 f"Table '{table_name}' is missing required document columns. Found columns: {sorted(columns)}"
