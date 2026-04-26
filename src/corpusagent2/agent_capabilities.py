@@ -20,7 +20,7 @@ from .analysis_tools import textrank_keywords
 from .io_utils import sentence_split as simple_sentence_split
 from .python_runner_service import DockerPythonRunnerService
 from .retrieval_budgeting import infer_retrieval_budget
-from .retrieval import _load_sentence_transformer, pg_dsn_from_env
+from .retrieval import _load_sentence_transformer, pg_dsn_from_env, retrieve_tfidf
 from .seed import resolve_device
 from .tool_registry import CapabilityToolAdapter, SchemaDescriptor, ToolExecutionResult, ToolRegistry, ToolSpec
 
@@ -108,6 +108,13 @@ QUERY_ANCHOR_STOPWORDS = STOPWORDS.union(
         "how",
         "did",
         "does",
+        "individual",
+        "common",
+        "most",
+        "such",
+        "including",
+        "include",
+        "included",
         "what",
         "which",
         "who",
@@ -158,35 +165,30 @@ QUERY_ANCHOR_STOPWORDS = STOPWORDS.union(
 )
 
 
+def _add_query_anchor(anchor_terms: list[str], seen: set[str], token: str) -> None:
+    for part in re.findall(r"[A-Za-z][A-Za-z0-9]+", str(token or "")):
+        lowered = part.lower()
+        if len(lowered) < 3 or lowered in QUERY_ANCHOR_STOPWORDS or lowered in seen:
+            continue
+        seen.add(lowered)
+        anchor_terms.append(lowered)
+
+
 def _query_anchor_terms(query: str) -> list[str]:
     text = str(query or "").strip()
     if not text:
         return []
     preferred: list[str] = []
+    preferred_seen: set[str] = set()
     for match in re.finditer(r"\b[A-Z][A-Za-z0-9]*(?:-[A-Z]?[A-Za-z0-9]+)?\b", text):
         token = match.group(0).strip()
-        lowered = token.lower()
-        if lowered in QUERY_ANCHOR_STOPWORDS or len(lowered) < 3:
-            continue
-        if token not in preferred:
-            preferred.append(token)
-        if "-" in token:
-            for part in token.split("-"):
-                part = part.strip()
-                lowered_part = part.lower()
-                if len(lowered_part) < 3 or lowered_part in QUERY_ANCHOR_STOPWORDS:
-                    continue
-                if part not in preferred:
-                    preferred.append(part)
+        _add_query_anchor(preferred, preferred_seen, token)
     if preferred:
         return preferred[:8]
     fallback: list[str] = []
-    for token in re.findall(r"[A-Za-z][A-Za-z0-9\\-]+", text):
-        lowered = token.lower()
-        if len(lowered) < 4 or lowered in QUERY_ANCHOR_STOPWORDS:
-            continue
-        if token not in fallback:
-            fallback.append(token)
+    fallback_seen: set[str] = set()
+    for token in re.findall(r"[A-Za-z][A-Za-z0-9-]+", text):
+        _add_query_anchor(fallback, fallback_seen, token)
     return fallback[:8]
 
 
@@ -394,6 +396,28 @@ def _rows_are_near_duplicates(left: dict[str, Any], right: dict[str, Any]) -> bo
     return False
 
 
+def _duplicate_candidate_keys(row: dict[str, Any]) -> list[str]:
+    keys: list[str] = []
+    doc_id = str(row.get("doc_id", "")).strip()
+    if doc_id:
+        keys.append(f"doc:{doc_id}")
+    date_key = str(row.get("date", row.get("published_at", "")))[:10]
+    title_norm = _normalize_duplicate_text(str(row.get("title", "")))
+    snippet_norm = _normalize_duplicate_text(str(row.get("snippet", "")))
+    if title_norm:
+        keys.append(f"title:{title_norm}")
+        if date_key:
+            keys.append(f"date-title:{date_key}:{title_norm}")
+    if snippet_norm:
+        snippet_key = " ".join(snippet_norm.split()[:12])
+        keys.append(f"snippet:{snippet_key}")
+        if date_key:
+            keys.append(f"date-snippet:{date_key}:{snippet_key}")
+    if title_norm and snippet_norm and date_key:
+        keys.append(f"date-combo:{date_key}:{title_norm}:{' '.join(snippet_norm.split()[:8])}")
+    return keys
+
+
 def _normalize_result_rows(rows: list[dict[str, Any]], retrieval_mode: str) -> list[dict[str, Any]]:
     if not rows:
         return []
@@ -420,10 +444,21 @@ def _dedupe_wire_rows(rows: list[dict[str, Any]]) -> tuple[list[dict[str, Any]],
         return [], 0
     ordered = sorted(rows, key=lambda item: _coerce_score(item.get("score", 0.0)), reverse=True)
     kept: list[dict[str, Any]] = []
+    buckets: defaultdict[str, list[int]] = defaultdict(list)
     duplicates_removed = 0
     for row in ordered:
         duplicate_of: dict[str, Any] | None = None
-        for candidate in kept:
+        candidate_indexes: list[int] = []
+        seen_indexes: set[int] = set()
+        row_keys = _duplicate_candidate_keys(row)
+        for key in row_keys:
+            for idx in buckets.get(key, []):
+                if idx in seen_indexes:
+                    continue
+                seen_indexes.add(idx)
+                candidate_indexes.append(idx)
+        for idx in candidate_indexes:
+            candidate = kept[idx]
             if _rows_are_near_duplicates(row, candidate):
                 duplicate_of = candidate
                 break
@@ -431,6 +466,9 @@ def _dedupe_wire_rows(rows: list[dict[str, Any]]) -> tuple[list[dict[str, Any]],
             copy = dict(row)
             copy["duplicate_cluster_size"] = 1
             kept.append(copy)
+            kept_index = len(kept) - 1
+            for key in row_keys:
+                buckets[key].append(kept_index)
             continue
         duplicate_of["duplicate_cluster_size"] = int(duplicate_of.get("duplicate_cluster_size", 1)) + 1
         duplicates_removed += 1
@@ -519,6 +557,17 @@ def _sql_fallback_store(context: "AgentExecutionContext") -> PostgresWorkingSetS
     return PostgresWorkingSetStore(dsn=dsn, documents_table=table)
 
 
+def _queryable_sql_store(context: "AgentExecutionContext") -> tuple[PostgresWorkingSetStore | None, str]:
+    store = _sql_fallback_store(context)
+    if store is None:
+        return None, "Postgres corpus store is not configured."
+    try:
+        store._document_columns()
+    except Exception as exc:
+        return None, str(exc)
+    return store, ""
+
+
 def _sql_date_filters(date_column: str, date_from: str, date_to: str) -> tuple[list[str], list[Any]]:
     clauses: list[str] = []
     params: list[Any] = []
@@ -566,7 +615,9 @@ def _sql_search_rows(
         f"setweight(to_tsvector('simple', {text_expr}), 'B')"
     )
     date_clauses, date_params = _sql_date_filters(columns["date"], date_from, date_to)
-    query_text = " ".join(tokens)
+    # Exhaustive analytical retrieval should build a high-recall population. Ranked fallback
+    # retrieval can be stricter, but full materialization should not require scaffold terms.
+    query_text = " OR ".join(tokens) if top_k <= 0 else " ".join(tokens)
     sql = (
         f"SELECT "
         f"{columns['doc_id']}::text AS doc_id, "
@@ -646,6 +697,110 @@ def _sql_search_rows(
             }
         )
     return normalized
+
+
+def _local_exhaustive_rows(
+    *,
+    query: str,
+    top_k: int,
+    date_from: str,
+    date_to: str,
+    context: "AgentExecutionContext",
+) -> list[dict[str, Any]]:
+    if context.runtime is None:
+        return []
+    anchors = [anchor.lower() for anchor in _query_anchor_terms(query)]
+    if not anchors:
+        return []
+    def _metadata_scan_rows() -> list[dict[str, Any]]:
+        try:
+            metadata = context.runtime.load_metadata()
+        except Exception:
+            return []
+        if metadata.empty:
+            return []
+        date_from_key = str(date_from or "")[:10]
+        date_to_key = str(date_to or "")[:10]
+        rows: list[dict[str, Any]] = []
+        for row in metadata.itertuples(index=False):
+            published_at = str(getattr(row, "published_at", "") or "")
+            published_key = published_at[:10]
+            if date_from_key and (not published_key or published_key < date_from_key):
+                continue
+            if date_to_key and (not published_key or published_key > date_to_key):
+                continue
+            title = str(getattr(row, "title", "") or "")
+            text = str(getattr(row, "text", "") or "")
+            source = str(getattr(row, "source", "") or "")
+            title_lower = title.lower()
+            text_lower = text.lower()
+            source_lower = source.lower()
+            title_hits = sum(1 for anchor in anchors if anchor in title_lower)
+            text_hits = sum(1 for anchor in anchors if anchor in text_lower)
+            source_hits = sum(1 for anchor in anchors if anchor in source_lower)
+            if title_hits == 0 and text_hits == 0 and source_hits == 0:
+                continue
+            score = float((title_hits * 4.0) + (text_hits * 1.5) + (source_hits * 1.0))
+            rows.append(
+                {
+                    "doc_id": str(getattr(row, "doc_id", "") or ""),
+                    "title": title,
+                    "snippet": text[:360],
+                    "outlet": source,
+                    "date": published_at,
+                    "score": score,
+                    "retrieval_mode": "local_exhaustive",
+                    "score_components": {"local_exhaustive": round(score, 6)},
+                }
+            )
+        rows.sort(key=lambda item: (item["score"], str(item.get("doc_id", ""))), reverse=True)
+        return rows
+    try:
+        lexical_vectorizer, lexical_matrix, lexical_doc_ids = context.runtime.load_lexical_assets()
+        query_text = " ".join(anchors) if anchors else str(query or "")
+        retrieval_results = retrieve_tfidf(
+            query=query_text,
+            vectorizer=lexical_vectorizer,
+            matrix=lexical_matrix,
+            doc_ids=lexical_doc_ids,
+            top_k=len(lexical_doc_ids),
+        )
+        if not retrieval_results:
+            return _metadata_scan_rows()
+        score_by_id = {result.doc_id: float(result.score) for result in retrieval_results}
+        metadata = context.runtime.load_docs(list(score_by_id.keys()))
+    except Exception:
+        return _metadata_scan_rows()
+    if metadata.empty:
+        return []
+    date_from_key = str(date_from or "")[:10]
+    date_to_key = str(date_to or "")[:10]
+    rows: list[dict[str, Any]] = []
+    for row in metadata.itertuples(index=False):
+        doc_id = str(getattr(row, "doc_id", "") or "")
+        published_at = str(getattr(row, "published_at", "") or "")
+        published_key = published_at[:10]
+        if date_from_key and (not published_key or published_key < date_from_key):
+            continue
+        if date_to_key and (not published_key or published_key > date_to_key):
+            continue
+        score = float(score_by_id.get(doc_id, 0.0))
+        if score <= 0.0:
+            continue
+        rows.append(
+            {
+                "doc_id": doc_id,
+                "title": str(getattr(row, "title", "") or ""),
+                "snippet": str(getattr(row, "text", "") or "")[:360],
+                "outlet": str(getattr(row, "source", "") or ""),
+                "date": published_at,
+                "score": score,
+                "retrieval_mode": "local_exhaustive",
+                "score_components": {"local_exhaustive": round(score, 6)},
+            }
+        )
+    rows.sort(key=lambda item: (item["score"], str(item.get("doc_id", ""))), reverse=True)
+    return rows
 
 
 def _sandbox_candidate_rows(
@@ -1119,7 +1274,8 @@ def _db_search(params: dict[str, Any], deps: dict[str, ToolExecutionResult], con
     use_year_balance = bool(years) and year_balance_mode not in {"0", "false", "no", "off"}
     if year_balance_mode == "auto":
         use_year_balance = len(years) >= 2
-    sql_store_available = _sql_fallback_store(context) is not None
+    _, sql_store_error = _queryable_sql_store(context)
+    sql_store_available = not bool(sql_store_error)
 
     if retrieval_strategy == "exhaustive_analytic" and sql_store_available:
         rows, duplicates_removed = _prepare_result_rows(
@@ -1152,10 +1308,46 @@ def _db_search(params: dict[str, Any], deps: dict[str, ToolExecutionResult], con
             evidence=list(rows),
             caveats=caveats,
         )
-    if retrieval_strategy == "exhaustive_analytic" and not sql_store_available:
-        caveats.append(
-            "Exhaustive retrieval was requested, but the Postgres corpus store is unavailable, so ranked retrieval was used instead."
+    if retrieval_strategy == "exhaustive_analytic" and not sql_store_available and context.runtime is not None:
+        rows, duplicates_removed = _prepare_result_rows(
+            _local_exhaustive_rows(
+                query=query,
+                top_k=0,
+                date_from=date_from,
+                date_to=date_to,
+                context=context,
+            ),
+            top_k=0,
+            retrieval_mode="local_exhaustive",
         )
+        if rows:
+            reason = f" ({sql_store_error})" if sql_store_error else ""
+            caveats.append(
+                "Exhaustive analytical retrieval used full local lexical materialization because the Postgres corpus store was unavailable"
+                f"{reason}."
+            )
+            if duplicates_removed > 0:
+                caveats.append(f"Suppressed {duplicates_removed} near-duplicate local exhaustive retrieval hits.")
+            return ToolExecutionResult(
+                payload={
+                    "results": rows,
+                    "query": query,
+                    "retrieval_mode": "local_exhaustive",
+                    "retrieval_strategy": retrieval_strategy,
+                    "result_count": len(rows),
+                },
+                evidence=list(rows),
+                caveats=caveats,
+            )
+    if retrieval_strategy == "exhaustive_analytic" and not sql_store_available:
+        if sql_store_error:
+            caveats.append(
+                f"Exhaustive Postgres materialization was unavailable ({sql_store_error}), so ranked retrieval was used instead."
+            )
+        else:
+            caveats.append(
+                "Exhaustive retrieval was requested, but the Postgres corpus store is unavailable, so ranked retrieval was used instead."
+            )
 
     def _primary_search_once(window_from: str, window_to: str, limit: int) -> list[dict[str, Any]]:
         return context.search_backend.search(
@@ -1203,16 +1395,23 @@ def _db_search(params: dict[str, Any], deps: dict[str, ToolExecutionResult], con
         primary_error = exc
     weak_anchor_match = bool(rows) and not _rows_match_query_anchor_terms(rows, query)
     if not rows or weak_anchor_match:
-        sql_rows, sql_duplicates_removed = _balanced_candidates(
-            lambda window_from, window_to, limit: _sql_search_rows(
-                query=query,
-                top_k=limit,
-                date_from=window_from,
-                date_to=window_to,
-                context=context,
-            ),
-            "sql",
-        )
+        sql_rows: list[dict[str, Any]] = []
+        sql_duplicates_removed = 0
+        sql_error: Exception | None = None
+        if sql_store_available:
+            try:
+                sql_rows, sql_duplicates_removed = _balanced_candidates(
+                    lambda window_from, window_to, limit: _sql_search_rows(
+                        query=query,
+                        top_k=limit,
+                        date_from=window_from,
+                        date_to=window_to,
+                        context=context,
+                    ),
+                    "sql",
+                )
+            except Exception as exc:
+                sql_error = exc
         if sql_rows and (not rows or _rows_match_query_anchor_terms(sql_rows, query)):
             rows = sql_rows
             if primary_error is not None:
@@ -1222,7 +1421,12 @@ def _db_search(params: dict[str, Any], deps: dict[str, ToolExecutionResult], con
             if sql_duplicates_removed > 0:
                 caveats.append(f"Suppressed {sql_duplicates_removed} near-duplicate SQL retrieval hits.")
         elif weak_anchor_match:
-            caveats.append("Hybrid retrieval returned documents that did not match the main query entities; off-topic hits were discarded.")
+            if sql_error is not None:
+                caveats.append(f"Hybrid retrieval returned off-topic documents and SQL fallback was unavailable: {sql_error}")
+            elif not sql_store_available and sql_store_error:
+                caveats.append(f"Hybrid retrieval returned off-topic documents and SQL fallback was unavailable: {sql_store_error}")
+            else:
+                caveats.append("Hybrid retrieval returned documents that did not match the main query entities; off-topic hits were discarded.")
             rows = []
     if not rows:
         sandbox_rows = _sandbox_retrieval_rows(
@@ -1299,9 +1503,41 @@ def _sql_query_search(params: dict[str, Any], deps: dict[str, ToolExecutionResul
     top_k = budget.top_k
     date_from = str(params.get("date_from", "")).strip()
     date_to = str(params.get("date_to", "")).strip()
+    _, sql_store_error = _queryable_sql_store(context)
+    sql_store_available = not bool(sql_store_error)
     if retrieval_strategy == "exhaustive_analytic":
+        if sql_store_available:
+            rows, duplicates_removed = _prepare_result_rows(
+                _sql_search_rows(
+                    query=query,
+                    top_k=0,
+                    date_from=date_from,
+                    date_to=date_to,
+                    context=context,
+                ),
+                top_k=0,
+                retrieval_mode="sql",
+            )
+            caveats = [] if rows else ["Exhaustive SQL retrieval did not find documents matching the main query entities."]
+            if rows:
+                caveats.append(
+                    f"Exhaustive analytical retrieval used full lexical Postgres materialization and returned {len(rows)} matching documents."
+                )
+            if duplicates_removed > 0:
+                caveats.append(f"Suppressed {duplicates_removed} near-duplicate SQL retrieval hits.")
+            return ToolExecutionResult(
+                payload={
+                    "results": rows,
+                    "query": query,
+                    "retrieval_mode": "sql",
+                    "retrieval_strategy": retrieval_strategy,
+                    "result_count": len(rows),
+                },
+                evidence=list(rows),
+                caveats=caveats,
+            )
         rows, duplicates_removed = _prepare_result_rows(
-            _sql_search_rows(
+            _local_exhaustive_rows(
                 query=query,
                 top_k=0,
                 date_from=date_from,
@@ -1309,20 +1545,25 @@ def _sql_query_search(params: dict[str, Any], deps: dict[str, ToolExecutionResul
                 context=context,
             ),
             top_k=0,
-            retrieval_mode="sql",
+            retrieval_mode="local_exhaustive",
         )
-        caveats = [] if rows else ["Exhaustive SQL retrieval did not find documents matching the main query entities."]
+        caveats = []
         if rows:
             caveats.append(
-                f"Exhaustive analytical retrieval used full lexical Postgres materialization and returned {len(rows)} matching documents."
+                "Exhaustive analytical retrieval used full local lexical materialization because the Postgres corpus store was unavailable"
+                f" ({sql_store_error})."
             )
         if duplicates_removed > 0:
-            caveats.append(f"Suppressed {duplicates_removed} near-duplicate SQL retrieval hits.")
+            caveats.append(f"Suppressed {duplicates_removed} near-duplicate local exhaustive retrieval hits.")
+        if not rows:
+            caveats.append(
+                f"Exhaustive SQL retrieval was unavailable ({sql_store_error}) and local lexical materialization did not find matching documents."
+            )
         return ToolExecutionResult(
             payload={
                 "results": rows,
                 "query": query,
-                "retrieval_mode": "sql",
+                "retrieval_mode": "local_exhaustive",
                 "retrieval_strategy": retrieval_strategy,
                 "result_count": len(rows),
             },

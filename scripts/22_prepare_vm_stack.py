@@ -237,6 +237,10 @@ def _retrieval_profile_env(profile: str) -> dict[str, str]:
             "CORPUSAGENT2_PG_BUILD_IVFFLAT": "true",
             "CORPUSAGENT2_PG_BUILD_HNSW": "false",
             "CORPUSAGENT2_PG_IVF_LISTS": "1024",
+            "CORPUSAGENT2_PG_INGEST_BATCH_SIZE": "250",
+            "CORPUSAGENT2_PG_INGEST_READ_BATCH_SIZE": "2000",
+            "CORPUSAGENT2_PG_INGEST_COMMIT_EVERY_BATCHES": "8",
+            "CORPUSAGENT2_PG_INGEST_PROGRESS_EVERY_ROWS": "10000",
         }
     return {
         "CORPUSAGENT2_VM_RETRIEVAL_PROFILE": "no-dense",
@@ -246,6 +250,10 @@ def _retrieval_profile_env(profile: str) -> dict[str, str]:
         "CORPUSAGENT2_ENABLE_DENSE_RETRIEVAL": "false",
         "CORPUSAGENT2_RETRIEVAL_BACKEND": "local",
         "CORPUSAGENT2_DEFAULT_RETRIEVAL_MODE": "lexical",
+        "CORPUSAGENT2_PG_INGEST_BATCH_SIZE": "250",
+        "CORPUSAGENT2_PG_INGEST_READ_BATCH_SIZE": "2000",
+        "CORPUSAGENT2_PG_INGEST_COMMIT_EVERY_BATCHES": "8",
+        "CORPUSAGENT2_PG_INGEST_PROGRESS_EVERY_ROWS": "10000",
     }
 
 
