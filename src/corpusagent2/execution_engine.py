@@ -47,17 +47,26 @@ class PlanExecutor:
         self.registry = registry
         self._cache = cache if cache is not None else {}
 
-    def _cache_key(self, node: PlanNode, resolution_tool_name: str, dependency_results: dict[str, ToolExecutionResult]) -> str:
+    def _cache_key(
+        self,
+        node: PlanNode,
+        resolution_tool_name: str,
+        dependency_results: dict[str, ToolExecutionResult],
+        context: ExecutionContext,
+    ) -> str:
         dependency_fingerprint = {
             key: sha256(json.dumps(_safe_json(value.payload), sort_keys=True).encode("utf-8")).hexdigest()
             for key, value in sorted(dependency_results.items())
         }
+        has_explicit_query = bool(str(node.params.get("query", "")).strip())
         payload = {
             "capability": node.capability,
             "tool_name": resolution_tool_name,
             "params": _safe_json(node.params),
             "dependencies": dependency_fingerprint,
         }
+        if node.capability in {"db_search", "sql_query_search"} and not has_explicit_query:
+            payload["implicit_query_context"] = str(getattr(context.question_spec, "raw_question", "")).strip()
         encoded = json.dumps(payload, sort_keys=True).encode("utf-8")
         return sha256(encoded).hexdigest()
 
@@ -147,7 +156,7 @@ class PlanExecutor:
                     context=exec_context,
                     params=node.params,
                 )
-                cache_key = self._cache_key(node, resolution.spec.tool_name, dependency_results)
+                cache_key = self._cache_key(node, resolution.spec.tool_name, dependency_results, exec_context)
                 cache_hit = bool(node.cacheable and cache_key in self._cache)
                 if cache_hit:
                     result = self._cache[cache_key]

@@ -1107,10 +1107,84 @@ def test_planner_search_budget_is_normalized_up_for_broad_scope_questions(tmp_pa
     )
 
     search_node = next(node for node in manifest.plan_dags[0]["nodes"] if node["capability"] == "db_search")
+    assert "football" in str(search_node["inputs"].get("query", "")).lower()
     assert search_node["inputs"].get("retrieve_all") is True
     assert int(search_node["inputs"]["top_k"]) == 0
     assert int(search_node["inputs"]["fallback_top_k"]) >= 80
     assert search_node["inputs"].get("retrieval_strategy") == "exhaustive_analytic"
+
+
+def test_queryless_planner_search_nodes_do_not_reuse_cache_across_questions(tmp_path: Path) -> None:
+    docs = _sample_documents()
+
+    def plan_payload(question: str) -> dict:
+        return {
+            "action": "emit_plan_dag",
+            "rewritten_question": question,
+            "plan_dag": {
+                "nodes": [
+                    {
+                        "node_id": "search",
+                        "capability": "db_search",
+                        "inputs": {"top_k": 5, "retrieval_mode": "hybrid"},
+                    },
+                    {"node_id": "fetch", "capability": "fetch_documents", "depends_on": ["search"]},
+                ]
+            },
+            "assumptions": [],
+            "clarification_question": "",
+            "rejection_reason": "",
+            "message": "",
+        }
+
+    def rephrase_payload(question: str) -> dict:
+        return {
+            "action": "accept_with_assumptions",
+            "rewritten_question": question,
+            "assumptions": [],
+            "clarification_question": "",
+            "rejection_reason": "",
+            "message": "",
+        }
+
+    answer_payload = {
+        "answer_text": "done",
+        "caveats": [],
+        "unsupported_parts": [],
+        "claim_verdicts": [],
+        "evidence_items": [],
+        "artifacts_used": [],
+    }
+    football_question = "What is the distribution of nouns in football reports?"
+    ukraine_question = "Which media predicted the outbreak of the Ukraine war in 2022?"
+    llm = StaticLLMClient(
+        [
+            rephrase_payload(football_question),
+            plan_payload(football_question),
+            answer_payload,
+            rephrase_payload(ukraine_question),
+            plan_payload(ukraine_question),
+            answer_payload,
+        ]
+    )
+    runtime = build_test_runtime(
+        tmp_path=tmp_path,
+        documents=docs,
+        search_rows_by_query=_search_rows(docs),
+        llm_client=llm,
+    )
+
+    first = runtime.handle_query(football_question, force_answer=True, no_cache=False)
+    second = runtime.handle_query(ukraine_question, force_answer=True, no_cache=False)
+
+    first_search = next(node for node in first.plan_dags[0]["nodes"] if node["capability"] == "db_search")
+    second_search = next(node for node in second.plan_dags[0]["nodes"] if node["capability"] == "db_search")
+    second_search_record = next(record for record in second.node_records if record.capability == "db_search")
+    assert "football" in str(first_search["inputs"].get("query", "")).lower()
+    assert "ukraine" in str(second_search["inputs"].get("query", "")).lower()
+    assert second_search_record.cache_hit is False
+    assert second.selected_docs
+    assert {doc["doc_id"] for doc in second.selected_docs} == {"u1", "u2"}
 
 
 def test_derive_summary_prefers_aggregated_noun_table_over_raw_pos_rows(tmp_path: Path) -> None:
