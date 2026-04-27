@@ -17,6 +17,7 @@ from corpusagent2.agent_capabilities import (
     _fetch_documents,
     _join_external_series,
     _lang_id,
+    _plot_artifact,
     _sql_query_search,
     _time_series_aggregate,
     _topic_model,
@@ -282,6 +283,63 @@ def test_build_evidence_table_can_aggregate_noun_distribution() -> None:
     assert any(row["metric"] == "matched_document_count" and row["value"] == 2 for row in summary.payload["rows"])
 
 
+def test_build_evidence_table_accepts_token_frequency_alias_without_fake_evidence(tmp_path: Path) -> None:
+    context = AgentExecutionContext(
+        run_id="run",
+        artifacts_dir=tmp_path,
+        search_backend=None,
+        working_store=InMemoryWorkingSetStore(),
+        runtime=None,
+    )
+    deps = {
+        "fetch": ToolExecutionResult(payload={"documents": [{"doc_id": "doc-1", "text": "Club player player"}]}),
+        "pos": ToolExecutionResult(
+            payload={
+                "rows": [
+                    {"doc_id": "doc-1", "token": "Club", "lemma": "club", "pos": "NOUN"},
+                    {"doc_id": "doc-1", "token": "player", "lemma": "player", "pos": "NOUN"},
+                    {"doc_id": "doc-1", "token": "player", "lemma": "player", "pos": "NOUN"},
+                ]
+            }
+        ),
+    }
+
+    result = _build_evidence_table(
+        {"task": "aggregate_token_frequencies", "filters": {"upos": ["NOUN"]}, "limit": 2},
+        deps,
+        context,
+    )
+
+    assert result.payload["rows"][0]["lemma"] == "player"
+    assert result.evidence == []
+    assert "doc_id" not in result.payload["rows"][0]
+
+
+def test_plot_artifact_refuses_requested_missing_fields_instead_of_plotting_doc_ids(tmp_path: Path) -> None:
+    context = AgentExecutionContext(
+        run_id="run",
+        artifacts_dir=tmp_path,
+        search_backend=None,
+        working_store=InMemoryWorkingSetStore(),
+        runtime=None,
+    )
+    deps = {
+        "evidence": ToolExecutionResult(
+            payload={"rows": [{"doc_id": "abc123", "score": 0.0, "rank": 1}]}
+        )
+    }
+
+    result = _plot_artifact(
+        {"x": "lemma", "y": "count", "limit": 10, "title": "Top nouns"},
+        deps,
+        context,
+    )
+
+    assert result.metadata["no_data"] is True
+    assert result.artifacts == []
+    assert "lemma" in result.caveats[0]
+
+
 def test_db_search_uses_sql_fallback_when_primary_search_is_empty(monkeypatch, tmp_path: Path) -> None:
     monkeypatch.setattr(
         agent_capabilities,
@@ -352,6 +410,14 @@ def test_query_anchor_terms_split_hyphenated_topic_terms_and_drop_filler() -> No
     )
 
     anchors = agent_capabilities._query_anchor_terms(query)
+
+    assert anchors == ["soccer"]
+
+
+def test_query_anchor_terms_drop_generic_hyphenated_modifiers() -> None:
+    anchors = agent_capabilities._query_anchor_terms(
+        "What is the frequency distribution of noun lemmas in association-soccer reports?"
+    )
 
     assert anchors == ["soccer"]
 
@@ -794,6 +860,49 @@ def test_fetch_documents_uses_runtime_fallback_when_store_errors() -> None:
     assert result.payload["documents"][0]["doc_id"] == "doc-1"
     assert result.payload["documents"][0]["outlet"] == "example.com"
     assert any("runtime fallback was used" in caveat for caveat in result.caveats)
+
+
+def test_fetch_documents_prefers_working_set_ref_over_preview_ids(tmp_path: Path) -> None:
+    store = InMemoryWorkingSetStore()
+    store.record_documents(
+        "run",
+        [
+            {"doc_id": "doc-1", "text": "one"},
+            {"doc_id": "doc-2", "text": "two"},
+            {"doc_id": "doc-3", "text": "three"},
+        ],
+    )
+    store.record_working_set(
+        "run",
+        "full_set",
+        [{"doc_id": "doc-1", "score": 0.9}, {"doc_id": "doc-2", "score": 0.7}, {"doc_id": "doc-3", "score": 0.5}],
+    )
+    context = AgentExecutionContext(
+        run_id="run",
+        artifacts_dir=tmp_path,
+        search_backend=None,
+        working_store=store,
+        runtime=None,
+    )
+    deps = {
+        "working_set": ToolExecutionResult(
+            payload={
+                "working_set_ref": "full_set",
+                "working_set_doc_ids": ["doc-1"],
+                "document_count": 3,
+                "preview_count": 1,
+                "working_set_truncated": True,
+            }
+        )
+    }
+
+    result = _fetch_documents({"batch_size": 10}, deps, context)
+
+    assert [row["doc_id"] for row in result.payload["documents"]] == ["doc-1", "doc-2", "doc-3"]
+    assert result.payload["document_count"] == 3
+    assert result.payload["returned_document_count"] == 3
+    assert result.payload["documents_truncated"] is False
+    assert result.payload["documents"][0]["score"] == 0.9
 
 
 def test_join_external_series_can_fetch_market_data(monkeypatch, tmp_path: Path) -> None:

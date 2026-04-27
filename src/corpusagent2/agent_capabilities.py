@@ -124,9 +124,13 @@ QUERY_ANCHOR_STOPWORDS = {
     "analyze",
     "analyzed",
     "and",
+    "association",
+    "associations",
+    "associated",
     "around",
     "article",
     "articles",
+    "available",
     "before",
     "been",
     "being",
@@ -157,6 +161,9 @@ QUERY_ANCHOR_STOPWORDS = {
     "full",
     "have",
     "how",
+    "identified",
+    "identifying",
+    "identify",
     "include",
     "included",
     "including",
@@ -193,6 +200,8 @@ QUERY_ANCHOR_STOPWORDS = {
     "toward",
     "towards",
     "under",
+    "used",
+    "using",
     "weekly",
     "were",
     "what",
@@ -1897,7 +1906,7 @@ def _fetch_documents(params: dict[str, Any], deps: dict[str, ToolExecutionResult
     working_set_ref = str(params.get("working_set_ref", "") or _working_set_ref(deps)).strip()
     if working_set_ref and not explicit_doc_ids:
         doc_ids = []
-    if not doc_ids:
+    if not doc_ids and not working_set_ref:
         doc_ids = _working_set_doc_ids(deps)
     if not doc_ids and not working_set_ref:
         doc_ids = [str(row.get("doc_id", "")) for row in search_rows if str(row.get("doc_id", "")).strip()]
@@ -3023,10 +3032,51 @@ def _quote_attribute(params: dict[str, Any], deps: dict[str, ToolExecutionResult
     return ToolExecutionResult(payload={"rows": attributed})
 
 
+NOUN_FREQUENCY_TASK_ALIASES = {
+    "aggregate_noun_frequencies",
+    "aggregate_noun_frequency",
+    "aggregate_noun_lemma_distribution",
+    "aggregate_noun_lemmas",
+    "aggregate_token_frequencies",
+    "frequency_distribution",
+    "noun_frequencies",
+    "noun_frequency",
+    "noun_frequency_distribution",
+    "noun_lemma_distribution",
+    "token_frequency_distribution",
+}
+
+
+def _is_noun_frequency_task(task: str, params: dict[str, Any]) -> bool:
+    if task in NOUN_FREQUENCY_TASK_ALIASES:
+        return True
+    filters = params.get("filters")
+    upos_values: set[str] = set()
+    if isinstance(filters, dict):
+        raw_upos = filters.get("upos", filters.get("pos", []))
+        if isinstance(raw_upos, str):
+            upos_values.add(raw_upos.upper())
+        elif isinstance(raw_upos, list):
+            upos_values.update(str(item).upper() for item in raw_upos)
+    return bool("frequency" in task and ("noun" in task or "NOUN" in upos_values or "PROPN" in upos_values))
+
+
+def _int_param(params: dict[str, Any], *names: str, default: int, minimum: int = 1, maximum: int = 1000) -> int:
+    for name in names:
+        if params.get(name) in (None, ""):
+            continue
+        try:
+            value = int(params.get(name) or default)
+        except (TypeError, ValueError):
+            continue
+        return max(minimum, min(maximum, value))
+    return max(minimum, min(maximum, default))
+
+
 def _build_evidence_table(params: dict[str, Any], deps: dict[str, ToolExecutionResult], context: AgentExecutionContext) -> ToolExecutionResult:
     task = str(params.get("task", "")).strip().lower()
-    if task == "noun_frequency_distribution":
-        top_k = int(params.get("top_k", 100) or 100)
+    if _is_noun_frequency_task(task, params):
+        top_k = _int_param(params, "top_k", "limit", default=100, maximum=5000)
         documents = _text_rows(deps)
         working_set_ref = str(params.get("working_set_ref", "") or _working_set_ref(deps)).strip()
         documents_truncated = _dependency_payload_flag(deps, "documents_truncated")
@@ -3291,7 +3341,8 @@ def _write_svg_plot_fallback(
     target = target.with_suffix(".svg")
     x_key = str(params.get("x", "")).strip()
     y_key = str(params.get("y", "")).strip()
-    first = rows[:16]
+    limit = _int_param(params, "limit", "top_k", default=16, maximum=75)
+    first = rows[:limit]
     labels = [
         str(
             item.get(
@@ -3307,7 +3358,7 @@ def _write_svg_plot_fallback(
     ]
     max_value = max((abs(value) for value in values), default=1.0) or 1.0
     width = 960
-    height = 540
+    height = max(420, 100 + (len(first) * 26))
     left = 180
     top = 72
     row_height = 24
@@ -3349,10 +3400,34 @@ def _plot_artifact(params: dict[str, Any], deps: dict[str, ToolExecutionResult],
             caveats=["No rows available for plotting."],
             metadata={"no_data": True, "no_data_reason": "No rows available for plotting."},
         )
+    limit = _int_param(params, "limit", "top_k", default=16, maximum=100)
+    first = [dict(item) for item in rows[:limit] if isinstance(item, dict)]
+    if not first:
+        return ToolExecutionResult(
+            payload={"rows": []},
+            caveats=["No structured rows available for plotting."],
+            metadata={"no_data": True, "no_data_reason": "No structured rows available for plotting."},
+        )
+    x_key = str(params.get("x", "")).strip()
+    y_key = str(params.get("y", "")).strip()
+    if x_key and not all(x_key in item for item in first):
+        return ToolExecutionResult(
+            payload={"rows": []},
+            caveats=[f"Plot requested x='{x_key}', but upstream rows do not contain that field."],
+            metadata={"no_data": True, "no_data_reason": f"Missing plot x field: {x_key}"},
+        )
+    if y_key and not all(y_key in item for item in first):
+        return ToolExecutionResult(
+            payload={"rows": []},
+            caveats=[f"Plot requested y='{y_key}', but upstream rows do not contain that field."],
+            metadata={"no_data": True, "no_data_reason": f"Missing plot y field: {y_key}"},
+        )
     plot_dir = context.artifacts_dir / "plots"
     plot_dir.mkdir(parents=True, exist_ok=True)
-    target = plot_dir / f"{params.get('plot_name', 'plot')}.png"
-    plot_name = str(params.get("plot_name", "plot")).replace("_", " ").title()
+    raw_plot_name = str(params.get("plot_name") or params.get("title") or "plot").strip() or "plot"
+    plot_slug = re.sub(r"[^A-Za-z0-9_.-]+", "_", raw_plot_name).strip("._")[:80] or "plot"
+    target = plot_dir / f"{plot_slug}.png"
+    plot_name = str(params.get("title") or raw_plot_name).replace("_", " ").title()
     try:
         import matplotlib
 
@@ -3360,7 +3435,6 @@ def _plot_artifact(params: dict[str, Any], deps: dict[str, ToolExecutionResult],
         import matplotlib.pyplot as plt
     except Exception as exc:
         fallback_target = _write_svg_plot_fallback(params=params, rows=rows, target=target, plot_name=plot_name)
-        first = rows[:16]
         return ToolExecutionResult(
             payload={"artifact_path": str(fallback_target), "rows": first, "plot_name": plot_name},
             artifacts=[str(fallback_target)],
@@ -3368,8 +3442,8 @@ def _plot_artifact(params: dict[str, Any], deps: dict[str, ToolExecutionResult],
             metadata={"fallback": "svg", "reason": "matplotlib_unavailable"},
         )
     plt.style.use("seaborn-v0_8-whitegrid")
-    figure, axis = plt.subplots(figsize=(12.5, 6.6), dpi=180)
-    first = rows[:16]
+    figure_height = max(5.6, min(14.0, 2.7 + (0.34 * len(first))))
+    figure, axis = plt.subplots(figsize=(13.2, figure_height), dpi=180)
     unique_time_bins = {
         str(item.get("time_bin", "unknown"))
         for item in first
@@ -3446,8 +3520,6 @@ def _plot_artifact(params: dict[str, Any], deps: dict[str, ToolExecutionResult],
         if handles:
             axis.legend(loc="best", fontsize=8, frameon=True)
     else:
-        x_key = str(params.get("x", "")).strip()
-        y_key = str(params.get("y", "")).strip()
         labels = [
             str(
                 item.get(
@@ -3461,18 +3533,44 @@ def _plot_artifact(params: dict[str, Any], deps: dict[str, ToolExecutionResult],
             float(item.get(y_key, item.get("count", item.get("score", item.get("weight", item.get("intensity", 0.0))))))
             for item in first
         ]
-        colors = ["#0f766e" if value >= 0 else "#be123c" for value in values]
-        bars = axis.bar(labels, values, color=colors, edgecolor="#17312d", linewidth=0.5)
-        for bar, value in zip(bars, values, strict=False):
-            axis.text(
-                bar.get_x() + bar.get_width() / 2,
-                value,
-                f"{value:.2f}",
-                ha="center",
-                va="bottom" if value >= 0 else "top",
-                fontsize=8,
+        if y_key and all(value == 0.0 for value in values) and y_key not in first[0]:
+            plt.close()
+            return ToolExecutionResult(
+                payload={"rows": []},
+                caveats=[f"Plot requested y='{y_key}', but upstream rows did not provide plottable non-zero values."],
+                metadata={"no_data": True, "no_data_reason": f"Missing usable plot y values: {y_key}"},
             )
-        axis.tick_params(axis="x", rotation=35)
+        colors = ["#0f766e" if value >= 0 else "#be123c" for value in values]
+        needs_horizontal = len(labels) > 8 or max((len(label) for label in labels), default=0) > 18
+        if needs_horizontal:
+            plotted_labels = labels[::-1]
+            plotted_values = values[::-1]
+            plotted_colors = colors[::-1]
+            bars = axis.barh(plotted_labels, plotted_values, color=plotted_colors, edgecolor="#17312d", linewidth=0.5)
+            max_abs = max((abs(value) for value in plotted_values), default=1.0) or 1.0
+            for bar, value in zip(bars, plotted_values, strict=False):
+                x_offset = max_abs * 0.012
+                axis.text(
+                    value + (x_offset if value >= 0 else -x_offset),
+                    bar.get_y() + bar.get_height() / 2,
+                    f"{value:g}",
+                    ha="left" if value >= 0 else "right",
+                    va="center",
+                    fontsize=8,
+                )
+            axis.set_xlabel(y_key or "Value")
+        else:
+            bars = axis.bar(labels, values, color=colors, edgecolor="#17312d", linewidth=0.5)
+            for bar, value in zip(bars, values, strict=False):
+                axis.text(
+                    bar.get_x() + bar.get_width() / 2,
+                    value,
+                    f"{value:g}",
+                    ha="center",
+                    va="bottom" if value >= 0 else "top",
+                    fontsize=8,
+                )
+            axis.tick_params(axis="x", rotation=25)
 
     axis.set_title(plot_name, fontsize=15, fontweight="bold")
     axis.set_facecolor("#fffaf2")

@@ -981,6 +981,20 @@ def test_heuristic_anchor_terms_split_hyphenated_topics_and_drop_scaffold(tmp_pa
     assert anchors == ["soccer"]
 
 
+def test_heuristic_anchor_terms_drop_generic_hyphenated_modifiers(tmp_path: Path) -> None:
+    runtime = build_test_runtime(
+        tmp_path=tmp_path,
+        documents=_sample_documents(),
+        search_rows_by_query={},
+    )
+
+    anchors = runtime.orchestrator._query_anchor_terms(
+        "What is the frequency distribution of noun lemmas in association-soccer reports?"
+    )
+
+    assert anchors == ["soccer"]
+
+
 def test_heuristic_anchor_terms_prefer_resolved_meaning(tmp_path: Path) -> None:
     runtime = build_test_runtime(
         tmp_path=tmp_path,

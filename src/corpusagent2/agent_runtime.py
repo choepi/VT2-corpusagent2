@@ -387,7 +387,11 @@ class MagicBoxOrchestrator:
             "analysis",
             "analyze",
             "and",
+            "association",
+            "associations",
+            "associated",
             "around",
+            "available",
             "between",
             "breakdown",
             "collection",
@@ -402,6 +406,9 @@ class MagicBoxOrchestrator:
             "from",
             "frequency",
             "how",
+            "identified",
+            "identifying",
+            "identify",
             "include",
             "included",
             "including",
@@ -426,6 +433,8 @@ class MagicBoxOrchestrator:
             "there",
             "this",
             "those",
+            "used",
+            "using",
             "what",
             "when",
             "where",
@@ -905,6 +914,10 @@ class MagicBoxOrchestrator:
                     "Size retrieval budgets to the question, and never use tiny default retrieval budgets for broad analytical questions. "
                     "When using db_search for ranked retrieval, set top_k and, when helpful, lexical_top_k, dense_top_k, rerank_top_k, and use_rerank based on the scope needed to answer the question faithfully. "
                     "When retrieve_all is true, top_k is only a fallback budget and must not be treated as the analyzed population size. "
+                    "For analytical frequency tables, use build_evidence_table with supported task names exactly: noun_frequency_distribution for noun/POS lemma counts, and summary_stats for compact aggregate summaries. "
+                    "Do not invent near-synonym task names such as aggregate_token_frequencies unless a tool catalog entry explicitly documents them. "
+                    "For plot_artifact, depend on the analytical table node and pass x, y, limit or top_k, and title; do not plot document evidence rows as if they were aggregate rows. "
+                    "When a clarification says one term means another, use the resolved term as the retrieval anchor; avoid hyphenated synonym paraphrases that introduce broad generic anchors. "
                     "When the user specifies an output limit such as 'top 20', pass that through to the relevant aggregation or plot node instead of hardcoding your own. "
                     "Treat clarification_history as authoritative user follow-up memory. If prior follow-up answers only resolve part of an ambiguity, ask only for the missing remainder instead of repeating the full earlier clarification prompt. "
                     "Do not assume the corpus is news unless the question or corpus schema indicates that."
@@ -931,7 +944,8 @@ class MagicBoxOrchestrator:
             "Return valid JSON with keys action, rewritten_question, assumptions, clarification_question, rejection_reason, message, plan_dag. "
             "Allowed actions: ask_clarification, emit_plan_dag, grounded_rejection. "
             "If action is emit_plan_dag, plan_dag.nodes must contain at least one executable node with node_id, capability, optional tool_name, inputs, and depends_on. "
-            "Choose retrieval budgets and retrieval_strategy values that match question scope instead of relying on tiny generic defaults."
+            "Choose retrieval budgets and retrieval_strategy values that match question scope instead of relying on tiny generic defaults. "
+            "Use documented build_evidence_table task names, especially noun_frequency_distribution for noun/POS lemma counts, and do not plot document evidence rows as aggregate plots."
         )
         try:
             trace = self.llm_client.complete_json_trace(

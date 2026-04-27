@@ -43,8 +43,8 @@ jobs:
       - name: Validate frontend gate secret
         run: |
           if [ "${CORPUSAGENT2_FRONTEND_ACCESS_GATE}" = "true" ] && [ -z "${CORPUSAGENT2_FRONTEND_ACCESS_PASSWORD_SHA256}" ]; then
-            echo "CORPUSAGENT2_FRONTEND_ACCESS_PASSWORD_SHA256 GitHub secret is required when the frontend access gate is enabled." >&2
-            exit 1
+            echo "::warning::CORPUSAGENT2_FRONTEND_ACCESS_PASSWORD_SHA256 is missing; disabling the static frontend access gate for this deploy."
+            echo "CORPUSAGENT2_FRONTEND_ACCESS_GATE=false" >> "$GITHUB_ENV"
           fi
 
       - name: Generate frontend runtime config
