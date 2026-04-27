@@ -1,283 +1,223 @@
 # CorpusAgent2
 
-CorpusAgent2 is an evidence-first agent runtime for longitudinal news analysis over a large corpus.
-The active system surface is the FastAPI backend, the capability-first tool registry, the PlanDAG executor,
-the web inspector, and the retrieval stack behind them.
+CorpusAgent2 is a prototype for asking questions over a large news corpus.
 
-Legacy deterministic framework files still exist as baseline material, but they are not the primary runtime path.
+The backend does the retrieval and analysis work. The frontend is just a small
+inspector UI so I can see the plan, tool calls, evidence, artifacts, and final
+answer while a run is happening.
 
-## Runtime Focus
+It is not meant to be a polished product yet. It is a working research/prototype
+repo, so some parts are cleaner than others.
 
-- capability-first tool selection instead of library-specific planning
-- LLM planning for clarification, assumptions, PlanDAG generation, revision, and synthesis
-- lexical + dense + rerank retrieval with explicit runtime health reporting
-- evidence tables, artifacts, and provenance persisted per run
-- safe Python sandbox execution for bounded analysis/code paths
+## What is in here
 
-## Retrieval Stack
+- FastAPI backend for the agent runtime
+- Static frontend in `web/`
+- Postgres/pgvector and OpenSearch retrieval support
+- local lexical/dense retrieval assets
+- planner/executor traces saved per run
+- evidence tables, plots, and run artifacts under `outputs/`
+- scripts for preparing CC-News style data
 
-`Lexical -> Dense -> Fusion (RRF) -> Cross-Encoder Rerank -> NLI Verification`
+## Requirements
 
-Implemented runtime stack:
+- Python 3.11
+- `uv`
+- Docker, if you want to run Postgres and OpenSearch locally
+- an OpenAI-compatible API key, unless you are only testing non-LLM pieces
+- corpus data, if you are building the index from scratch
 
-- lexical retrieval via TF-IDF (`scripts/02_build_retrieval_assets.py` + `scripts/03_evaluate_retrieval.py`)
-- dense retrieval with `intfloat/e5-base-v2`
-- dense candidate rerank fallback when full-corpus dense assets are not ready yet
-- RRF fusion
-- cross-encoder reranking
-- NLI claim verification
+## Quick start on Windows
 
-## Provenance Contract
+From PowerShell:
 
-Every tool call can be persisted with:
+```powershell
+uv sync
+Copy-Item .env.example .env
+notepad .env
+```
 
-- `run_id`
-- `tool_name`
-- `tool_version`
-- `model_id`
-- `params_hash`
-- `inputs_ref`
-- `outputs_ref`
-- `evidence` list of `{doc_id, chunk_id, score_components, span_offsets}`
+At minimum, set these in `.env`:
 
-See `src/corpusagent2/agent_runtime.py`, `src/corpusagent2/agent_executor.py`, and `src/corpusagent2/provenance.py`.
+```dotenv
+OPENAI_API_KEY=your_key_here
+CORPUSAGENT2_FRONTEND_API_BASE_URL=http://127.0.0.1:8001
+```
 
-## KPI Schemas
+If you want the local database services:
 
-See `config/kpi_schema.json`:
+```powershell
+docker compose -f deploy\docker-compose.yml up -d postgres opensearch
+```
 
-- `SentimentSeries(entity, time_bin, mean, std, n_docs, model_id)`
-- `EntityTrend(entity, time_bin, count, doc_freq, top_cooccurring, confidence_stats, model_id)`
-- `TopicsOverTime(topic_id, time_bin, weight, top_terms, coherence_proxy)`
-- `BurstEvents(entity_or_term, burst_level, start, end, intensity)`
-- `Keyphrases(phrase, time_bin, score, doc_freq, method)`
+Start the backend and frontend:
 
-## Repository Layout
+```powershell
+.\.venv\Scripts\python.exe scripts\15_start_local_stack.py
+```
+
+Then open:
 
 ```text
-corpusagent2/
-  config/
-  data/
-    raw/incoming/
-    raw/ccnews_staged/
-    processed/
-    indices/
-  log/
-  outputs/
-  scripts/
-  slurm/
-  src/corpusagent2/
+http://127.0.0.1:5500
 ```
 
-## Local Run (No Docker)
+The API is on:
 
-Python requirement: `3.11.x`
-
-Device selection:
-
-- default is automatic: `cuda -> mps -> cpu`
-- local override (machine-specific) uses env var `CORPUSAGENT2_DEVICE` with values: `auto`, `cuda`, `mps`, `cpu`
-- Windows current shell override example: `set CORPUSAGENT2_DEVICE=cpu`
-- hardware check via uv (no project resolution):
-
-```bash
-uv run --no-project --python .venv\Scripts\python.exe python -c "import json,sys; sys.path.insert(0,'src'); from corpusagent2.seed import runtime_device_report; print(json.dumps(runtime_device_report(), indent=2))"
+```text
+http://127.0.0.1:8001
 ```
 
-Retrieval backend selection:
-
-- default is local file-based retrieval assets
-- set `CORPUSAGENT2_RETRIEVAL_BACKEND=pgvector` to use Postgres/pgvector for dense retrieval
-- required for pgvector mode: `CORPUSAGENT2_PG_DSN`
-- optional: `CORPUSAGENT2_PG_TABLE` (default: `article_corpus`)
-
-Temporal KPI aggregation:
-
-- set `CORPUSAGENT2_TIME_GRANULARITY=year` (default) or `month` before `scripts/05_run_nlp_tooling.py`
-- sentiment/time-series consumers should request exactly one granularity
-- mixed time bins are rejected by MCP `sentiment_over_time` tool (no silent LLM/NLI fallback)
-
-1. Install dependencies:
+## Quick start on Linux/macOS
 
 ```bash
 uv sync
+cp .env.example .env
 ```
 
-2. Put CC-News source files (`.jsonl` or `.jsonl.gz`) into `data/raw/incoming/`.
+Edit `.env` and set:
 
-3. Run data/retrieval stages:
+```dotenv
+OPENAI_API_KEY=your_key_here
+CORPUSAGENT2_FRONTEND_API_BASE_URL=http://127.0.0.1:8001
+```
+
+Start local services if needed:
+
+```bash
+docker compose -f deploy/docker-compose.yml up -d postgres opensearch
+```
+
+Run the app:
+
+```bash
+.venv/bin/python scripts/15_start_local_stack.py
+```
+
+Open `http://127.0.0.1:5500`.
+
+## If the app starts but retrieval is empty
+
+That usually means the UI and backend are running, but the corpus/index is not
+ready yet.
+
+For a fresh local corpus build, put `.jsonl` or `.jsonl.gz` files in:
+
+```text
+data/raw/incoming/
+```
+
+Then run the preparation scripts:
 
 ```bash
 python scripts/00_stage_ccnews_files.py
 python scripts/01_prepare_dataset.py
 python scripts/02_build_retrieval_assets.py
-python scripts/03_evaluate_retrieval.py
-python scripts/04_evaluate_faithfulness.py
-python scripts/05_run_nlp_tooling.py
-```
-
-4. Optional interactive prompt:
-
-```bash
-python main.py
-```
-
-5. Optional Postgres/pgvector setup:
-
-```bash
 python scripts/09_init_postgres_schema.py
 python scripts/10_ingest_parquet_to_postgres.py
+python scripts/21_bulk_index_opensearch.py
 python scripts/26_backfill_pgvector_embeddings.py
 python scripts/11_build_pgvector_index.py
 ```
 
-For a fresh Ubuntu VM, prefer the single bootstrap:
+This can take a while on a real corpus.
+
+For a fresh Ubuntu VM, the easier path is:
 
 ```bash
 python3 scripts/22_prepare_vm_stack.py --install-system
 ```
 
-`hybrid` is the default VM profile. That path builds lexical assets locally, ingests the corpus into Postgres, backfills pgvector embeddings directly in the database, bulk-indexes OpenSearch, and then builds the pgvector ANN index once the backfill is complete. Pass `--retrieval-profile no-dense` if you want the lighter lexical-only VM path.
+## Useful commands
 
-Example environment variables (Windows cmd):
-
-```bash
-set CORPUSAGENT2_PG_DSN=postgresql://USER:PASSWORD@HOST:5432/DBNAME
-set CORPUSAGENT2_PG_TABLE=article_corpus
-set CORPUSAGENT2_RETRIEVAL_BACKEND=pgvector
-```
-
-## Agent Runtime Quick Start
-
-The agent runtime uses `config/app_config.toml` as the default toggle file and lets `.env` override those values for machine-specific secrets.
-
-Useful overrides include:
-
-- `CORPUSAGENT2_LLM_PROVIDER`
-- `CORPUSAGENT2_LLM_BASE_URL`
-- `CORPUSAGENT2_LLM_API_KEY`
-- `CORPUSAGENT2_FRONTEND_API_BASE_URL`
-- `CORPUSAGENT2_PG_DSN`
-- `CORPUSAGENT2_OPENSEARCH_URL`
-
-1. Inspect the effective config:
+Print the config the backend is actually using:
 
 ```bash
-./.venv/bin/python scripts/16_print_effective_config.py
+python scripts/16_print_effective_config.py
 ```
 
-2. Start backend + static frontend together:
+Run the backend only:
 
 ```bash
-./.venv/bin/python scripts/15_start_local_stack.py
+python scripts/12_run_agent_api.py
 ```
 
-3. If you prefer to run them separately:
+Run the frontend only:
 
 ```bash
-./.venv/bin/python scripts/12_run_agent_api.py
-./.venv/bin/python scripts/13_write_frontend_config.py
-./.venv/bin/python scripts/14_run_static_frontend.py
+python scripts/14_run_static_frontend.py
 ```
 
-4. Repair or complete dense retrieval when needed:
-
-Preferred VM path:
+Run tests:
 
 ```bash
-./.venv/bin/python scripts/22_prepare_vm_stack.py
+python -m pytest -q
 ```
 
-Manual repair path:
-
-```bash
-./.venv/bin/python scripts/26_backfill_pgvector_embeddings.py
-./.venv/bin/python scripts/11_build_pgvector_index.py
-```
-
-`/runtime-info` and the frontend now show whether full-corpus dense retrieval is truly ready, whether the runtime is using pgvector, local dense assets, or the dense candidate-rerank fallback, and how many pgvector rows currently have embeddings.
-
-5. Optional temporary public demo path:
-
-- keep the static frontend on GitHub Pages
-- expose the FastAPI backend with Cloudflare Tunnel or a VM HTTPS endpoint
-- do not expose Postgres or OpenSearch directly
-- Quick Tunnels are for testing/development only
-
-6. Optional Ubuntu VM bootstrap:
-
-```bash
-bash scripts/bootstrap_ubuntu_vm.sh /home/$USER/corpusagent2
-```
-
-7. Deployment notes:
-
-- GitHub Pages deploys only `web/`
-- the Pages workflow generates `web/config.js` from `config/app_config.toml`
-- keep machine-specific secrets and backend URLs in `.env`
-- see `docs/deployment.md` for local, tunnel, and VM deployment paths
-
-## MCP Server
-
-Run the MCP server when you want tool-based integration (stdio transport):
+Run the MCP server:
 
 ```bash
 python scripts/07_mcp_server.py
 ```
 
-## Slurm Run
+## Config notes
 
-Default Slurm resources are encoded directly in each submit script:
+Most defaults live in:
 
-- partition: `gpu_top`
-- gpu: `1`
-- cpus: `16`
-- mem: `64G`
-- time: `24:00:00`
-- account: `cai_nlp`
-
-Submit commands:
-
-```bash
-sbatch /home/$USER/corpusagent2/slurm/run_prepare.sbatch
-sbatch /home/$USER/corpusagent2/slurm/run_build_assets.sbatch
-sbatch /home/$USER/corpusagent2/slurm/run_evaluation.sbatch
-sbatch /home/$USER/corpusagent2/slurm/run_framework.sbatch
+```text
+config/app_config.toml
 ```
 
-If you want a best-effort recommendation for backfill-friendly GPU submit parameters before submitting, run:
+Machine-specific values go in `.env`. The main ones I usually touch are:
 
-```bash
-python scripts/29_advise_slurm_submit.py --profile prebuilt_bundle
+```dotenv
+OPENAI_API_KEY=
+CORPUSAGENT2_FRONTEND_API_BASE_URL=
+CORPUSAGENT2_PG_DSN=
+CORPUSAGENT2_RETRIEVAL_BACKEND=
+CORPUSAGENT2_OPENSEARCH_URL=
+CORPUSAGENT2_DEVICE=
 ```
 
-Each Slurm script:
+The frontend writes `web/config.js` when it starts. If the frontend is calling
+the wrong backend URL, check `CORPUSAGENT2_FRONTEND_API_BASE_URL`.
 
-- uses `#!/bin/bash -l`
-- stages code to `/scratch/$USER/...` with `rsync -aL` (follows symlinks)
-- activates `/home/$USER/corpusagent2/.venv/bin/activate`
-- sets HF caches to scratch
-- syncs generated outputs back to project home
+## Where output goes
 
-## Notes on Gold Data
+Runs write files under:
 
-`config/retrieval_queries.jsonl` and `config/faithfulness_claims.jsonl` are starter templates.
-For meaningful metrics, populate:
+```text
+outputs/agent_runtime/
+```
 
-- `relevant_doc_ids`
-- `gold_evidence_doc_ids`
-- claim categories (`A/B/C/D`) and evidence mapping
+The useful files are usually:
 
-Gold files used by scripts:
+- `summary.json`
+- `nodes/*.json`
+- generated plots/artifacts
+- selected evidence rows
 
-- retrieval evaluation/backtests: `config/retrieval_queries.jsonl`
-- faithfulness evaluation: `config/faithfulness_claims.jsonl`
-- framework workload queries + ad-hoc claims: `config/framework_workload.jsonl`
+When a run looks strange, start with the node JSON files. They show what each
+tool received, what it returned, and why it may have produced no data.
 
-## Reproducibility
+## Repo map
 
-- deterministic seeds are set in all scripts (`SEED` constant)
-- all stages write machine-readable JSON summaries in `outputs/`
-- retrieval + verification outputs are tracked by run id
-- runtime manifests persist tool calls, selected documents, evidence tables, artifacts, and final outputs
+```text
+config/                default config
+data/                  raw and processed corpus data
+deploy/                docker compose for Postgres/OpenSearch
+docs/                  longer notes
+outputs/               generated run output
+scripts/               setup, indexing, runtime, and utility scripts
+src/corpusagent2/      backend/runtime code
+tests/                 pytest suite
+web/                   static frontend
+```
+
+## Current caveats
+
+- Some analytics are still heuristic in the prototype.
+- Large corpus setup needs disk space and patience.
+- Full hybrid retrieval expects Postgres/pgvector and OpenSearch to be healthy.
+- The frontend is a debugging UI, not a finished app.
 

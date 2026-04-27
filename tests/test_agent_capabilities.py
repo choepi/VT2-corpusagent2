@@ -340,6 +340,90 @@ def test_plot_artifact_refuses_requested_missing_fields_instead_of_plotting_doc_
     assert "lemma" in result.caveats[0]
 
 
+def test_plot_artifact_resolves_noun_lemma_alias_to_lemma(tmp_path: Path) -> None:
+    context = AgentExecutionContext(
+        run_id="run",
+        artifacts_dir=tmp_path,
+        search_backend=None,
+        working_store=InMemoryWorkingSetStore(),
+        runtime=None,
+    )
+    deps = {
+        "table": ToolExecutionResult(
+            payload={"rows": [{"lemma": "team", "count": 3}, {"lemma": "game", "count": 2}]}
+        )
+    }
+
+    result = _plot_artifact(
+        {"x": "noun_lemma", "y": "count", "top_k": 2, "title": "Top nouns"},
+        deps,
+        context,
+    )
+
+    assert result.artifacts
+    assert Path(result.payload["artifact_path"]).exists()
+    assert result.payload["resolved_x"] == "lemma"
+    assert result.metadata["resolved_x"] == "lemma"
+    assert any("Resolved plot x field 'noun_lemma'" in caveat for caveat in result.caveats)
+
+
+def test_plot_artifact_infers_fields_when_axis_names_are_omitted(tmp_path: Path) -> None:
+    context = AgentExecutionContext(
+        run_id="run",
+        artifacts_dir=tmp_path,
+        search_backend=None,
+        working_store=InMemoryWorkingSetStore(),
+        runtime=None,
+    )
+    deps = {
+        "table": ToolExecutionResult(
+            payload={
+                "rows": [
+                    {"outlet": "NZZ", "mentions": "1,200"},
+                    {"outlet": "TA", "mentions": "950"},
+                    {"outlet": "SRF", "mentions": "not available"},
+                    {"outlet": "WOZ", "mentions": "125"},
+                ]
+            }
+        )
+    }
+
+    result = _plot_artifact({"top_k": 3, "title": "Mentions by outlet"}, deps, context)
+
+    assert result.artifacts
+    assert Path(result.payload["artifact_path"]).exists()
+    assert result.payload["resolved_x"] == "outlet"
+    assert result.payload["resolved_y"] == "mentions"
+    assert result.payload["plotted_row_count"] == 3
+    assert any("Inferred plot x field 'outlet'" in caveat for caveat in result.caveats)
+    assert any("Inferred plot y field 'mentions'" in caveat for caveat in result.caveats)
+
+
+def test_plot_artifact_resolves_normalized_axis_aliases(tmp_path: Path) -> None:
+    context = AgentExecutionContext(
+        run_id="run",
+        artifacts_dir=tmp_path,
+        search_backend=None,
+        working_store=InMemoryWorkingSetStore(),
+        runtime=None,
+    )
+    deps = {
+        "table": ToolExecutionResult(
+            payload={"rows": [{"lemma": "team", "count": 3}, {"lemma": "game", "count": 2}]}
+        )
+    }
+
+    result = _plot_artifact(
+        {"x": "noun lemma", "y": "frequency", "top_k": 2, "title": "Top nouns"},
+        deps,
+        context,
+    )
+
+    assert result.artifacts
+    assert result.payload["resolved_x"] == "lemma"
+    assert result.payload["resolved_y"] == "count"
+
+
 def test_db_search_uses_sql_fallback_when_primary_search_is_empty(monkeypatch, tmp_path: Path) -> None:
     monkeypatch.setattr(
         agent_capabilities,
@@ -606,6 +690,41 @@ def test_noun_distribution_streams_full_working_set_when_fetch_is_preview(tmp_pa
     assert rows_by_lemma["banana"]["document_frequency"] == 3
     assert result.payload["analyzed_document_count"] == 3
     assert result.metadata["full_working_set"] is True
+
+
+def test_noun_distribution_streaming_filters_function_words(tmp_path: Path) -> None:
+    store = InMemoryWorkingSetStore()
+    working_rows = [{"doc_id": "doc-1", "rank": 1, "score": 1.0}]
+    store.record_working_set("run", "all_docs", working_rows)
+    store.document_lookup["doc-1"] = {
+        "doc_id": "doc-1",
+        "title": "",
+        "text": "was his said but are has they will team game soccer soccer player",
+        "published_at": "2022-01-01",
+        "source": "NZZ",
+    }
+    context = AgentExecutionContext(
+        run_id="run",
+        artifacts_dir=tmp_path,
+        search_backend=_EmptySearchBackend(),
+        working_store=store,
+        runtime=None,
+    )
+    fetch_preview = ToolExecutionResult(
+        payload={
+            "documents": [],
+            "working_set_ref": "all_docs",
+            "document_count": 1,
+            "returned_document_count": 0,
+            "documents_truncated": True,
+        }
+    )
+
+    result = _build_evidence_table({"task": "noun_frequency_distribution", "top_k": 10}, {"fetch": fetch_preview}, context)
+
+    lemmas = {row["lemma"] for row in result.payload["rows"]}
+    assert {"team", "game", "soccer", "player"}.issubset(lemmas)
+    assert not {"was", "his", "said", "but", "are", "has", "they", "will"}.intersection(lemmas)
 
 
 def test_local_exhaustive_requires_multi_anchor_coverage(monkeypatch, tmp_path: Path) -> None:
