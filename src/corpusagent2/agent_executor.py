@@ -181,17 +181,32 @@ class AsyncPlanExecutor:
         node: AgentPlanNode,
         resolution_tool_name: str,
         dependency_results: dict[str, ToolExecutionResult],
+        context: AgentExecutionContext,
     ) -> str:
         dependency_fingerprint = {
             key: sha256(json.dumps(_safe_json(value.payload), sort_keys=True).encode("utf-8")).hexdigest()
             for key, value in sorted(dependency_results.items())
         }
+        implicit_query_context = ""
+        node_inputs = dict(node.inputs)
+        payload_inputs = node_inputs.get("payload") if isinstance(node_inputs.get("payload"), dict) else {}
+        has_explicit_query = bool(
+            str(node_inputs.get("query", "")).strip()
+            or str(payload_inputs.get("query", "")).strip()
+        )
+        if node.capability in {"db_search", "sql_query_search"} and not has_explicit_query:
+            implicit_query_context = str(
+                getattr(context.state, "rewritten_question", "")
+                or getattr(context.state, "question", "")
+            ).strip()
         payload = {
             "capability": node.capability,
             "tool_name": resolution_tool_name,
             "inputs": _safe_json(node.inputs),
             "dependencies": dependency_fingerprint,
         }
+        if implicit_query_context:
+            payload["implicit_query_context"] = implicit_query_context
         encoded = json.dumps(payload, sort_keys=True).encode("utf-8")
         return sha256(encoded).hexdigest()
 
@@ -266,7 +281,7 @@ class AsyncPlanExecutor:
                 None,
             )
 
-        cache_key = self._cache_key(node, resolution.spec.tool_name, dependency_results)
+        cache_key = self._cache_key(node, resolution.spec.tool_name, dependency_results, context)
         start_event_payload = {
             "event": "node_started",
             "node_id": node.node_id,

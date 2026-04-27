@@ -276,10 +276,15 @@ class MagicBoxOrchestrator:
             for part in [question_text, dag.metadata.get("question_family", "")]
             if part
         ).strip()
+        query_text = ""
+        if dag_text:
+            query_text = self._compact_query_terms(dag_text, self._query_anchor_terms(dag_text)) or dag_text
         search_inputs = infer_retrieval_budget(
             dag_text,
             configured_mode=os.getenv("CORPUSAGENT2_DEFAULT_RETRIEVAL_MODE", "hybrid"),
         ).to_inputs()
+        if query_text:
+            search_inputs["query"] = query_text
         if requires_retrieval_backbone:
             search_inputs.update(self._extract_date_window(dag_text))
 
@@ -306,14 +311,18 @@ class MagicBoxOrchestrator:
             depends_on = list(node.depends_on)
             node_inputs = dict(node.inputs)
             if node.capability in self._SEARCH_BACKBONE_CAPABILITIES:
+                payload_inputs = node_inputs.get("payload") if isinstance(node_inputs.get("payload"), dict) else {}
+                merged_node_inputs = {**payload_inputs, **{key: value for key, value in node_inputs.items() if key != "payload"}}
                 normalized_search_inputs = infer_retrieval_budget(
                     dag_text,
-                    inputs=node_inputs,
+                    inputs=merged_node_inputs,
                     configured_mode=os.getenv("CORPUSAGENT2_DEFAULT_RETRIEVAL_MODE", "hybrid"),
                 ).to_inputs()
                 for key in ("query", "date_from", "date_to", "year_balance", "retrieve_all", "retrieval_strategy"):
-                    if key in node_inputs and node_inputs.get(key) not in (None, ""):
-                        normalized_search_inputs[key] = node_inputs[key]
+                    if key in merged_node_inputs and merged_node_inputs.get(key) not in (None, ""):
+                        normalized_search_inputs[key] = merged_node_inputs[key]
+                if query_text and not str(normalized_search_inputs.get("query", "")).strip():
+                    normalized_search_inputs["query"] = query_text
                 node_inputs = normalized_search_inputs
             if node.capability == "fetch_documents" and search_node_id and not depends_on:
                 depends_on = [search_node_id]
@@ -906,6 +915,7 @@ class MagicBoxOrchestrator:
                     "Prefer typed repo tools before python_runner. "
                     "Use python_runner only as a bounded last-resort fallback when no typed tool fits or a typed tool has already failed. "
                     "Prefer db_search plus fetch_documents for normal retrieval. "
+                    "Every db_search or sql_query_search node must include a non-empty query string derived from the rewritten question; do not rely on implicit query context. "
                     "Use sql_query_search when hybrid retrieval is sparse, off-target, or entity coverage is poor. "
                     "Choose an explicit retrieval_strategy when planning retrieval-backed work. "
                     "Use retrieval_strategy='exhaustive_analytic' for corpus-wide aggregates, distributions, trends, comparisons, and questions that ask for all relevant records; in that mode the goal is to materialize the full candidate working set before analysis rather than relying on a tiny ranked slice. "
