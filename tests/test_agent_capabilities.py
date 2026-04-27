@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import base64
+from concurrent.futures import ThreadPoolExecutor
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import corpusagent2.retrieval as retrieval
 import pandas as pd
@@ -77,6 +79,11 @@ class _OffTopicSearchBackend:
                 "score": 0.8,
             }
         ]
+
+
+class _FailingSearchBackend:
+    def search(self, **kwargs):
+        raise RuntimeError("backend rejected query syntax")
 
 
 class _CapturingSearchBackend:
@@ -207,6 +214,31 @@ def test_fetch_documents_can_read_working_set_doc_ids_from_dependency_payload() 
     assert result.payload["documents"][0]["doc_id"] == "doc-1"
 
 
+def test_fetch_documents_resolves_node_id_working_set_ref_from_dependency_payload() -> None:
+    store = InMemoryWorkingSetStore()
+    store.document_lookup["doc-1"] = {
+        "doc_id": "doc-1",
+        "title": "Sample",
+        "text": "Document text",
+        "published_at": "2022-02-20",
+        "source": "example.com",
+    }
+    store.record_working_set("run", "actual_ref", [{"doc_id": "doc-1", "rank": 1, "score": 1.0}])
+    context = AgentExecutionContext(
+        run_id="run",
+        artifacts_dir=Path("."),
+        search_backend=None,
+        working_store=store,
+        runtime=None,
+    )
+    deps = {"fetch": ToolExecutionResult(payload={"working_set_ref": "actual_ref", "document_count": 1})}
+
+    result = _fetch_documents({"working_set_ref": "n2", "limit": 1}, deps, context)
+
+    assert result.payload["working_set_ref"] == "actual_ref"
+    assert result.payload["documents"][0]["doc_id"] == "doc-1"
+
+
 def test_clean_normalize_lang_id_and_working_set_flow_preserves_documents() -> None:
     store = InMemoryWorkingSetStore()
     context = AgentExecutionContext(
@@ -313,6 +345,96 @@ def test_build_evidence_table_accepts_token_frequency_alias_without_fake_evidenc
     assert result.payload["rows"][0]["lemma"] == "player"
     assert result.evidence == []
     assert "doc_id" not in result.payload["rows"][0]
+
+
+def test_build_evidence_table_uses_heuristic_noun_distribution_without_pos_rows(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(agent_capabilities, "_load_spacy_model", lambda: None)
+    context = AgentExecutionContext(
+        run_id="run",
+        artifacts_dir=tmp_path,
+        search_backend=None,
+        working_store=InMemoryWorkingSetStore(),
+        runtime=None,
+    )
+    deps = {
+        "fetch": ToolExecutionResult(
+            payload={
+                "documents": [
+                    {"doc_id": "doc-1", "text": "Football club player player"},
+                    {"doc_id": "doc-2", "text": "Soccer club strategy"},
+                ],
+                "document_count": 2,
+                "returned_document_count": 2,
+                "documents_truncated": False,
+            }
+        )
+    }
+
+    result = _build_evidence_table({"task": "noun_frequency_distribution", "top_k": 5}, deps, context)
+
+    rows_by_lemma = {row["lemma"]: row for row in result.payload["rows"]}
+    assert rows_by_lemma["player"]["count"] == 2
+    assert rows_by_lemma["club"]["document_frequency"] == 2
+    assert result.metadata["provider"] == "heuristic_batch"
+    assert result.metadata["preview_only"] is False
+
+
+def test_noun_distribution_ignores_machine_payload_terms(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(agent_capabilities, "_load_spacy_model", lambda: None)
+    context = AgentExecutionContext(
+        run_id="run",
+        artifacts_dir=tmp_path,
+        search_backend=None,
+        working_store=InMemoryWorkingSetStore(),
+        runtime=None,
+    )
+    deps = {
+        "fetch": ToolExecutionResult(
+            payload={
+                "documents": [
+                    {
+                        "doc_id": "doc-1",
+                        "title": "Ronaldo transfer value debate",
+                        "text": (
+                            '","duration":174,"analytics":{"video_id":"abc"},'
+                            '"thumbnail_url":"https://example.invalid/t.jpg",'
+                            '"article_type":"uber_article","content_type":"video"'
+                        ),
+                    }
+                ],
+                "document_count": 1,
+                "returned_document_count": 1,
+                "documents_truncated": False,
+            }
+        )
+    }
+
+    result = _build_evidence_table({"task": "noun_frequency_distribution", "top_k": 20}, deps, context)
+
+    lemmas = {row["lemma"] for row in result.payload["rows"]}
+    assert {"ronaldo", "transfer", "value", "debate"}.intersection(lemmas)
+    assert "duration" not in lemmas
+    assert "analytics" not in lemmas
+    assert result.metadata["machine_payload_document_count"] == 1
+
+
+def test_result_normalization_penalizes_machine_payload_snippets() -> None:
+    rows = [
+        {
+            "doc_id": "json",
+            "title": "Video shell",
+            "snippet": '","duration":174,"analytics":{"video_id":"abc"},"thumbnail_url":"x","content_type":"video"',
+            "score": 10.0,
+        },
+        {"doc_id": "article", "title": "Article", "snippet": "Ronaldo scored in the football match.", "score": 9.0},
+    ]
+
+    normalized = agent_capabilities._normalize_result_rows(rows, "sql")
+
+    assert normalized[0]["doc_id"] == "article"
+    machine_row = next(row for row in normalized if row["doc_id"] == "json")
+    assert machine_row["snippet_is_machine_payload"] is True
+    assert machine_row["score_quality_multiplier"] < 1.0
 
 
 def test_plot_artifact_refuses_requested_missing_fields_instead_of_plotting_doc_ids(tmp_path: Path) -> None:
@@ -424,6 +546,793 @@ def test_plot_artifact_resolves_normalized_axis_aliases(tmp_path: Path) -> None:
     assert result.payload["resolved_y"] == "count"
 
 
+def test_plot_artifact_resolves_month_and_series_aliases(tmp_path: Path) -> None:
+    context = AgentExecutionContext(
+        run_id="run",
+        artifacts_dir=tmp_path,
+        search_backend=None,
+        working_store=InMemoryWorkingSetStore(),
+        runtime=None,
+    )
+    deps = {
+        "table": ToolExecutionResult(
+            payload={
+                "rows": [
+                    {"time_bin": "2017-01", "linked_entity": "SPUR", "document_frequency": 4},
+                    {"time_bin": "2017-02", "linked_entity": "SPUR", "document_frequency": 7},
+                    {"time_bin": "2017-01", "linked_entity": "HUD", "document_frequency": 2},
+                    {"time_bin": "2017-02", "linked_entity": "HUD", "document_frequency": 3},
+                ]
+            }
+        )
+    }
+
+    result = _plot_artifact(
+        {"plot_type": "line", "x": "month", "y": "document_frequency", "series": "actor", "title": "Actors"},
+        deps,
+        context,
+    )
+
+    assert result.artifacts
+    assert result.payload["resolved_x"] == "time_bin"
+    assert result.payload["resolved_y"] == "document_frequency"
+    assert result.payload["resolved_series"] == "linked_entity"
+    assert agent_capabilities._image_has_visual_content(Path(result.payload["artifact_path"]))
+
+
+def test_plot_artifact_outputs_nonblank_images_when_called_concurrently(tmp_path: Path) -> None:
+    deps = {
+        "table": ToolExecutionResult(
+            payload={
+                "rows": [
+                    {"time_bin": "2017-01", "canonical_entity": "Switzerland", "count": 4},
+                    {"time_bin": "2017-02", "canonical_entity": "Switzerland", "count": 6},
+                    {"time_bin": "2017-01", "canonical_entity": "Paris Agreement", "count": 3},
+                    {"time_bin": "2017-02", "canonical_entity": "Paris Agreement", "count": 2},
+                ]
+            }
+        )
+    }
+
+    def render(index: int) -> ToolExecutionResult:
+        context = AgentExecutionContext(
+            run_id=f"run-{index}",
+            artifacts_dir=tmp_path / f"run-{index}",
+            search_backend=None,
+            working_store=InMemoryWorkingSetStore(),
+            runtime=None,
+        )
+        return _plot_artifact(
+            {
+                "plot_type": "line",
+                "x": "time_bin",
+                "y": "count",
+                "series": "canonical_entity",
+                "title": f"Concurrent Plot {index}",
+            },
+            deps,
+            context,
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(render, range(2)))
+
+    for result in results:
+        assert result.artifacts
+        assert agent_capabilities._image_has_visual_content(Path(result.payload["artifact_path"]))
+
+
+def test_plot_artifact_resolves_published_at_to_time_bin(tmp_path: Path) -> None:
+    context = AgentExecutionContext(
+        run_id="run",
+        artifacts_dir=tmp_path,
+        search_backend=None,
+        working_store=InMemoryWorkingSetStore(),
+        runtime=None,
+    )
+    deps = {
+        "series": ToolExecutionResult(
+            payload={"rows": [{"entity": "Trump", "time_bin": "2017-01", "normalized_value": 4.0}]}
+        )
+    }
+
+    result = _plot_artifact(
+        {"plot_type": "line", "x": "published_at", "y": "normalized_value", "series": "entity"},
+        deps,
+        context,
+    )
+
+    assert result.artifacts
+    assert result.payload["resolved_x"] == "time_bin"
+    assert result.payload["resolved_y"] == "normalized_value"
+
+
+def test_plot_artifact_resolves_published_at_month_to_time_bin(tmp_path: Path) -> None:
+    context = AgentExecutionContext(
+        run_id="run",
+        artifacts_dir=tmp_path,
+        search_backend=None,
+        working_store=InMemoryWorkingSetStore(),
+        runtime=None,
+    )
+    deps = {
+        "series": ToolExecutionResult(
+            payload={"rows": [{"canonical_entity": "Switzerland", "time_bin": "2017-01", "mention_count": 4}]}
+        )
+    }
+
+    result = _plot_artifact(
+        {"plot_type": "line", "x": "published_at_month", "y": "mention_count", "series": "canonical_entity"},
+        deps,
+        context,
+    )
+
+    assert result.artifacts
+    assert result.payload["resolved_x"] == "time_bin"
+
+
+def test_plot_artifact_resolves_entity_canonical_series_alias(tmp_path: Path) -> None:
+    context = AgentExecutionContext(
+        run_id="run",
+        artifacts_dir=tmp_path,
+        search_backend=None,
+        working_store=InMemoryWorkingSetStore(),
+        runtime=None,
+    )
+    deps = {
+        "series": ToolExecutionResult(
+            payload={
+                "rows": [
+                    {"canonical_entity": "NZZ", "month": "2017-01", "mention_share": 0.2},
+                    {"canonical_entity": "NZZ", "month": "2017-02", "mention_share": 0.1},
+                ]
+            }
+        )
+    }
+
+    result = _plot_artifact(
+        {"plot_type": "line", "x": "month", "y": "mention_share", "series": "entity_canonical"},
+        deps,
+        context,
+    )
+
+    assert result.artifacts
+    assert result.payload["resolved_series"] == "canonical_entity"
+
+
+def test_plot_artifact_resolves_monthly_entity_share_alias(tmp_path: Path) -> None:
+    context = AgentExecutionContext(
+        run_id="run",
+        artifacts_dir=tmp_path,
+        search_backend=None,
+        working_store=InMemoryWorkingSetStore(),
+        runtime=None,
+    )
+    deps = {
+        "series": ToolExecutionResult(
+            payload={
+                "rows": [
+                    {"canonical_entity": "NZZ", "month": "2017-01", "mention_share": 0.2},
+                    {"canonical_entity": "NZZ", "month": "2017-02", "mention_share": 0.1},
+                ]
+            }
+        )
+    }
+
+    result = _plot_artifact(
+        {
+            "plot_type": "line",
+            "x": "month",
+            "y": "share_of_monthly_entity_mentions",
+            "series": "canonical_entity",
+        },
+        deps,
+        context,
+    )
+
+    assert result.artifacts
+    assert result.payload["resolved_y"] == "mention_share"
+
+
+def test_plot_artifact_resolves_share_of_documents_alias(tmp_path: Path) -> None:
+    context = AgentExecutionContext(
+        run_id="run",
+        artifacts_dir=tmp_path,
+        search_backend=None,
+        working_store=InMemoryWorkingSetStore(),
+        runtime=None,
+    )
+    deps = {
+        "table": ToolExecutionResult(
+            payload={"rows": [{"entity": "Trump", "time_bin": "2017-01", "share_of_docs": 0.25}]}
+        )
+    }
+
+    result = _plot_artifact(
+        {"x": "entity", "y": "share_of_documents", "title": "Entity share"},
+        deps,
+        context,
+    )
+
+    assert result.artifacts
+    assert result.payload["resolved_y"] == "share_of_docs"
+
+
+def test_plot_artifact_resolves_share_of_mentions_alias(tmp_path: Path) -> None:
+    context = AgentExecutionContext(
+        run_id="run",
+        artifacts_dir=tmp_path,
+        search_backend=None,
+        working_store=InMemoryWorkingSetStore(),
+        runtime=None,
+    )
+    deps = {
+        "table": ToolExecutionResult(
+            payload={"rows": [{"entity": "Trump", "time_bin": "2017-01", "mention_share": 0.5}]}
+        )
+    }
+
+    result = _plot_artifact(
+        {"x": "entity", "y": "share_of_mentions", "title": "Mention share"},
+        deps,
+        context,
+    )
+
+    assert result.artifacts
+    assert result.payload["resolved_y"] == "mention_share"
+
+
+def test_plot_artifact_resolves_normalized_document_frequency_alias(tmp_path: Path) -> None:
+    context = AgentExecutionContext(
+        run_id="run",
+        artifacts_dir=tmp_path,
+        search_backend=None,
+        working_store=InMemoryWorkingSetStore(),
+        runtime=None,
+    )
+    deps = {
+        "series": ToolExecutionResult(
+            payload={"rows": [{"entity": "Switzerland", "time_bin": "2017-01", "normalized_value": 3.0}]}
+        )
+    }
+
+    result = _plot_artifact(
+        {"plot_type": "line", "x": "time_bin", "y": "normalized_document_frequency", "series": "entity"},
+        deps,
+        context,
+    )
+
+    assert result.artifacts
+    assert result.payload["resolved_y"] == "normalized_value"
+
+    result = _plot_artifact(
+        {"plot_type": "line", "x": "time_bin", "y": "document_frequency_normalized", "series": "entity"},
+        deps,
+        context,
+    )
+
+    assert result.artifacts
+    assert result.payload["resolved_y"] == "normalized_value"
+
+
+def test_plot_artifact_prefers_nonzero_alias_candidate(tmp_path: Path) -> None:
+    context = AgentExecutionContext(
+        run_id="run",
+        artifacts_dir=tmp_path,
+        search_backend=None,
+        working_store=InMemoryWorkingSetStore(),
+        runtime=None,
+    )
+    deps = {
+        "table": ToolExecutionResult(
+            payload={
+                "rows": [
+                    {
+                        "entity": "Switzerland",
+                        "time_bin": "2017-01",
+                        "share_of_documents": 0.0,
+                        "mention_share": 0.25,
+                    }
+                ]
+            }
+        )
+    }
+
+    result = _plot_artifact(
+        {"x": "entity", "y": "share_of_climate_docs", "title": "Climate document share"},
+        deps,
+        context,
+    )
+
+    assert result.artifacts
+    assert result.payload["resolved_y"] == "mention_share"
+
+
+def test_build_evidence_table_uses_task_name_for_entity_frequency(tmp_path: Path) -> None:
+    context = AgentExecutionContext(
+        run_id="run",
+        artifacts_dir=tmp_path,
+        search_backend=None,
+        working_store=InMemoryWorkingSetStore(),
+        runtime=None,
+    )
+    deps = {
+        "entities": ToolExecutionResult(
+            payload={
+                "rows": [
+                    {"doc_id": "d1", "linked_entity": "SPUR", "label": "ORG", "time_bin": "2017-01"},
+                    {"doc_id": "d1", "linked_entity": "SPUR", "label": "ORG", "time_bin": "2017-01"},
+                    {"doc_id": "d2", "linked_entity": "HUD", "label": "ORG", "time_bin": "2017-02"},
+                    {"doc_id": "d3", "linked_entity": "2017", "label": "DATE", "time_bin": "2017-02"},
+                ]
+            }
+        )
+    }
+
+    result = _build_evidence_table(
+        {
+            "task_name": "named_entity_distribution",
+            "entity_field": "linked_entity",
+            "entity_types": ["ORG"],
+            "group_by_time": "month",
+        },
+        deps,
+        context,
+    )
+
+    rows = result.payload["rows"]
+    spur = next(row for row in rows if row["entity"] == "SPUR")
+    assert spur["month"] == "2017-01"
+    assert spur["mention_count"] == 2
+    assert spur["document_frequency"] == 1
+    assert all(row["entity"] != "2017" for row in rows)
+
+
+def test_python_runner_handles_native_entity_aggregation_without_sandbox(tmp_path: Path) -> None:
+    context = AgentExecutionContext(
+        run_id="run",
+        artifacts_dir=tmp_path,
+        search_backend=None,
+        working_store=InMemoryWorkingSetStore(),
+        runtime=None,
+        python_runner=None,
+    )
+    deps = {
+        "entities": ToolExecutionResult(
+            payload={"rows": [{"doc_id": "d1", "entity": "Emmanuel Macron", "label": "PERSON", "time_bin": "2017-12"}]}
+        )
+    }
+
+    result = agent_capabilities._python_runner(
+        {"task": "aggregate_named_entity_prominence_overall", "entity_types": ["PERSON"]},
+        deps,
+        context,
+    )
+
+    assert result.payload["rows"][0]["entity"] == "Emmanuel Macron"
+    assert result.payload["exit_code"] == 0
+
+
+def test_python_runner_flattens_nested_entity_aggregation_params(tmp_path: Path) -> None:
+    context = AgentExecutionContext(
+        run_id="run",
+        artifacts_dir=tmp_path,
+        search_backend=None,
+        working_store=InMemoryWorkingSetStore(),
+        runtime=None,
+        python_runner=None,
+    )
+    deps = {
+        "entities": ToolExecutionResult(
+            payload={
+                "rows": [
+                    {
+                        "doc_id": "d1",
+                        "entity_text": "Switzerland",
+                        "entity_label": "GPE",
+                        "published_at": "2017-01-15",
+                    },
+                    {
+                        "doc_id": "d1",
+                        "entity_text": "2017",
+                        "entity_label": "DATE",
+                        "published_at": "2017-01-15",
+                    },
+                ]
+            }
+        )
+    }
+
+    result = agent_capabilities._python_runner(
+        {
+            "task": "aggregate_named_entities_overall_and_monthly",
+            "params": {
+                "entity_text_field": "entity_text",
+                "entity_label_field": "entity_label",
+                "allowed_entity_labels": ["GPE"],
+                "time_field": "published_at",
+            },
+        },
+        deps,
+        context,
+    )
+
+    rows = result.payload["rows"]
+    assert rows[0]["entity"] == "Switzerland"
+    assert rows[0]["month"] == "2017-01"
+    assert all(row["entity"] != "2017" for row in rows)
+
+
+def test_actor_prominence_merge_preserves_time_and_filters_junk_entities(tmp_path: Path) -> None:
+    context = AgentExecutionContext(
+        run_id="run",
+        artifacts_dir=tmp_path,
+        search_backend=None,
+        working_store=InMemoryWorkingSetStore(),
+        runtime=None,
+        python_runner=None,
+    )
+    deps = {
+        "actors": ToolExecutionResult(
+            payload={
+                "rows": [
+                    {
+                        "actor": "Councilman Ritchie Torres",
+                        "month": "2017-01",
+                        "mention_count": 2,
+                        "document_frequency": 1,
+                    },
+                    {"actor": "he", "month": "2017-01", "mention_count": 2},
+                    {"actor": "ICICI Bank today", "month": "2017-02", "mention_count": 1},
+                ]
+            }
+        )
+    }
+
+    result = agent_capabilities._python_runner(
+        {"task": "merge_actor_prominence_series"},
+        deps,
+        context,
+    )
+
+    actors = {row["actor"]: row for row in result.payload["rows"]}
+    assert "he" not in actors
+    assert actors["Councilman Ritchie Torres"]["month"] == "2017-01"
+    assert "ICICI Bank" in actors
+    assert "ICICI Bank today" not in actors
+
+
+def test_entity_surface_filter_keeps_real_uppercase_entities() -> None:
+    assert agent_capabilities._valid_entity_surface("US")
+    assert agent_capabilities._valid_entity_surface("U.S.")
+    assert agent_capabilities._valid_entity_surface("Will Smith")
+    assert not agent_capabilities._valid_entity_surface("has")
+    assert not agent_capabilities._valid_entity_surface("He")
+    assert not agent_capabilities._valid_entity_surface("report")
+    assert not agent_capabilities._valid_entity_surface("1cd6eb4bc602a32061d545e5bd3b39a7895b851ef3de7a82b1a82b39d630bc6f")
+
+
+def test_sentence_split_rows_remain_document_inputs_for_downstream_tools(tmp_path: Path) -> None:
+    context = AgentExecutionContext(
+        run_id="run",
+        artifacts_dir=tmp_path,
+        search_backend=None,
+        working_store=InMemoryWorkingSetStore(),
+        runtime=None,
+    )
+    deps = {
+        "fetch": ToolExecutionResult(
+            payload={
+                "documents": [
+                    {
+                        "doc_id": "d1",
+                        "text": "Cristiano Ronaldo is an elite star. Lionel Messi has great value.",
+                        "published_at": "2018-01-02",
+                        "source": "sports.example",
+                    }
+                ]
+            }
+        )
+    }
+
+    split = agent_capabilities._sentence_split_docs({}, deps, context)
+    rows = agent_capabilities._doc_rows({"split": split})
+
+    assert rows[0]["published_at"] == "2018-01-02"
+    assert "Cristiano Ronaldo" in rows[0]["text"]
+
+
+def test_claim_span_extract_honors_target_aliases_and_focus_terms(tmp_path: Path) -> None:
+    context = AgentExecutionContext(
+        run_id="run",
+        artifacts_dir=tmp_path,
+        search_backend=None,
+        working_store=InMemoryWorkingSetStore(),
+        runtime=None,
+    )
+    deps = {
+        "docs": ToolExecutionResult(
+            payload={
+                "documents": [
+                    {
+                        "doc_id": "d1",
+                        "text": "Cristiano Ronaldo was called an elite star. A coach discussed unrelated tactics.",
+                        "published_at": "2018-01-02",
+                        "source": "sports.example",
+                    },
+                    {
+                        "doc_id": "d2",
+                        "text": "Lionel Messi retained great value for Barcelona.",
+                        "published_at": "2018-02-03",
+                        "source": "sports.example",
+                    },
+                ]
+            }
+        )
+    }
+
+    result = agent_capabilities._claim_span_extract(
+        {
+            "targets": [
+                {"label": "Cristiano Ronaldo", "match_terms": ["Ronaldo"]},
+                {"label": "Lionel Messi", "match_terms": ["Messi"]},
+            ],
+            "claim_focus_terms": ["elite", "value"],
+        },
+        deps,
+        context,
+    )
+
+    rows = result.payload["rows"]
+    assert {row["target_entity"] for row in rows} == {"Cristiano Ronaldo", "Lionel Messi"}
+    assert all(row["claim_span"] for row in rows)
+    assert all(row["entity_label"] for row in rows)
+    assert all(row["published_at"] for row in rows)
+
+
+def test_targeted_claim_and_sentiment_infer_comparison_entities_from_question(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("CORPUSAGENT2_PROVIDER_ORDER_SENTIMENT", "heuristic")
+    context = AgentExecutionContext(
+        run_id="run",
+        artifacts_dir=tmp_path,
+        search_backend=None,
+        working_store=InMemoryWorkingSetStore(),
+        runtime=None,
+        state=SimpleNamespace(question="How did the perceived value of Cristiano Ronaldo versus Lionel Messi evolve over time?"),
+    )
+    deps = {
+        "docs": ToolExecutionResult(
+            payload={
+                "documents": [
+                    {
+                        "doc_id": "d1",
+                        "text": "Cristiano Ronaldo signed a valuable contract. Lionel Messi retained great market value.",
+                        "published_at": "2018-03-20",
+                        "source": "sports.example",
+                    }
+                ]
+            }
+        )
+    }
+
+    claims = agent_capabilities._claim_span_extract(
+        {"query_focus": "Cristiano Ronaldo Lionel Messi value valuation worth market value contract"},
+        deps,
+        context,
+    )
+    sentiment = agent_capabilities._sentiment(
+        {
+            "window_strategy": "entity_local_context",
+            "context_keywords": ["value", "contract"],
+            "query_focus": "Cristiano Ronaldo Lionel Messi value contract",
+        },
+        deps,
+        context,
+    )
+
+    assert {row["target_entity"] for row in claims.payload["rows"]} == {"Cristiano Ronaldo", "Lionel Messi"}
+    assert {row["entity_label"] for row in sentiment.payload["rows"]} == {"Cristiano Ronaldo", "Lionel Messi"}
+
+
+def test_time_series_aggregate_merges_metric_sources_by_series_definitions(tmp_path: Path) -> None:
+    context = AgentExecutionContext(
+        run_id="run",
+        artifacts_dir=tmp_path,
+        search_backend=None,
+        working_store=InMemoryWorkingSetStore(),
+        runtime=None,
+    )
+    deps = {
+        "entities": ToolExecutionResult(
+            payload={
+                "rows": [
+                    {"doc_id": "d1", "entity": "Ronaldo", "published_at": "2018-01-02"},
+                    {"doc_id": "d2", "entity": "Messi", "published_at": "2018-01-03"},
+                ]
+            }
+        ),
+        "strength": ToolExecutionResult(
+            payload={"rows": [{"doc_id": "d1", "target_entity": "Cristiano Ronaldo", "published_at": "2018-01-02", "score": 0.7}]}
+        ),
+        "sentiment": ToolExecutionResult(
+            payload={"rows": [{"doc_id": "d2", "target_entity": "Lionel Messi", "published_at": "2018-01-03", "score": 0.25}]}
+        ),
+    }
+
+    result = _time_series_aggregate(
+        {
+            "bucket": "month",
+            "series_definitions": [
+                {"series_name": "Cristiano Ronaldo", "aliases": ["Ronaldo"]},
+                {"series_name": "Lionel Messi", "aliases": ["Messi"]},
+            ],
+            "metrics": [
+                {"name": "mention_count", "source": "entities", "aggregation": "count"},
+                {"name": "avg_claim_strength", "source": "strength", "aggregation": "mean"},
+                {"name": "avg_claim_sentiment", "source": "sentiment", "aggregation": "mean"},
+            ],
+        },
+        deps,
+        context,
+    )
+
+    rows = {(row["series_name"], row["time_bin"]): row for row in result.payload["rows"]}
+    assert rows[("Cristiano Ronaldo", "2018-01")]["mention_count"] == 1
+    assert rows[("Cristiano Ronaldo", "2018-01")]["avg_claim_strength"] == 0.7
+    assert rows[("Lionel Messi", "2018-01")]["avg_claim_sentiment"] == 0.25
+    assert rows[("Lionel Messi", "2018-01")]["bucket"] == "2018-01"
+
+
+def test_time_series_aggregate_uses_metrics_source_and_mean_alias_fields(tmp_path: Path) -> None:
+    context = AgentExecutionContext(
+        run_id="run",
+        artifacts_dir=tmp_path,
+        search_backend=None,
+        working_store=InMemoryWorkingSetStore(),
+        runtime=None,
+    )
+    deps = {
+        "claims": ToolExecutionResult(
+            payload={
+                "rows": [
+                    {"doc_id": "d1", "entity_label": "Cristiano Ronaldo", "published_at": "2018-01-02"},
+                ]
+            }
+        ),
+        "scores": ToolExecutionResult(
+            payload={
+                "rows": [
+                    {"doc_id": "d1", "entity_label": "Cristiano Ronaldo", "published_at": "2018-01-02", "claim_strength_score": 0.5},
+                    {"doc_id": "d2", "entity_label": "Cristiano Ronaldo", "published_at": "2018-01-03", "claim_strength_score": 0.9},
+                ]
+            }
+        ),
+    }
+
+    result = _time_series_aggregate(
+        {
+            "documents_source": "claims",
+            "metrics_source": "scores",
+            "time_field": "published_at",
+            "series_key": "entity_label",
+            "value_field": "claim_strength_score",
+            "aggregation": "mean",
+            "interval": "month",
+        },
+        deps,
+        context,
+    )
+
+    rows = result.payload["rows"]
+    assert rows[0]["entity_label"] == "Cristiano Ronaldo"
+    assert rows[0]["claim_strength_score"] == 0.7
+    assert rows[0]["mean_claim_strength_score"] == 0.7
+    assert rows[0]["bucket"] == "2018-01"
+
+
+def test_time_series_aggregate_handles_document_series_and_string_metrics(tmp_path: Path) -> None:
+    context = AgentExecutionContext(
+        run_id="run",
+        artifacts_dir=tmp_path,
+        search_backend=None,
+        working_store=InMemoryWorkingSetStore(),
+        runtime=None,
+    )
+    deps = {
+        "docs": ToolExecutionResult(
+            payload={
+                "documents": [
+                    {
+                        "doc_id": "d1",
+                        "text": "Cristiano Ronaldo signed a valuable new contract.",
+                        "published_at": "2018-03-20",
+                    },
+                    {
+                        "doc_id": "d2",
+                        "text": "Lionel Messi retained high market value.",
+                        "published_at": "2018-03-21",
+                    },
+                ]
+            }
+        )
+    }
+
+    result = _time_series_aggregate(
+        {
+            "documents_node": "docs",
+            "bucket_granularity": "month",
+            "series": [
+                {"name": "ronaldo_value_docs", "entity_terms": ["Cristiano Ronaldo", "Ronaldo"], "keyword_terms": ["contract", "value"]},
+                {"name": "messi_value_docs", "entity_terms": ["Lionel Messi", "Messi"], "keyword_terms": ["market value"]},
+            ],
+            "metrics": ["document_count"],
+        },
+        deps,
+        context,
+    )
+
+    rows = {(row["series_name"], row["time_bin"]): row for row in result.payload["rows"]}
+    assert rows[("Cristiano Ronaldo", "2018-03")]["document_count"] == 1
+    assert rows[("Lionel Messi", "2018-03")]["document_count"] == 1
+
+
+def test_time_series_aggregate_handles_named_average_metrics(tmp_path: Path) -> None:
+    context = AgentExecutionContext(
+        run_id="run",
+        artifacts_dir=tmp_path,
+        search_backend=None,
+        working_store=InMemoryWorkingSetStore(),
+        runtime=None,
+    )
+    deps = {
+        "sentiment": ToolExecutionResult(
+            payload={
+                "rows": [
+                    {"doc_id": "d1", "entity_label": "Cristiano Ronaldo", "published_at": "2018-03-20", "sentiment_score": 0.4},
+                    {"doc_id": "d2", "entity_label": "Cristiano Ronaldo", "published_at": "2018-03-21", "sentiment_score": 0.8},
+                ]
+            }
+        )
+    }
+
+    result = _time_series_aggregate(
+        {
+            "documents_node": "sentiment",
+            "time_field": "published_at",
+            "group_by": "target_label",
+            "metrics": ["average_sentiment", "document_count"],
+            "bucket_granularity": "month",
+        },
+        deps,
+        context,
+    )
+
+    assert result.payload["rows"][0]["average_sentiment"] == 0.6
+    assert result.payload["rows"][0]["document_count"] == 2
+    assert result.payload["rows"][0]["target_label"] == "Cristiano Ronaldo"
+
+
+def test_python_runner_refuses_prose_instead_of_executing_invalid_code(tmp_path: Path) -> None:
+    context = AgentExecutionContext(
+        run_id="run",
+        artifacts_dir=tmp_path,
+        search_backend=None,
+        working_store=InMemoryWorkingSetStore(),
+        runtime=None,
+        python_runner=None,
+    )
+
+    result = agent_capabilities._python_runner(
+        {"code": "Merge monthly actor prominence tables from entity mentions and quote attributions."},
+        {},
+        context,
+    )
+
+    assert result.metadata["no_data"] is True
+    assert result.payload["exit_code"] == 0
+    assert "not valid Python" in result.caveats[0]
+
+
 def test_db_search_uses_sql_fallback_when_primary_search_is_empty(monkeypatch, tmp_path: Path) -> None:
     monkeypatch.setattr(
         agent_capabilities,
@@ -477,6 +1386,29 @@ def test_db_search_discards_off_topic_rows_when_query_entities_do_not_match(monk
     assert any("off-topic" in caveat.lower() or "main query entities" in caveat.lower() for caveat in result.caveats)
 
 
+def test_db_search_returns_no_data_when_source_filtered_sql_fallback_is_empty(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(agent_capabilities, "_sql_search_rows", lambda **kwargs: [])
+    monkeypatch.setattr(agent_capabilities, "_queryable_sql_store", lambda context: (object(), ""))
+    context = AgentExecutionContext(
+        run_id="run",
+        artifacts_dir=tmp_path,
+        search_backend=_FailingSearchBackend(),
+        working_store=_ExplodingStore(),
+        runtime=None,
+    )
+
+    result = _db_search(
+        {"query": '(football OR soccer) AND source:("NZZ" OR "Tages-Anzeiger")', "top_k": 5},
+        {},
+        context,
+    )
+
+    assert result.payload["results"] == []
+    assert result.payload["result_count"] == 0
+    assert result.metadata["no_data"] is True
+    assert any("source filters" in caveat.lower() for caveat in result.caveats)
+
+
 def test_query_anchor_terms_drop_analytic_scaffold_words_for_exhaustive_questions() -> None:
     anchors = [value.lower() for value in agent_capabilities._query_anchor_terms("What is the distribution of nouns across all football reports in the corpus?")]
 
@@ -522,6 +1454,82 @@ def test_query_anchor_terms_prefer_resolved_meaning_over_ambiguous_term() -> Non
     )
 
     assert anchors == ["soccer"]
+
+
+def test_sql_websearch_query_text_preserves_explicit_or_broadening() -> None:
+    query = (
+        "football OR soccer OR premier league OR champions league OR fa cup "
+        "OR world cup OR match report OR fixture"
+    )
+    anchors = agent_capabilities._query_anchor_terms(query)
+
+    query_text = agent_capabilities._sql_websearch_query_text(query, anchors)
+
+    assert " OR " in query_text
+    assert "football OR soccer" in query_text
+    assert "premier league" in query_text
+    assert not query_text.startswith("football soccer")
+    assert agent_capabilities._min_required_anchor_hits(query, anchors, top_k=0) == 1
+
+
+def test_sql_websearch_query_text_keeps_default_anchor_conjunction() -> None:
+    query = "privacy regulation stock drawdown reports"
+    anchors = agent_capabilities._query_anchor_terms(query)
+
+    query_text = agent_capabilities._sql_websearch_query_text(query, anchors)
+
+    assert " OR " not in query_text
+    assert query_text == " ".join(anchors)
+    assert agent_capabilities._min_required_anchor_hits(query, anchors, top_k=0) > 1
+
+
+def test_sql_websearch_query_clauses_preserve_and_between_or_groups() -> None:
+    query = '("Cristiano Ronaldo" OR Ronaldo OR CR7 OR "Lionel Messi" OR Messi) AND (value OR worth OR contract)'
+    anchors = agent_capabilities._query_anchor_terms(query)
+
+    clauses = agent_capabilities._sql_websearch_query_clauses(query, anchors)
+
+    assert len(clauses) == 2
+    assert "ronaldo" in clauses[0]
+    assert " OR " in clauses[0]
+    assert "value OR worth" in clauses[1]
+
+
+def test_query_anchor_terms_strip_source_filters() -> None:
+    query = '(football OR Fussball) AND source:("NZZ" OR "Tages-Anzeiger")'
+
+    anchors = agent_capabilities._query_anchor_terms(query)
+    sources = agent_capabilities._query_source_filters(query)
+
+    assert "source" not in anchors
+    assert "nzz" not in anchors
+    assert "tages" not in anchors
+    assert sources == ["nzz", "tagesanzeiger"]
+
+
+def test_local_exhaustive_applies_source_filters(tmp_path: Path) -> None:
+    context = AgentExecutionContext(
+        run_id="run",
+        artifacts_dir=tmp_path,
+        search_backend=None,
+        working_store=InMemoryWorkingSetStore(),
+        runtime=_RuntimeWithMetadata(
+            [
+                {"doc_id": "nzz-1", "title": "Football report", "text": "football match", "published_at": "2017-01-01", "source": "www.nzz.ch"},
+                {"doc_id": "ta-1", "title": "Football report", "text": "football match", "published_at": "2017-01-01", "source": "www.tagesanzeiger.ch"},
+            ]
+        ),
+    )
+
+    rows = agent_capabilities._local_exhaustive_rows(
+        query='football source:"NZZ"',
+        top_k=0,
+        date_from="",
+        date_to="",
+        context=context,
+    )
+
+    assert [row["doc_id"] for row in rows] == ["nzz-1"]
 
 
 def test_db_search_materializes_full_sql_match_set_for_exhaustive_questions(monkeypatch, tmp_path: Path) -> None:
@@ -692,14 +1700,15 @@ def test_noun_distribution_streams_full_working_set_when_fetch_is_preview(tmp_pa
     assert result.metadata["full_working_set"] is True
 
 
-def test_noun_distribution_streaming_filters_function_words(tmp_path: Path) -> None:
+def test_noun_distribution_streaming_filters_function_words(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(agent_capabilities, "_load_spacy_model", lambda: None)
     store = InMemoryWorkingSetStore()
     working_rows = [{"doc_id": "doc-1", "rank": 1, "score": 1.0}]
     store.record_working_set("run", "all_docs", working_rows)
     store.document_lookup["doc-1"] = {
         "doc_id": "doc-1",
         "title": "",
-        "text": "was his said but are has they will team game soccer soccer player",
+        "text": "was his said but are has they will now how take right var try catch error team game soccer soccer player",
         "published_at": "2022-01-01",
         "source": "NZZ",
     }
@@ -724,7 +1733,163 @@ def test_noun_distribution_streaming_filters_function_words(tmp_path: Path) -> N
 
     lemmas = {row["lemma"] for row in result.payload["rows"]}
     assert {"team", "game", "soccer", "player"}.issubset(lemmas)
-    assert not {"was", "his", "said", "but", "are", "has", "they", "will"}.intersection(lemmas)
+    assert not {"was", "his", "said", "but", "are", "has", "they", "will", "now", "how", "take", "right"}.intersection(lemmas)
+    assert not {"var", "try", "catch", "error"}.intersection(lemmas)
+
+
+def test_noun_distribution_streams_id_only_working_set(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(agent_capabilities, "_load_spacy_model", lambda: None)
+    store = InMemoryWorkingSetStore()
+    store.record_working_set("run", "all_docs", [{"doc_id": "doc-1"}])
+    store.document_lookup["doc-1"] = {
+        "doc_id": "doc-1",
+        "title": "Football report",
+        "text": "Club player scored goal",
+        "published_at": "2022-01-01",
+        "source": "NZZ",
+    }
+    context = AgentExecutionContext(
+        run_id="run",
+        artifacts_dir=tmp_path,
+        search_backend=_EmptySearchBackend(),
+        working_store=store,
+        runtime=None,
+    )
+    working_set = ToolExecutionResult(
+        payload={
+            "working_set_ref": "all_docs",
+            "working_set_doc_ids": ["doc-1"],
+            "document_count": 1,
+            "preview_count": 1,
+            "working_set_truncated": False,
+        }
+    )
+
+    result = _build_evidence_table({"task": "noun_frequency_distribution", "top_k": 10}, {"n2": working_set}, context)
+
+    lemmas = {row["lemma"] for row in result.payload["rows"]}
+    assert {"football", "club", "player"}.issubset(lemmas)
+    assert result.metadata["full_working_set"] is True
+
+
+def test_noun_distribution_resolves_node_id_working_set_ref(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(agent_capabilities, "_load_spacy_model", lambda: None)
+    store = InMemoryWorkingSetStore()
+    store.record_working_set("run", "all_docs", [{"doc_id": "doc-1"}])
+    store.document_lookup["doc-1"] = {
+        "doc_id": "doc-1",
+        "title": "Football report",
+        "text": "Club player scored goal",
+        "published_at": "2022-01-01",
+        "source": "NZZ",
+    }
+    context = AgentExecutionContext(
+        run_id="run",
+        artifacts_dir=tmp_path,
+        search_backend=_EmptySearchBackend(),
+        working_store=store,
+        runtime=None,
+    )
+    fetch_preview = ToolExecutionResult(
+        payload={
+            "documents": [],
+            "working_set_ref": "all_docs",
+            "document_count": 1,
+            "returned_document_count": 0,
+            "documents_truncated": True,
+        }
+    )
+
+    result = _build_evidence_table(
+        {"task": "noun_frequency_distribution", "working_set_ref": "n2", "top_k": 10},
+        {"fetch": fetch_preview},
+        context,
+    )
+
+    assert result.payload["working_set_ref"] == "all_docs"
+    assert result.payload["analyzed_document_count"] == 1
+    assert {"club", "player"}.issubset({row["lemma"] for row in result.payload["rows"]})
+
+
+def test_large_working_set_noun_distribution_can_skip_spacy(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("CORPUSAGENT2_NOUN_SPACY_MAX_DOCS", "0")
+    monkeypatch.setattr(
+        agent_capabilities,
+        "_load_spacy_model",
+        lambda: (_ for _ in ()).throw(AssertionError("spaCy should not load for large working-set fallback")),
+    )
+    store = InMemoryWorkingSetStore()
+    store.record_working_set("run", "all_docs", [{"doc_id": "doc-1"}])
+    store.document_lookup["doc-1"] = {
+        "doc_id": "doc-1",
+        "title": "Football report",
+        "text": "Club player scored goal",
+        "published_at": "2022-01-01",
+        "source": "NZZ",
+    }
+    context = AgentExecutionContext(
+        run_id="run",
+        artifacts_dir=tmp_path,
+        search_backend=_EmptySearchBackend(),
+        working_store=store,
+        runtime=None,
+    )
+
+    rows, metadata = agent_capabilities._noun_frequency_rows_from_working_set(context, "all_docs", top_k=10)
+
+    assert rows
+    assert metadata["provider"] == "heuristic_batch"
+    assert "exceeds CORPUSAGENT2_NOUN_SPACY_MAX_DOCS" in metadata["provider_fallback_reason"]
+
+
+def test_large_working_set_noun_distribution_uses_uncapped_sql_when_enabled(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.delenv("CORPUSAGENT2_WORKING_SET_ANALYSIS_MAX_DOCS", raising=False)
+    monkeypatch.setenv("CORPUSAGENT2_USE_SQL_TOKEN_AGGREGATE", "true")
+    monkeypatch.setattr(agent_capabilities, "_count_working_set", lambda context, label, fallback=0: 50000)
+    captured: dict[str, object] = {}
+
+    def fake_sql(context, working_set_ref, *, top_k, max_documents=None):
+        captured["max_documents"] = max_documents
+        return [{"lemma": "club", "count": 10}], {"provider": "postgres_token_aggregate", "analyzed_document_count": 50000}
+
+    monkeypatch.setattr(agent_capabilities, "_sql_noun_frequency_rows_from_working_set", fake_sql)
+    context = AgentExecutionContext(
+        run_id="run",
+        artifacts_dir=tmp_path,
+        search_backend=_EmptySearchBackend(),
+        working_store=InMemoryWorkingSetStore(),
+        runtime=None,
+    )
+
+    rows, metadata = agent_capabilities._noun_frequency_rows_from_working_set(context, "all_docs", top_k=10)
+
+    assert rows == [{"lemma": "club", "count": 10}]
+    assert captured["max_documents"] is None
+    assert metadata["provider"] == "postgres_token_aggregate"
+
+
+def test_large_working_set_noun_distribution_respects_explicit_sql_cap(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("CORPUSAGENT2_WORKING_SET_ANALYSIS_MAX_DOCS", "123")
+    monkeypatch.setenv("CORPUSAGENT2_USE_SQL_TOKEN_AGGREGATE", "true")
+    monkeypatch.setattr(agent_capabilities, "_count_working_set", lambda context, label, fallback=0: 50000)
+    captured: dict[str, object] = {}
+
+    def fake_sql(context, working_set_ref, *, top_k, max_documents=None):
+        captured["max_documents"] = max_documents
+        return [{"lemma": "club", "count": 10}], {"provider": "postgres_token_aggregate", "analyzed_document_count": 123}
+
+    monkeypatch.setattr(agent_capabilities, "_sql_noun_frequency_rows_from_working_set", fake_sql)
+    context = AgentExecutionContext(
+        run_id="run",
+        artifacts_dir=tmp_path,
+        search_backend=_EmptySearchBackend(),
+        working_store=InMemoryWorkingSetStore(),
+        runtime=None,
+    )
+
+    agent_capabilities._noun_frequency_rows_from_working_set(context, "all_docs", top_k=10)
+
+    assert captured["max_documents"] == 123
 
 
 def test_local_exhaustive_requires_multi_anchor_coverage(monkeypatch, tmp_path: Path) -> None:
@@ -1027,6 +2192,8 @@ def test_fetch_documents_prefers_working_set_ref_over_preview_ids(tmp_path: Path
 def test_join_external_series_can_fetch_market_data(monkeypatch, tmp_path: Path) -> None:
     def _fake_series(**kwargs):
         assert kwargs["ticker"] == "META"
+        assert kwargs["start"] == "2018-03-01"
+        assert kwargs["end"] == "2018-05-01"
         return [
             {"ticker": "META", "date": "2018-03-01", "time_bin": "2018-03", "market_close": 180.5, "market_return": -0.01, "market_drawdown": -0.01},
             {"ticker": "META", "date": "2018-04-01", "time_bin": "2018-04", "market_close": 165.0, "market_return": -0.04, "market_drawdown": -0.04},
@@ -1056,6 +2223,61 @@ def test_join_external_series_can_fetch_market_data(monkeypatch, tmp_path: Path)
     assert result.payload["rows"]
     assert result.payload["rows"][0]["market_close"] == 180.5
     assert result.metadata["provider"] == "yfinance"
+
+
+def test_join_external_series_aggregates_daily_rows_to_time_bin(monkeypatch, tmp_path: Path) -> None:
+    def _fake_series(**kwargs):
+        assert kwargs["ticker"] == "CL=F"
+        assert kwargs["start"] == "2018-03-01"
+        assert kwargs["end"] == "2018-04-01"
+        return [
+            {
+                "ticker": "CL=F",
+                "date": "2018-03-01",
+                "time_bin": "2018-03",
+                "market_open": 60.0,
+                "market_high": 62.0,
+                "market_low": 59.0,
+                "market_close": 61.0,
+                "market_volume": 10,
+                "market_return": 0.01,
+                "market_drawdown": -0.02,
+            },
+            {
+                "ticker": "CL=F",
+                "date": "2018-03-30",
+                "time_bin": "2018-03",
+                "market_open": 61.0,
+                "market_high": 65.0,
+                "market_low": 60.0,
+                "market_close": 64.0,
+                "market_volume": 15,
+                "market_return": 0.02,
+                "market_drawdown": -0.01,
+            },
+        ]
+
+    monkeypatch.setattr(agent_capabilities, "_fetch_yfinance_series_rows", _fake_series)
+    context = AgentExecutionContext(
+        run_id="run",
+        artifacts_dir=tmp_path,
+        search_backend=None,
+        working_store=_ExplodingStore(),
+        runtime=None,
+    )
+    deps = {"series": ToolExecutionResult(payload={"rows": [{"entity": "__all__", "time_bin": "2018-03", "count": 10}]})}
+
+    result = _join_external_series({"ticker": "CL=F", "left_key": "time_bin", "right_key": "time_bin"}, deps, context)
+
+    assert len(result.payload["rows"]) == 1
+    assert result.payload["rows"][0]["market_open"] == 60.0
+    assert result.payload["rows"][0]["market_close"] == 64.0
+    assert result.payload["rows"][0]["market_volume"] == 25
+    assert any("Aggregated external series" in caveat for caveat in result.caveats)
+
+
+def test_infer_market_ticker_maps_oil_price_to_crude_futures() -> None:
+    assert agent_capabilities._infer_market_ticker_from_text("How did the oil price change in America?") == "CL=F"
 
 
 def test_fetch_documents_strict_backend_disables_runtime_fallback(monkeypatch) -> None:
@@ -1102,6 +2324,53 @@ def test_time_series_aggregate_defaults_to_month_granularity(monkeypatch, tmp_pa
 
     assert {"entity": "negative", "time_bin": "2018-03", "count": -2} in result.payload["rows"]
     assert any(row["time_bin"] == "2018-04" for row in result.payload["rows"])
+
+
+def test_time_series_aggregate_filters_invalid_entities_and_adds_normalized_value(tmp_path: Path) -> None:
+    context = AgentExecutionContext(
+        run_id="run",
+        artifacts_dir=tmp_path,
+        search_backend=None,
+        working_store=_ExplodingStore(),
+        runtime=None,
+    )
+    deps = {
+        "entities": ToolExecutionResult(
+            payload={
+                "rows": [
+                    {"entity": "Greta Thunberg", "label": "PERSON", "doc_id": "d1", "published_at": "2018-03-01"},
+                    {"entity": "2018", "label": "DATE", "doc_id": "d1", "published_at": "2018-03-01"},
+                    {"entity": "#", "label": "ORG", "doc_id": "d2", "published_at": "2018-03-02"},
+                ]
+            }
+        )
+    }
+
+    result = _time_series_aggregate(
+        {"group_by": "entity", "entity_types": ["PERSON", "ORG"], "normalize_by": "documents_per_period"},
+        deps,
+        context,
+    )
+
+    assert result.payload["rows"] == [
+        {
+            "entity": "Greta Thunberg",
+            "canonical_entity": "Greta Thunberg",
+            "actor": "Greta Thunberg",
+            "entity_label": "Greta Thunberg",
+            "series_name": "Greta Thunberg",
+            "time_bin": "2018-03",
+            "bucket": "2018-03",
+            "month": "2018-03",
+            "period": "2018-03",
+            "time_period": "2018-03",
+            "count": 1,
+            "mention_count": 1,
+            "mention_count_normalized": 1.0,
+            "normalized_value": 1.0,
+        }
+    ]
+    assert result.payload["skipped_row_count"] == 2
 
 
 def test_topic_model_emits_time_slices_instead_of_all_bucket(monkeypatch, tmp_path: Path) -> None:
