@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from hashlib import sha256
 import json
+import os
 from pathlib import Path
 import time
 from typing import Any
@@ -91,6 +92,35 @@ def _payload_preview(payload: Any) -> Any:
     return _safe_json(payload)
 
 
+def _storage_preview_limit() -> int:
+    raw = os.getenv("CORPUSAGENT2_STORED_PAYLOAD_PREVIEW_ROWS", "50").strip()
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return 50
+
+
+def _compact_payload_for_storage(payload: Any) -> Any:
+    preview_limit = _storage_preview_limit()
+    if isinstance(payload, dict):
+        compact: dict[str, Any] = {}
+        for key, value in payload.items():
+            if isinstance(value, list) and key in {"results", "documents", "rows", "evidence_items", "artifacts", "working_set_doc_ids"}:
+                compact[key] = _safe_json(value[:preview_limit])
+                if len(value) > preview_limit:
+                    compact[f"{key}_truncated"] = True
+                    compact[f"{key}_count"] = len(value)
+                continue
+            compact[key] = _compact_payload_for_storage(value) if isinstance(value, (dict, list)) else _safe_json(value)
+        return compact
+    if isinstance(payload, list):
+        compact_list = [_compact_payload_for_storage(item) for item in payload[:preview_limit]]
+        if len(payload) > preview_limit:
+            return {"items": compact_list, "items_truncated": True, "items_count": len(payload)}
+        return compact_list
+    return _safe_json(payload)
+
+
 def _summarize_tool_result(result: ToolExecutionResult, *, dependency_results: dict[str, ToolExecutionResult]) -> dict[str, Any]:
     payload = result.payload
     items_key, items = _result_items(payload)
@@ -167,7 +197,7 @@ class AsyncPlanExecutor:
 
     def _write_node_artifact(self, artifacts_dir: Path, node: AgentPlanNode, result: ToolExecutionResult) -> str:
         target = artifacts_dir / "nodes" / f"{node.node_id}.json"
-        write_json(target, {"payload": _safe_json(result.payload), "metadata": _safe_json(result.metadata)})
+        write_json(target, {"payload": _compact_payload_for_storage(result.payload), "metadata": _safe_json(result.metadata)})
         return str(target)
 
     def _emit_event(self, context: AgentExecutionContext, payload: dict[str, Any]) -> None:
@@ -292,7 +322,7 @@ class AsyncPlanExecutor:
                     "dependency_nodes": sorted(dependency_results.keys()),
                     "cache_key": cache_key,
                     "summary": _summarize_tool_result(result, dependency_results=dependency_results),
-                    "payload": _safe_json(result.payload),
+                    "payload": _compact_payload_for_storage(result.payload),
                 },
             )
             context.working_store.record_artifact(
@@ -405,7 +435,7 @@ class AsyncPlanExecutor:
                         "dependency_nodes": sorted(dependency_results.keys()),
                         "cache_key": cache_key,
                         "summary": _summarize_tool_result(result, dependency_results=dependency_results),
-                        "payload": _safe_json(result.payload),
+                        "payload": _compact_payload_for_storage(result.payload),
                     },
                 )
                 context.working_store.record_artifact(

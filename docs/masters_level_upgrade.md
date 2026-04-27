@@ -39,12 +39,12 @@ To read as a master's thesis instead of an engineering report, add four things:
 
 ## Recommended Master's-Level Addition
 
-The strongest addition is a focused case-study chapter with manual evaluation on a politically salient query family such as Trump coverage. Use it to show where the pipeline succeeds and where it breaks.
+The strongest addition is a focused case-study chapter with manual evaluation on a clearly scoped query family chosen from the corpus. Use it to show where the pipeline succeeds and where it breaks.
 
 Suggested chapter structure:
 
 1. Case study setup.
-   Explain the Trump query family, date range, corpus slice, and why it stress-tests sentiment and framing.
+   Explain the query family, date range, corpus slice, and why it stress-tests the relevant retrieval and analysis tools.
 
 2. Multi-view analysis.
    Report:

@@ -756,7 +756,7 @@ def test_broad_scope_clarification_prevents_repeat_question_loop(tmp_path: Path)
 
     assert manifest.status in {"completed", "partial"}
     assert not manifest.clarification_questions
-    assert any("Europe-wide overall coverage" in item for item in manifest.assumptions)
+    assert any("aggregate comparison over available metadata groups" in item for item in manifest.assumptions)
 
 
 def test_multi_year_monthly_clarification_is_accepted_as_sufficient(tmp_path: Path) -> None:
@@ -964,6 +964,35 @@ def test_framing_shift_heuristic_query_is_entity_driven_not_hardcoded_to_faceboo
     assert "Palmolive" in query_text
     assert "Facebook" not in query_text
     assert "Cambridge Analytica" not in query_text
+
+
+def test_heuristic_anchor_terms_split_hyphenated_topics_and_drop_scaffold(tmp_path: Path) -> None:
+    runtime = build_test_runtime(
+        tmp_path=tmp_path,
+        documents=_sample_documents(),
+        search_rows_by_query={},
+    )
+
+    anchors = runtime.orchestrator._query_anchor_terms(
+        "What is the frequency distribution of individual noun lemmas across "
+        "soccer-related reports in the corpus, such as the most common nouns?"
+    )
+
+    assert anchors == ["soccer"]
+
+
+def test_heuristic_anchor_terms_prefer_resolved_meaning(tmp_path: Path) -> None:
+    runtime = build_test_runtime(
+        tmp_path=tmp_path,
+        documents=_sample_documents(),
+        search_rows_by_query={},
+    )
+
+    anchors = runtime.orchestrator._query_anchor_terms(
+        "What is the distribution of noun lemmas in all football reports, where football means soccer?"
+    )
+
+    assert anchors == ["soccer"]
 
 
 def test_noun_distribution_heuristic_plan_uses_scope_budget_and_aggregate_nodes(tmp_path: Path) -> None:
@@ -1205,7 +1234,7 @@ def test_openai_style_plan_without_retrieval_backbone_falls_back_to_heuristic(tm
     assert any(node.get("capability") == "fetch_documents" for node in manifest.plan_dags[0]["nodes"])
 
 
-def test_finance_question_heuristic_plan_uses_market_series_when_ticker_is_inferred(tmp_path: Path, monkeypatch) -> None:
+def test_finance_question_heuristic_plan_uses_market_series_when_ticker_is_explicit(tmp_path: Path, monkeypatch) -> None:
     docs = _sample_documents()
 
     def _fake_series(**kwargs):
@@ -1227,13 +1256,36 @@ def test_finance_question_heuristic_plan_uses_market_series_when_ticker_is_infer
     runtime.orchestrator.llm_client = None
 
     manifest = runtime.handle_query(
-        "How did Facebook coverage shift from innovation/growth framing to privacy/regulation framing around the Cambridge Analytica scandal from 2016 to 2019, and how did this correspond to stock drawdowns?",
+        "How did coverage shift from innovation/growth framing to privacy/regulation framing from 2016 to 2019, and how did this correspond to stock drawdowns for ticker META?",
         force_answer=True,
         no_cache=True,
     )
 
     assert manifest.status in {"completed", "partial"}
     assert any(
+        any(node.get("capability") == "join_external_series" for node in dag.get("nodes", []))
+        for dag in manifest.plan_dags
+    )
+
+
+def test_finance_question_does_not_infer_market_series_from_company_name(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("CORPUSAGENT2_PROVIDER_ORDER_SENTIMENT", "heuristic")
+    monkeypatch.setenv("CORPUSAGENT2_PROVIDER_ORDER_TOPIC_MODEL", "heuristic")
+    runtime = build_test_runtime(
+        tmp_path=tmp_path,
+        documents=_sample_documents(),
+        search_rows_by_query=_search_rows(_sample_documents()),
+    )
+    runtime.llm_client = None
+    runtime.orchestrator.llm_client = None
+
+    manifest = runtime.handle_query(
+        "How did Facebook coverage shift from innovation/growth framing to privacy/regulation framing from 2016 to 2019, and how did this correspond to stock drawdowns?",
+        force_answer=True,
+        no_cache=True,
+    )
+
+    assert not any(
         any(node.get("capability") == "join_external_series" for node in dag.get("nodes", []))
         for dag in manifest.plan_dags
     )

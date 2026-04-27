@@ -42,8 +42,29 @@ STOPWORDS = {
 POSITIVE_WORDS = {"good", "strong", "gain", "improve", "success", "positive", "optimistic"}
 NEGATIVE_WORDS = {"bad", "weak", "loss", "drop", "risk", "fear", "negative", "warn", "crisis"}
 CLAIM_KEYWORDS = {
-    "predict", "predicted", "prediction", "warn", "warned", "warning", "imminent",
-    "within days", "could invade", "will invade", "invasion",
+    "anticipate",
+    "anticipated",
+    "anticipates",
+    "claim",
+    "claimed",
+    "claims",
+    "expect",
+    "expected",
+    "expects",
+    "forecast",
+    "forecasted",
+    "forecasts",
+    "foresaw",
+    "foresee",
+    "imminent",
+    "likely",
+    "predict",
+    "predicted",
+    "prediction",
+    "risk",
+    "warn",
+    "warned",
+    "warning",
 }
 LANGUAGE_HINTS = {
     "de": {"und", "der", "die", "das", "nicht", "mit", "ist", "ein"},
@@ -91,84 +112,108 @@ def _default_time_granularity() -> str:
     return (os.getenv("CORPUSAGENT2_TIME_GRANULARITY", "month").strip().lower() or "month")
 
 
-QUERY_ANCHOR_STOPWORDS = STOPWORDS.union(
-    {
-        "aggregate",
-        "aggregated",
-        "analysis",
-        "analyze",
-        "analysed",
-        "analyzed",
-        "article",
-        "articles",
-        "breakdown",
-        "collection",
-        "corpus",
-        "dataset",
-        "how",
-        "did",
-        "does",
-        "individual",
-        "common",
-        "most",
-        "such",
-        "including",
-        "include",
-        "included",
-        "what",
-        "which",
-        "who",
-        "why",
-        "around",
-        "during",
-        "toward",
-        "towards",
-        "shift",
-        "shifted",
-        "framing",
-        "frame",
-        "growth",
-        "innovation",
-        "privacy",
-        "regulation",
-        "distribution",
-        "document",
-        "documents",
-        "drawdown",
-        "drawdowns",
-        "frequency",
-        "frequencies",
-        "lemma",
-        "lemmas",
-        "noun",
-        "nouns",
-        "stock",
-        "stocks",
-        "overall",
-        "monthly",
-        "record",
-        "records",
-        "related",
-        "relevant",
-        "report",
-        "reports",
-        "result",
-        "results",
-        "row",
-        "rows",
-        "story",
-        "stories",
-        "weekly",
-        "daily",
-        "yearly",
-    }
-)
+QUERY_ANCHOR_STOPWORDS = {
+    "about",
+    "across",
+    "after",
+    "aggregate",
+    "aggregated",
+    "all",
+    "analysed",
+    "analysis",
+    "analyze",
+    "analyzed",
+    "and",
+    "around",
+    "article",
+    "articles",
+    "before",
+    "been",
+    "being",
+    "between",
+    "breakdown",
+    "collection",
+    "common",
+    "complete",
+    "corpus",
+    "could",
+    "daily",
+    "dataset",
+    "did",
+    "distribution",
+    "document",
+    "documents",
+    "does",
+    "during",
+    "each",
+    "entire",
+    "every",
+    "for",
+    "frame",
+    "framing",
+    "frequencies",
+    "frequency",
+    "from",
+    "full",
+    "have",
+    "how",
+    "include",
+    "included",
+    "including",
+    "individual",
+    "into",
+    "lemma",
+    "lemmas",
+    "monthly",
+    "most",
+    "noun",
+    "nouns",
+    "overall",
+    "record",
+    "records",
+    "related",
+    "relevant",
+    "report",
+    "reports",
+    "result",
+    "results",
+    "row",
+    "rows",
+    "shift",
+    "shifted",
+    "should",
+    "stories",
+    "story",
+    "such",
+    "that",
+    "the",
+    "their",
+    "there",
+    "this",
+    "toward",
+    "towards",
+    "under",
+    "weekly",
+    "were",
+    "what",
+    "when",
+    "where",
+    "which",
+    "while",
+    "who",
+    "whole",
+    "why",
+    "with",
+    "would",
+    "yearly",
+}
 
 
-def _add_query_anchor(anchor_terms: list[str], seen: set[str], token: str) -> None:
+def _add_query_anchor(anchor_terms: list[str], seen: set[str], token: str, *, blocked: set[str] | None = None) -> None:
+    blocked = blocked or set()
     for part in re.findall(r"[A-Za-z][A-Za-z0-9]+", str(token or "")):
         lowered = part.lower()
-        if len(lowered) < 3 or lowered in QUERY_ANCHOR_STOPWORDS or lowered in seen:
+        if len(lowered) < 3 or lowered in QUERY_ANCHOR_STOPWORDS or lowered in seen or lowered in blocked:
             continue
         seen.add(lowered)
         anchor_terms.append(lowered)
@@ -178,17 +223,29 @@ def _query_anchor_terms(query: str) -> list[str]:
     text = str(query or "").strip()
     if not text:
         return []
+    resolved_terms: list[str] = []
+    resolved_seen: set[str] = set()
+    blocked_terms: set[str] = set()
+    for match in re.finditer(
+        r"['\"]?([A-Za-z][A-Za-z0-9-]+)['\"]?\s+(?:means|refers\s+to|interpreted\s+as)\s+['\"]?([A-Za-z][A-Za-z0-9-]+)['\"]?",
+        text,
+        flags=re.IGNORECASE,
+    ):
+        blocked_terms.update(part.lower() for part in re.findall(r"[A-Za-z][A-Za-z0-9]+", match.group(1)))
+        _add_query_anchor(resolved_terms, resolved_seen, match.group(2), blocked=blocked_terms)
+    if resolved_terms:
+        return resolved_terms[:8]
     preferred: list[str] = []
     preferred_seen: set[str] = set()
     for match in re.finditer(r"\b[A-Z][A-Za-z0-9]*(?:-[A-Z]?[A-Za-z0-9]+)?\b", text):
         token = match.group(0).strip()
-        _add_query_anchor(preferred, preferred_seen, token)
+        _add_query_anchor(preferred, preferred_seen, token, blocked=blocked_terms)
     if preferred:
         return preferred[:8]
     fallback: list[str] = []
     fallback_seen: set[str] = set()
     for token in re.findall(r"[A-Za-z][A-Za-z0-9-]+", text):
-        _add_query_anchor(fallback, fallback_seen, token)
+        _add_query_anchor(fallback, fallback_seen, token, blocked=blocked_terms)
     return fallback[:8]
 
 
@@ -243,6 +300,37 @@ def _working_set_doc_ids(dependency_results: dict[str, ToolExecutionResult]) -> 
     return []
 
 
+def _working_set_ref(dependency_results: dict[str, ToolExecutionResult]) -> str:
+    for result in dependency_results.values():
+        payload = result.payload
+        if not isinstance(payload, dict):
+            continue
+        ref = str(payload.get("working_set_ref", "")).strip()
+        if ref:
+            return ref
+    return ""
+
+
+def _dependency_payload_flag(dependency_results: dict[str, ToolExecutionResult], key: str) -> bool:
+    for result in dependency_results.values():
+        payload = result.payload
+        if isinstance(payload, dict) and bool(payload.get(key)):
+            return True
+    return False
+
+
+def _dependency_payload_int(dependency_results: dict[str, ToolExecutionResult], key: str, default: int = 0) -> int:
+    for result in dependency_results.values():
+        payload = result.payload
+        if not isinstance(payload, dict) or payload.get(key) in (None, ""):
+            continue
+        try:
+            return int(payload.get(key) or 0)
+        except (TypeError, ValueError):
+            continue
+    return default
+
+
 def _dedupe_doc_ids(doc_ids: list[str]) -> list[str]:
     ordered: list[str] = []
     seen: set[str] = set()
@@ -253,6 +341,148 @@ def _dedupe_doc_ids(doc_ids: list[str]) -> list[str]:
         seen.add(normalized)
         ordered.append(normalized)
     return ordered
+
+
+def _result_preview_limit() -> int:
+    raw = os.getenv("CORPUSAGENT2_RESULT_PREVIEW_ROWS", "50").strip()
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return 50
+
+
+def _count_working_set(context: "AgentExecutionContext", label: str, fallback: int = 0) -> int:
+    counter = getattr(context.working_store, "count_working_set", None)
+    if not callable(counter):
+        return fallback
+    try:
+        return int(counter(context.run_id, label))
+    except Exception:
+        return fallback
+
+
+def _fetch_working_set_ids(
+    context: "AgentExecutionContext",
+    label: str,
+    *,
+    limit: int | None = None,
+    offset: int = 0,
+) -> list[str]:
+    fetcher = getattr(context.working_store, "fetch_working_set_doc_ids", None)
+    if not callable(fetcher):
+        return []
+    try:
+        return [str(item).strip() for item in fetcher(context.run_id, label, limit=limit, offset=offset) if str(item).strip()]
+    except Exception:
+        return []
+
+
+def _iter_working_set_documents(
+    context: "AgentExecutionContext",
+    label: str,
+    *,
+    batch_size: int | None = None,
+):
+    if not label:
+        return
+    fetcher = getattr(context.working_store, "fetch_working_set_documents", None)
+    if not callable(fetcher):
+        return
+    resolved_batch_size = int(batch_size or os.getenv("CORPUSAGENT2_WORKING_SET_ANALYSIS_BATCH_SIZE", "1000") or 1000)
+    resolved_batch_size = max(1, resolved_batch_size)
+    offset = 0
+    while True:
+        if context.cancel_requested and context.cancel_requested():
+            break
+        rows = fetcher(context.run_id, label, limit=resolved_batch_size, offset=offset)
+        if not rows:
+            break
+        for row in rows:
+            if isinstance(row, dict):
+                yield dict(row)
+        if len(rows) < resolved_batch_size:
+            break
+        offset += resolved_batch_size
+
+
+def _materialize_result_working_set(
+    context: "AgentExecutionContext",
+    *,
+    query: str,
+    retrieval_mode: str,
+    rows: list[dict[str, Any]],
+) -> tuple[str, int]:
+    recorder = getattr(context.working_store, "record_working_set", None)
+    if not callable(recorder) or not rows:
+        return "", 0
+    digest = sha256(f"{retrieval_mode}\n{query}".encode("utf-8")).hexdigest()[:12]
+    label = f"{retrieval_mode}_search_{digest}"
+    recorder(context.run_id, label, rows)
+    return label, _count_working_set(context, label, len(rows))
+
+
+def _search_result(
+    *,
+    context: "AgentExecutionContext",
+    query: str,
+    retrieval_mode: str,
+    retrieval_strategy: str,
+    rows: list[dict[str, Any]],
+    caveats: list[str],
+) -> ToolExecutionResult:
+    preview_limit = _result_preview_limit()
+    preview_rows = list(rows[:preview_limit])
+    label, materialized_count = _materialize_result_working_set(
+        context,
+        query=query,
+        retrieval_mode=retrieval_mode,
+        rows=rows,
+    )
+    result_count = materialized_count or len(rows)
+    payload = {
+        "results": preview_rows if label else rows,
+        "query": query,
+        "retrieval_mode": retrieval_mode,
+        "retrieval_strategy": retrieval_strategy,
+        "result_count": result_count,
+        "document_count": result_count,
+    }
+    if label:
+        payload.update(
+            {
+                "working_set_ref": label,
+                "preview_count": len(preview_rows),
+                "results_truncated": result_count > len(preview_rows),
+            }
+        )
+        if result_count > len(preview_rows):
+            caveats = list(caveats) + [
+                f"Full retrieval population was materialized as working_set_ref='{label}'; only {len(preview_rows)} preview rows are shown in JSON/UI."
+            ]
+    return ToolExecutionResult(
+        payload=payload,
+        evidence=preview_rows if label else list(rows),
+        caveats=caveats,
+        metadata={
+            "working_set_ref": label,
+            "full_result_count": result_count,
+            "payload_truncated": bool(label and result_count > len(preview_rows)),
+        },
+    )
+
+
+def _min_exhaustive_anchor_hits(anchors: list[str]) -> int:
+    count = len([anchor for anchor in anchors if str(anchor).strip()])
+    if count <= 1:
+        return count
+    if count == 2:
+        return 2
+    return max(2, (count * 2 + 2) // 3)
+
+
+def _anchor_hit_count(text: str, anchors: list[str]) -> int:
+    haystack = str(text or "").lower()
+    return sum(1 for anchor in anchors if re.search(rf"\b{re.escape(str(anchor).lower())}\b", haystack))
 
 
 def _normalized_pos_label(value: Any) -> str:
@@ -304,9 +534,57 @@ def _noun_frequency_rows(
     return rows
 
 
+def _noun_frequency_rows_from_working_set(
+    context: "AgentExecutionContext",
+    working_set_ref: str,
+    *,
+    top_k: int,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    lemma_counts: Counter[str] = Counter()
+    doc_counts: defaultdict[str, set[str]] = defaultdict(set)
+    analyzed_documents = 0
+    total_tokens = 0
+    for document in _iter_working_set_documents(context, working_set_ref):
+        doc_id = str(document.get("doc_id", "")).strip()
+        text = f"{document.get('title', '')} {document.get('text', '')}".strip()
+        if not doc_id or not text:
+            continue
+        analyzed_documents += 1
+        for token in _tokenize(text):
+            pos = _heuristic_pos(token)
+            if pos not in {"NOUN", "PROPN"}:
+                continue
+            lemma = _lemma(token)
+            if not lemma or len(lemma) < 3 or lemma in STOPWORDS:
+                continue
+            lemma_counts[lemma] += 1
+            doc_counts[lemma].add(doc_id)
+            total_tokens += 1
+    rows: list[dict[str, Any]] = []
+    for rank, (lemma, count) in enumerate(lemma_counts.most_common(top_k), start=1):
+        rows.append(
+            {
+                "lemma": lemma,
+                "count": int(count),
+                "relative_frequency": round(count / max(total_tokens, 1), 6),
+                "document_frequency": len(doc_counts[lemma]),
+                "rank": rank,
+            }
+        )
+    return rows, {
+        "analyzed_document_count": analyzed_documents,
+        "total_noun_tokens": total_tokens,
+        "full_working_set": True,
+        "working_set_ref": working_set_ref,
+        "provider": "heuristic_batch",
+    }
+
+
 def _summary_stat_rows(
     documents: list[dict[str, Any]],
     upstream_rows: list[dict[str, Any]],
+    *,
+    matched_document_count: int | None = None,
 ) -> list[dict[str, Any]]:
     total_noun_tokens = sum(int(row.get("count", 0) or 0) for row in upstream_rows)
     top_nouns = ", ".join(
@@ -315,7 +593,7 @@ def _summary_stat_rows(
         if str(row.get("lemma", "")).strip()
     )
     return [
-        {"metric": "matched_document_count", "value": len(documents)},
+        {"metric": "matched_document_count", "value": matched_document_count if matched_document_count is not None else len(documents)},
         {"metric": "total_noun_tokens", "value": total_noun_tokens},
         {"metric": "unique_noun_lemmas", "value": len(upstream_rows)},
         {"metric": "top_nouns", "value": top_nouns},
@@ -530,21 +808,6 @@ _SPACY_NLP = None
 _STANZA_PIPELINES: dict[tuple[str, str], Any] = {}
 _FLAIR_OBJECTS: dict[str, Any] = {}
 _YFINANCE_SERIES_CACHE: dict[tuple[str, str, str, str], list[dict[str, Any]]] = {}
-MARKET_TICKER_ALIASES = {
-    "facebook": "META",
-    "meta": "META",
-    "amazon": "AMZN",
-    "aws": "AMZN",
-    "alphabet": "GOOGL",
-    "google": "GOOGL",
-    "microsoft": "MSFT",
-    "apple": "AAPL",
-    "tesla": "TSLA",
-    "nvidia": "NVDA",
-    "netflix": "NFLX",
-    "uber": "UBER",
-    "paypal": "PYPL",
-}
 
 
 def _sql_fallback_store(context: "AgentExecutionContext") -> PostgresWorkingSetStore | None:
@@ -615,9 +878,11 @@ def _sql_search_rows(
         f"setweight(to_tsvector('simple', {text_expr}), 'B')"
     )
     date_clauses, date_params = _sql_date_filters(columns["date"], date_from, date_to)
-    # Exhaustive analytical retrieval should build a high-recall population. Ranked fallback
-    # retrieval can be stricter, but full materialization should not require scaffold terms.
-    query_text = " OR ".join(tokens) if top_k <= 0 else " ".join(tokens)
+    # Exhaustive analytical retrieval should build a population, not a loose union
+    # of every row matching any anchor. Multi-anchor queries therefore require
+    # the anchors together; broadening happens through explicit query wording,
+    # not an implicit OR explosion.
+    query_text = " ".join(tokens)
     sql = (
         f"SELECT "
         f"{columns['doc_id']}::text AS doc_id, "
@@ -642,18 +907,22 @@ def _sql_search_rows(
                 cursor.execute(sql, tuple(params))
                 rows = cursor.fetchall()
     except Exception:
-        like_clauses: list[str] = []
+        hit_parts: list[str] = []
         like_score_parts: list[str] = []
-        like_params: list[Any] = []
+        score_params: list[Any] = []
+        hit_params: list[Any] = []
         for token in tokens:
             needle = f"%{token.lower()}%"
             title_match = f"LOWER({title_expr}) LIKE %s"
             text_match = f"LOWER({text_expr}) LIKE %s"
-            like_clauses.append(f"({title_match} OR {text_match})")
+            hit_parts.append(f"(CASE WHEN ({title_match} OR {text_match}) THEN 1 ELSE 0 END)")
             like_score_parts.append(
                 f"(CASE WHEN {title_match} THEN 2 ELSE 0 END + CASE WHEN {text_match} THEN 1 ELSE 0 END)"
             )
-            like_params.extend([needle, needle, needle, needle])
+            score_params.extend([needle, needle])
+            hit_params.extend([needle, needle])
+        min_hits = _min_exhaustive_anchor_hits(tokens) if top_k <= 0 else 1
+        hit_expr = " + ".join(hit_parts)
         fallback_sql = (
             f"SELECT "
             f"{columns['doc_id']}::text AS doc_id, "
@@ -663,12 +932,12 @@ def _sql_search_rows(
             f"{date_expr} AS date, "
             f"({' + '.join(like_score_parts)})::float AS score "
             f"FROM {table_name} "
-            f"WHERE ({' OR '.join(like_clauses)})"
+            f"WHERE ({hit_expr}) >= %s"
         )
         if date_clauses:
             fallback_sql += f" AND {' AND '.join(date_clauses)}"
         fallback_sql += " ORDER BY score DESC"
-        fallback_params: list[Any] = like_params + date_params
+        fallback_params: list[Any] = score_params + hit_params + [min_hits] + date_params
         if top_k > 0:
             fallback_sql += " LIMIT %s"
             fallback_params.append(int(top_k))
@@ -712,6 +981,7 @@ def _local_exhaustive_rows(
     anchors = [anchor.lower() for anchor in _query_anchor_terms(query)]
     if not anchors:
         return []
+    min_hits = _min_exhaustive_anchor_hits(anchors) if top_k <= 0 else 1
     def _metadata_scan_rows() -> list[dict[str, Any]]:
         try:
             metadata = context.runtime.load_metadata()
@@ -735,10 +1005,10 @@ def _local_exhaustive_rows(
             title_lower = title.lower()
             text_lower = text.lower()
             source_lower = source.lower()
-            title_hits = sum(1 for anchor in anchors if anchor in title_lower)
-            text_hits = sum(1 for anchor in anchors if anchor in text_lower)
-            source_hits = sum(1 for anchor in anchors if anchor in source_lower)
-            if title_hits == 0 and text_hits == 0 and source_hits == 0:
+            title_hits = _anchor_hit_count(title_lower, anchors)
+            text_hits = _anchor_hit_count(text_lower, anchors)
+            source_hits = _anchor_hit_count(source_lower, anchors)
+            if _anchor_hit_count(f"{title} {text} {source}", anchors) < min_hits:
                 continue
             score = float((title_hits * 4.0) + (text_hits * 1.5) + (source_hits * 1.0))
             rows.append(
@@ -786,6 +1056,9 @@ def _local_exhaustive_rows(
             continue
         score = float(score_by_id.get(doc_id, 0.0))
         if score <= 0.0:
+            continue
+        combined = f"{getattr(row, 'title', '')} {getattr(row, 'text', '')} {getattr(row, 'source', '')}"
+        if _anchor_hit_count(combined, anchors) < min_hits:
             continue
         rows.append(
             {
@@ -1180,13 +1453,15 @@ def _encode_texts(
 
 
 def _infer_market_ticker_from_text(text: str) -> str:
-    lowered = text.lower()
-    for alias, ticker in MARKET_TICKER_ALIASES.items():
-        if alias in lowered:
-            return ticker
-    ticker_match = re.search(r"\b[A-Z]{1,5}\b", text)
+    explicit_match = re.search(
+        r"\b(?:ticker|symbol)\s*[:=]?\s*\$?([A-Z]{1,5}(?:\.[A-Z])?)\b",
+        text,
+    )
+    if explicit_match:
+        return explicit_match.group(1)
+    ticker_match = re.search(r"(?<![A-Za-z0-9])\$([A-Z]{1,5}(?:\.[A-Z])?)\b", text)
     if ticker_match:
-        return ticker_match.group(0)
+        return ticker_match.group(1)
     return ""
 
 
@@ -1297,15 +1572,12 @@ def _db_search(params: dict[str, Any], deps: dict[str, ToolExecutionResult], con
                 caveats.append(f"Suppressed {duplicates_removed} near-duplicate SQL retrieval hits.")
         else:
             caveats.append("Exhaustive SQL retrieval did not find documents matching the main query entities.")
-        return ToolExecutionResult(
-            payload={
-                "results": rows,
-                "query": query,
-                "retrieval_mode": "sql",
-                "retrieval_strategy": retrieval_strategy,
-                "result_count": len(rows),
-            },
-            evidence=list(rows),
+        return _search_result(
+            context=context,
+            query=query,
+            retrieval_mode="sql",
+            retrieval_strategy=retrieval_strategy,
+            rows=rows,
             caveats=caveats,
         )
     if retrieval_strategy == "exhaustive_analytic" and not sql_store_available and context.runtime is not None:
@@ -1328,15 +1600,12 @@ def _db_search(params: dict[str, Any], deps: dict[str, ToolExecutionResult], con
             )
             if duplicates_removed > 0:
                 caveats.append(f"Suppressed {duplicates_removed} near-duplicate local exhaustive retrieval hits.")
-            return ToolExecutionResult(
-                payload={
-                    "results": rows,
-                    "query": query,
-                    "retrieval_mode": "local_exhaustive",
-                    "retrieval_strategy": retrieval_strategy,
-                    "result_count": len(rows),
-                },
-                evidence=list(rows),
+            return _search_result(
+                context=context,
+                query=query,
+                retrieval_mode="local_exhaustive",
+                retrieval_strategy=retrieval_strategy,
+                rows=rows,
                 caveats=caveats,
             )
     if retrieval_strategy == "exhaustive_analytic" and not sql_store_available:
@@ -1525,15 +1794,12 @@ def _sql_query_search(params: dict[str, Any], deps: dict[str, ToolExecutionResul
                 )
             if duplicates_removed > 0:
                 caveats.append(f"Suppressed {duplicates_removed} near-duplicate SQL retrieval hits.")
-            return ToolExecutionResult(
-                payload={
-                    "results": rows,
-                    "query": query,
-                    "retrieval_mode": "sql",
-                    "retrieval_strategy": retrieval_strategy,
-                    "result_count": len(rows),
-                },
-                evidence=list(rows),
+            return _search_result(
+                context=context,
+                query=query,
+                retrieval_mode="sql",
+                retrieval_strategy=retrieval_strategy,
+                rows=rows,
                 caveats=caveats,
             )
         rows, duplicates_removed = _prepare_result_rows(
@@ -1559,15 +1825,12 @@ def _sql_query_search(params: dict[str, Any], deps: dict[str, ToolExecutionResul
             caveats.append(
                 f"Exhaustive SQL retrieval was unavailable ({sql_store_error}) and local lexical materialization did not find matching documents."
             )
-        return ToolExecutionResult(
-            payload={
-                "results": rows,
-                "query": query,
-                "retrieval_mode": "local_exhaustive",
-                "retrieval_strategy": retrieval_strategy,
-                "result_count": len(rows),
-            },
-            evidence=list(rows),
+        return _search_result(
+            context=context,
+            query=query,
+            retrieval_mode="local_exhaustive",
+            retrieval_strategy=retrieval_strategy,
+            rows=rows,
             caveats=caveats,
         )
     years = _year_range(date_from, date_to)
@@ -1623,19 +1886,30 @@ def _sql_query_search(params: dict[str, Any], deps: dict[str, ToolExecutionResul
 
 
 def _fetch_documents(params: dict[str, Any], deps: dict[str, ToolExecutionResult], context: AgentExecutionContext) -> ToolExecutionResult:
-    doc_ids = [str(item) for item in params.get("doc_ids", []) if str(item).strip()]
+    explicit_doc_ids = [str(item) for item in params.get("doc_ids", []) if str(item).strip()]
+    doc_ids = list(explicit_doc_ids)
     search_rows = _search_rows(deps)
     search_lookup = {
         str(row.get("doc_id", "")).strip(): row
         for row in search_rows
         if str(row.get("doc_id", "")).strip()
     }
+    working_set_ref = str(params.get("working_set_ref", "") or _working_set_ref(deps)).strip()
+    if working_set_ref and not explicit_doc_ids:
+        doc_ids = []
     if not doc_ids:
         doc_ids = _working_set_doc_ids(deps)
-    if not doc_ids:
+    if not doc_ids and not working_set_ref:
         doc_ids = [str(row.get("doc_id", "")) for row in search_rows if str(row.get("doc_id", "")).strip()]
+    batching = params.get("batching") if isinstance(params.get("batching"), dict) else {}
+    explicit_limit = params.get("limit", params.get("batch_size", batching.get("batch_size")))
+    try:
+        fetch_limit = int(explicit_limit) if explicit_limit not in (None, "") else int(os.getenv("CORPUSAGENT2_WORKING_SET_FETCH_LIMIT", "1000"))
+    except ValueError:
+        fetch_limit = 1000
+    fetch_limit = max(1, fetch_limit)
     doc_ids = _dedupe_doc_ids(doc_ids)
-    if not doc_ids:
+    if not doc_ids and not working_set_ref:
         return ToolExecutionResult(payload={"documents": []}, evidence=[])
     allow_local_fallback = _env_flag("CORPUSAGENT2_ALLOW_LOCAL_FALLBACK", True)
     require_backend_services = _env_flag("CORPUSAGENT2_REQUIRE_BACKEND_SERVICES", False)
@@ -1657,16 +1931,35 @@ def _fetch_documents(params: dict[str, Any], deps: dict[str, ToolExecutionResult
         return merged
 
     caveats: list[str] = []
-    try:
-        rows = context.working_store.fetch_documents(doc_ids)
-    except Exception as exc:
-        if not allow_local_fallback:
-            raise
-        rows = []
-        caveats.append(f"Working-set document fetch failed and runtime fallback was used: {exc}")
+    total_available = len(doc_ids)
+    if working_set_ref and not doc_ids:
+        total_available = _count_working_set(context, working_set_ref, 0)
+        fetcher = getattr(context.working_store, "fetch_working_set_documents", None)
+        if callable(fetcher):
+            try:
+                rows = fetcher(context.run_id, working_set_ref, limit=fetch_limit, offset=0)
+            except Exception as exc:
+                if not allow_local_fallback:
+                    raise
+                rows = []
+                caveats.append(f"Working-set document fetch failed and runtime fallback was used: {exc}")
+        else:
+            ids = _fetch_working_set_ids(context, working_set_ref, limit=fetch_limit)
+            rows = context.working_store.fetch_documents(ids) if ids else []
+    else:
+        try:
+            rows = context.working_store.fetch_documents(doc_ids[:fetch_limit] if len(doc_ids) > fetch_limit else doc_ids)
+        except Exception as exc:
+            if not allow_local_fallback:
+                raise
+            rows = []
+            caveats.append(f"Working-set document fetch failed and runtime fallback was used: {exc}")
     if not rows and context.runtime is not None and allow_local_fallback:
         try:
-            df = context.runtime.load_docs(doc_ids)
+            fallback_ids = doc_ids[:fetch_limit]
+            if working_set_ref and not fallback_ids:
+                fallback_ids = _fetch_working_set_ids(context, working_set_ref, limit=fetch_limit)
+            df = context.runtime.load_docs(fallback_ids)
             rows = [
                 _merge_document(
                     {
@@ -1685,8 +1978,19 @@ def _fetch_documents(params: dict[str, Any], deps: dict[str, ToolExecutionResult
             caveats.append(f"Runtime document lookup fallback failed: {exc}")
     else:
         rows = [_merge_document(dict(row)) for row in rows]
+    if total_available > len(rows):
+        caveats.append(
+            f"Fetched {len(rows)} preview/batch documents from working set of {total_available}. "
+            "Large-population analysis should consume working_set_ref in batches instead of treating this preview as the full corpus."
+        )
     return ToolExecutionResult(
-        payload={"documents": rows},
+        payload={
+            "documents": rows,
+            "working_set_ref": working_set_ref,
+            "document_count": total_available or len(rows),
+            "returned_document_count": len(rows),
+            "documents_truncated": total_available > len(rows),
+        },
         evidence=[{"doc_id": row["doc_id"], "score": row.get("score", 0.0)} for row in rows],
         caveats=caveats,
     )
@@ -1694,6 +1998,28 @@ def _fetch_documents(params: dict[str, Any], deps: dict[str, ToolExecutionResult
 
 def _create_working_set(params: dict[str, Any], deps: dict[str, ToolExecutionResult], context: AgentExecutionContext) -> ToolExecutionResult:
     filters = dict(params.get("filter", {})) if isinstance(params.get("filter"), dict) else {}
+    upstream_ref = str(params.get("working_set_ref", "") or _working_set_ref(deps)).strip()
+    if upstream_ref and not filters:
+        count = _count_working_set(context, upstream_ref, 0)
+        preview_ids = _fetch_working_set_ids(context, upstream_ref, limit=_result_preview_limit())
+        if context.state is not None:
+            context.state.working_set_ref = upstream_ref
+            context.state.working_set_count = count
+            context.state.working_set_doc_ids = list(preview_ids)
+        return ToolExecutionResult(
+            payload={
+                "working_set_ref": upstream_ref,
+                "working_set_doc_ids": preview_ids,
+                "document_count": count,
+                "preview_count": len(preview_ids),
+                "working_set_truncated": count > len(preview_ids),
+            },
+            caveats=[
+                f"Working set '{upstream_ref}' contains {count} documents; payload includes only preview IDs."
+            ]
+            if count > len(preview_ids)
+            else [],
+        )
     rows = _text_rows(deps)
     if rows:
         context.working_store.record_documents(context.run_id, rows)
@@ -2662,11 +2988,12 @@ def _claim_strength_score(params: dict[str, Any], deps: dict[str, ToolExecutionR
     for row in spans:
         excerpt = str(row.get("excerpt", "")).lower()
         score = 0.3
-        if "imminent" in excerpt or "within days" in excerpt:
+        matched = {str(item).lower() for item in row.get("matched_keywords", []) if str(item).strip()}
+        if "imminent" in matched or "likely" in matched:
             score += 0.35
-        if "will invade" in excerpt or "could invade" in excerpt:
+        if matched.intersection({"predict", "predicted", "prediction", "forecast", "forecasted", "forecasts", "foresaw", "foresee"}):
             score += 0.25
-        if "warn" in excerpt or "prediction" in excerpt or "predicted" in excerpt:
+        if matched.intersection({"warn", "warned", "warning", "anticipate", "anticipated", "anticipates", "expect", "expected", "expects"}):
             score += 0.15
         scored.append({**row, "score": round(min(score, 1.0), 3)})
     scored.sort(key=lambda item: float(item.get("score", 0.0)), reverse=True)
@@ -2701,6 +3028,33 @@ def _build_evidence_table(params: dict[str, Any], deps: dict[str, ToolExecutionR
     if task == "noun_frequency_distribution":
         top_k = int(params.get("top_k", 100) or 100)
         documents = _text_rows(deps)
+        working_set_ref = str(params.get("working_set_ref", "") or _working_set_ref(deps)).strip()
+        documents_truncated = _dependency_payload_flag(deps, "documents_truncated")
+        full_document_count = _dependency_payload_int(deps, "document_count", len(documents))
+        if working_set_ref and documents_truncated:
+            noun_rows, full_metadata = _noun_frequency_rows_from_working_set(
+                context,
+                working_set_ref,
+                top_k=top_k,
+            )
+            caveats = [
+                (
+                    "Upstream fetched documents were only a preview, so noun distribution was computed by "
+                    "streaming the full working_set_ref in batches instead of using preview-only POS rows."
+                )
+            ]
+            if full_document_count and full_metadata.get("analyzed_document_count") != full_document_count:
+                caveats.append(
+                    f"Expected {full_document_count} working-set documents but analyzed {full_metadata.get('analyzed_document_count', 0)}."
+                )
+            if not noun_rows:
+                caveats.append("No noun distribution rows were produced from the full working set.")
+            return ToolExecutionResult(
+                payload={"rows": noun_rows, **full_metadata},
+                evidence=[],
+                caveats=caveats,
+                metadata={"no_data": not noun_rows, "task": task, **full_metadata},
+            )
         pos_rows = []
         for result in deps.values():
             payload = result.payload if isinstance(result.payload, dict) else {}
@@ -2713,17 +3067,27 @@ def _build_evidence_table(params: dict[str, Any], deps: dict[str, ToolExecutionR
                 break
         noun_rows = _noun_frequency_rows(documents, pos_rows, top_k=top_k)
         caveats = [] if noun_rows else ["No noun distribution rows were produced from the upstream documents and POS rows."]
+        if documents_truncated:
+            caveats.append(
+                "Noun distribution is preview-only because upstream documents were truncated and no batch working_set_ref was available."
+            )
         return ToolExecutionResult(
-            payload={"rows": noun_rows},
+            payload={"rows": noun_rows, "analyzed_document_count": len(documents), "source_document_count": full_document_count},
             evidence=[],
             caveats=caveats,
-            metadata={"no_data": not noun_rows, "task": task},
+            metadata={"no_data": not noun_rows, "task": task, "preview_only": bool(documents_truncated)},
         )
     if task == "summary_stats":
         documents = _text_rows(deps)
         upstream_rows = []
+        matched_document_count: int | None = None
         for result in deps.values():
             payload = result.payload if isinstance(result.payload, dict) else {}
+            if payload.get("analyzed_document_count") not in (None, ""):
+                try:
+                    matched_document_count = int(payload.get("analyzed_document_count") or 0)
+                except (TypeError, ValueError):
+                    matched_document_count = matched_document_count
             rows = payload.get("rows")
             if not isinstance(rows, list) or not rows:
                 continue
@@ -2731,7 +3095,7 @@ def _build_evidence_table(params: dict[str, Any], deps: dict[str, ToolExecutionR
             if isinstance(first, dict) and "lemma" in first and "count" in first:
                 upstream_rows = [dict(item) for item in rows if isinstance(item, dict)]
                 break
-        summary_rows = _summary_stat_rows(documents, upstream_rows)
+        summary_rows = _summary_stat_rows(documents, upstream_rows, matched_document_count=matched_document_count)
         caveats = [] if summary_rows else ["No summary statistics rows were produced from the upstream aggregation."]
         return ToolExecutionResult(
             payload={"rows": summary_rows},
@@ -2907,18 +3271,71 @@ def _join_external_series(params: dict[str, Any], deps: dict[str, ToolExecutionR
     )
 
 
-def _plot_artifact(params: dict[str, Any], deps: dict[str, ToolExecutionResult], context: AgentExecutionContext) -> ToolExecutionResult:
-    try:
-        import matplotlib
+def _svg_escape(value: object) -> str:
+    return (
+        str(value)
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+    )
 
-        matplotlib.use("Agg", force=True)
-        import matplotlib.pyplot as plt
-    except Exception as exc:
-        return ToolExecutionResult(
-            payload={"rows": []},
-            caveats=[f"matplotlib unavailable: {exc}"],
-            metadata={"no_data": True, "no_data_reason": f"matplotlib unavailable: {exc}"},
+
+def _write_svg_plot_fallback(
+    *,
+    params: dict[str, Any],
+    rows: list[dict[str, Any]],
+    target: Path,
+    plot_name: str,
+) -> Path:
+    target = target.with_suffix(".svg")
+    x_key = str(params.get("x", "")).strip()
+    y_key = str(params.get("y", "")).strip()
+    first = rows[:16]
+    labels = [
+        str(
+            item.get(
+                x_key,
+                item.get("lemma", item.get("entity", item.get("term", item.get("doc_id", item.get("time_bin", "row"))))),
+            )
         )
+        for item in first
+    ]
+    values = [
+        float(item.get(y_key, item.get("count", item.get("score", item.get("weight", item.get("intensity", 0.0))))))
+        for item in first
+    ]
+    max_value = max((abs(value) for value in values), default=1.0) or 1.0
+    width = 960
+    height = 540
+    left = 180
+    top = 72
+    row_height = 24
+    bar_width = 650
+    lines = [
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">',
+        '<rect width="100%" height="100%" fill="#fffdf8"/>',
+        f'<text x="{left}" y="38" font-family="Verdana, sans-serif" font-size="20" font-weight="700" fill="#17312d">{_svg_escape(plot_name)}</text>',
+    ]
+    for index, (label, value) in enumerate(zip(labels, values, strict=False)):
+        y = top + (index * row_height)
+        normalized_width = int((abs(value) / max_value) * bar_width)
+        color = "#0f766e" if value >= 0 else "#be123c"
+        lines.append(
+            f'<text x="16" y="{y + 16}" font-family="Verdana, sans-serif" font-size="12" fill="#17312d">{_svg_escape(label[:24])}</text>'
+        )
+        lines.append(
+            f'<rect x="{left}" y="{y}" width="{normalized_width}" height="16" rx="3" fill="{color}" opacity="0.82"/>'
+        )
+        lines.append(
+            f'<text x="{left + normalized_width + 8}" y="{y + 13}" font-family="Verdana, sans-serif" font-size="11" fill="#17312d">{value:.2f}</text>'
+        )
+    lines.append("</svg>")
+    target.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return target
+
+
+def _plot_artifact(params: dict[str, Any], deps: dict[str, ToolExecutionResult], context: AgentExecutionContext) -> ToolExecutionResult:
     rows = []
     for result in deps.values():
         payload = result.payload
@@ -2935,9 +3352,23 @@ def _plot_artifact(params: dict[str, Any], deps: dict[str, ToolExecutionResult],
     plot_dir = context.artifacts_dir / "plots"
     plot_dir.mkdir(parents=True, exist_ok=True)
     target = plot_dir / f"{params.get('plot_name', 'plot')}.png"
+    plot_name = str(params.get("plot_name", "plot")).replace("_", " ").title()
+    try:
+        import matplotlib
+
+        matplotlib.use("Agg", force=True)
+        import matplotlib.pyplot as plt
+    except Exception as exc:
+        fallback_target = _write_svg_plot_fallback(params=params, rows=rows, target=target, plot_name=plot_name)
+        first = rows[:16]
+        return ToolExecutionResult(
+            payload={"artifact_path": str(fallback_target), "rows": first, "plot_name": plot_name},
+            artifacts=[str(fallback_target)],
+            caveats=[f"matplotlib unavailable; generated SVG fallback plot instead: {exc}"],
+            metadata={"fallback": "svg", "reason": "matplotlib_unavailable"},
+        )
     plt.style.use("seaborn-v0_8-whitegrid")
     figure, axis = plt.subplots(figsize=(12.5, 6.6), dpi=180)
-    plot_name = str(params.get("plot_name", "plot")).replace("_", " ").title()
     first = rows[:16]
     unique_time_bins = {
         str(item.get("time_bin", "unknown"))

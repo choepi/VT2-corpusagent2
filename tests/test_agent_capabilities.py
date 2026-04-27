@@ -356,6 +356,24 @@ def test_query_anchor_terms_split_hyphenated_topic_terms_and_drop_filler() -> No
     assert anchors == ["soccer"]
 
 
+def test_query_anchor_terms_keep_domain_topics_instead_of_example_frames() -> None:
+    anchors = agent_capabilities._query_anchor_terms("privacy regulation stock drawdown reports")
+
+    assert "privacy" in anchors
+    assert "regulation" in anchors
+    assert "stock" in anchors
+    assert "drawdown" in anchors
+    assert "reports" not in anchors
+
+
+def test_query_anchor_terms_prefer_resolved_meaning_over_ambiguous_term() -> None:
+    anchors = agent_capabilities._query_anchor_terms(
+        "What is the distribution of noun lemmas in all football reports, where football means soccer?"
+    )
+
+    assert anchors == ["soccer"]
+
+
 def test_db_search_materializes_full_sql_match_set_for_exhaustive_questions(monkeypatch, tmp_path: Path) -> None:
     search_backend = _CapturingSearchBackend()
     captured: dict[str, object] = {}
@@ -399,6 +417,166 @@ def test_db_search_materializes_full_sql_match_set_for_exhaustive_questions(monk
     assert result.payload["retrieval_strategy"] == "exhaustive_analytic"
     assert len(result.payload["results"]) == 2
     assert any("full lexical postgres" in caveat.lower() for caveat in result.caveats)
+
+
+def test_exhaustive_db_search_returns_preview_and_materialized_working_set(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("CORPUSAGENT2_RESULT_PREVIEW_ROWS", "10")
+    search_backend = _CapturingSearchBackend()
+
+    def _fake_sql_search_rows(**kwargs):
+        words = [
+            "alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel", "india", "juliet",
+            "kilo", "lima", "mike", "november", "oscar", "papa", "quebec", "romeo", "sierra", "tango",
+            "uniform", "victor", "whiskey", "xray", "yankee",
+        ]
+        return [
+            {
+                "doc_id": f"doc-{idx}",
+                "title": f"Football {words[idx]} report",
+                "snippet": f"{words[idx]} football tactics and club strategy.",
+                "outlet": "NZZ",
+                "date": f"2022-01-{idx + 1:02d}",
+                "score": float(idx),
+            }
+            for idx in range(25)
+        ]
+
+    monkeypatch.setattr(agent_capabilities, "_queryable_sql_store", lambda context: (object(), ""))
+    monkeypatch.setattr(agent_capabilities, "_sql_search_rows", _fake_sql_search_rows)
+    store = InMemoryWorkingSetStore()
+    context = AgentExecutionContext(
+        run_id="run",
+        artifacts_dir=tmp_path,
+        search_backend=search_backend,
+        working_store=store,
+        runtime=None,
+    )
+
+    result = _db_search({"query": "What is the distribution of nouns across all football reports in the corpus?"}, {}, context)
+    working_set = _create_working_set({}, {"search": result}, context)
+
+    assert result.payload["result_count"] == 25
+    assert len(result.payload["results"]) == 10
+    assert result.payload["results_truncated"] is True
+    assert result.payload["working_set_ref"]
+    assert store.count_working_set("run", result.payload["working_set_ref"]) == 25
+    assert working_set.payload["document_count"] == 25
+    assert len(working_set.payload["working_set_doc_ids"]) == 10
+
+
+def test_fetch_documents_prefers_working_set_ref_over_search_preview(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("CORPUSAGENT2_WORKING_SET_FETCH_LIMIT", "2")
+    store = InMemoryWorkingSetStore()
+    rows = [
+        {"doc_id": "doc-1", "rank": 1, "score": 3.0},
+        {"doc_id": "doc-2", "rank": 2, "score": 2.0},
+        {"doc_id": "doc-3", "rank": 3, "score": 1.0},
+    ]
+    store.record_working_set("run", "search_all", rows)
+    for row in rows:
+        store.document_lookup[row["doc_id"]] = {
+            "doc_id": row["doc_id"],
+            "title": f"Document {row['doc_id']}",
+            "text": f"Full text for {row['doc_id']}",
+            "published_at": "2022-01-01",
+            "source": "NZZ",
+        }
+    context = AgentExecutionContext(
+        run_id="run",
+        artifacts_dir=tmp_path,
+        search_backend=_EmptySearchBackend(),
+        working_store=store,
+        runtime=None,
+    )
+    search = ToolExecutionResult(
+        payload={
+            "results": [{"doc_id": "doc-1", "title": "preview only"}],
+            "working_set_ref": "search_all",
+            "result_count": 3,
+            "results_truncated": True,
+        }
+    )
+
+    result = _fetch_documents({}, {"search": search}, context)
+
+    assert [row["doc_id"] for row in result.payload["documents"]] == ["doc-1", "doc-2"]
+    assert result.payload["document_count"] == 3
+    assert result.payload["returned_document_count"] == 2
+    assert result.payload["documents_truncated"] is True
+
+
+def test_noun_distribution_streams_full_working_set_when_fetch_is_preview(tmp_path: Path) -> None:
+    store = InMemoryWorkingSetStore()
+    working_rows = [{"doc_id": f"doc-{idx}", "rank": idx, "score": float(idx)} for idx in range(1, 4)]
+    store.record_working_set("run", "all_docs", working_rows)
+    store.document_lookup.update(
+        {
+            "doc-1": {"doc_id": "doc-1", "title": "", "text": "apple banana", "published_at": "2022-01-01", "source": "NZZ"},
+            "doc-2": {"doc_id": "doc-2", "title": "", "text": "banana banana", "published_at": "2022-01-02", "source": "NZZ"},
+            "doc-3": {"doc_id": "doc-3", "title": "", "text": "carrot banana", "published_at": "2022-01-03", "source": "TA"},
+        }
+    )
+    context = AgentExecutionContext(
+        run_id="run",
+        artifacts_dir=tmp_path,
+        search_backend=_EmptySearchBackend(),
+        working_store=store,
+        runtime=None,
+    )
+    fetch_preview = ToolExecutionResult(
+        payload={
+            "documents": [store.document_lookup["doc-1"]],
+            "working_set_ref": "all_docs",
+            "document_count": 3,
+            "returned_document_count": 1,
+            "documents_truncated": True,
+        }
+    )
+
+    result = _build_evidence_table({"task": "noun_frequency_distribution", "top_k": 5}, {"fetch": fetch_preview}, context)
+
+    rows_by_lemma = {row["lemma"]: row for row in result.payload["rows"]}
+    assert rows_by_lemma["banana"]["count"] == 4
+    assert rows_by_lemma["banana"]["document_frequency"] == 3
+    assert result.payload["analyzed_document_count"] == 3
+    assert result.metadata["full_working_set"] is True
+
+
+def test_local_exhaustive_requires_multi_anchor_coverage(monkeypatch, tmp_path: Path) -> None:
+    runtime = _RuntimeWithMetadata(
+        [
+            {
+                "doc_id": "d1",
+                "title": "Soccer schedule",
+                "text": "Television times and sports listings.",
+                "published_at": "2022-05-01",
+                "source": "NZZ",
+            },
+            {
+                "doc_id": "d2",
+                "title": "Soccer league report",
+                "text": "League tactics and match analysis.",
+                "published_at": "2022-05-02",
+                "source": "TA",
+            },
+        ]
+    )
+    monkeypatch.setattr(
+        agent_capabilities,
+        "_queryable_sql_store",
+        lambda context: (None, "Postgres unavailable"),
+    )
+    context = AgentExecutionContext(
+        run_id="run",
+        artifacts_dir=tmp_path,
+        search_backend=_CapturingSearchBackend(),
+        working_store=_ExplodingStore(),
+        runtime=runtime,
+    )
+
+    result = _db_search({"query": "What is the distribution of nouns across all soccer league reports?"}, {}, context)
+
+    assert [row["doc_id"] for row in result.payload["results"]] == ["d2"]
 
 
 def test_db_search_uses_local_exhaustive_materialization_when_sql_store_is_unavailable(monkeypatch, tmp_path: Path) -> None:

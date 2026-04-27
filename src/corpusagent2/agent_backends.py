@@ -461,6 +461,25 @@ class WorkingSetStore(Protocol):
     def fetch_documents(self, doc_ids: list[str]) -> list[dict[str, Any]]:
         ...
 
+    def record_working_set(self, run_id: str, label: str, rows: list[dict[str, Any]]) -> None:
+        ...
+
+    def fetch_working_set_doc_ids(self, run_id: str, label: str, *, limit: int | None = None, offset: int = 0) -> list[str]:
+        ...
+
+    def fetch_working_set_documents(
+        self,
+        run_id: str,
+        label: str,
+        *,
+        limit: int | None = None,
+        offset: int = 0,
+    ) -> list[dict[str, Any]]:
+        ...
+
+    def count_working_set(self, run_id: str, label: str) -> int:
+        ...
+
     def record_documents(self, run_id: str, rows: list[dict[str, Any]]) -> None:
         ...
 
@@ -491,6 +510,7 @@ class InMemoryWorkingSetStore:
     outputs_by_run: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
     runs: dict[str, dict[str, Any]] = field(default_factory=dict)
     document_lookup: dict[str, dict[str, Any]] = field(default_factory=dict)
+    working_sets_by_run: dict[tuple[str, str], list[dict[str, Any]]] = field(default_factory=dict)
 
     def create_run(self, *, run_id: str, question: str, rewritten_question: str, force_answer: bool, no_cache: bool) -> None:
         self.runs[run_id] = {
@@ -503,6 +523,43 @@ class InMemoryWorkingSetStore:
 
     def fetch_documents(self, doc_ids: list[str]) -> list[dict[str, Any]]:
         return [dict(self.document_lookup[doc_id]) for doc_id in doc_ids if doc_id in self.document_lookup]
+
+    def record_working_set(self, run_id: str, label: str, rows: list[dict[str, Any]]) -> None:
+        seen: set[str] = set()
+        materialized: list[dict[str, Any]] = []
+        for rank, row in enumerate(rows, start=1):
+            doc_id = str(row.get("doc_id", "")).strip()
+            if not doc_id or doc_id in seen:
+                continue
+            seen.add(doc_id)
+            materialized.append(
+                {
+                    "doc_id": doc_id,
+                    "rank": int(row.get("rank", rank) or rank),
+                    "score": float(row.get("score", 0.0) or 0.0),
+                }
+            )
+        self.working_sets_by_run[(run_id, label)] = materialized
+
+    def fetch_working_set_doc_ids(self, run_id: str, label: str, *, limit: int | None = None, offset: int = 0) -> list[str]:
+        rows = self.working_sets_by_run.get((run_id, label), [])
+        selected = rows[max(0, offset) :]
+        if limit is not None:
+            selected = selected[: max(0, limit)]
+        return [str(row["doc_id"]) for row in selected]
+
+    def fetch_working_set_documents(
+        self,
+        run_id: str,
+        label: str,
+        *,
+        limit: int | None = None,
+        offset: int = 0,
+    ) -> list[dict[str, Any]]:
+        return self.fetch_documents(self.fetch_working_set_doc_ids(run_id, label, limit=limit, offset=offset))
+
+    def count_working_set(self, run_id: str, label: str) -> int:
+        return len(self.working_sets_by_run.get((run_id, label), []))
 
     def record_documents(self, run_id: str, rows: list[dict[str, Any]]) -> None:
         self.documents_by_run.setdefault(run_id, []).extend(dict(row) for row in rows)
@@ -615,6 +672,20 @@ class PostgresWorkingSetStore:
               output_type TEXT NOT NULL,
               payload JSONB NOT NULL DEFAULT '{}'::jsonb
             );
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS ca_agent_working_set_docs (
+              run_id TEXT NOT NULL,
+              label TEXT NOT NULL,
+              doc_id TEXT NOT NULL,
+              rank INTEGER NOT NULL DEFAULT 0,
+              score DOUBLE PRECISION NOT NULL DEFAULT 0,
+              PRIMARY KEY (run_id, label, doc_id)
+            );
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS idx_ca_agent_working_set_docs_order
+            ON ca_agent_working_set_docs (run_id, label, rank);
             """,
         ]
         with self._connect() as conn:
@@ -743,6 +814,133 @@ class PostgresWorkingSetStore:
             }
             for row in rows
         ]
+
+    def record_working_set(self, run_id: str, label: str, rows: list[dict[str, Any]]) -> None:
+        self.ensure_schema()
+        materialized: list[tuple[str, str, str, int, float]] = []
+        seen: set[str] = set()
+        for rank, row in enumerate(rows, start=1):
+            doc_id = str(row.get("doc_id", "")).strip()
+            if not doc_id or doc_id in seen:
+                continue
+            seen.add(doc_id)
+            materialized.append(
+                (
+                    run_id,
+                    label,
+                    doc_id,
+                    int(row.get("rank", rank) or rank),
+                    float(row.get("score", 0.0) or 0.0),
+                )
+            )
+        with self._connect() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    "DELETE FROM ca_agent_working_set_docs WHERE run_id = %s AND label = %s",
+                    (run_id, label),
+                )
+                for start in range(0, len(materialized), 5000):
+                    cursor.executemany(
+                        """
+                        INSERT INTO ca_agent_working_set_docs (run_id, label, doc_id, rank, score)
+                        VALUES (%s, %s, %s, %s, %s)
+                        ON CONFLICT (run_id, label, doc_id) DO UPDATE SET
+                          rank = EXCLUDED.rank,
+                          score = EXCLUDED.score;
+                        """,
+                        materialized[start : start + 5000],
+                    )
+            conn.commit()
+
+    def fetch_working_set_doc_ids(self, run_id: str, label: str, *, limit: int | None = None, offset: int = 0) -> list[str]:
+        self.ensure_schema()
+        params: list[Any] = [run_id, label]
+        limit_clause = ""
+        if limit is not None:
+            limit_clause = " LIMIT %s OFFSET %s"
+            params.extend([max(0, int(limit)), max(0, int(offset))])
+        elif offset > 0:
+            limit_clause = " OFFSET %s"
+            params.append(max(0, int(offset)))
+        with self._connect() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT doc_id
+                    FROM ca_agent_working_set_docs
+                    WHERE run_id = %s AND label = %s
+                    ORDER BY rank, doc_id
+                    """
+                    + limit_clause,
+                    tuple(params),
+                )
+                rows = cursor.fetchall()
+        return [str(row[0]) for row in rows]
+
+    def fetch_working_set_documents(
+        self,
+        run_id: str,
+        label: str,
+        *,
+        limit: int | None = None,
+        offset: int = 0,
+    ) -> list[dict[str, Any]]:
+        columns = self._document_columns()
+        table_name = self._safe_identifier(self.documents_table)
+        select_title = f"doc.{columns['title']}" if columns["title"] else "''"
+        select_date = f"doc.{columns['date']}" if columns["date"] else "''"
+        select_source = f"doc.{columns['source']}" if columns["source"] else "''"
+        params: list[Any] = [run_id, label]
+        limit_clause = ""
+        if limit is not None:
+            limit_clause = " LIMIT %s OFFSET %s"
+            params.extend([max(0, int(limit)), max(0, int(offset))])
+        elif offset > 0:
+            limit_clause = " OFFSET %s"
+            params.append(max(0, int(offset)))
+        query = (
+            f"SELECT "
+            f"doc.{columns['doc_id']} AS doc_id, "
+            f"{select_title} AS title, "
+            f"doc.{columns['text']} AS text, "
+            f"{select_date} AS published_at, "
+            f"{select_source} AS source "
+            f"FROM ca_agent_working_set_docs ws "
+            f"JOIN {table_name} doc ON doc.{columns['doc_id']}::text = ws.doc_id "
+            f"WHERE ws.run_id = %s AND ws.label = %s "
+            f"ORDER BY ws.rank, ws.doc_id"
+            f"{limit_clause}"
+        )
+        with self._connect() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(query, tuple(params))
+                rows = cursor.fetchall()
+        return [
+            {
+                "doc_id": str(row[0]),
+                "title": str(row[1] or ""),
+                "text": str(row[2] or ""),
+                "date": str(row[3] or ""),
+                "published_at": str(row[3] or ""),
+                "outlet": str(row[4] or ""),
+                "source": str(row[4] or ""),
+            }
+            for row in rows
+        ]
+
+    def count_working_set(self, run_id: str, label: str) -> int:
+        self.ensure_schema()
+        with self._connect() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT COUNT(*)
+                    FROM ca_agent_working_set_docs
+                    WHERE run_id = %s AND label = %s
+                    """,
+                    (run_id, label),
+                )
+                return int(cursor.fetchone()[0] or 0)
 
     def record_documents(self, run_id: str, rows: list[dict[str, Any]]) -> None:
         self.ensure_schema()

@@ -258,6 +258,8 @@ class AgentRunState:
     tool_catalog: list[dict[str, Any]] = field(default_factory=list)
     corpus_schema: dict[str, Any] = field(default_factory=dict)
     working_set_doc_ids: list[str] = field(default_factory=list)
+    working_set_ref: str = ""
+    working_set_count: int = 0
     artifacts: dict[str, str] = field(default_factory=dict)
     failures: list[dict[str, Any]] = field(default_factory=list)
     planner_calls_used: int = 0

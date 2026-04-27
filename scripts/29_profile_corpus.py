@@ -37,18 +37,7 @@ LANGUAGE_HINTS = {
     "es": {"que", "los", "las", "con", "para", "una", "del", "por"},
 }
 
-DEFAULT_PROBES = {
-    "football": r"\bfootball\b",
-    "soccer": r"\bsoccer\b|\bassociation football\b",
-    "facebook": r"\bfacebook\b|\bmeta\b",
-    "cambridge_analytica": r"\bcambridge analytica\b",
-    "ukraine": r"\bukraine\b|\bkyiv\b|\bkiev\b",
-    "donald_trump": r"\bdonald trump\b|\btrump\b",
-    "covid": r"\bcovid(?:-19)?\b|\bcoronavirus\b|\bpandemic\b",
-    "bitcoin": r"\bbitcoin\b|\bbtc\b|\bcryptocurrency\b",
-    "brexit": r"\bbrexit\b",
-    "climate": r"\bclimate change\b|\bglobal warming\b|\bcarbon emissions?\b",
-}
+DEFAULT_PROBES: dict[str, str] = {}
 
 
 def parse_args() -> argparse.Namespace:
@@ -61,7 +50,7 @@ def parse_args() -> argparse.Namespace:
         "--probe",
         action="append",
         default=[],
-        help="Additional benchmark probe in the form name=regex. Can be provided multiple times.",
+        help="Benchmark probe in the form name=regex. Can be provided multiple times.",
     )
     return parser.parse_args()
 
@@ -190,16 +179,6 @@ def _markdown_report(
     if not top_sources.empty:
         row = top_sources.iloc[0]
         dominant_source = f"{row['source']} ({int(row['count'])} docs, share {float(row['share_of_corpus']):.3f})"
-    football_row = probe_rows.loc[probe_rows["probe"] == "football"] if not probe_rows.empty else pd.DataFrame()
-    soccer_row = probe_rows.loc[probe_rows["probe"] == "soccer"] if not probe_rows.empty else pd.DataFrame()
-    facebook_row = probe_rows.loc[probe_rows["probe"] == "facebook"] if not probe_rows.empty else pd.DataFrame()
-    cambridge_row = probe_rows.loc[probe_rows["probe"] == "cambridge_analytica"] if not probe_rows.empty else pd.DataFrame()
-
-    def _probe_count(frame: pd.DataFrame) -> int:
-        if frame.empty:
-            return 0
-        return int(frame.iloc[0]["doc_count"])
-
     lines = [
         "# Corpus Profile",
         "",
@@ -213,14 +192,15 @@ def _markdown_report(
         "",
         "## Coverage Checks",
         "",
-        f"- `football`: {_probe_count(football_row)} docs",
-        f"- `soccer`: {_probe_count(soccer_row)} docs",
-        f"- `facebook`: {_probe_count(facebook_row)} docs",
-        f"- `cambridge_analytica`: {_probe_count(cambridge_row)} docs",
-        "",
-        "## Lexical Shape",
-        "",
     ]
+    if probe_rows.empty:
+        lines.append("- No coverage probes configured. Pass `--probe name=regex` to measure topic coverage.")
+    else:
+        lines.extend(
+            f"- `{row.probe}`: {int(row.doc_count)} docs"
+            for row in probe_rows.sort_values("doc_count", ascending=False).itertuples(index=False)
+        )
+    lines.extend(["", "## Lexical Shape", ""])
     if not top_tokens.empty:
         lines.append("- Top content tokens: " + ", ".join(top_tokens["token"].head(20).tolist()))
     if not top_bigrams.empty:

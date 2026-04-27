@@ -35,15 +35,14 @@ STOPWORDS = {
     "the", "and", "for", "that", "with", "from", "this", "have", "were", "been", "will", "would", "about",
     "their", "they", "them", "said", "says", "into", "than", "then", "after", "before", "over", "under",
     "more", "most", "some", "such", "much", "many", "also", "could", "should", "news", "media", "coverage",
-    "trump", "donald",
 }
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run an in-depth corpus analysis for a query slice.")
     parser.add_argument("--documents-path", type=Path, default=REPO_ROOT / "data" / "processed" / "documents.parquet")
-    parser.add_argument("--output-dir", type=Path, default=REPO_ROOT / "outputs" / "corpus_deep_analysis" / "trump")
-    parser.add_argument("--query", default="Trump|Donald Trump", help="Regex used to select relevant documents.")
+    parser.add_argument("--output-dir", type=Path, default=REPO_ROOT / "outputs" / "corpus_deep_analysis" / "query_slice")
+    parser.add_argument("--query", required=True, help="Regex used to select relevant documents.")
     parser.add_argument("--date-from", default="", help="Inclusive lower date bound, e.g. 2017-01-01")
     parser.add_argument("--date-to", default="", help="Inclusive upper date bound, e.g. 2019-12-31")
     parser.add_argument("--sample-size", type=int, default=12000, help="Maximum documents used for topic modeling.")

@@ -44,18 +44,11 @@ def evidence_required(question: str) -> bool:
     return any(keyword in lowered for keyword in keywords)
 
 
-def rewrite_special_cases(question: str) -> tuple[str, list[str]]:
-    lowered = str(question).lower()
-    assumptions: list[str] = []
+def normalize_question_text(question: str) -> tuple[str, list[str]]:
     rewritten = str(question).strip()
-    if "ukraine" in lowered and "predict" in lowered:
-        rewritten = (
-            "Which media published explicit immediate pre-invasion warnings or predictions "
-            "about a Russian invasion of Ukraine before 2022-02-24?"
-        )
-        assumptions.append(
-            "Interpret 'predicted the outbreak of the Ukraine war' as explicit immediate pre-invasion warning or prediction before 2022-02-24."
-        )
-    if "risk/regulation" in lowered:
-        rewritten = rewritten.replace("risk/regulation", "risk and regulation")
-    return rewritten, assumptions
+    rewritten = re.sub(
+        r"\b([A-Za-z][A-Za-z-]{2,})/([A-Za-z][A-Za-z-]{2,})\b",
+        r"\1 and \2",
+        rewritten,
+    )
+    return rewritten, []
