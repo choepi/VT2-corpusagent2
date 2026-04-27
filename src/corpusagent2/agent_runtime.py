@@ -915,6 +915,7 @@ class MagicBoxOrchestrator:
                     "When using db_search for ranked retrieval, set top_k and, when helpful, lexical_top_k, dense_top_k, rerank_top_k, and use_rerank based on the scope needed to answer the question faithfully. "
                     "When retrieve_all is true, top_k is only a fallback budget and must not be treated as the analyzed population size. "
                     "For analytical frequency tables, use build_evidence_table with supported task names exactly: noun_frequency_distribution for noun/POS lemma counts, and summary_stats for compact aggregate summaries. "
+                    "noun_frequency_distribution rows contain lemma, count, relative_frequency, document_frequency, and rank; plot them with x='lemma' and y='count'. "
                     "Do not invent near-synonym task names such as aggregate_token_frequencies unless a tool catalog entry explicitly documents them. "
                     "For plot_artifact, depend on the analytical table node and pass x, y, limit or top_k, and title; do not plot document evidence rows as if they were aggregate rows. "
                     "When a clarification says one term means another, use the resolved term as the retrieval anchor; avoid hyphenated synonym paraphrases that introduce broad generic anchors. "

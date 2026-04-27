@@ -6,9 +6,11 @@ from dataclasses import dataclass
 from hashlib import sha256
 import importlib.util
 import json
+import math
 import os
 from pathlib import Path
 import re
+import textwrap
 from typing import Any, Callable
 from urllib.parse import quote
 
@@ -99,6 +101,38 @@ STRUCTURAL_TERM_STOPWORDS = {
     "data",
     "json",
 }
+FUNCTION_WORD_STOPWORDS = {
+    "a", "an", "the", "and", "or", "but", "nor", "so", "yet", "if", "then", "than", "because", "as",
+    "of", "to", "in", "on", "at", "by", "for", "from", "with", "without", "into", "onto", "out", "up",
+    "down", "off", "over", "under", "through", "across", "between", "among",
+    "i", "me", "my", "mine", "we", "us", "our", "ours", "you", "your", "yours", "he", "him", "his",
+    "she", "her", "hers", "it", "its", "they", "them", "their", "theirs", "who", "whom", "whose",
+    "whoever", "what", "whatever", "which", "whichever", "that", "this", "these", "those",
+    "am", "is", "are", "was", "were", "be", "been", "being", "do", "does", "did", "done", "doing",
+    "have", "has", "had", "having", "will", "would", "shall", "should", "can", "could", "may",
+    "might", "must",
+    "not", "no", "yes", "just", "very", "also", "only", "even", "ever", "never", "again", "still",
+    "more", "most", "less", "least", "many", "much", "some", "any", "all", "both", "each", "either",
+    "neither", "one", "two", "three", "first", "second", "last", "new", "latest", "former", "other",
+    "another", "same", "own", "few", "several", "such",
+    "said", "say", "says", "told", "according", "reported", "announced", "asked", "added", "called",
+    "made", "make", "makes", "got", "get", "gets",
+}
+TEMPLATE_TERM_STOPWORDS = {
+    "taboola", "window", "push", "container", "placement", "target_type", "target", "type", "mode",
+    "mix", "thumbnail", "thumbnails", "interstitial", "gallery", "caption", "close", "photo", "image",
+    "javascript", "subscribe", "subscription", "email",
+}
+NOUN_LEMMA_STOPWORDS = STOPWORDS | STRUCTURAL_TERM_STOPWORDS | FUNCTION_WORD_STOPWORDS | TEMPLATE_TERM_STOPWORDS
+
+
+def _valid_noun_lemma(lemma: str, *, min_length: int = 2) -> bool:
+    normalized = str(lemma or "").strip().lower()
+    if not normalized or len(normalized) < min_length:
+        return False
+    if normalized in NOUN_LEMMA_STOPWORDS:
+        return False
+    return bool(re.search(r"[a-z]", normalized))
 
 
 def _env_flag(name: str, default: bool) -> bool:
@@ -520,9 +554,7 @@ def _noun_frequency_rows(
         if label not in {"NOUN", "PROPN"}:
             continue
         lemma = str(row.get("lemma", row.get("token", ""))).strip().lower()
-        if not lemma or len(lemma) < 2:
-            continue
-        if lemma in STOPWORDS or lemma in STRUCTURAL_TERM_STOPWORDS:
+        if not _valid_noun_lemma(lemma, min_length=2):
             continue
         doc_id = str(row.get("doc_id", "")).strip()
         counts[lemma] += 1
@@ -564,7 +596,7 @@ def _noun_frequency_rows_from_working_set(
             if pos not in {"NOUN", "PROPN"}:
                 continue
             lemma = _lemma(token)
-            if not lemma or len(lemma) < 3 or lemma in STOPWORDS:
+            if not _valid_noun_lemma(lemma, min_length=3):
                 continue
             lemma_counts[lemma] += 1
             doc_counts[lemma].add(doc_id)
@@ -1308,7 +1340,7 @@ def _lemma(token: str) -> str:
 
 def _heuristic_pos(token: str) -> str:
     lowered = token.lower()
-    if lowered in STOPWORDS:
+    if lowered in NOUN_LEMMA_STOPWORDS:
         return "STOP"
     if lowered.endswith("ly"):
         return "ADV"
@@ -3321,6 +3353,224 @@ def _join_external_series(params: dict[str, Any], deps: dict[str, ToolExecutionR
     )
 
 
+PLOT_FIELD_ALIASES = {
+    "noun_lemma": ("lemma", "term", "token"),
+    "noun": ("lemma", "term", "token"),
+    "label": ("label", "name", "lemma", "entity", "term", "source", "outlet", "time_bin", "doc_id"),
+    "name": ("name", "label", "entity", "term", "lemma"),
+    "x": ("time_bin", "date", "label", "name", "lemma", "entity", "term", "source", "doc_id"),
+    "category": ("label", "name", "lemma", "entity", "term", "source", "outlet"),
+    "date": ("date", "published_at", "time_bin"),
+    "time": ("time_bin", "date", "published_at"),
+    "time_bucket": ("time_bin", "date", "published_at"),
+    "outlet": ("outlet", "source"),
+    "source": ("source", "outlet"),
+    "token": ("lemma", "term"),
+    "term": ("lemma", "token"),
+    "value": ("value", "count", "score", "weight", "mean", "intensity"),
+    "y": ("count", "value", "score", "weight", "mean", "intensity"),
+    "token_count": ("count",),
+    "noun_count": ("count",),
+    "frequency": ("count", "relative_frequency", "frequency", "freq"),
+    "freq": ("count", "relative_frequency", "frequency"),
+    "document_count": ("document_frequency", "count"),
+    "doc_frequency": ("document_frequency", "count"),
+    "df": ("document_frequency", "count"),
+    "mentions": ("count", "document_frequency"),
+    "mention_count": ("count", "document_frequency"),
+    "entity_count": ("count", "document_frequency"),
+    "topic_weight": ("weight",),
+    "sentiment": ("mean", "score", "value"),
+}
+PLOT_X_FIELD_PRIORITY = (
+    "time_bin",
+    "date",
+    "published_at",
+    "label",
+    "name",
+    "lemma",
+    "term",
+    "entity",
+    "source",
+    "outlet",
+    "topic_id",
+    "doc_id",
+)
+PLOT_Y_FIELD_PRIORITY = (
+    "count",
+    "value",
+    "score",
+    "weight",
+    "mean",
+    "intensity",
+    "relative_frequency",
+    "document_frequency",
+    "frequency",
+)
+PLOT_NUMERIC_FIELD_EXCLUDES = {"rank", "id", "doc_id", "topic_id", "year", "month", "day"}
+
+
+def _normalize_plot_field_name(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", str(value or "").strip().lower())
+
+
+def _ordered_plot_keys(rows: list[dict[str, Any]]) -> list[str]:
+    seen: set[str] = set()
+    keys: list[str] = []
+    for row in rows:
+        for key in row.keys():
+            text = str(key)
+            if text not in seen:
+                seen.add(text)
+                keys.append(text)
+    return keys
+
+
+def _plot_field_coverage(rows: list[dict[str, Any]], field: str) -> int:
+    return sum(1 for row in rows if str(row.get(field, "")).strip() != "")
+
+
+def _plot_float(value: Any) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return float(value)
+    if isinstance(value, (int, float)):
+        number = float(value)
+        return number if math.isfinite(number) else None
+    text = str(value).strip()
+    if not text:
+        return None
+    is_percent = text.endswith("%")
+    text = text.rstrip("%").replace(",", "")
+    try:
+        number = float(text)
+    except ValueError:
+        return None
+    if not math.isfinite(number):
+        return None
+    return number / 100.0 if is_percent else number
+
+
+def _plot_field_has_numeric_values(rows: list[dict[str, Any]], field: str) -> bool:
+    return any(_plot_float(row.get(field)) is not None for row in rows)
+
+
+def _resolve_existing_plot_field(
+    rows: list[dict[str, Any]],
+    field: str,
+    *,
+    require_numeric: bool,
+) -> str | None:
+    if not field:
+        return None
+    keys = _ordered_plot_keys(rows)
+    normalized = _normalize_plot_field_name(field)
+    candidates: list[str] = []
+    if field in keys:
+        candidates.append(field)
+    candidates.extend(key for key in keys if _normalize_plot_field_name(key) == normalized and key not in candidates)
+    alias_candidates = list(PLOT_FIELD_ALIASES.get(str(field).strip().lower(), ()))
+    if not alias_candidates:
+        for alias_key, aliases in PLOT_FIELD_ALIASES.items():
+            if _normalize_plot_field_name(alias_key) == normalized:
+                alias_candidates.extend(aliases)
+                break
+    candidates.extend(candidate for candidate in alias_candidates if candidate not in candidates)
+    candidates.extend(
+        key
+        for key in keys
+        for alias in alias_candidates
+        if _normalize_plot_field_name(key) == _normalize_plot_field_name(alias) and key not in candidates
+    )
+    for candidate in candidates:
+        if _plot_field_coverage(rows, candidate) <= 0:
+            continue
+        if require_numeric and not _plot_field_has_numeric_values(rows, candidate):
+            continue
+        return candidate
+    return None
+
+
+def _resolve_plot_field(
+    rows: list[dict[str, Any]],
+    requested: str,
+    axis_name: str,
+    *,
+    require_numeric: bool = False,
+    allow_infer: bool = False,
+) -> tuple[str, str | None]:
+    field = str(requested or "").strip()
+    resolved = _resolve_existing_plot_field(rows, field, require_numeric=require_numeric)
+    if resolved:
+        if field and resolved != field:
+            return resolved, f"Resolved plot {axis_name} field '{field}' to upstream field '{resolved}'."
+        return resolved, None
+    if field or not allow_infer:
+        return field, None
+    priority = PLOT_Y_FIELD_PRIORITY if require_numeric else PLOT_X_FIELD_PRIORITY
+    for candidate in priority:
+        resolved = _resolve_existing_plot_field(rows, candidate, require_numeric=require_numeric)
+        if resolved:
+            return resolved, f"Inferred plot {axis_name} field '{resolved}' from upstream rows."
+    if require_numeric:
+        for key in _ordered_plot_keys(rows):
+            if key in PLOT_NUMERIC_FIELD_EXCLUDES:
+                continue
+            if _plot_field_has_numeric_values(rows, key):
+                return key, f"Inferred plot {axis_name} field '{key}' from numeric upstream values."
+    else:
+        for key in _ordered_plot_keys(rows):
+            if _plot_field_coverage(rows, key) > 0:
+                return key, f"Inferred plot {axis_name} field '{key}' from upstream rows."
+    return "", None
+
+
+def _plot_label(value: Any, *, width: int = 48) -> str:
+    text = re.sub(r"\s+", " ", str(value or "")).strip()
+    if not text:
+        return "row"
+    shortened = textwrap.shorten(text, width=width, placeholder="...")
+    if shortened == "...":
+        return text[: max(1, width - 3)] + "..."
+    return shortened
+
+
+def _plot_value_label(value: float) -> str:
+    abs_value = abs(value)
+    if abs_value >= 1000:
+        return f"{value:,.0f}"
+    if abs_value >= 10:
+        return f"{value:.1f}".rstrip("0").rstrip(".")
+    if abs_value >= 1:
+        return f"{value:.2f}".rstrip("0").rstrip(".")
+    return f"{value:.3g}"
+
+
+def _prepare_plot_points(
+    rows: list[dict[str, Any]],
+    *,
+    x_key: str,
+    y_key: str,
+    limit: int,
+) -> tuple[list[dict[str, Any]], int]:
+    points: list[dict[str, Any]] = []
+    skipped = 0
+    for index, row in enumerate(rows):
+        value = _plot_float(row.get(y_key)) if y_key else None
+        if value is None:
+            skipped += 1
+            continue
+        raw_label = row.get(x_key) if x_key else None
+        if raw_label is None or str(raw_label).strip() == "":
+            raw_label = f"row {index + 1}"
+        label = _plot_label(raw_label)
+        points.append({"label": label, "value": value, "row": row})
+        if len(points) >= limit:
+            break
+    return points, skipped
+
+
 def _svg_escape(value: object) -> str:
     return (
         str(value)
@@ -3342,27 +3592,16 @@ def _write_svg_plot_fallback(
     x_key = str(params.get("x", "")).strip()
     y_key = str(params.get("y", "")).strip()
     limit = _int_param(params, "limit", "top_k", default=16, maximum=75)
-    first = rows[:limit]
-    labels = [
-        str(
-            item.get(
-                x_key,
-                item.get("lemma", item.get("entity", item.get("term", item.get("doc_id", item.get("time_bin", "row"))))),
-            )
-        )
-        for item in first
-    ]
-    values = [
-        float(item.get(y_key, item.get("count", item.get("score", item.get("weight", item.get("intensity", 0.0))))))
-        for item in first
-    ]
+    points, _ = _prepare_plot_points(rows, x_key=x_key, y_key=y_key, limit=limit)
+    labels = [point["label"] for point in points]
+    values = [float(point["value"]) for point in points]
     max_value = max((abs(value) for value in values), default=1.0) or 1.0
     width = 960
-    height = max(420, 100 + (len(first) * 26))
-    left = 180
+    height = max(420, 110 + (len(points) * 30))
+    left = 230
     top = 72
-    row_height = 24
-    bar_width = 650
+    row_height = 28
+    bar_width = 600
     lines = [
         f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">',
         '<rect width="100%" height="100%" fill="#fffdf8"/>',
@@ -3373,13 +3612,13 @@ def _write_svg_plot_fallback(
         normalized_width = int((abs(value) / max_value) * bar_width)
         color = "#0f766e" if value >= 0 else "#be123c"
         lines.append(
-            f'<text x="16" y="{y + 16}" font-family="Verdana, sans-serif" font-size="12" fill="#17312d">{_svg_escape(label[:24])}</text>'
+            f'<text x="16" y="{y + 16}" font-family="Verdana, sans-serif" font-size="12" fill="#17312d">{_svg_escape(label[:34])}</text>'
         )
         lines.append(
             f'<rect x="{left}" y="{y}" width="{normalized_width}" height="16" rx="3" fill="{color}" opacity="0.82"/>'
         )
         lines.append(
-            f'<text x="{left + normalized_width + 8}" y="{y + 13}" font-family="Verdana, sans-serif" font-size="11" fill="#17312d">{value:.2f}</text>'
+            f'<text x="{left + normalized_width + 8}" y="{y + 13}" font-family="Verdana, sans-serif" font-size="11" fill="#17312d">{_plot_value_label(value)}</text>'
         )
     lines.append("</svg>")
     target.write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -3401,27 +3640,59 @@ def _plot_artifact(params: dict[str, Any], deps: dict[str, ToolExecutionResult],
             metadata={"no_data": True, "no_data_reason": "No rows available for plotting."},
         )
     limit = _int_param(params, "limit", "top_k", default=16, maximum=100)
-    first = [dict(item) for item in rows[:limit] if isinstance(item, dict)]
-    if not first:
+    structured_rows = [dict(item) for item in rows if isinstance(item, dict)]
+    if not structured_rows:
         return ToolExecutionResult(
             payload={"rows": []},
             caveats=["No structured rows available for plotting."],
             metadata={"no_data": True, "no_data_reason": "No structured rows available for plotting."},
         )
-    x_key = str(params.get("x", "")).strip()
-    y_key = str(params.get("y", "")).strip()
-    if x_key and not all(x_key in item for item in first):
+    requested_x_key = str(params.get("x", "")).strip()
+    requested_y_key = str(params.get("y", "")).strip()
+    x_key, x_caveat = _resolve_plot_field(
+        structured_rows,
+        requested_x_key,
+        "x",
+        allow_infer=not requested_x_key,
+    )
+    y_key, y_caveat = _resolve_plot_field(
+        structured_rows,
+        requested_y_key,
+        "y",
+        require_numeric=True,
+        allow_infer=not requested_y_key,
+    )
+    plot_field_caveats = [caveat for caveat in (x_caveat, y_caveat) if caveat]
+    if requested_x_key and _plot_field_coverage(structured_rows, x_key) <= 0:
         return ToolExecutionResult(
             payload={"rows": []},
-            caveats=[f"Plot requested x='{x_key}', but upstream rows do not contain that field."],
-            metadata={"no_data": True, "no_data_reason": f"Missing plot x field: {x_key}"},
+            caveats=[f"Plot requested x='{requested_x_key}', but upstream rows do not contain a compatible field."],
+            metadata={"no_data": True, "no_data_reason": f"Missing plot x field: {requested_x_key}"},
         )
-    if y_key and not all(y_key in item for item in first):
+    if requested_y_key and (
+        _plot_field_coverage(structured_rows, y_key) <= 0 or not _plot_field_has_numeric_values(structured_rows, y_key)
+    ):
         return ToolExecutionResult(
             payload={"rows": []},
-            caveats=[f"Plot requested y='{y_key}', but upstream rows do not contain that field."],
-            metadata={"no_data": True, "no_data_reason": f"Missing plot y field: {y_key}"},
+            caveats=[f"Plot requested y='{requested_y_key}', but upstream rows do not contain compatible numeric values."],
+            metadata={"no_data": True, "no_data_reason": f"Missing plot y field: {requested_y_key}"},
         )
+    if not y_key:
+        return ToolExecutionResult(
+            payload={"rows": []},
+            caveats=["No numeric field was available for plotting."],
+            metadata={"no_data": True, "no_data_reason": "No numeric plot field available."},
+        )
+    points, skipped_points = _prepare_plot_points(structured_rows, x_key=x_key, y_key=y_key, limit=limit)
+    if not points:
+        return ToolExecutionResult(
+            payload={"rows": []},
+            caveats=[f"Plot field '{y_key}' did not contain numeric values in the selected rows."],
+            metadata={"no_data": True, "no_data_reason": f"Missing usable plot y values: {y_key}"},
+        )
+    if skipped_points:
+        plot_field_caveats.append(f"Skipped {skipped_points} row(s) without numeric values for '{y_key}'.")
+    first = [dict(point["row"]) for point in points]
     plot_dir = context.artifacts_dir / "plots"
     plot_dir.mkdir(parents=True, exist_ok=True)
     raw_plot_name = str(params.get("plot_name") or params.get("title") or "plot").strip() or "plot"
@@ -3434,16 +3705,34 @@ def _plot_artifact(params: dict[str, Any], deps: dict[str, ToolExecutionResult],
         matplotlib.use("Agg", force=True)
         import matplotlib.pyplot as plt
     except Exception as exc:
-        fallback_target = _write_svg_plot_fallback(params=params, rows=rows, target=target, plot_name=plot_name)
+        fallback_params = {**params, "x": x_key, "y": y_key}
+        fallback_target = _write_svg_plot_fallback(params=fallback_params, rows=structured_rows, target=target, plot_name=plot_name)
         return ToolExecutionResult(
-            payload={"artifact_path": str(fallback_target), "rows": first, "plot_name": plot_name},
+            payload={
+                "artifact_path": str(fallback_target),
+                "rows": first,
+                "plot_name": plot_name,
+                "resolved_x": x_key,
+                "resolved_y": y_key,
+                "plotted_row_count": len(first),
+                "skipped_row_count": skipped_points,
+            },
             artifacts=[str(fallback_target)],
-            caveats=[f"matplotlib unavailable; generated SVG fallback plot instead: {exc}"],
-            metadata={"fallback": "svg", "reason": "matplotlib_unavailable"},
+            caveats=[*plot_field_caveats, f"matplotlib unavailable; generated SVG fallback plot instead: {exc}"],
+            metadata={
+                "fallback": "svg",
+                "reason": "matplotlib_unavailable",
+                "resolved_x": x_key,
+                "resolved_y": y_key,
+                "plotted_row_count": len(first),
+                "skipped_row_count": skipped_points,
+            },
         )
-    plt.style.use("seaborn-v0_8-whitegrid")
     figure_height = max(5.6, min(14.0, 2.7 + (0.34 * len(first))))
     figure, axis = plt.subplots(figsize=(13.2, figure_height), dpi=180)
+    axis.grid(axis="x", color="#d9d2c3", linewidth=0.8, alpha=0.55)
+    axis.grid(axis="y", visible=False)
+    axis.tick_params(axis="both", labelsize=8.5, colors="#17312d")
     unique_time_bins = {
         str(item.get("time_bin", "unknown"))
         for item in first
@@ -3462,7 +3751,7 @@ def _plot_artifact(params: dict[str, Any], deps: dict[str, ToolExecutionResult],
             if top_terms:
                 label = f"{label}: {', '.join(top_terms)}"
             labels.append(label)
-            values.append(float(item.get("weight", 0.0)))
+            values.append(_plot_float(item.get("weight")) or 0.0)
         colors = ["#0f766e", "#138f7a", "#16a085", "#54b499", "#7ec9b4", "#a5ded0"]
         axis.barh(labels[::-1], values[::-1], color=colors[: len(values)][::-1], edgecolor="#17312d", linewidth=0.7)
         axis.set_xlabel("Topic weight")
@@ -3473,8 +3762,11 @@ def _plot_artifact(params: dict[str, Any], deps: dict[str, ToolExecutionResult],
         ordered = sorted(first, key=lambda item: str(item.get("time_bin", "unknown")))
         x_labels = [str(item.get("time_bin", "unknown")) for item in ordered]
         x_values = list(range(len(x_labels)))
-        signal_values = [float(item.get("count", item.get("score", item.get("weight", 0.0)))) for item in ordered]
-        market_values = [float(item.get("market_close", 0.0)) for item in ordered]
+        signal_values = [
+            _plot_float(item.get("count", item.get("score", item.get("weight", 0.0)))) or 0.0
+            for item in ordered
+        ]
+        market_values = [_plot_float(item.get("market_close")) or 0.0 for item in ordered]
         axis.bar(x_values, signal_values, color="#0f766e", alpha=0.78, width=0.65, label="Corpus signal")
         axis.set_ylabel("Corpus signal", color="#0f766e")
         axis.tick_params(axis="y", colors="#0f766e")
@@ -3489,9 +3781,11 @@ def _plot_artifact(params: dict[str, Any], deps: dict[str, ToolExecutionResult],
             axis.legend(handles_1 + handles_2, labels_1 + labels_2, loc="best", fontsize=8, frameon=True)
     elif time_series_like:
         series_by_entity: defaultdict[str, list[tuple[str, float]]] = defaultdict(list)
-        for item in rows:
+        for item in structured_rows:
             entity = str(item.get("entity", item.get("label", item.get("term", "__all__"))))
-            value = float(item.get("count", item.get("score", item.get("weight", item.get("intensity", 0.0)))))
+            value = _plot_float(item.get(y_key, item.get("count", item.get("score", item.get("weight", item.get("intensity", 0.0))))))
+            if value is None:
+                continue
             series_by_entity[entity].append((str(item.get("time_bin", "unknown")), value))
         top_entities = sorted(
             series_by_entity.items(),
@@ -3520,26 +3814,8 @@ def _plot_artifact(params: dict[str, Any], deps: dict[str, ToolExecutionResult],
         if handles:
             axis.legend(loc="best", fontsize=8, frameon=True)
     else:
-        labels = [
-            str(
-                item.get(
-                    x_key,
-                    item.get("lemma", item.get("entity", item.get("term", item.get("doc_id", item.get("time_bin", "row"))))),
-                )
-            )
-            for item in first
-        ]
-        values = [
-            float(item.get(y_key, item.get("count", item.get("score", item.get("weight", item.get("intensity", 0.0))))))
-            for item in first
-        ]
-        if y_key and all(value == 0.0 for value in values) and y_key not in first[0]:
-            plt.close()
-            return ToolExecutionResult(
-                payload={"rows": []},
-                caveats=[f"Plot requested y='{y_key}', but upstream rows did not provide plottable non-zero values."],
-                metadata={"no_data": True, "no_data_reason": f"Missing usable plot y values: {y_key}"},
-            )
+        labels = [point["label"] for point in points]
+        values = [float(point["value"]) for point in points]
         colors = ["#0f766e" if value >= 0 else "#be123c" for value in values]
         needs_horizontal = len(labels) > 8 or max((len(label) for label in labels), default=0) > 18
         if needs_horizontal:
@@ -3553,24 +3829,25 @@ def _plot_artifact(params: dict[str, Any], deps: dict[str, ToolExecutionResult],
                 axis.text(
                     value + (x_offset if value >= 0 else -x_offset),
                     bar.get_y() + bar.get_height() / 2,
-                    f"{value:g}",
+                    _plot_value_label(value),
                     ha="left" if value >= 0 else "right",
                     va="center",
                     fontsize=8,
                 )
-            axis.set_xlabel(y_key or "Value")
+            axis.set_xlabel(y_key.replace("_", " ").title() or "Value")
         else:
             bars = axis.bar(labels, values, color=colors, edgecolor="#17312d", linewidth=0.5)
             for bar, value in zip(bars, values, strict=False):
                 axis.text(
                     bar.get_x() + bar.get_width() / 2,
                     value,
-                    f"{value:g}",
+                    _plot_value_label(value),
                     ha="center",
                     va="bottom" if value >= 0 else "top",
                     fontsize=8,
                 )
             axis.tick_params(axis="x", rotation=25)
+            axis.set_ylabel(y_key.replace("_", " ").title() or "Value")
 
     axis.set_title(plot_name, fontsize=15, fontweight="bold")
     axis.set_facecolor("#fffaf2")
@@ -3581,8 +3858,23 @@ def _plot_artifact(params: dict[str, Any], deps: dict[str, ToolExecutionResult],
     plt.savefig(target)
     plt.close()
     return ToolExecutionResult(
-        payload={"artifact_path": str(target), "rows": first, "plot_name": plot_name},
+        payload={
+            "artifact_path": str(target),
+            "rows": first,
+            "plot_name": plot_name,
+            "resolved_x": x_key,
+            "resolved_y": y_key,
+            "plotted_row_count": len(first),
+            "skipped_row_count": skipped_points,
+        },
         artifacts=[str(target)],
+        caveats=plot_field_caveats,
+        metadata={
+            "resolved_x": x_key,
+            "resolved_y": y_key,
+            "plotted_row_count": len(first),
+            "skipped_row_count": skipped_points,
+        },
     )
 
 
