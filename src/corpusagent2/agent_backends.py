@@ -556,7 +556,19 @@ class InMemoryWorkingSetStore:
         limit: int | None = None,
         offset: int = 0,
     ) -> list[dict[str, Any]]:
-        return self.fetch_documents(self.fetch_working_set_doc_ids(run_id, label, limit=limit, offset=offset))
+        rows = self.working_sets_by_run.get((run_id, label), [])[max(0, offset) :]
+        if limit is not None:
+            rows = rows[: max(0, limit)]
+        documents: list[dict[str, Any]] = []
+        for row in rows:
+            doc_id = str(row.get("doc_id", "")).strip()
+            if doc_id not in self.document_lookup:
+                continue
+            document = dict(self.document_lookup[doc_id])
+            document.setdefault("rank", int(row.get("rank", 0) or 0))
+            document.setdefault("score", float(row.get("score", 0.0) or 0.0))
+            documents.append(document)
+        return documents
 
     def count_working_set(self, run_id: str, label: str) -> int:
         return len(self.working_sets_by_run.get((run_id, label), []))
@@ -904,7 +916,9 @@ class PostgresWorkingSetStore:
             f"{select_title} AS title, "
             f"doc.{columns['text']} AS text, "
             f"{select_date} AS published_at, "
-            f"{select_source} AS source "
+            f"{select_source} AS source, "
+            f"ws.rank AS rank, "
+            f"ws.score AS score "
             f"FROM ca_agent_working_set_docs ws "
             f"JOIN {table_name} doc ON doc.{columns['doc_id']}::text = ws.doc_id "
             f"WHERE ws.run_id = %s AND ws.label = %s "
@@ -924,6 +938,8 @@ class PostgresWorkingSetStore:
                 "published_at": str(row[3] or ""),
                 "outlet": str(row[4] or ""),
                 "source": str(row[4] or ""),
+                "rank": int(row[5] or 0),
+                "score": float(row[6] or 0.0),
             }
             for row in rows
         ]
