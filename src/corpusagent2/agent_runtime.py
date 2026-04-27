@@ -5,12 +5,13 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 import importlib.util
 import json
+import math
 import os
 from pathlib import Path
 import re
 import threading
 import uuid
-from typing import Any
+from typing import Any, Callable
 
 from .agent_backends import (
     HybridSearchBackend,
@@ -45,6 +46,21 @@ from .tool_registry import ToolRegistry
 from .python_runner_service import DockerPythonRunnerService
 
 TERMINAL_RUN_STATUSES = {"completed", "partial", "failed", "rejected", "needs_clarification", "aborted"}
+SOURCE_SCOPE_ALIASES = {
+    "swiss": (
+        "swissinfoch",
+        "nzzch",
+        "tagesanzeigerch",
+        "blickch",
+        "letempsch",
+        "20minch",
+        "20minuten",
+        "20minutench",
+        "srfch",
+        "rtsch",
+        "watsonch",
+    ),
+}
 
 
 def _env_flag(name: str, default: bool) -> bool:
@@ -284,7 +300,8 @@ class MagicBoxOrchestrator:
             configured_mode=os.getenv("CORPUSAGENT2_DEFAULT_RETRIEVAL_MODE", "hybrid"),
         ).to_inputs()
         if query_text:
-            search_inputs["query"] = query_text
+            repaired_query = self._repair_search_query(str(search_inputs.get("query", "")), query_text)
+            search_inputs["query"] = self._apply_source_scope_to_query(repaired_query, dag_text)
         if requires_retrieval_backbone:
             search_inputs.update(self._extract_date_window(dag_text))
 
@@ -321,8 +338,12 @@ class MagicBoxOrchestrator:
                 for key in ("query", "date_from", "date_to", "year_balance", "retrieve_all", "retrieval_strategy"):
                     if key in merged_node_inputs and merged_node_inputs.get(key) not in (None, ""):
                         normalized_search_inputs[key] = merged_node_inputs[key]
-                if query_text and not str(normalized_search_inputs.get("query", "")).strip():
-                    normalized_search_inputs["query"] = query_text
+                if query_text:
+                    repaired_query = self._repair_search_query(
+                        str(normalized_search_inputs.get("query", "")),
+                        query_text,
+                    )
+                    normalized_search_inputs["query"] = self._apply_source_scope_to_query(repaired_query, dag_text)
                 node_inputs = normalized_search_inputs
             if node.capability == "fetch_documents" and search_node_id and not depends_on:
                 depends_on = [search_node_id]
@@ -346,7 +367,148 @@ class MagicBoxOrchestrator:
                     description=node.description,
                 )
             )
-        return AgentPlanDAG(nodes=normalized_nodes, metadata=dict(dag.metadata))
+        metadata = dict(dag.metadata)
+        if self._needs_temporal_portrayal_analysis(dag_text):
+            self._ensure_temporal_portrayal_nodes(normalized_nodes, unique_node_id, dag_text)
+            if metadata.get("question_family", "") in {"", "generic"}:
+                metadata["question_family"] = "temporal_portrayal_shift"
+        return AgentPlanDAG(nodes=normalized_nodes, metadata=metadata)
+
+    def _needs_temporal_portrayal_analysis(self, text: str) -> bool:
+        lowered = str(text or "").lower()
+        entity_trend_question = any(
+            phrase in lowered
+            for phrase in ("named entities", "named entity", "which actors", "actors dominated", "entities dominate")
+        )
+        explicit_portrayal_or_value = any(
+            term in lowered
+            for term in (
+                "sentiment", "tone", "framing", "portrayal", "portrayed",
+                "perceived", "perception", "value", "valuation", "worth", "reputation",
+            )
+        )
+        if entity_trend_question and not explicit_portrayal_or_value:
+            return False
+        temporal = any(
+            term in lowered
+            for term in (
+                "shift", "shifted", "changed", "change", "trend", "over time",
+                "evolve", "evolved", "evolution", "from ", "between ", "correspond",
+            )
+        )
+        portrayal = explicit_portrayal_or_value or any(
+            term in lowered
+            for term in (
+                "coverage",
+                "explained", "explain", "media", "news", "topic", "topics", "keyterm", "keyterms",
+            )
+        )
+        comparison = bool(re.search(r"\b(vs\.?|versus|compared? to|comparison|relative to)\b", lowered))
+        return temporal and (portrayal or comparison)
+
+    def _ensure_temporal_portrayal_nodes(
+        self,
+        normalized_nodes: list[AgentPlanNode],
+        unique_node_id: Callable[[str], str],
+        question_text: str,
+    ) -> None:
+        def first_node_id(capability: str) -> str:
+            return next((node.node_id for node in normalized_nodes if node.capability == capability), "")
+
+        fetch_node_id = first_node_id("fetch_documents")
+        if not fetch_node_id:
+            return
+
+        def ensure_node(
+            capability: str,
+            preferred_id: str,
+            depends_on: list[str],
+            *,
+            inputs: dict[str, Any] | None = None,
+            optional: bool = False,
+        ) -> str:
+            existing = first_node_id(capability)
+            if existing:
+                return existing
+            node_id = unique_node_id(preferred_id)
+            normalized_nodes.append(
+                AgentPlanNode(
+                    node_id=node_id,
+                    capability=capability,
+                    inputs=inputs or {},
+                    depends_on=list(dict.fromkeys(depends_on)),
+                    optional=optional,
+                )
+            )
+            return node_id
+
+        ensure_node("ner", "entities", [fetch_node_id], optional=True)
+        keyterms_node_id = ensure_node("extract_keyterms", "keyterms", [fetch_node_id], optional=True)
+        topics_node_id = ensure_node("topic_model", "topics", [fetch_node_id], inputs={"num_topics": 6}, optional=True)
+        value_focus_terms = [
+            "value", "valuation", "worth", "market value", "transfer fee", "transfer",
+            "salary", "salaries", "wage", "wages", "earnings", "contract", "price",
+            "priced", "expensive", "cost", "paid",
+        ]
+        lowered_question = str(question_text or "").lower()
+        context_keywords = [term for term in value_focus_terms if term in lowered_question]
+        sentiment_node_id = ensure_node("sentiment", "sentiment", [fetch_node_id])
+        for node in normalized_nodes:
+            if node.node_id == sentiment_node_id:
+                updated_inputs = dict(node.inputs)
+                updated_inputs.setdefault("window_strategy", "entity_local_context")
+                updated_inputs.setdefault("query_focus", question_text)
+                if context_keywords:
+                    updated_inputs.setdefault("context_keywords", context_keywords)
+                node.inputs = updated_inputs
+                break
+        series_node_id = ensure_node("time_series_aggregate", "series", [sentiment_node_id])
+        for node in normalized_nodes:
+            if node.node_id == series_node_id:
+                updated_inputs = dict(node.inputs)
+                updated_inputs.setdefault("documents_node", sentiment_node_id)
+                updated_inputs.setdefault("time_field", "published_at")
+                updated_inputs.setdefault("bucket_granularity", "month")
+                updated_inputs.setdefault("group_by", "target_label")
+                updated_inputs.setdefault("metrics", ["average_sentiment", "document_count"])
+                node.inputs = updated_inputs
+                break
+        ensure_node("change_point_detect", "changes", [series_node_id], optional=True)
+
+        sentiment_plot_defaults = {
+            "x": "time_bin",
+            "y": "average_sentiment",
+            "series": "target_label",
+            "plot_type": "line",
+        }
+        has_sentiment_plot = False
+        for node in normalized_nodes:
+            if node.capability == "plot_artifact" and series_node_id in node.depends_on:
+                updated_inputs = dict(node.inputs)
+                for key, value in sentiment_plot_defaults.items():
+                    updated_inputs.setdefault(key, value)
+                node.inputs = updated_inputs
+                has_sentiment_plot = True
+        if not has_sentiment_plot:
+            normalized_nodes.append(
+                AgentPlanNode(
+                    node_id=unique_node_id("plot_sentiment"),
+                    capability="plot_artifact",
+                    inputs={"plot_name": "portrayal_sentiment_series", **sentiment_plot_defaults},
+                    depends_on=[series_node_id],
+                    optional=True,
+                )
+            )
+        if not any(node.capability == "plot_artifact" and topics_node_id in node.depends_on for node in normalized_nodes):
+            normalized_nodes.append(
+                AgentPlanNode(
+                    node_id=unique_node_id("plot_topics"),
+                    capability="plot_artifact",
+                    inputs={"plot_name": "portrayal_topics"},
+                    depends_on=[topics_node_id or keyterms_node_id],
+                    optional=True,
+                )
+            )
 
     def _question_with_clarifications(self, state: AgentRunState) -> str:
         history = [str(item).strip() for item in state.clarification_history if str(item).strip()]
@@ -384,6 +546,71 @@ class MagicBoxOrchestrator:
         filtered = [token for token in tokens if token.lower() not in stopwords]
         return " ".join(filtered[:8]).strip()
 
+    def _query_needs_topical_repair(self, planned_query: str, fallback_query: str) -> bool:
+        planned_tokens = [token.lower() for token in re.findall(r"[A-Za-z][A-Za-z0-9]+", planned_query)]
+        fallback_tokens = [token.lower() for token in re.findall(r"[A-Za-z][A-Za-z0-9]+", fallback_query)]
+        if not planned_tokens or not fallback_tokens:
+            return False
+        broad_scope_tokens = {
+            "america",
+            "american",
+            "usa",
+            "united",
+            "states",
+            "state",
+            "us",
+            "swiss",
+            "switzerland",
+            "media",
+            "news",
+            "newspaper",
+            "newspapers",
+            "outlet",
+            "outlets",
+        }
+        if len(planned_tokens) <= 2 and all(token in broad_scope_tokens for token in planned_tokens):
+            topical_tokens = [token for token in fallback_tokens if token not in broad_scope_tokens]
+            return len(topical_tokens) >= 2
+        return False
+
+    def _repair_search_query(self, planned_query: str, fallback_query: str) -> str:
+        planned = str(planned_query or "").strip()
+        fallback = str(fallback_query or "").strip()
+        if not planned:
+            return fallback
+        if fallback and self._query_needs_topical_repair(planned, fallback):
+            return fallback
+        return planned
+
+    def _source_scope_filters_for_question(self, text: str) -> list[str]:
+        lowered = str(text or "").lower()
+        if re.search(r"\bswiss\s+(?:newspapers?|media|press|outlets?|sources?)\b", lowered) or re.search(
+            r"\b(?:newspapers?|media|press|outlets?|sources?)\s+in\s+switzerland\b",
+            lowered,
+        ):
+            return list(SOURCE_SCOPE_ALIASES["swiss"])
+        return []
+
+    def _apply_source_scope_to_query(self, query: str, question_text: str) -> str:
+        cleaned_query = str(query or "").strip()
+        if not cleaned_query:
+            return cleaned_query
+        if re.search(r"\bsource\s*:\s*\*", cleaned_query, flags=re.IGNORECASE):
+            cleaned_query = re.sub(
+                r"\s*(?:AND|OR)?\s*\(?\s*source\s*:\s*\*\s*\)?",
+                " ",
+                cleaned_query,
+                flags=re.IGNORECASE,
+            )
+            cleaned_query = " ".join(cleaned_query.split()).strip()
+        elif re.search(r"\bsource\s*:", cleaned_query, flags=re.IGNORECASE):
+            return cleaned_query
+        filters = self._source_scope_filters_for_question(question_text)
+        if not filters:
+            return cleaned_query
+        rendered = " OR ".join(f'"{item}"' for item in filters)
+        return f"({cleaned_query}) AND source:({rendered})"
+
     def _query_anchor_terms(self, text: str) -> list[str]:
         anchors: list[str] = []
         seen: set[str] = set()
@@ -407,6 +634,7 @@ class MagicBoxOrchestrator:
             "common",
             "corpus",
             "dataset",
+            "did",
             "distribution",
             "document",
             "documents",
@@ -415,6 +643,8 @@ class MagicBoxOrchestrator:
             "from",
             "frequency",
             "how",
+            "explained",
+            "explain",
             "identified",
             "identifying",
             "identify",
@@ -422,6 +652,7 @@ class MagicBoxOrchestrator:
             "included",
             "including",
             "individual",
+            "it",
             "lemma",
             "lemmas",
             "most",
@@ -451,6 +682,27 @@ class MagicBoxOrchestrator:
             "which",
             "who",
             "why",
+            "change",
+            "changed",
+            "america",
+            "american",
+            "usa",
+            "united",
+            "states",
+            "state",
+            "swiss",
+            "switzerland",
+            "media",
+            "news",
+            "newspaper",
+            "newspapers",
+            "entity",
+            "entities",
+            "named",
+            "dominate",
+            "dominated",
+            "public",
+            "discourse",
         }
 
         def _add_anchor(token: str) -> None:
@@ -479,6 +731,7 @@ class MagicBoxOrchestrator:
         return anchors[:8]
 
     def _infer_market_ticker(self, text: str) -> str:
+        lowered = str(text or "").lower()
         explicit_match = re.search(
             r"\b(?:ticker|symbol)\s*[:=]?\s*\$?([A-Z]{1,5}(?:\.[A-Z])?)\b",
             text,
@@ -488,6 +741,10 @@ class MagicBoxOrchestrator:
         cashtag_match = re.search(r"(?<![A-Za-z0-9])\$([A-Z]{1,5}(?:\.[A-Z])?)\b", text)
         if cashtag_match:
             return cashtag_match.group(1)
+        if any(term in lowered for term in ("crude oil", "oil price", "oil prices", "wti", "brent")):
+            return "CL=F"
+        if any(term in lowered for term in ("gasoline price", "gas prices", "gas price")):
+            return "RB=F"
         return ""
 
     def _search_inputs_for_question(
@@ -507,9 +764,11 @@ class MagicBoxOrchestrator:
         )
         search_inputs = budget.to_inputs()
         if query_text:
-            search_inputs["query"] = query_text
+            search_inputs["query"] = self._apply_source_scope_to_query(query_text, question_text)
         elif "query" in merged_inputs and str(merged_inputs.get("query", "")).strip():
-            search_inputs["query"] = merged_inputs["query"]
+            search_inputs["query"] = self._apply_source_scope_to_query(str(merged_inputs["query"]), question_text)
+        elif str(search_inputs.get("query", "")).strip():
+            search_inputs["query"] = self._apply_source_scope_to_query(str(search_inputs["query"]), question_text)
         for key in ("date_from", "date_to", "year_balance", "retrieve_all", "retrieval_strategy"):
             if key in merged_inputs and merged_inputs.get(key) not in (None, ""):
                 search_inputs[key] = merged_inputs[key]
@@ -808,13 +1067,7 @@ class MagicBoxOrchestrator:
                 assumptions=list(heuristic_assumptions),
                 plan_dag=dag,
             )
-        asks_media_shift = any(
-            term in text
-            for term in ("sentiment", "tone", "coverage", "framing", "topic", "topics", "media", "news", "keyterm", "keyterms")
-        ) and any(
-            term in text
-            for term in ("shift", "shifted", "changed", "change", "trend", "over time", "evolve", "evolution", "compare", "comparison", "correspond")
-        )
+        asks_media_shift = self._needs_temporal_portrayal_analysis(rewritten)
         if asks_media_shift:
             search_inputs = self._search_inputs_for_question(rewritten, query_text=query_text)
             market_ticker = self._infer_market_ticker(rewritten)
@@ -832,7 +1085,11 @@ class MagicBoxOrchestrator:
                 AgentPlanNode("plot_topics", "plot_artifact", inputs={"plot_name": "framing_topics"}, depends_on=["topics"], optional=True),
             ]
             assumptions: list[str] = []
-            if any(term in text for term in ["stock", "drawdown", "share price", "market", "valuation"]):
+            needs_external_series = bool(market_ticker) or any(
+                term in text
+                for term in ["stock", "drawdown", "share price", "market", "valuation", "oil price", "oil prices", "crude oil", "gas price", "gas prices"]
+            )
+            if needs_external_series:
                 if market_ticker:
                     nodes.append(
                         AgentPlanNode(
@@ -860,13 +1117,13 @@ class MagicBoxOrchestrator:
                     )
                 else:
                     assumptions.append(
-                        "The runtime could not infer a market ticker automatically, so stock-drawdown correspondence needs a supplied ticker or external series."
+                        "The runtime could not infer an external price-series ticker automatically, so market correspondence needs a supplied ticker or external series."
                     )
             dag = AgentPlanDAG(
                 nodes=nodes,
                 metadata={
                     "question_family": "framing_shift",
-                    "requires_external_series": any(term in text for term in ["stock", "drawdown", "share price", "market", "valuation"]),
+                    "requires_external_series": needs_external_series,
                     "market_ticker": market_ticker,
                 },
             )
@@ -901,7 +1158,13 @@ class MagicBoxOrchestrator:
                 used_fallback=True,
                 note="No LLM client configured; heuristic planning policy used.",
             )
-            return self._heuristic_plan(state)
+            heuristic = self._heuristic_plan(state)
+            if heuristic.action == "emit_plan_dag" and heuristic.plan_dag is not None:
+                heuristic.plan_dag = self._normalize_plan_dag(
+                    heuristic.plan_dag,
+                    question_text=heuristic.rewritten_question or state.rewritten_question or state.question,
+                )
+            return heuristic
         messages = [
             {
                 "role": "system",
@@ -1007,6 +1270,11 @@ class MagicBoxOrchestrator:
                 )
             if action.action == "ask_clarification" and state.force_answer:
                 heuristic = self._heuristic_plan(state)
+                if heuristic.action == "emit_plan_dag" and heuristic.plan_dag is not None:
+                    heuristic.plan_dag = self._normalize_plan_dag(
+                        heuristic.plan_dag,
+                        question_text=heuristic.rewritten_question or state.rewritten_question or state.question,
+                    )
                 heuristic.assumptions = list(
                     dict.fromkeys(
                         list(action.assumptions)
@@ -1017,6 +1285,11 @@ class MagicBoxOrchestrator:
             sufficient, clarification_assumptions = self._broad_scope_clarification_is_sufficient(state)
             if action.action == "ask_clarification" and sufficient:
                 heuristic = self._heuristic_plan(state)
+                if heuristic.action == "emit_plan_dag" and heuristic.plan_dag is not None:
+                    heuristic.plan_dag = self._normalize_plan_dag(
+                        heuristic.plan_dag,
+                        question_text=heuristic.rewritten_question or state.rewritten_question or state.question,
+                    )
                 heuristic.rewritten_question = action.rewritten_question or heuristic.rewritten_question or state.rewritten_question
                 heuristic.assumptions = list(
                     dict.fromkeys(
@@ -1041,7 +1314,13 @@ class MagicBoxOrchestrator:
                 error=error_text,
                 note=note,
             )
-            return self._heuristic_plan(state)
+            heuristic = self._heuristic_plan(state)
+            if heuristic.action == "emit_plan_dag" and heuristic.plan_dag is not None:
+                heuristic.plan_dag = self._normalize_plan_dag(
+                    heuristic.plan_dag,
+                    question_text=heuristic.rewritten_question or state.rewritten_question or state.question,
+                )
+            return heuristic
 
     def revise_after_failure(
         self,
@@ -1193,7 +1472,8 @@ class MagicBoxOrchestrator:
                     "You are the grounded synthesis module for a corpus agent operating over a user-provided corpus. "
                     "Return JSON with keys answer_text, evidence_items, artifacts_used, unsupported_parts, caveats, claim_verdicts. "
                     "Use only the provided summaries, tool outputs, and evidence. "
-                    "Do not claim direct correspondence to stock-price moves or external market behavior unless an external series was explicitly attached."
+                    "Do not claim direct correspondence to stock-price moves or external market behavior unless an external series was explicitly attached. "
+                    "When has_external_series is true and summary.external_series is present, use that compact external-series summary and do not say the external series is missing."
                 ),
             },
             {
@@ -1287,8 +1567,103 @@ class MagicBoxOrchestrator:
             )
         return fallback_rows
 
+    @staticmethod
+    def _summary_float(value: Any) -> float | None:
+        if value is None or isinstance(value, bool):
+            return None
+        if isinstance(value, (int, float)):
+            number = float(value)
+            return number if math.isfinite(number) else None
+        text = str(value).strip().replace(",", "")
+        if not text:
+            return None
+        try:
+            number = float(text)
+        except ValueError:
+            return None
+        return number if math.isfinite(number) else None
+
+    def _external_series_rows(self, snapshot: AgentExecutionSnapshot) -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
+        for result in snapshot.node_results.values():
+            payload = result.payload if isinstance(result.payload, dict) else {}
+            payload_rows = payload.get("rows", [])
+            if not isinstance(payload_rows, list):
+                continue
+            for row in payload_rows:
+                if not isinstance(row, dict):
+                    continue
+                if not any(str(key).startswith("market_") for key in row.keys()):
+                    continue
+                if self._summary_float(row.get("market_close")) is None:
+                    continue
+                rows.append(dict(row))
+        return rows
+
+    def _external_series_summary(self, snapshot: AgentExecutionSnapshot) -> dict[str, Any]:
+        rows = self._external_series_rows(snapshot)
+        if not rows:
+            return {}
+        ordered = sorted(rows, key=lambda row: str(row.get("date") or row.get("time_bin") or ""))
+        close_points: list[tuple[str, float]] = []
+        drawdowns: list[float] = []
+        for row in ordered:
+            close = self._summary_float(row.get("market_close"))
+            if close is None:
+                continue
+            period = str(row.get("time_bin") or row.get("date") or "").strip()
+            close_points.append((period, close))
+            drawdown = self._summary_float(row.get("market_drawdown"))
+            if drawdown is not None:
+                drawdowns.append(drawdown)
+        if not close_points:
+            return {}
+        first_period, first_close = close_points[0]
+        last_period, last_close = close_points[-1]
+        change = last_close - first_close
+        pct_change = None if first_close == 0 else change / first_close
+        ticker = ""
+        for row in ordered:
+            ticker = str(row.get("ticker", "")).strip()
+            if ticker:
+                break
+        if not ticker:
+            for result in snapshot.node_results.values():
+                metadata = result.metadata if isinstance(result.metadata, dict) else {}
+                ticker = str(metadata.get("ticker", "")).strip()
+                if ticker:
+                    break
+        return {
+            "ticker": ticker,
+            "row_count": len(close_points),
+            "start_period": first_period,
+            "end_period": last_period,
+            "first_close": round(first_close, 4),
+            "last_close": round(last_close, 4),
+            "absolute_change": round(change, 4),
+            "percent_change": round(pct_change, 6) if pct_change is not None else None,
+            "min_drawdown": round(min(drawdowns), 6) if drawdowns else None,
+            "sample": [
+                {"period": period, "market_close": round(close, 4)}
+                for period, close in close_points[:3]
+            ],
+        }
+
     def _derive_summary(self, snapshot: AgentExecutionSnapshot) -> dict[str, Any]:
         summary: dict[str, Any] = {}
+        external_summary = self._external_series_summary(snapshot)
+        if external_summary:
+            summary["external_series"] = external_summary
+        non_metric_rows_available = any(
+            isinstance((payload := (result.payload if isinstance(result.payload, dict) else {})).get("rows"), list)
+            and bool(payload.get("rows"))
+            and not (
+                isinstance(payload["rows"][0], dict)
+                and "metric" in payload["rows"][0]
+                and "value" in payload["rows"][0]
+            )
+            for result in snapshot.node_results.values()
+        )
         noun_distribution_attempted = any(
             node_id == "noun_distribution"
             or str((result.metadata if isinstance(result.metadata, dict) else {}).get("task", "")).strip().lower()
@@ -1314,11 +1689,13 @@ class MagicBoxOrchestrator:
                 ][:15]
                 summary["noun_distribution_source"] = "aggregated_table"
             elif "metric" in first and "value" in first:
-                summary["summary_stats"] = {
+                summary_stats = {
                     str(row.get("metric", "")).strip(): row.get("value")
                     for row in rows
                     if str(row.get("metric", "")).strip()
                 }
+                if not (non_metric_rows_available and summary_stats.get("matched_document_count") == 0):
+                    summary["summary_stats"] = summary_stats
             elif "pos" in first and "lemma" in first and "noun_distribution" not in summary and not noun_distribution_attempted:
                 counts: dict[str, int] = {}
                 for row in rows:
@@ -1362,20 +1739,7 @@ class MagicBoxOrchestrator:
         return summary
 
     def _has_external_series(self, snapshot: AgentExecutionSnapshot) -> bool:
-        for node_id, result in snapshot.node_results.items():
-            payload = result.payload if isinstance(result.payload, dict) else {}
-            metadata = result.metadata if isinstance(result.metadata, dict) else {}
-            rows = list(payload.get("rows", []))
-            if not rows:
-                continue
-            if node_id == "join_external_series":
-                return True
-            if str(metadata.get("tool_name", "")).endswith("join_external_series"):
-                return True
-            first = rows[0] if rows else {}
-            if isinstance(first, dict) and any(str(key).startswith("market_") for key in first.keys()):
-                return True
-        return False
+        return bool(self._external_series_rows(snapshot))
 
     def _apply_answer_guardrails(
         self,
@@ -1386,7 +1750,7 @@ class MagicBoxOrchestrator:
         question_text = f"{state.question} {state.rewritten_question}".lower()
         needs_market_guardrail = any(
             term in question_text
-            for term in ["stock", "drawdown", "share price", "valuation", "market"]
+            for term in ["stock", "drawdown", "share price", "valuation", "market", "oil price", "oil prices", "crude oil", "gas price", "gas prices"]
         )
         if needs_market_guardrail and not self._has_external_series(snapshot):
             note = (

@@ -10,8 +10,9 @@ import math
 import os
 from pathlib import Path
 import re
+import threading
 import textwrap
-from typing import Any, Callable
+from typing import Any, Callable, Iterable
 from urllib.parse import quote
 
 import pandas as pd
@@ -34,6 +35,7 @@ SPEAKER_PATTERN = re.compile(
     r"([A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2})\s+(said|says|warned|argued|claimed|according to)",
     re.IGNORECASE,
 )
+MATPLOTLIB_PLOT_LOCK = threading.RLock()
 
 STOPWORDS = {
     "the", "and", "for", "that", "with", "this", "from", "have", "were", "their", "about", "into", "there",
@@ -104,7 +106,8 @@ STRUCTURAL_TERM_STOPWORDS = {
 FUNCTION_WORD_STOPWORDS = {
     "a", "an", "the", "and", "or", "but", "nor", "so", "yet", "if", "then", "than", "because", "as",
     "of", "to", "in", "on", "at", "by", "for", "from", "with", "without", "into", "onto", "out", "up",
-    "down", "off", "over", "under", "through", "across", "between", "among",
+    "down", "off", "over", "under", "through", "across", "between", "among", "against", "during",
+    "since", "until", "via", "per", "above", "below", "near",
     "i", "me", "my", "mine", "we", "us", "our", "ours", "you", "your", "yours", "he", "him", "his",
     "she", "her", "hers", "it", "its", "they", "them", "their", "theirs", "who", "whom", "whose",
     "whoever", "what", "whatever", "which", "whichever", "that", "this", "these", "those",
@@ -112,18 +115,63 @@ FUNCTION_WORD_STOPWORDS = {
     "have", "has", "had", "having", "will", "would", "shall", "should", "can", "could", "may",
     "might", "must",
     "not", "no", "yes", "just", "very", "also", "only", "even", "ever", "never", "again", "still",
+    "now", "here", "there", "why", "where", "when", "how", "back",
     "more", "most", "less", "least", "many", "much", "some", "any", "all", "both", "each", "either",
     "neither", "one", "two", "three", "first", "second", "last", "new", "latest", "former", "other",
     "another", "same", "own", "few", "several", "such",
     "said", "say", "says", "told", "according", "reported", "announced", "asked", "added", "called",
-    "made", "make", "makes", "got", "get", "gets",
+    "made", "make", "makes", "got", "get", "gets", "take", "takes", "took", "taken", "won",
+    "go", "goes", "going", "went", "gone", "want", "wants", "wanted", "need", "needs", "needed",
+    "see", "sees", "saw", "seen", "know", "knows", "knew", "known", "think", "thinks", "thought",
+    "come", "comes", "came", "coming", "look", "looks", "looked", "looking", "use", "uses", "used",
+    "work", "works", "worked", "working",
+    "like", "well", "good", "better", "best", "right",
+}
+ENTITY_SURFACE_STOPWORDS = {
+    "unknown", "none", "null", "n/a",
+    "he", "him", "his", "she", "her", "hers", "it", "its",
+    "they", "them", "their", "theirs", "we", "our", "ours", "you", "your", "yours",
+    "this", "that", "these", "those", "who", "whom", "whose", "which", "what",
+    "is", "are", "was", "were", "be", "been", "being",
+    "do", "does", "did", "done", "doing", "have", "has", "had", "having",
+    "said", "say", "says", "told", "reported", "announced", "asked", "added",
+    "report", "reports", "article", "articles", "story", "stories", "news",
 }
 TEMPLATE_TERM_STOPWORDS = {
     "taboola", "window", "push", "container", "placement", "target_type", "target", "type", "mode",
     "mix", "thumbnail", "thumbnails", "interstitial", "gallery", "caption", "close", "photo", "image",
-    "javascript", "subscribe", "subscription", "email",
+    "javascript", "subscribe", "subscription", "email", "advertisement", "advertisements", "ad", "ads",
+    "script", "function", "return", "var", "let", "const", "try", "catch", "error", "undefined",
+    "tmr", "banner",
 }
-NOUN_LEMMA_STOPWORDS = STOPWORDS | STRUCTURAL_TERM_STOPWORDS | FUNCTION_WORD_STOPWORDS | TEMPLATE_TERM_STOPWORDS
+MACHINE_PAYLOAD_MARKERS = {
+    "analytics",
+    "article_type",
+    "author_name",
+    "content_type",
+    "duration",
+    "embed_url",
+    "image_url",
+    "playlist",
+    "thumbnail_url",
+    "video_id",
+    "video_playlist",
+}
+HUMAN_TEXT_JSON_KEYS = {
+    "article",
+    "body",
+    "caption",
+    "dek",
+    "description",
+    "headline",
+    "lede",
+    "summary",
+    "text",
+    "title",
+}
+NOUN_LEMMA_STOPWORDS = (
+    STOPWORDS | STRUCTURAL_TERM_STOPWORDS | FUNCTION_WORD_STOPWORDS | TEMPLATE_TERM_STOPWORDS | MACHINE_PAYLOAD_MARKERS
+)
 
 
 def _valid_noun_lemma(lemma: str, *, min_length: int = 2) -> bool:
@@ -133,6 +181,126 @@ def _valid_noun_lemma(lemma: str, *, min_length: int = 2) -> bool:
     if normalized in NOUN_LEMMA_STOPWORDS:
         return False
     return bool(re.search(r"[a-z]", normalized))
+
+
+def _collapse_text(value: Any) -> str:
+    return " ".join(str(value or "").replace("\x00", " ").split()).strip()
+
+
+def _looks_machine_payload(text: str) -> bool:
+    sample = str(text or "")[:12000]
+    if not sample.strip():
+        return False
+    lower = sample.lower()
+    marker_hits = sum(1 for marker in MACHINE_PAYLOAD_MARKERS if marker in lower)
+    json_key_hits = len(re.findall(r'"[A-Za-z_][A-Za-z0-9_\-]{1,48}"\s*:', sample))
+    structural_chars = sum(sample.count(char) for char in "{}[]:,")
+    token_count = max(1, len(re.findall(r"\w+", sample)))
+    structural_density = structural_chars / max(1, len(sample))
+    key_density = json_key_hits / token_count
+    starts_like_payload = sample.lstrip().startswith(("{", "[", '","', '":'))
+    return bool(
+        (starts_like_payload and json_key_hits >= 3)
+        or (json_key_hits >= 8 and marker_hits >= 2)
+        or (json_key_hits >= 18 and key_density >= 0.08)
+        or (marker_hits >= 4 and structural_density >= 0.08)
+    )
+
+
+def _decode_jsonish_string(value: str) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    try:
+        decoded = json.loads(f'"{raw}"')
+    except Exception:
+        decoded = raw.replace('\\"', '"').replace("\\n", " ").replace("\\/", "/")
+    return _collapse_text(decoded)
+
+
+def _extract_human_text_from_payload(text: str) -> list[str]:
+    sample = str(text or "")[:60000]
+    chunks: list[str] = []
+    seen: set[str] = set()
+    key_pattern = "|".join(re.escape(key) for key in sorted(HUMAN_TEXT_JSON_KEYS))
+    for match in re.finditer(rf'"(?:{key_pattern})"\s*:\s*"((?:\\.|[^"\\])*)"', sample, flags=re.IGNORECASE):
+        candidate = _decode_jsonish_string(match.group(1))
+        normalized = candidate.lower()
+        if len(candidate) < 20 or normalized in {"null", "none", "undefined"}:
+            continue
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        chunks.append(candidate)
+    return chunks[:8]
+
+
+def _analysis_text_char_limit() -> int:
+    raw = os.getenv("CORPUSAGENT2_ANALYSIS_TEXT_CHAR_LIMIT", "20000").strip()
+    try:
+        return max(1000, int(raw))
+    except ValueError:
+        return 20000
+
+
+def _noun_spacy_max_documents() -> int | None:
+    raw = os.getenv("CORPUSAGENT2_NOUN_SPACY_MAX_DOCS", "10000").strip()
+    try:
+        value = int(raw)
+    except ValueError:
+        return 10000
+    if value < 0:
+        return None
+    return max(0, value)
+
+
+def _sql_aggregate_text_char_limit() -> int:
+    raw = os.getenv("CORPUSAGENT2_SQL_AGGREGATE_TEXT_CHAR_LIMIT", "4000").strip()
+    try:
+        return max(500, int(raw))
+    except ValueError:
+        return 4000
+
+
+def _working_set_analysis_max_documents() -> int | None:
+    raw = os.getenv("CORPUSAGENT2_WORKING_SET_ANALYSIS_MAX_DOCS", "2000").strip()
+    try:
+        value = int(raw)
+    except ValueError:
+        return 2000
+    if value < 0:
+        return None
+    return max(1, value)
+
+
+def _working_set_analysis_limit_explicit() -> bool:
+    return os.getenv("CORPUSAGENT2_WORKING_SET_ANALYSIS_MAX_DOCS") is not None
+
+
+def _clean_analysis_text(title: Any = "", text: Any = "") -> tuple[str, dict[str, bool]]:
+    title_text = _collapse_text(title)
+    raw_body_text = str(text or "").replace("\x00", " ")
+    flags = {"machine_payload": False, "truncated": False}
+    if not raw_body_text.strip():
+        return title_text, flags
+    limit = _sql_aggregate_text_char_limit()
+    if _looks_machine_payload(raw_body_text):
+        flags["machine_payload"] = True
+        chunks = [title_text, *_extract_human_text_from_payload(raw_body_text)]
+        cleaned = _collapse_text(" ".join(chunk for chunk in chunks if chunk))
+    else:
+        body_slice = raw_body_text
+        if len(body_slice) > limit * 2:
+            flags["truncated"] = True
+            body_slice = body_slice[: limit * 2]
+        cleaned = _collapse_text(f"{title_text} {body_slice}".strip())
+        cleaned = re.sub(r"_taboola\s*=\s*window\._taboola\s*\|\|\s*\[\]\s*;?", " ", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"_taboola\.push\([^)]*\)\s*;?", " ", cleaned, flags=re.IGNORECASE)
+        cleaned = _collapse_text(cleaned)
+    if len(cleaned) > limit:
+        flags["truncated"] = True
+        cleaned = cleaned[:limit]
+    return cleaned, flags
 
 
 def _env_flag(name: str, default: bool) -> bool:
@@ -262,8 +430,62 @@ def _add_query_anchor(anchor_terms: list[str], seen: set[str], token: str, *, bl
         anchor_terms.append(lowered)
 
 
+GROUPED_FIELD_FILTER_PATTERN = re.compile(
+    r"\b(?P<field>source|outlet|site|domain)\s*:\s*\((?P<group>[^)]*)\)",
+    flags=re.IGNORECASE,
+)
+FIELD_FILTER_PATTERN = re.compile(
+    r"\b(?P<field>source|outlet|site|domain)\s*:\s*(?:\"(?P<quoted>[^\"]+)\"|'(?P<single>[^']+)'|(?P<bare>[^\s)]+))",
+    flags=re.IGNORECASE,
+)
+
+
+def _normalize_source_filter(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", str(value or "").strip().lower())
+
+
+def _query_source_filters(query: str) -> list[str]:
+    filters: list[str] = []
+    seen: set[str] = set()
+    for group_match in GROUPED_FIELD_FILTER_PATTERN.finditer(str(query or "")):
+        group = group_match.group("group") or ""
+        values = re.findall(r'"([^"]+)"|\'([^\']+)\'|([A-Za-z0-9_.-]+)', group)
+        for parts in values:
+            value = next((part for part in parts if part), "")
+            if value.upper() in {"OR", "AND", "NOT"}:
+                continue
+            normalized = _normalize_source_filter(value)
+            if normalized and normalized not in seen:
+                seen.add(normalized)
+                filters.append(normalized)
+    for match in FIELD_FILTER_PATTERN.finditer(str(query or "")):
+        value = match.group("quoted") or match.group("single") or match.group("bare") or ""
+        if str(value).startswith("("):
+            continue
+        normalized = _normalize_source_filter(value)
+        if normalized and normalized not in seen:
+            seen.add(normalized)
+            filters.append(normalized)
+    return filters
+
+
+def _query_without_field_filters(query: str) -> str:
+    text = GROUPED_FIELD_FILTER_PATTERN.sub(" ", str(query or ""))
+    text = FIELD_FILTER_PATTERN.sub(" ", text)
+    text = re.sub(r"\b(?:AND|OR|NOT)\b\s*(?=[)\s]*$)", " ", text, flags=re.IGNORECASE)
+    text = re.sub(r"\(\s*\)", " ", text)
+    return " ".join(text.split())
+
+
+def _row_matches_source_filters(source: Any, filters: list[str]) -> bool:
+    if not filters:
+        return True
+    normalized = _normalize_source_filter(str(source or ""))
+    return any(item in normalized for item in filters)
+
+
 def _query_anchor_terms(query: str) -> list[str]:
-    text = str(query or "").strip()
+    text = _query_without_field_filters(str(query or "")).strip()
     if not text:
         return []
     resolved_terms: list[str] = []
@@ -292,6 +514,105 @@ def _query_anchor_terms(query: str) -> list[str]:
     return fallback[:8]
 
 
+def _query_or_groups(query: str) -> list[str]:
+    text = _query_without_field_filters(str(query or "")).strip()
+    if not text or not re.search(r"\bOR\b|\|", text, flags=re.IGNORECASE):
+        return []
+    groups: list[str] = []
+    seen: set[str] = set()
+    for raw_group in re.split(r"\s+\bOR\b\s+|\s*\|\s*", text, flags=re.IGNORECASE):
+        anchors = _query_anchor_terms(raw_group)
+        if not anchors:
+            continue
+        group = " ".join(anchors[:6]).strip()
+        if group and group not in seen:
+            seen.add(group)
+            groups.append(group)
+    return groups
+
+
+def _strip_wrapping_parentheses(text: str) -> str:
+    value = str(text or "").strip()
+    while value.startswith("(") and value.endswith(")"):
+        depth = 0
+        balanced = True
+        for index, char in enumerate(value):
+            if char == "(":
+                depth += 1
+            elif char == ")":
+                depth -= 1
+                if depth == 0 and index != len(value) - 1:
+                    balanced = False
+                    break
+        if not balanced:
+            break
+        value = value[1:-1].strip()
+    return value
+
+
+def _split_top_level_and_groups(query: str) -> list[str]:
+    text = _query_without_field_filters(str(query or "")).strip()
+    if not text:
+        return []
+    groups: list[str] = []
+    start = 0
+    depth = 0
+    quote: str | None = None
+    index = 0
+    while index < len(text):
+        char = text[index]
+        if quote:
+            if char == quote:
+                quote = None
+            index += 1
+            continue
+        if char in {"'", '"'}:
+            quote = char
+            index += 1
+            continue
+        if char == "(":
+            depth += 1
+            index += 1
+            continue
+        if char == ")":
+            depth = max(0, depth - 1)
+            index += 1
+            continue
+        if depth == 0 and re.match(r"\s+AND\s+", text[index:], flags=re.IGNORECASE):
+            groups.append(_strip_wrapping_parentheses(text[start:index]))
+            match = re.match(r"\s+AND\s+", text[index:], flags=re.IGNORECASE)
+            index += len(match.group(0)) if match else 5
+            start = index
+            continue
+        index += 1
+    groups.append(_strip_wrapping_parentheses(text[start:]))
+    return [group for group in groups if group]
+
+
+def _sql_websearch_query_text(query: str, tokens: list[str]) -> str:
+    # Preserve an explicit planner/user disjunction. Joining these tokens with
+    # spaces would turn a broad OR query into an accidental AND query.
+    or_groups = _query_or_groups(query)
+    if len(or_groups) > 1:
+        return " OR ".join(or_groups[:32])
+    return " ".join(tokens)
+
+
+def _sql_websearch_query_clauses(query: str, tokens: list[str]) -> list[str]:
+    and_groups = _split_top_level_and_groups(query)
+    if len(and_groups) > 1:
+        clauses = []
+        for group in and_groups:
+            group_tokens = _query_anchor_terms(group)
+            if not group_tokens:
+                continue
+            clauses.append(_sql_websearch_query_text(group, group_tokens))
+        if len(clauses) > 1:
+            return clauses[:8]
+    query_text = _sql_websearch_query_text(query, tokens)
+    return [query_text] if query_text else []
+
+
 def _payload_or_params(params: dict[str, Any]) -> dict[str, Any]:
     payload = params.get("payload")
     if not isinstance(payload, dict):
@@ -316,6 +637,48 @@ def _dependency_rows(dependency_results: dict[str, ToolExecutionResult]) -> list
     return []
 
 
+TEXT_ROW_FIELDS = ("text", "cleaned_text", "claim_span", "excerpt", "quote")
+
+
+def _coerce_text_document_row(row: dict[str, Any]) -> dict[str, Any]:
+    copy = dict(row)
+    if not str(copy.get("text", copy.get("cleaned_text", ""))).strip():
+        sentences = copy.get("sentences")
+        if isinstance(sentences, list):
+            joined = " ".join(str(item).strip() for item in sentences if str(item).strip())
+            if joined:
+                copy["text"] = joined
+        if not str(copy.get("text", copy.get("cleaned_text", ""))).strip():
+            for field in ("claim_span", "excerpt", "quote"):
+                value = str(copy.get(field, "") or "").strip()
+                if value:
+                    copy["text"] = value
+                    break
+    return _with_cleaned_document_text(copy)
+
+
+def _row_has_text_payload(row: dict[str, Any]) -> bool:
+    if isinstance(row.get("sentences"), list) and row.get("sentences"):
+        return True
+    return any(str(row.get(field, "") or "").strip() for field in TEXT_ROW_FIELDS)
+
+
+def _with_cleaned_document_text(row: dict[str, Any]) -> dict[str, Any]:
+    copy = dict(row)
+    if str(copy.get("cleaned_text", "")).strip():
+        return copy
+    cleaned, flags = _clean_analysis_text(copy.get("title", ""), copy.get("text", ""))
+    if cleaned:
+        copy["cleaned_text"] = cleaned
+        if flags.get("machine_payload"):
+            copy["text"] = cleaned
+    if flags.get("machine_payload"):
+        copy["text_is_machine_payload"] = True
+    if flags.get("truncated"):
+        copy["analysis_text_truncated"] = True
+    return copy
+
+
 def _text_rows(dependency_results: dict[str, ToolExecutionResult]) -> list[dict[str, Any]]:
     direct = _doc_rows(dependency_results)
     if direct:
@@ -325,11 +688,54 @@ def _text_rows(dependency_results: dict[str, ToolExecutionResult]) -> list[dict[
         text = str(row.get("text", row.get("cleaned_text", ""))).strip()
         if not text and not str(row.get("title", "")).strip():
             continue
-        copy = dict(row)
+        copy = _coerce_text_document_row(dict(row))
         if "text" not in copy and text:
             copy["text"] = text
         rows.append(copy)
     return rows
+
+
+def _entity_analysis_max_documents() -> int | None:
+    raw = os.getenv("CORPUSAGENT2_ENTITY_ANALYSIS_MAX_DOCS", "2000").strip()
+    try:
+        value = int(raw)
+    except ValueError:
+        return 2000
+    if value < 0:
+        return None
+    return max(1, value)
+
+
+def _analysis_document_rows_from_deps(
+    deps: dict[str, ToolExecutionResult],
+    context: "AgentExecutionContext",
+    *,
+    max_documents: int | None = None,
+) -> tuple[list[dict[str, Any]], dict[str, Any], list[str]]:
+    documents = _doc_rows(deps)
+    if documents:
+        return documents, {"analyzed_document_count": len(documents), "documents_from": "dependency_rows"}, []
+    working_set_ref = _working_set_ref(deps)
+    if not working_set_ref:
+        return [], {"analyzed_document_count": 0, "documents_from": "none"}, []
+    rows = [
+        _with_cleaned_document_text(row)
+        for row in _iter_working_set_documents(context, working_set_ref, max_documents=max_documents)
+    ]
+    working_set_count = _count_working_set(context, working_set_ref, len(rows))
+    caveats = ["No fetched document rows were available, so documents were streamed from working_set_ref for analysis."]
+    if max_documents is not None and working_set_count > max_documents:
+        caveats.append(
+            f"Entity analysis was capped at {max_documents} documents from a working set of {working_set_count}; "
+            "set CORPUSAGENT2_ENTITY_ANALYSIS_MAX_DOCS=-1 for an uncapped offline run."
+        )
+    return rows, {
+        "analyzed_document_count": len(rows),
+        "working_set_document_count": working_set_count,
+        "working_set_ref": working_set_ref,
+        "documents_from": "working_set_ref",
+        "analysis_document_limit": max_documents,
+    }, caveats
 
 
 def _working_set_doc_ids(dependency_results: dict[str, ToolExecutionResult]) -> list[str]:
@@ -352,6 +758,40 @@ def _working_set_ref(dependency_results: dict[str, ToolExecutionResult]) -> str:
         if ref:
             return ref
     return ""
+
+
+def _looks_like_plan_node_ref(value: str) -> bool:
+    normalized = str(value or "").strip().lower()
+    return bool(re.fullmatch(r"n\d+", normalized)) or normalized in {
+        "search",
+        "fetch",
+        "documents",
+        "working_set",
+        "working-set",
+    }
+
+
+def _resolve_working_set_ref(params: dict[str, Any], dependency_results: dict[str, ToolExecutionResult]) -> str:
+    for key in (
+        "working_set_ref",
+        "working_set_from",
+        "working_set_source",
+        "working_set_source_node",
+        "working_set_source_node_id",
+        "source_node",
+        "source_node_id",
+    ):
+        raw = str(params.get(key, "") or "").strip()
+        if not raw:
+            continue
+        if raw in dependency_results:
+            payload = dependency_results[raw].payload
+            if isinstance(payload, dict) and str(payload.get("working_set_ref", "")).strip():
+                return str(payload.get("working_set_ref", "")).strip()
+        if _looks_like_plan_node_ref(raw):
+            continue
+        return raw
+    return _working_set_ref(dependency_results)
 
 
 def _dependency_payload_flag(dependency_results: dict[str, ToolExecutionResult], key: str) -> bool:
@@ -425,6 +865,7 @@ def _iter_working_set_documents(
     label: str,
     *,
     batch_size: int | None = None,
+    max_documents: int | None = None,
 ):
     if not label:
         return
@@ -434,18 +875,161 @@ def _iter_working_set_documents(
     resolved_batch_size = int(batch_size or os.getenv("CORPUSAGENT2_WORKING_SET_ANALYSIS_BATCH_SIZE", "1000") or 1000)
     resolved_batch_size = max(1, resolved_batch_size)
     offset = 0
+    yielded = 0
     while True:
         if context.cancel_requested and context.cancel_requested():
             break
-        rows = fetcher(context.run_id, label, limit=resolved_batch_size, offset=offset)
+        if max_documents is not None and yielded >= max_documents:
+            break
+        limit = resolved_batch_size
+        if max_documents is not None:
+            limit = min(limit, max(0, max_documents - yielded))
+        if limit <= 0:
+            break
+        rows = fetcher(context.run_id, label, limit=limit, offset=offset)
         if not rows:
             break
         for row in rows:
             if isinstance(row, dict):
                 yield dict(row)
+                yielded += 1
+                if max_documents is not None and yielded >= max_documents:
+                    break
         if len(rows) < resolved_batch_size:
             break
-        offset += resolved_batch_size
+        offset += len(rows)
+
+
+def _sql_noun_frequency_rows_from_working_set(
+    context: "AgentExecutionContext",
+    working_set_ref: str,
+    *,
+    top_k: int,
+    max_documents: int | None = None,
+) -> tuple[list[dict[str, Any]], dict[str, Any]] | None:
+    if not isinstance(context.working_store, PostgresWorkingSetStore):
+        return None
+    store = context.working_store
+    try:
+        columns = store._document_columns()
+    except Exception:
+        return None
+    table_name = store._safe_identifier(store.documents_table)
+    title_expr = f"COALESCE(doc.{columns['title']}::text, '')" if columns["title"] else "''"
+    text_expr = f"COALESCE(doc.{columns['text']}::text, '')"
+    machine_checks = " OR ".join(
+        f"LOWER({text_expr}) LIKE %s"
+        for _ in ("duration", "thumbnail", "analytics", "video_playlist")
+    )
+    stopwords = sorted(NOUN_LEMMA_STOPWORDS)
+    limit = _sql_aggregate_text_char_limit()
+    token_regex = r"[A-Za-z][A-Za-z'-]+"
+    sql = f"""
+        WITH selected_ws AS (
+            SELECT doc_id, rank
+            FROM ca_agent_working_set_docs
+            WHERE run_id = %s AND label = %s
+            ORDER BY rank, doc_id
+            {"LIMIT %s" if max_documents is not None else ""}
+        ),
+        docs AS (
+            SELECT
+                doc.{columns['doc_id']}::text AS doc_id,
+                (
+                    {title_expr}
+                    || ' '
+                    || CASE WHEN ({machine_checks}) THEN '' ELSE LEFT({text_expr}, %s) END
+                ) AS analysis_text
+            FROM selected_ws ws
+            JOIN {table_name} doc ON doc.{columns['doc_id']}::text = ws.doc_id
+        ),
+        tokens AS (
+            SELECT
+                docs.doc_id,
+                LOWER(match.token[1]) AS token
+            FROM docs
+            CROSS JOIN LATERAL regexp_matches(docs.analysis_text, %s, 'g') AS match(token)
+        ),
+        lemmas AS (
+            SELECT
+                doc_id,
+                CASE
+                    WHEN token LIKE '%%ies' AND char_length(token) > 4
+                        THEN substring(token from 1 for char_length(token) - 3) || 'y'
+                    WHEN token LIKE '%%s' AND char_length(token) > 3
+                        THEN substring(token from 1 for char_length(token) - 1)
+                    ELSE token
+                END AS lemma
+            FROM tokens
+            WHERE char_length(token) >= 3 AND NOT (token = ANY(%s))
+        ),
+        grouped AS (
+            SELECT lemma, COUNT(*)::bigint AS count, COUNT(DISTINCT doc_id)::bigint AS document_frequency
+            FROM lemmas
+            WHERE char_length(lemma) >= 3
+              AND lemma ~ '[a-z]'
+              AND NOT (lemma = ANY(%s))
+            GROUP BY lemma
+        ),
+        totals AS (
+            SELECT COALESCE(SUM(count), 0)::bigint AS total_count FROM grouped
+        )
+        SELECT grouped.lemma, grouped.count, grouped.document_frequency, totals.total_count
+        FROM grouped
+        CROSS JOIN totals
+        ORDER BY grouped.count DESC, grouped.lemma
+        LIMIT %s
+    """
+    params: list[Any] = [
+        context.run_id,
+        working_set_ref,
+    ]
+    if max_documents is not None:
+        params.append(max(1, int(max_documents)))
+    params.extend(
+        [
+        "%\"duration\"%",
+        "%thumbnail%",
+        "%analytics%",
+        "%video_playlist%",
+        limit,
+        token_regex,
+        stopwords,
+        stopwords,
+        max(1, int(top_k)),
+        ]
+    )
+    try:
+        with store._connect() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(sql, tuple(params))
+                rows = cursor.fetchall()
+    except Exception:
+        return None
+    total_tokens = int(rows[0][3] or 0) if rows else 0
+    payload_rows = [
+        {
+            "lemma": str(row[0]),
+            "count": int(row[1] or 0),
+            "relative_frequency": round(int(row[1] or 0) / max(total_tokens, 1), 6),
+            "document_frequency": int(row[2] or 0),
+            "rank": rank,
+        }
+        for rank, row in enumerate(rows, start=1)
+        if _valid_noun_lemma(str(row[0]), min_length=3)
+    ]
+    return payload_rows, {
+        "provider": "postgres_token_aggregate",
+        "analyzed_document_count": min(_count_working_set(context, working_set_ref, 0), max_documents)
+        if max_documents is not None
+        else _count_working_set(context, working_set_ref, 0),
+        "total_noun_tokens": total_tokens,
+        "full_working_set": True,
+        "working_set_ref": working_set_ref,
+        "analysis_text_char_limit": limit,
+        "analysis_text_limit_scope": "postgres_token_aggregate_per_document",
+        "analysis_document_limit": max_documents,
+    }
 
 
 def _materialize_result_working_set(
@@ -523,6 +1107,14 @@ def _min_exhaustive_anchor_hits(anchors: list[str]) -> int:
     return max(2, (count * 2 + 2) // 3)
 
 
+def _min_required_anchor_hits(query: str, anchors: list[str], *, top_k: int) -> int:
+    if top_k > 0:
+        return 1
+    if len(_query_or_groups(query)) > 1:
+        return 1
+    return _min_exhaustive_anchor_hits(anchors)
+
+
 def _anchor_hit_count(text: str, anchors: list[str]) -> int:
     haystack = str(text or "").lower()
     return sum(1 for anchor in anchors if re.search(rf"\b{re.escape(str(anchor).lower())}\b", haystack))
@@ -581,26 +1173,122 @@ def _noun_frequency_rows_from_working_set(
     *,
     top_k: int,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    working_set_count = _count_working_set(context, working_set_ref, 0)
+    spacy_limit = _noun_spacy_max_documents()
+    prefer_spacy = spacy_limit is None or working_set_count <= spacy_limit
+    analysis_max_documents = _working_set_analysis_max_documents()
+    if analysis_max_documents is not None and working_set_count > analysis_max_documents:
+        prefer_spacy = False
+    if not prefer_spacy and _env_flag("CORPUSAGENT2_USE_SQL_TOKEN_AGGREGATE", False):
+        sql_max_documents = analysis_max_documents if _working_set_analysis_limit_explicit() else None
+        sql_result = _sql_noun_frequency_rows_from_working_set(
+            context,
+            working_set_ref,
+            top_k=top_k,
+            max_documents=sql_max_documents,
+        )
+        if sql_result is not None:
+            rows, metadata = sql_result
+            metadata["working_set_document_count"] = working_set_count
+            metadata["provider_fallback_reason"] = (
+                f"working_set_document_count {working_set_count} exceeds CORPUSAGENT2_NOUN_SPACY_MAX_DOCS={spacy_limit}"
+            )
+            return rows, metadata
+    rows, metadata = _noun_frequency_rows_from_documents(
+        _iter_working_set_documents(context, working_set_ref, max_documents=analysis_max_documents),
+        top_k=top_k,
+        full_working_set=True,
+        working_set_ref=working_set_ref,
+        prefer_spacy=prefer_spacy,
+    )
+    metadata["working_set_document_count"] = working_set_count
+    metadata["analysis_document_limit"] = analysis_max_documents
+    if not prefer_spacy:
+        metadata["provider_fallback_reason"] = (
+            f"working_set_document_count {working_set_count} exceeds CORPUSAGENT2_NOUN_SPACY_MAX_DOCS={spacy_limit}"
+        )
+    return rows, metadata
+
+
+def _noun_frequency_rows_from_documents(
+    documents: Iterable[dict[str, Any]],
+    *,
+    top_k: int,
+    full_working_set: bool = False,
+    working_set_ref: str = "",
+    prefer_spacy: bool = True,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     lemma_counts: Counter[str] = Counter()
     doc_counts: defaultdict[str, set[str]] = defaultdict(set)
     analyzed_documents = 0
     total_tokens = 0
-    for document in _iter_working_set_documents(context, working_set_ref):
-        doc_id = str(document.get("doc_id", "")).strip()
-        text = f"{document.get('title', '')} {document.get('text', '')}".strip()
-        if not doc_id or not text:
-            continue
-        analyzed_documents += 1
-        for token in _tokenize(text):
-            pos = _heuristic_pos(token)
-            if pos not in {"NOUN", "PROPN"}:
+    machine_payload_documents = 0
+    truncated_documents = 0
+    provider = "heuristic_batch"
+    nlp = _load_spacy_model() if prefer_spacy else None
+    use_spacy = bool(prefer_spacy and nlp is not None and _spacy_supports_pos(nlp))
+    batch_size_raw = os.getenv("CORPUSAGENT2_NOUN_BATCH_SIZE", "64").strip()
+    try:
+        batch_size = max(1, int(batch_size_raw))
+    except ValueError:
+        batch_size = 64
+
+    def prepared_documents() -> Iterable[tuple[str, str]]:
+        nonlocal analyzed_documents, machine_payload_documents, truncated_documents
+        for document in documents:
+            doc_id = str(document.get("doc_id", "")).strip()
+            if not doc_id:
                 continue
-            lemma = _lemma(token)
-            if not _valid_noun_lemma(lemma, min_length=3):
+            text, flags = _clean_analysis_text(document.get("title", ""), document.get("text", document.get("cleaned_text", "")))
+            if document.get("text_is_machine_payload"):
+                flags["machine_payload"] = True
+            if not text:
                 continue
-            lemma_counts[lemma] += 1
-            doc_counts[lemma].add(doc_id)
-            total_tokens += 1
+            analyzed_documents += 1
+            if flags.get("machine_payload"):
+                machine_payload_documents += 1
+            if flags.get("truncated"):
+                truncated_documents += 1
+            yield doc_id, text
+
+    if use_spacy:
+        provider = "spacy_batch"
+        disabled = _spacy_noun_pipe_disabled(nlp)
+        context_manager = nlp.select_pipes(disable=disabled) if disabled else None
+        try:
+            if context_manager is not None:
+                context_manager.__enter__()
+            for batch in _iter_batches(prepared_documents(), batch_size):
+                doc_ids = [item[0] for item in batch]
+                texts = [item[1] for item in batch]
+                for doc_id, doc in zip(doc_ids, nlp.pipe(texts, batch_size=batch_size), strict=False):
+                    for token in doc:
+                        label = _normalized_pos_label(getattr(token, "pos_", ""))
+                        if label not in {"NOUN", "PROPN"}:
+                            continue
+                        lemma = str(getattr(token, "lemma_", "") or getattr(token, "text", "") or "").strip().lower()
+                        if lemma == "-pron-":
+                            lemma = str(getattr(token, "text", "") or "").strip().lower()
+                        if not _valid_noun_lemma(lemma, min_length=3):
+                            continue
+                        lemma_counts[lemma] += 1
+                        doc_counts[lemma].add(doc_id)
+                        total_tokens += 1
+        finally:
+            if context_manager is not None:
+                context_manager.__exit__(None, None, None)
+    else:
+        for doc_id, text in prepared_documents():
+            for token in _tokenize(text):
+                pos = _heuristic_pos(token)
+                if pos not in {"NOUN", "PROPN"}:
+                    continue
+                lemma = _lemma(token)
+                if not _valid_noun_lemma(lemma, min_length=3):
+                    continue
+                lemma_counts[lemma] += 1
+                doc_counts[lemma].add(doc_id)
+                total_tokens += 1
     rows: list[dict[str, Any]] = []
     for rank, (lemma, count) in enumerate(lemma_counts.most_common(top_k), start=1):
         rows.append(
@@ -615,9 +1303,11 @@ def _noun_frequency_rows_from_working_set(
     return rows, {
         "analyzed_document_count": analyzed_documents,
         "total_noun_tokens": total_tokens,
-        "full_working_set": True,
+        "full_working_set": bool(full_working_set),
         "working_set_ref": working_set_ref,
-        "provider": "heuristic_batch",
+        "provider": provider,
+        "machine_payload_document_count": machine_payload_documents,
+        "analysis_text_truncated_document_count": truncated_documents,
     }
 
 
@@ -737,10 +1427,51 @@ def _duplicate_candidate_keys(row: dict[str, Any]) -> list[str]:
     return keys
 
 
+def _display_snippet(title: Any, snippet: Any) -> tuple[str, dict[str, bool]]:
+    cleaned, flags = _clean_analysis_text(title, snippet)
+    if not cleaned:
+        cleaned = _collapse_text(title)
+    return textwrap.shorten(cleaned, width=360, placeholder="..."), flags
+
+
+def _retrieval_quality_multiplier(title: Any, snippet: Any) -> tuple[float, dict[str, bool]]:
+    _, flags = _display_snippet(title, snippet)
+    if flags.get("machine_payload"):
+        return 0.35, flags
+    return 1.0, flags
+
+
 def _normalize_result_rows(rows: list[dict[str, Any]], retrieval_mode: str) -> list[dict[str, Any]]:
     if not rows:
         return []
-    ordered = sorted(rows, key=lambda item: _coerce_score(item.get("score", 0.0)), reverse=True)
+    prepared: list[dict[str, Any]] = []
+    for row in rows:
+        copy = dict(row)
+        raw_snippet = copy.get("snippet", copy.get("text", ""))
+        multiplier = 1.0
+        multiplier_flags: dict[str, bool] = {}
+        if not bool(copy.get("score_quality_adjusted")):
+            multiplier, multiplier_flags = _retrieval_quality_multiplier(copy.get("title", ""), raw_snippet)
+        if "snippet" in copy or "text" in copy:
+            snippet, flags = _display_snippet(copy.get("title", ""), raw_snippet)
+            copy["snippet"] = snippet
+            if flags.get("machine_payload") or multiplier_flags.get("machine_payload"):
+                copy["snippet_is_machine_payload"] = True
+        score = _coerce_score(copy.get("score", 0.0))
+        if not bool(copy.get("score_quality_adjusted")):
+            if multiplier != 1.0:
+                copy["raw_score"] = score
+                copy["score"] = score * multiplier
+                copy["score_quality_adjusted"] = True
+                copy["score_quality_multiplier"] = multiplier
+                if multiplier_flags.get("machine_payload"):
+                    copy["snippet_is_machine_payload"] = True
+            else:
+                copy["score"] = score
+        else:
+            copy["score"] = score
+        prepared.append(copy)
+    ordered = sorted(prepared, key=lambda item: _coerce_score(item.get("score", 0.0)), reverse=True)
     max_score = max((_coerce_score(item.get("score", 0.0)) for item in ordered), default=0.0)
     normalized: list[dict[str, Any]] = []
     for rank, row in enumerate(ordered, start=1):
@@ -749,7 +1480,7 @@ def _normalize_result_rows(rows: list[dict[str, Any]], retrieval_mode: str) -> l
         copy["score"] = score
         copy["rank"] = rank
         copy["retrieval_mode"] = str(copy.get("retrieval_mode", retrieval_mode) or retrieval_mode)
-        copy["score_display"] = str(copy.get("score_display") or _score_display(score / max_score if max_score > 0 else score))
+        copy["score_display"] = _score_display(score / max_score if max_score > 0 else score)
         score_components = copy.get("score_components", {})
         if not isinstance(score_components, dict) or not score_components:
             score_components = {copy["retrieval_mode"]: round(score, 6)}
@@ -914,16 +1645,28 @@ def _sql_search_rows(
     text_expr = f"COALESCE({columns['text']}::text, '')"
     date_expr = f"COALESCE({columns['date']}::text, '')" if columns["date"] else "''"
     source_expr = f"COALESCE({columns['source']}::text, '')" if columns["source"] else "''"
+    source_filters = _query_source_filters(query)
+    source_clauses = [
+        f"regexp_replace(LOWER({source_expr}), '[^a-z0-9]+', '', 'g') LIKE %s"
+        for _ in source_filters
+    ]
+    source_params = [f"%{item}%" for item in source_filters]
     vector_expr = (
         f"setweight(to_tsvector('simple', {title_expr}), 'A') || "
         f"setweight(to_tsvector('simple', {text_expr}), 'B')"
     )
     date_clauses, date_params = _sql_date_filters(columns["date"], date_from, date_to)
-    # Exhaustive analytical retrieval should build a population, not a loose union
-    # of every row matching any anchor. Multi-anchor queries therefore require
-    # the anchors together; broadening happens through explicit query wording,
-    # not an implicit OR explosion.
-    query_text = " ".join(tokens)
+    query_clauses = _sql_websearch_query_clauses(query, tokens)
+    if not query_clauses:
+        return []
+    rank_expr = " + ".join(
+        f"ts_rank_cd({vector_expr}, websearch_to_tsquery('simple', %s))"
+        for _ in query_clauses
+    )
+    match_expr = " AND ".join(
+        f"{vector_expr} @@ websearch_to_tsquery('simple', %s)"
+        for _ in query_clauses
+    )
     sql = (
         f"SELECT "
         f"{columns['doc_id']}::text AS doc_id, "
@@ -931,14 +1674,16 @@ def _sql_search_rows(
         f"SUBSTRING({text_expr} FROM 1 FOR 360) AS snippet, "
         f"{source_expr} AS outlet, "
         f"{date_expr} AS date, "
-        f"ts_rank_cd({vector_expr}, websearch_to_tsquery('simple', %s)) AS score "
+        f"({rank_expr}) AS score "
         f"FROM {table_name} "
-        f"WHERE {vector_expr} @@ websearch_to_tsquery('simple', %s)"
+        f"WHERE {match_expr}"
     )
     if date_clauses:
         sql += f" AND {' AND '.join(date_clauses)}"
+    if source_clauses:
+        sql += f" AND ({' OR '.join(source_clauses)})"
     sql += " ORDER BY score DESC"
-    params: list[Any] = [query_text, query_text, *date_params]
+    params: list[Any] = [*query_clauses, *query_clauses, *date_params, *source_params]
     if top_k > 0:
         sql += " LIMIT %s"
         params.append(int(top_k))
@@ -962,7 +1707,7 @@ def _sql_search_rows(
             )
             score_params.extend([needle, needle])
             hit_params.extend([needle, needle])
-        min_hits = _min_exhaustive_anchor_hits(tokens) if top_k <= 0 else 1
+        min_hits = _min_required_anchor_hits(query, tokens, top_k=top_k)
         hit_expr = " + ".join(hit_parts)
         fallback_sql = (
             f"SELECT "
@@ -977,8 +1722,10 @@ def _sql_search_rows(
         )
         if date_clauses:
             fallback_sql += f" AND {' AND '.join(date_clauses)}"
+        if source_clauses:
+            fallback_sql += f" AND ({' OR '.join(source_clauses)})"
         fallback_sql += " ORDER BY score DESC"
-        fallback_params: list[Any] = score_params + hit_params + [min_hits] + date_params
+        fallback_params: list[Any] = score_params + hit_params + [min_hits] + date_params + source_params
         if top_k > 0:
             fallback_sql += " LIMIT %s"
             fallback_params.append(int(top_k))
@@ -1022,7 +1769,8 @@ def _local_exhaustive_rows(
     anchors = [anchor.lower() for anchor in _query_anchor_terms(query)]
     if not anchors:
         return []
-    min_hits = _min_exhaustive_anchor_hits(anchors) if top_k <= 0 else 1
+    min_hits = _min_required_anchor_hits(query, anchors, top_k=top_k)
+    source_filters = _query_source_filters(query)
     def _metadata_scan_rows() -> list[dict[str, Any]]:
         try:
             metadata = context.runtime.load_metadata()
@@ -1043,6 +1791,8 @@ def _local_exhaustive_rows(
             title = str(getattr(row, "title", "") or "")
             text = str(getattr(row, "text", "") or "")
             source = str(getattr(row, "source", "") or "")
+            if not _row_matches_source_filters(source, source_filters):
+                continue
             title_lower = title.lower()
             text_lower = text.lower()
             source_lower = source.lower()
@@ -1099,6 +1849,8 @@ def _local_exhaustive_rows(
         if score <= 0.0:
             continue
         combined = f"{getattr(row, 'title', '')} {getattr(row, 'text', '')} {getattr(row, 'source', '')}"
+        if not _row_matches_source_filters(str(getattr(row, "source", "") or ""), source_filters):
+            continue
         if _anchor_hit_count(combined, anchors) < min_hits:
             continue
         rows.append(
@@ -1138,6 +1890,15 @@ def _sandbox_candidate_rows(
             frame = frame[published.str.slice(0, 10) >= str(date_from)[:10]]
         if date_to:
             frame = frame[published.str.slice(0, 10) <= str(date_to)[:10]]
+    if frame.empty:
+        return []
+    source_filters = _query_source_filters(query)
+    if source_filters and "source" in frame.columns:
+        normalized_sources = frame["source"].fillna("").astype(str).map(_normalize_source_filter)
+        mask = pd.Series(False, index=frame.index)
+        for source_filter in source_filters:
+            mask = mask | normalized_sources.str.contains(re.escape(source_filter), regex=True, na=False)
+        frame = frame[mask]
     if frame.empty:
         return []
     escaped = "|".join(re.escape(term) for term in anchors)
@@ -1353,14 +2114,43 @@ def _heuristic_pos(token: str) -> str:
     return "NOUN"
 
 
+def _spacy_supports_pos(nlp: Any) -> bool:
+    pipes = set(getattr(nlp, "pipe_names", []) or [])
+    return bool(pipes.intersection({"tagger", "morphologizer"}))
+
+
+def _spacy_noun_pipe_disabled(nlp: Any) -> list[str]:
+    needed = {"tok2vec", "transformer", "tagger", "morphologizer", "attribute_ruler", "lemmatizer"}
+    return [pipe for pipe in getattr(nlp, "pipe_names", []) if pipe not in needed]
+
+
+def _iter_batches(items: Iterable[Any], batch_size: int) -> Iterable[list[Any]]:
+    batch: list[Any] = []
+    for item in items:
+        batch.append(item)
+        if len(batch) >= batch_size:
+            yield batch
+            batch = []
+    if batch:
+        yield batch
+
+
 def _doc_rows(dependency_results: dict[str, ToolExecutionResult]) -> list[dict[str, Any]]:
     for result in dependency_results.values():
         payload = result.payload
         if isinstance(payload, dict):
             if "documents" in payload:
-                return list(payload["documents"])
+                return [_coerce_text_document_row(dict(item)) for item in payload["documents"] if isinstance(item, dict)]
             if "results" in payload and payload["results"] and "text" in payload["results"][0]:
-                return list(payload["results"])
+                return [_coerce_text_document_row(dict(item)) for item in payload["results"] if isinstance(item, dict)]
+            if "rows" in payload and isinstance(payload["rows"], list) and payload["rows"]:
+                text_rows = [
+                    _coerce_text_document_row(dict(item))
+                    for item in payload["rows"]
+                    if isinstance(item, dict) and _row_has_text_payload(item)
+                ]
+                if text_rows:
+                    return text_rows
     return []
 
 
@@ -1418,6 +2208,14 @@ def _time_bin(value: str, granularity: str | None = None) -> str:
 
 def _row_timestamp(row: dict[str, Any]) -> str:
     return str(row.get("date", row.get("published_at", "")))
+
+
+def _row_analysis_text(row: dict[str, Any]) -> str:
+    cleaned = str(row.get("cleaned_text", "")).strip()
+    if cleaned:
+        return cleaned
+    text, _ = _clean_analysis_text(row.get("title", ""), row.get("text", ""))
+    return text
 
 
 def _infer_language(text: str) -> tuple[str, float]:
@@ -1494,6 +2292,7 @@ def _encode_texts(
 
 
 def _infer_market_ticker_from_text(text: str) -> str:
+    lowered = str(text or "").lower()
     explicit_match = re.search(
         r"\b(?:ticker|symbol)\s*[:=]?\s*\$?([A-Z]{1,5}(?:\.[A-Z])?)\b",
         text,
@@ -1503,6 +2302,10 @@ def _infer_market_ticker_from_text(text: str) -> str:
     ticker_match = re.search(r"(?<![A-Za-z0-9])\$([A-Z]{1,5}(?:\.[A-Z])?)\b", text)
     if ticker_match:
         return ticker_match.group(1)
+    if any(term in lowered for term in ("crude oil", "oil price", "oil prices", "wti", "brent")):
+        return "CL=F"
+    if any(term in lowered for term in ("gasoline price", "gas prices", "gas price")):
+        return "RB=F"
     return ""
 
 
@@ -1586,7 +2389,10 @@ def _db_search(params: dict[str, Any], deps: dict[str, ToolExecutionResult], con
     caveats: list[str] = []
     rows: list[dict[str, Any]] = []
     primary_error: Exception | None = None
+    sql_fallback_attempted = False
     years = _year_range(date_from, date_to)
+    source_filters = _query_source_filters(query)
+    backend_query = _query_without_field_filters(query) if source_filters else query
     use_year_balance = bool(years) and year_balance_mode not in {"0", "false", "no", "off"}
     if year_balance_mode == "auto":
         use_year_balance = len(years) >= 2
@@ -1661,7 +2467,7 @@ def _db_search(params: dict[str, Any], deps: dict[str, ToolExecutionResult], con
 
     def _primary_search_once(window_from: str, window_to: str, limit: int) -> list[dict[str, Any]]:
         return context.search_backend.search(
-            query=query,
+            query=backend_query,
             top_k=limit,
             date_from=window_from,
             date_to=window_to,
@@ -1693,6 +2499,11 @@ def _db_search(params: dict[str, Any], deps: dict[str, ToolExecutionResult], con
 
     try:
         rows, duplicates_removed = _balanced_candidates(_primary_search_once, retrieval_mode)
+        if source_filters:
+            rows = [
+                row for row in rows
+                if _row_matches_source_filters(row.get("outlet", row.get("source", "")), source_filters)
+            ]
         if use_year_balance and years:
             present_years = sorted({year for year in (_row_year(row) for row in rows) if year is not None})
             caveats.append(f"Year-balanced retrieval was applied across {', '.join(str(year) for year in years)}.")
@@ -1709,6 +2520,7 @@ def _db_search(params: dict[str, Any], deps: dict[str, ToolExecutionResult], con
         sql_duplicates_removed = 0
         sql_error: Exception | None = None
         if sql_store_available:
+            sql_fallback_attempted = True
             try:
                 sql_rows, sql_duplicates_removed = _balanced_candidates(
                     lambda window_from, window_to, limit: _sql_search_rows(
@@ -1757,12 +2569,35 @@ def _db_search(params: dict[str, Any], deps: dict[str, ToolExecutionResult], con
             if sandbox_duplicates_removed > 0:
                 caveats.append(f"Suppressed {sandbox_duplicates_removed} near-duplicate sandbox retrieval hits.")
     if primary_error is not None and not rows:
+        if sql_fallback_attempted and source_filters:
+            caveats.append(
+                "Primary search backend failed after source filters were stripped for fallback retrieval, "
+                f"and SQL fallback found no matching documents: {primary_error}"
+            )
+            caveats.append(f"No documents matched source filters: {', '.join(source_filters)}.")
+            return ToolExecutionResult(
+                payload={
+                    "results": [],
+                    "query": query,
+                    "retrieval_mode": "sql",
+                    "retrieval_strategy": retrieval_strategy,
+                    "result_count": 0,
+                    "document_count": 0,
+                },
+                evidence=[],
+                caveats=caveats,
+                metadata={
+                    "no_data": True,
+                    "no_data_reason": "source_filtered_sql_fallback_empty",
+                    "primary_error": str(primary_error),
+                },
+            )
         if context.runtime is None or not allow_local_fallback:
             raise primary_error
         from .agent_backends import LocalSearchBackend
 
         local_rows = LocalSearchBackend(context.runtime).search(
-            query=query,
+            query=backend_query,
             top_k=max(top_k * 3, 40),
             date_from=date_from,
             date_to=date_to,
@@ -1935,7 +2770,7 @@ def _fetch_documents(params: dict[str, Any], deps: dict[str, ToolExecutionResult
         for row in search_rows
         if str(row.get("doc_id", "")).strip()
     }
-    working_set_ref = str(params.get("working_set_ref", "") or _working_set_ref(deps)).strip()
+    working_set_ref = _resolve_working_set_ref(params, deps)
     if working_set_ref and not explicit_doc_ids:
         doc_ids = []
     if not doc_ids and not working_set_ref:
@@ -1969,7 +2804,7 @@ def _fetch_documents(params: dict[str, Any], deps: dict[str, ToolExecutionResult
         merged["score_display"] = str(merged.get("score_display") or _score_display(merged["score"]))
         if "score_components" in merged and not isinstance(merged.get("score_components"), dict):
             merged.pop("score_components", None)
-        return merged
+        return _with_cleaned_document_text(merged)
 
     caveats: list[str] = []
     total_available = len(doc_ids)
@@ -2088,7 +2923,7 @@ def _lang_id(params: dict[str, Any], deps: dict[str, ToolExecutionResult], conte
     rows = _text_rows(deps)
     detected = []
     for row in rows:
-        text = str(row.get("text", row.get("cleaned_text", "")))
+        text = _row_analysis_text(row)
         language, confidence = _infer_language(text)
         detected.append(
             {
@@ -2105,19 +2940,35 @@ def _lang_id(params: dict[str, Any], deps: dict[str, ToolExecutionResult], conte
 
 def _clean_normalize(params: dict[str, Any], deps: dict[str, ToolExecutionResult], context: AgentExecutionContext) -> ToolExecutionResult:
     rows = _doc_rows(deps)
-    cleaned = [
-        {
-            "doc_id": row["doc_id"],
-            "title": str(row.get("title", "")),
-            "text": " ".join(str(row.get("text", "")).split()).strip(),
-            "cleaned_text": " ".join(str(row.get("text", "")).split()).strip(),
-            "published_at": str(row.get("published_at", row.get("date", ""))),
-            "date": str(row.get("date", row.get("published_at", ""))),
-            "source": str(row.get("source", row.get("outlet", ""))),
-            "outlet": str(row.get("outlet", row.get("source", ""))),
-        }
-        for row in rows
-    ]
+    cleaned = []
+    for row in rows:
+        raw_body_text = str(row.get("text", row.get("cleaned_text", "")) or "").replace("\x00", " ")
+        if _looks_machine_payload(raw_body_text):
+            text, flags = _clean_analysis_text(row.get("title", ""), raw_body_text)
+        else:
+            limit = _analysis_text_char_limit()
+            flags = {"machine_payload": False, "truncated": False}
+            if len(raw_body_text) > limit * 2:
+                flags["truncated"] = True
+                raw_body_text = raw_body_text[: limit * 2]
+            text = _collapse_text(raw_body_text)
+            if len(text) > limit:
+                flags["truncated"] = True
+                text = text[:limit]
+        cleaned.append(
+            {
+                "doc_id": row["doc_id"],
+                "title": str(row.get("title", "")),
+                "text": text,
+                "cleaned_text": text,
+                "published_at": str(row.get("published_at", row.get("date", ""))),
+                "date": str(row.get("date", row.get("published_at", ""))),
+                "source": str(row.get("source", row.get("outlet", ""))),
+                "outlet": str(row.get("outlet", row.get("source", ""))),
+                "text_is_machine_payload": bool(flags.get("machine_payload")),
+                "analysis_text_truncated": bool(flags.get("truncated")),
+            }
+        )
     return ToolExecutionResult(payload={"documents": cleaned, "rows": cleaned})
 
 
@@ -2127,7 +2978,7 @@ def _tokenize_docs(params: dict[str, Any], deps: dict[str, ToolExecutionResult],
     output = []
     used_provider = "regex"
     for row in rows:
-        text = str(row.get("text", ""))
+        text = _row_analysis_text(row)
         tokens: list[str] | None = None
         for provider in providers:
             try:
@@ -2166,7 +3017,7 @@ def _sentence_split_docs(params: dict[str, Any], deps: dict[str, ToolExecutionRe
     output = []
     used_provider = "heuristic"
     for row in rows:
-        text = str(row.get("text", ""))
+        text = _row_analysis_text(row)
         sentences: list[str] | None = None
         for provider in providers:
             try:
@@ -2199,7 +3050,15 @@ def _sentence_split_docs(params: dict[str, Any], deps: dict[str, ToolExecutionRe
                     break
             except Exception:
                 sentences = None
-        output.append({"doc_id": row["doc_id"], "sentences": sentences or simple_sentence_split(text)})
+        sentence_rows = sentences or simple_sentence_split(text)
+        output_row = {
+            key: row.get(key)
+            for key in ("doc_id", "title", "date", "published_at", "outlet", "source", "rank", "score")
+            if key in row
+        }
+        output_row["sentences"] = sentence_rows
+        output_row["text"] = " ".join(sentence_rows)
+        output.append(output_row)
     return ToolExecutionResult(
         payload={"rows": output},
         metadata=_metadata(used_provider, f"{used_provider}_sentence_split"),
@@ -2217,7 +3076,7 @@ def _pos_morph(params: dict[str, Any], deps: dict[str, ToolExecutionResult], con
                 nlp = _load_spacy_model()
                 if nlp is None or "tagger" not in getattr(nlp, "pipe_names", []):
                     continue
-                docs = nlp.pipe([str(row.get("text", "")) for row in rows], batch_size=16)
+                docs = nlp.pipe([_row_analysis_text(row) for row in rows], batch_size=16)
                 for row, doc in zip(rows, docs, strict=False):
                     for token in doc:
                         output.append(
@@ -2238,7 +3097,7 @@ def _pos_morph(params: dict[str, Any], deps: dict[str, ToolExecutionResult], con
                 if pipeline is None:
                     continue
                 for row in rows:
-                    doc = pipeline(str(row.get("text", "")))
+                    doc = pipeline(_row_analysis_text(row))
                     for sentence in doc.sentences:
                         for word in sentence.words:
                             output.append(
@@ -2261,7 +3120,7 @@ def _pos_morph(params: dict[str, Any], deps: dict[str, ToolExecutionResult], con
                 from flair.data import Sentence
 
                 for row in rows:
-                    sentence = Sentence(str(row.get("text", "")))
+                    sentence = Sentence(_row_analysis_text(row))
                     tagger.predict(sentence)
                     for token in sentence.tokens:
                         output.append(
@@ -2281,7 +3140,7 @@ def _pos_morph(params: dict[str, Any], deps: dict[str, ToolExecutionResult], con
                 import nltk
 
                 for row in rows:
-                    tagged = nltk.pos_tag(nltk.word_tokenize(str(row.get("text", ""))))
+                    tagged = nltk.pos_tag(nltk.word_tokenize(_row_analysis_text(row)))
                     for token, tag in tagged:
                         output.append(
                             {
@@ -2302,7 +3161,7 @@ def _pos_morph(params: dict[str, Any], deps: dict[str, ToolExecutionResult], con
 
     if not output:
         for row in rows:
-            for token in _tokenize(str(row.get("text", ""))):
+            for token in _tokenize(_row_analysis_text(row)):
                 output.append(
                     {
                         "doc_id": str(row.get("doc_id", "")),
@@ -2331,7 +3190,7 @@ def _lemmatize_docs(params: dict[str, Any], deps: dict[str, ToolExecutionResult]
                 nlp = _load_spacy_model()
                 if nlp is None:
                     continue
-                docs = nlp.pipe([str(row.get("text", "")) for row in rows], batch_size=16)
+                docs = nlp.pipe([_row_analysis_text(row) for row in rows], batch_size=16)
                 output = [
                     {"doc_id": row["doc_id"], "lemmas": [(token.lemma_ or _lemma(token.text)).lower() for token in doc]}
                     for row, doc in zip(rows, docs, strict=False)
@@ -2344,7 +3203,7 @@ def _lemmatize_docs(params: dict[str, Any], deps: dict[str, ToolExecutionResult]
                     continue
                 output = []
                 for row in rows:
-                    doc = pipeline(str(row.get("text", "")))
+                    doc = pipeline(_row_analysis_text(row))
                     output.append(
                         {
                             "doc_id": row["doc_id"],
@@ -2362,7 +3221,7 @@ def _lemmatize_docs(params: dict[str, Any], deps: dict[str, ToolExecutionResult]
 
                 output = []
                 for row in rows:
-                    blob = TextBlob(str(row.get("text", "")))
+                    blob = TextBlob(_row_analysis_text(row))
                     output.append(
                         {
                             "doc_id": row["doc_id"],
@@ -2376,7 +3235,7 @@ def _lemmatize_docs(params: dict[str, Any], deps: dict[str, ToolExecutionResult]
             continue
     if not output:
         output = [
-            {"doc_id": row["doc_id"], "lemmas": [_lemma(token) for token in _tokenize(str(row.get("text", "")))]}
+            {"doc_id": row["doc_id"], "lemmas": [_lemma(token) for token in _tokenize(_row_analysis_text(row))]}
             for row in rows
         ]
     return ToolExecutionResult(
@@ -2389,7 +3248,7 @@ def _dependency_parse(params: dict[str, Any], deps: dict[str, ToolExecutionResul
     rows = _doc_rows(deps)
     parsed = []
     for row in rows:
-        sentences = simple_sentence_split(str(row.get("text", "")))[:8]
+        sentences = simple_sentence_split(_row_analysis_text(row))[:8]
         deps_rows = []
         for sentence in sentences:
             tokens = _tokenize(sentence)
@@ -2428,7 +3287,11 @@ def _noun_chunks(params: dict[str, Any], deps: dict[str, ToolExecutionResult], c
 
 
 def _ner(params: dict[str, Any], deps: dict[str, ToolExecutionResult], context: AgentExecutionContext) -> ToolExecutionResult:
-    rows = _doc_rows(deps)
+    rows, source_metadata, source_caveats = _analysis_document_rows_from_deps(
+        deps,
+        context,
+        max_documents=_entity_analysis_max_documents(),
+    )
     entities: list[dict[str, Any]] = []
     providers = _provider_order("ner", ["spacy", "stanza", "flair", "regex"])
     used_provider = "regex"
@@ -2438,16 +3301,18 @@ def _ner(params: dict[str, Any], deps: dict[str, ToolExecutionResult], context: 
                 nlp = _load_spacy_model()
                 if nlp is None or "ner" not in getattr(nlp, "pipe_names", []):
                     continue
-                docs = nlp.pipe([str(row.get("text", "")) for row in rows], batch_size=16)
+                docs = nlp.pipe([_row_analysis_text(row) for row in rows], batch_size=16)
                 for row, doc in zip(rows, docs, strict=False):
                     for ent in doc.ents:
                         entities.append(
                             {
                                 "doc_id": str(row.get("doc_id", "")),
                                 "entity": ent.text.strip(),
+                                "entity_text": ent.text.strip(),
                                 "label": ent.label_,
                                 "outlet": str(row.get("outlet", row.get("source", ""))),
                                 "time_bin": _time_bin(_row_timestamp(row)),
+                                "published_at": _row_timestamp(row),
                             }
                         )
                 used_provider = "spacy"
@@ -2457,15 +3322,17 @@ def _ner(params: dict[str, Any], deps: dict[str, ToolExecutionResult], context: 
                 if pipeline is None:
                     continue
                 for row in rows:
-                    doc = pipeline(str(row.get("text", "")))
+                    doc = pipeline(_row_analysis_text(row))
                     for ent in getattr(doc, "ents", []):
                         entities.append(
                             {
                                 "doc_id": str(row.get("doc_id", "")),
                                 "entity": ent.text.strip(),
+                                "entity_text": ent.text.strip(),
                                 "label": ent.type,
                                 "outlet": str(row.get("outlet", row.get("source", ""))),
                                 "time_bin": _time_bin(_row_timestamp(row)),
+                                "published_at": _row_timestamp(row),
                             }
                         )
                 used_provider = "stanza"
@@ -2477,16 +3344,18 @@ def _ner(params: dict[str, Any], deps: dict[str, ToolExecutionResult], context: 
                 from flair.data import Sentence
 
                 for row in rows:
-                    sentence = Sentence(str(row.get("text", "")))
+                    sentence = Sentence(_row_analysis_text(row))
                     tagger.predict(sentence)
                     for entity in sentence.get_spans("ner"):
                         entities.append(
                             {
                                 "doc_id": str(row.get("doc_id", "")),
                                 "entity": entity.text.strip(),
+                                "entity_text": entity.text.strip(),
                                 "label": entity.get_label("ner").value,
                                 "outlet": str(row.get("outlet", row.get("source", ""))),
                                 "time_bin": _time_bin(_row_timestamp(row)),
+                                "published_at": _row_timestamp(row),
                             }
                         )
                 used_provider = "flair"
@@ -2497,23 +3366,27 @@ def _ner(params: dict[str, Any], deps: dict[str, ToolExecutionResult], context: 
 
     if not entities:
         for row in rows:
-            for match in ENTITY_PATTERN.finditer(str(row.get("text", ""))):
+            for match in ENTITY_PATTERN.finditer(_row_analysis_text(row)):
                 entities.append(
                     {
                         "doc_id": str(row.get("doc_id", "")),
                         "entity": match.group(0).strip(),
+                        "entity_text": match.group(0).strip(),
                         "label": "ENTITY",
                         "outlet": str(row.get("outlet", row.get("source", ""))),
                         "time_bin": _time_bin(_row_timestamp(row)),
+                        "published_at": _row_timestamp(row),
                     }
                 )
     return ToolExecutionResult(
         payload={"rows": entities},
-        metadata=_metadata(used_provider, f"{used_provider}_ner"),
+        caveats=source_caveats,
+        metadata={**_metadata(used_provider, f"{used_provider}_ner"), **source_metadata},
     )
 
 
 def _entity_link(params: dict[str, Any], deps: dict[str, ToolExecutionResult], context: AgentExecutionContext) -> ToolExecutionResult:
+    target_groups = _target_alias_groups(params)
     entity_rows = []
     for result in deps.values():
         payload = result.payload
@@ -2527,12 +3400,29 @@ def _entity_link(params: dict[str, Any], deps: dict[str, ToolExecutionResult], c
     linked = []
     for row in entity_rows:
         link_payload = _link_entity_row(str(row.get("entity", "")), str(row.get("label", "")))
+        canonical = str(link_payload.get("entity", "")).strip()
+        target_canonical, matched_alias = _match_target_alias(
+            " ".join(
+                str(row.get(field, "") or "")
+                for field in ("entity", "entity_text", "canonical_entity", "linked_entity")
+            ),
+            target_groups,
+        )
+        if target_canonical:
+            canonical = target_canonical
         linked.append(
             {
                 "doc_id": str(row.get("doc_id", "")),
                 **link_payload,
+                "canonical_entity": canonical,
+                "linked_entity": canonical,
+                "target_entity": canonical if target_canonical else str(row.get("target_entity", "")),
+                "series_name": canonical,
+                "matched_alias": matched_alias,
+                "entity_text": str(row.get("entity_text", row.get("entity", ""))),
                 "outlet": str(row.get("outlet", "")),
                 "time_bin": str(row.get("time_bin", "")),
+                "published_at": str(row.get("published_at", row.get("date", ""))),
             }
         )
     return ToolExecutionResult(
@@ -2542,15 +3432,25 @@ def _entity_link(params: dict[str, Any], deps: dict[str, ToolExecutionResult], c
 
 
 def _extract_keyterms(params: dict[str, Any], deps: dict[str, ToolExecutionResult], context: AgentExecutionContext) -> ToolExecutionResult:
-    joined = "\n".join(str(row.get("text", "")) for row in _doc_rows(deps))
-    keyterms = [{"term": term, "score": float(score)} for term, score in textrank_keywords(joined, top_k=25)]
+    joined = "\n".join(_row_analysis_text(row) for row in _doc_rows(deps))
+    keyterms = []
+    seen: set[str] = set()
+    requested_top_k = _int_param(params, "top_k", "limit", default=25, maximum=500)
+    for term, score in textrank_keywords(joined, top_k=max(requested_top_k * 4, 25)):
+        normalized = str(term or "").strip().lower()
+        if normalized in seen or not _valid_noun_lemma(normalized, min_length=3):
+            continue
+        seen.add(normalized)
+        keyterms.append({"term": normalized, "score": float(score)})
+        if len(keyterms) >= requested_top_k:
+            break
     return ToolExecutionResult(payload={"rows": keyterms})
 
 
 def _extract_svo_triples(params: dict[str, Any], deps: dict[str, ToolExecutionResult], context: AgentExecutionContext) -> ToolExecutionResult:
     triples = []
     for row in _doc_rows(deps):
-        for sentence in simple_sentence_split(str(row.get("text", "")))[:6]:
+        for sentence in simple_sentence_split(_row_analysis_text(row))[:6]:
             tokens = _tokenize(sentence)
             if len(tokens) >= 3:
                 triples.append(
@@ -2569,7 +3469,7 @@ def _topic_model(params: dict[str, Any], deps: dict[str, ToolExecutionResult], c
     providers = _provider_order("topic_model", ["textacy", "gensim", "heuristic"])
     payload: list[dict[str, Any]] = []
     used_provider = "heuristic"
-    texts = [str(row.get("text", "")) for row in rows]
+    texts = [_row_analysis_text(row) for row in rows]
     num_topics = int(params.get("num_topics", 4))
     granularity = str(params.get("granularity", _default_time_granularity())).strip().lower() or "month"
     topics_per_bin = max(int(params.get("topics_per_bin", 1)), 1)
@@ -2587,9 +3487,9 @@ def _topic_model(params: dict[str, Any], deps: dict[str, ToolExecutionResult], c
                 topic_counter = 1
                 for time_bin, bucket in sorted(bucket_rows.items()):
                     cleaned = [
-                        tprep.normalize.whitespace(tprep.remove.punctuation(str(item.get("text", "")).lower()))
+                        tprep.normalize.whitespace(tprep.remove.punctuation(_row_analysis_text(item).lower()))
                         for item in bucket
-                        if str(item.get("text", "")).strip()
+                        if _row_analysis_text(item).strip()
                     ]
                     if not cleaned:
                         continue
@@ -2621,7 +3521,7 @@ def _topic_model(params: dict[str, Any], deps: dict[str, ToolExecutionResult], c
                 topic_counter = 1
                 for time_bin, bucket in sorted(bucket_rows.items()):
                     tokenized = [
-                        [token.lower() for token in _tokenize(str(item.get("text", ""))) if token.lower() not in STOPWORDS]
+                        [token.lower() for token in _tokenize(_row_analysis_text(item)) if token.lower() not in STOPWORDS]
                         for item in bucket
                     ]
                     dictionary = corpora.Dictionary(tokenized)
@@ -2657,7 +3557,7 @@ def _topic_model(params: dict[str, Any], deps: dict[str, ToolExecutionResult], c
         grouped: defaultdict[str, Counter] = defaultdict(Counter)
         for row in rows:
             time_bin = _time_bin(_row_timestamp(row), granularity)
-            for token in _tokenize(str(row.get("text", "")).lower()):
+            for token in _tokenize(_row_analysis_text(row).lower()):
                 if token in STOPWORDS:
                     continue
                 grouped[time_bin][token] += 1
@@ -2679,7 +3579,7 @@ def _topic_model(params: dict[str, Any], deps: dict[str, ToolExecutionResult], c
 def _readability_stats(params: dict[str, Any], deps: dict[str, ToolExecutionResult], context: AgentExecutionContext) -> ToolExecutionResult:
     rows = []
     for doc in _doc_rows(deps):
-        text = str(doc.get("text", ""))
+        text = _row_analysis_text(doc)
         sentences = simple_sentence_split(text)
         tokens = _tokenize(text)
         avg_sentence_len = len(tokens) / max(len(sentences), 1)
@@ -2691,7 +3591,7 @@ def _readability_stats(params: dict[str, Any], deps: dict[str, ToolExecutionResu
 def _lexical_diversity(params: dict[str, Any], deps: dict[str, ToolExecutionResult], context: AgentExecutionContext) -> ToolExecutionResult:
     rows = []
     for doc in _doc_rows(deps):
-        tokens = [token.lower() for token in _tokenize(str(doc.get("text", "")))]
+        tokens = [token.lower() for token in _tokenize(_row_analysis_text(doc))]
         rows.append({"doc_id": doc["doc_id"], "type_token_ratio": len(set(tokens)) / max(len(tokens), 1)})
     return ToolExecutionResult(payload={"rows": rows})
 
@@ -2700,7 +3600,7 @@ def _extract_ngrams(params: dict[str, Any], deps: dict[str, ToolExecutionResult]
     n = int(params.get("n", 2))
     counts: Counter = Counter()
     for doc in _doc_rows(deps):
-        tokens = [token.lower() for token in _tokenize(str(doc.get("text", ""))) if token.lower() not in STOPWORDS]
+        tokens = [token.lower() for token in _tokenize(_row_analysis_text(doc)) if token.lower() not in STOPWORDS]
         for idx in range(len(tokens) - n + 1):
             counts[" ".join(tokens[idx : idx + n])] += 1
     return ToolExecutionResult(
@@ -2712,15 +3612,135 @@ def _extract_acronyms(params: dict[str, Any], deps: dict[str, ToolExecutionResul
     pattern = re.compile(r"\b[A-Z]{2,8}\b")
     counts: Counter = Counter()
     for doc in _doc_rows(deps):
-        counts.update(match.group(0) for match in pattern.finditer(str(doc.get("text", ""))))
+        counts.update(match.group(0) for match in pattern.finditer(_row_analysis_text(doc)))
     return ToolExecutionResult(
         payload={"rows": [{"acronym": item, "count": int(count)} for item, count in counts.most_common(20)]}
     )
 
 
+def _raw_list_param(params: dict[str, Any], *names: str) -> list[str]:
+    values: list[str] = []
+    for name in names:
+        raw = params.get(name)
+        if raw in (None, ""):
+            continue
+        if isinstance(raw, str):
+            quoted = re.findall(r'"([^"]+)"|\'([^\']+)\'', raw)
+            for left, right in quoted:
+                value = (left or right).strip()
+                if value:
+                    values.append(value)
+            if name == "query_focus":
+                values.extend(re.findall(r"[A-Za-z][A-Za-z0-9'-]{2,}", raw))
+                continue
+            values.extend(token for token in re.split(r"[,;/|]|\bOR\b|\bAND\b", raw, flags=re.IGNORECASE) if token.strip())
+        elif isinstance(raw, list):
+            values.extend(str(item).strip() for item in raw if str(item).strip())
+    return list(dict.fromkeys(_collapse_text(value) for value in values if _collapse_text(value)))
+
+
+def _focus_terms(params: dict[str, Any]) -> list[str]:
+    terms = _raw_list_param(
+        params,
+        "focus_terms",
+        "claim_focus_terms",
+        "context_keywords",
+        "keywords",
+        "claim_keywords",
+        "query_focus",
+    )
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    for term in terms:
+        if not term:
+            continue
+        if len(term) > 80:
+            term_tokens = [token for token in re.findall(r"[A-Za-z][A-Za-z0-9'-]{2,}", term) if token.lower() not in STOPWORDS]
+            candidates = term_tokens
+        else:
+            candidates = [term]
+        for candidate in candidates:
+            normalized = candidate.strip(" \"'.,;:()[]{}")
+            lowered = normalized.lower()
+            if len(normalized) < 3 or lowered in STOPWORDS or lowered in TEMPLATE_TERM_STOPWORDS:
+                continue
+            if lowered in seen:
+                continue
+            seen.add(lowered)
+            cleaned.append(normalized)
+    return cleaned
+
+
+def _context_window_for_alias(text: str, aliases: list[str], *, window_chars: int) -> tuple[str, str]:
+    haystack = str(text or "")
+    best_alias = ""
+    best_start: int | None = None
+    for alias in sorted((alias for alias in aliases if alias), key=len, reverse=True):
+        match = re.search(rf"(?<![A-Za-z0-9]){re.escape(alias)}(?![A-Za-z0-9])", haystack, flags=re.IGNORECASE)
+        if match:
+            best_alias = alias
+            best_start = match.start()
+            break
+    if best_start is None:
+        return "", ""
+    start = max(0, best_start - window_chars)
+    end = min(len(haystack), best_start + len(best_alias) + window_chars)
+    return _collapse_text(haystack[start:end]), best_alias
+
+
+def _targeted_text_units(
+    docs: list[dict[str, Any]],
+    params: dict[str, Any],
+    context: AgentExecutionContext,
+) -> list[dict[str, Any]]:
+    target_groups = _target_alias_groups(params, context)
+    if not target_groups:
+        return [
+            {
+                "doc": doc,
+                "text": _row_analysis_text(doc),
+                "target_entity": str(doc.get("target_entity", doc.get("entity_label", "")) or ""),
+                "matched_alias": str(doc.get("matched_alias", "") or ""),
+                "matched_focus_terms": [],
+            }
+            for doc in docs
+        ]
+    focus_terms = _focus_terms(params)
+    window_chars = _int_param(params, "window_chars", "context_window_chars", default=500, maximum=5000)
+    units: list[dict[str, Any]] = []
+    for doc in docs:
+        full_text = _row_analysis_text(doc)
+        lowered_full = full_text.lower()
+        for canonical, aliases in target_groups:
+            window, matched_alias = _context_window_for_alias(full_text, aliases, window_chars=window_chars)
+            if not window:
+                continue
+            lowered_window = window.lower()
+            matched_focus = [
+                term
+                for term in focus_terms
+                if term.lower() in lowered_window or term.lower() in lowered_full
+            ]
+            if focus_terms and not matched_focus:
+                continue
+            units.append(
+                {
+                    "doc": doc,
+                    "text": window,
+                    "target_entity": canonical,
+                    "entity_label": canonical,
+                    "series_name": canonical,
+                    "matched_alias": matched_alias,
+                    "matched_focus_terms": matched_focus,
+                }
+            )
+    return units
+
+
 def _sentiment(params: dict[str, Any], deps: dict[str, ToolExecutionResult], context: AgentExecutionContext) -> ToolExecutionResult:
     rows = []
     docs = _doc_rows(deps)
+    units = _targeted_text_units(docs, params, context)
     providers = _provider_order("sentiment", ["flair", "textblob", "heuristic"])
     used_provider = "heuristic"
     for provider in providers:
@@ -2732,17 +3752,27 @@ def _sentiment(params: dict[str, Any], deps: dict[str, ToolExecutionResult], con
                 from flair.data import Sentence
 
                 rows = []
-                for doc in docs:
-                    sentence = Sentence(str(doc.get("text", ""))[:1500])
+                for unit in units:
+                    doc = unit["doc"]
+                    sentence = Sentence(str(unit.get("text", ""))[:1500])
                     classifier.predict(sentence)
                     label = sentence.labels[0].value.lower() if sentence.labels else "neutral"
                     confidence = float(sentence.labels[0].score) if sentence.labels else 0.0
+                    numeric_score = confidence if label == "positive" else -confidence if label == "negative" else 0.0
                     rows.append(
                         {
                             "doc_id": doc["doc_id"],
-                            "score": confidence if label == "positive" else -confidence if label == "negative" else 0.0,
+                            "score": numeric_score,
+                            "sentiment_score": numeric_score,
                             "label": label,
                             "time_bin": _time_bin(_row_timestamp(doc)),
+                            "published_at": _row_timestamp(doc),
+                            "entity_label": unit.get("entity_label", doc.get("entity_label", doc.get("target_entity", ""))),
+                            "target_entity": unit.get("target_entity", doc.get("target_entity", "")),
+                            "series_name": unit.get("series_name", doc.get("series_name", "")),
+                            "matched_alias": unit.get("matched_alias", doc.get("matched_alias", "")),
+                            "matched_focus_terms": unit.get("matched_focus_terms", doc.get("matched_focus_terms", [])),
+                            **_series_identity_fields(doc),
                         }
                     )
                 used_provider = "flair"
@@ -2751,15 +3781,24 @@ def _sentiment(params: dict[str, Any], deps: dict[str, ToolExecutionResult], con
                 from textblob import TextBlob
 
                 rows = []
-                for doc in docs:
-                    polarity = float(TextBlob(str(doc.get("text", ""))).sentiment.polarity)
+                for unit in units:
+                    doc = unit["doc"]
+                    polarity = float(TextBlob(str(unit.get("text", ""))).sentiment.polarity)
                     label = "positive" if polarity > 0.05 else "negative" if polarity < -0.05 else "neutral"
                     rows.append(
                         {
                             "doc_id": doc["doc_id"],
                             "score": polarity,
+                            "sentiment_score": polarity,
                             "label": label,
                             "time_bin": _time_bin(_row_timestamp(doc)),
+                            "published_at": _row_timestamp(doc),
+                            "entity_label": unit.get("entity_label", doc.get("entity_label", doc.get("target_entity", ""))),
+                            "target_entity": unit.get("target_entity", doc.get("target_entity", "")),
+                            "series_name": unit.get("series_name", doc.get("series_name", "")),
+                            "matched_alias": unit.get("matched_alias", doc.get("matched_alias", "")),
+                            "matched_focus_terms": unit.get("matched_focus_terms", doc.get("matched_focus_terms", [])),
+                            **_series_identity_fields(doc),
                         }
                     )
                 used_provider = "textblob"
@@ -2769,8 +3808,9 @@ def _sentiment(params: dict[str, Any], deps: dict[str, ToolExecutionResult], con
             continue
 
     if not rows:
-        for doc in docs:
-            tokens = [token.lower() for token in _tokenize(str(doc.get("text", "")))]
+        for unit in units:
+            doc = unit["doc"]
+            tokens = [token.lower() for token in _tokenize(str(unit.get("text", "")))]
             score = sum(1 for token in tokens if token in POSITIVE_WORDS) - sum(
                 1 for token in tokens if token in NEGATIVE_WORDS
             )
@@ -2778,8 +3818,16 @@ def _sentiment(params: dict[str, Any], deps: dict[str, ToolExecutionResult], con
                 {
                     "doc_id": doc["doc_id"],
                     "score": float(score),
+                    "sentiment_score": float(score),
                     "label": "positive" if score > 0 else "negative" if score < 0 else "neutral",
                     "time_bin": _time_bin(_row_timestamp(doc)),
+                    "published_at": _row_timestamp(doc),
+                    "entity_label": unit.get("entity_label", doc.get("entity_label", doc.get("target_entity", ""))),
+                    "target_entity": unit.get("target_entity", doc.get("target_entity", "")),
+                    "series_name": unit.get("series_name", doc.get("series_name", "")),
+                    "matched_alias": unit.get("matched_alias", doc.get("matched_alias", "")),
+                    "matched_focus_terms": unit.get("matched_focus_terms", doc.get("matched_focus_terms", [])),
+                    **_series_identity_fields(doc),
                 }
             )
     return ToolExecutionResult(
@@ -2805,7 +3853,7 @@ def _word_embeddings(params: dict[str, Any], deps: dict[str, ToolExecutionResult
         {
             token.lower()
             for doc in _doc_rows(deps)
-            for token in _tokenize(str(doc.get("text", "")))
+            for token in _tokenize(_row_analysis_text(doc))
             if token.lower() not in STOPWORDS
         }
     )[:256]
@@ -2834,7 +3882,7 @@ def _doc_embeddings(params: dict[str, Any], deps: dict[str, ToolExecutionResult]
     docs = _doc_rows(deps)
     if not docs:
         return ToolExecutionResult(payload={"rows": []})
-    texts = [f"{str(doc.get('title', ''))} {str(doc.get('text', ''))}".strip() for doc in docs]
+    texts = [_row_analysis_text(doc) for doc in docs]
     model_id = _sentence_embedding_model_id(context, params)
     embeddings, resolved_device = _encode_texts(texts, model_id=model_id, normalize=True)
     rows = []
@@ -2858,7 +3906,7 @@ def _similarity_index(params: dict[str, Any], deps: dict[str, ToolExecutionResul
     if len(docs) < 2:
         return ToolExecutionResult(payload={"rows": []})
     model_id = _sentence_embedding_model_id(context, params)
-    texts = [f"{str(doc.get('title', ''))} {str(doc.get('text', ''))}".strip() for doc in docs]
+    texts = [_row_analysis_text(doc) for doc in docs]
     embeddings, resolved_device = _encode_texts(texts, model_id=model_id, normalize=True)
     rows = []
     for idx, left_doc in enumerate(docs):
@@ -2885,7 +3933,7 @@ def _similarity_pairwise(params: dict[str, Any], deps: dict[str, ToolExecutionRe
     rows = []
     model_id = _sentence_embedding_model_id(context, params)
     if query:
-        texts = [query] + [f"{str(doc.get('title', ''))} {str(doc.get('text', ''))}".strip() for doc in docs]
+        texts = [query] + [_row_analysis_text(doc) for doc in docs]
         embeddings, resolved_device = _encode_texts(texts, model_id=model_id, normalize=True)
         query_vector = embeddings[0]
         for idx, doc in enumerate(docs, start=1):
@@ -2897,7 +3945,7 @@ def _similarity_pairwise(params: dict[str, Any], deps: dict[str, ToolExecutionRe
                 }
             )
     else:
-        texts = [f"{str(doc.get('title', ''))} {str(doc.get('text', ''))}".strip() for doc in docs]
+        texts = [_row_analysis_text(doc) for doc in docs]
         embeddings, resolved_device = _encode_texts(texts, model_id=model_id, normalize=True)
         for idx, left_doc in enumerate(docs):
             left_vector = embeddings[idx]
@@ -2916,30 +3964,415 @@ def _similarity_pairwise(params: dict[str, Any], deps: dict[str, ToolExecutionRe
     )
 
 
-def _time_series_aggregate(params: dict[str, Any], deps: dict[str, ToolExecutionResult], context: AgentExecutionContext) -> ToolExecutionResult:
-    source_rows = []
-    for result in deps.values():
-        payload = result.payload
-        if isinstance(payload, dict) and "rows" in payload:
-            source_rows = list(payload["rows"])
-            break
-    granularity = str(params.get("granularity", _default_time_granularity())).strip().lower() or "month"
-    grouped: defaultdict[tuple[str, str], int] = defaultdict(int)
-    for row in source_rows:
-        entity = str(
-            row.get("entity")
-            or row.get("label")
-            or row.get("term")
-            or (f"topic_{row.get('topic_id')}" if row.get("topic_id") is not None else "")
-            or row.get("doc_id")
-            or "__all__"
+def _metric_name_list(params: dict[str, Any]) -> list[str]:
+    raw_metrics = params.get("metrics", [])
+    if isinstance(raw_metrics, str):
+        raw_metrics = [raw_metrics]
+    if not isinstance(raw_metrics, list):
+        return []
+    names: list[str] = []
+    for metric in raw_metrics:
+        if isinstance(metric, str):
+            name = metric.strip()
+        elif isinstance(metric, dict):
+            name = str(metric.get("name", metric.get("metric", "")) or "").strip()
+        else:
+            name = ""
+        if name:
+            names.append(name)
+    return list(dict.fromkeys(names))
+
+
+def _time_series_source_name(params: dict[str, Any]) -> str:
+    return str(
+        params.get(
+            "metrics_source",
+            params.get(
+                "documents_node",
+                params.get(
+                    "documents_source",
+                    params.get("source", params.get("source_node", params.get("source_node_id", ""))),
+                ),
+            ),
         )
-        timestamp = str(row.get("date") or row.get("published_at") or row.get("time_bin") or "")
+        or ""
+    ).strip()
+
+
+def _series_dicts(params: dict[str, Any]) -> list[dict[str, Any]]:
+    raw_series = params.get("series_definitions", params.get("series", []))
+    if isinstance(raw_series, dict):
+        raw_series = [raw_series]
+    if not isinstance(raw_series, list):
+        return []
+    return [dict(item) for item in raw_series if isinstance(item, dict)]
+
+
+def _series_display_name(item: dict[str, Any]) -> str:
+    raw_entity_terms = item.get("entity_terms", item.get("terms", item.get("match_terms", [])))
+    if isinstance(raw_entity_terms, str):
+        entity_terms = [raw_entity_terms]
+    elif isinstance(raw_entity_terms, list):
+        entity_terms = [str(term).strip() for term in raw_entity_terms if str(term).strip()]
+    else:
+        entity_terms = []
+    explicit = str(item.get("series_name", item.get("label", item.get("entity", ""))) or "").strip()
+    if explicit:
+        return explicit
+    raw_name = str(item.get("name", "") or "").strip()
+    if entity_terms and (not raw_name or "_" in raw_name or raw_name.lower().endswith(("_docs", "_documents"))):
+        return entity_terms[0]
+    return raw_name or (entity_terms[0] if entity_terms else "")
+
+
+def _series_match_terms(item: dict[str, Any]) -> list[str]:
+    terms: list[str] = []
+    for key in ("aliases", "match_terms", "terms", "entity_terms"):
+        raw = item.get(key)
+        if isinstance(raw, str):
+            terms.append(raw)
+        elif isinstance(raw, list):
+            terms.extend(str(term).strip() for term in raw if str(term).strip())
+    display = _series_display_name(item)
+    if display:
+        terms.append(display)
+        terms.extend(_target_aliases_for_name(display))
+    return list(dict.fromkeys(term for term in terms if term))
+
+
+def _time_series_rows_from_document_series(
+    params: dict[str, Any],
+    deps: dict[str, ToolExecutionResult],
+    *,
+    granularity: str,
+) -> tuple[list[dict[str, Any]], int] | None:
+    series_items = _series_dicts(params)
+    metric_names = {name.lower() for name in _metric_name_list(params)}
+    if not series_items or (metric_names and not metric_names.intersection({"document_count", "doc_count", "count"})):
+        return None
+    source = _time_series_source_name(params)
+    docs = _dependency_rows_for_source(deps, source) if source else _payload_rows_from_all_dependencies(deps)
+    docs = [_coerce_text_document_row(dict(doc)) for doc in docs if isinstance(doc, dict) and _row_has_text_payload(doc)]
+    if not docs:
+        return [], 0
+    values: Counter[tuple[str, str]] = Counter()
+    doc_sets: defaultdict[tuple[str, str], set[str]] = defaultdict(set)
+    for doc in docs:
+        text = _row_analysis_text(doc)
+        haystack = text.lower()
+        timestamp = str(_first_nonempty_field(doc, ["published_at", "date", "time_bin", "month", "period", "time_period"]))
         time_bin = _time_bin(timestamp, granularity)
-        value = row.get("count", row.get("weight", row.get("score", 1)))
-        grouped[(entity, time_bin)] += int(round(float(value)))
-    rows = [{"entity": entity, "time_bin": time_bin, "count": count} for (entity, time_bin), count in sorted(grouped.items())]
-    return ToolExecutionResult(payload={"rows": rows})
+        doc_id = str(doc.get("doc_id", "") or "").strip()
+        for item in series_items:
+            series_name = _series_display_name(item)
+            aliases = _series_match_terms(item)
+            keyword_terms = item.get("keyword_terms", item.get("context_keywords", item.get("keywords", [])))
+            if isinstance(keyword_terms, str):
+                keywords = [keyword_terms]
+            elif isinstance(keyword_terms, list):
+                keywords = [str(term).strip() for term in keyword_terms if str(term).strip()]
+            else:
+                keywords = []
+            if not series_name or not any(_alias_in_text(text, alias) for alias in aliases):
+                continue
+            if keywords and not any(keyword.lower() in haystack for keyword in keywords):
+                continue
+            values[(series_name, time_bin)] += 1
+            if doc_id:
+                doc_sets[(series_name, time_bin)].add(doc_id)
+    rows = []
+    for (series_name, time_bin), count in sorted(values.items()):
+        document_count = len(doc_sets.get((series_name, time_bin), set())) or int(count)
+        rows.append(
+            {
+                "series_name": series_name,
+                "target_entity": series_name,
+                "entity": series_name,
+                "canonical_entity": series_name,
+                "entity_label": series_name,
+                "time_bin": time_bin,
+                "bucket": time_bin,
+                "month": time_bin,
+                "period": time_bin,
+                "time_period": time_bin,
+                "document_count": document_count,
+                "doc_count": document_count,
+                "count": document_count,
+            }
+        )
+    return rows, 0
+
+
+def _time_series_rows_from_named_metrics(
+    params: dict[str, Any],
+    deps: dict[str, ToolExecutionResult],
+    *,
+    granularity: str,
+) -> tuple[list[dict[str, Any]], int] | None:
+    raw_metrics = params.get("metrics", [])
+    if isinstance(raw_metrics, list) and any(isinstance(metric, dict) for metric in raw_metrics):
+        return None
+    metric_names = _metric_name_list(params)
+    supported = {
+        "average_sentiment",
+        "avg_sentiment",
+        "mean_sentiment",
+        "average_claim_strength",
+        "avg_claim_strength",
+        "mean_claim_strength",
+        "document_count",
+        "doc_count",
+        "claim_count",
+        "count",
+        "average_score",
+        "avg_score",
+        "mean_score",
+    }
+    normalized_metrics = [name.lower() for name in metric_names if name.lower() in supported]
+    if not normalized_metrics:
+        return None
+    source = _time_series_source_name(params)
+    source_rows = _dependency_rows_for_source(deps, source) if source else _payload_rows_from_all_dependencies(deps)
+    if not source_rows:
+        return [], 0
+    raw_group_by = params.get("group_by", params.get("series_key", ""))
+    group_candidates = [str(item) for item in raw_group_by] if isinstance(raw_group_by, list) else [str(raw_group_by or "")]
+    group_candidates.extend(
+        [
+            "target_label",
+            "series_name",
+            "target_entity",
+            "entity_label",
+            "canonical_entity",
+            "linked_entity",
+            "actor",
+            "attributed_actor",
+            "entity_text",
+            "entity",
+            "label",
+            "term",
+        ]
+    )
+    date_field = str(params.get("date_field", params.get("time_field", params.get("datetime_field", ""))) or "")
+    values: defaultdict[tuple[str, str, str], list[float]] = defaultdict(list)
+    doc_sets: defaultdict[tuple[str, str], set[str]] = defaultdict(set)
+    row_counts: Counter[tuple[str, str]] = Counter()
+    skipped = 0
+    for row in source_rows:
+        entity = _canonical_entity(_first_nonempty_field(row, group_candidates))
+        if not entity and row.get("topic_id") is not None:
+            entity = f"topic_{row.get('topic_id')}"
+        if not entity or (entity not in {"__all__"} and not entity.startswith("topic_") and not _valid_entity_surface(entity)):
+            skipped += 1
+            continue
+        timestamp = str(_first_nonempty_field(row, [date_field, "month", "period", "time_period", "date", "published_at", "time_bin"]))
+        time_bin = _time_bin(timestamp, granularity)
+        key = (entity, time_bin)
+        row_counts[key] += 1
+        doc_id = str(row.get("doc_id", "") or "").strip()
+        if doc_id:
+            doc_sets[key].add(doc_id)
+        for metric in normalized_metrics:
+            if metric in {"document_count", "doc_count", "claim_count", "count"}:
+                continue
+            if metric in {"average_sentiment", "avg_sentiment", "mean_sentiment"}:
+                value = _plot_float(row.get("sentiment_score", row.get("score")))
+                output_metric = "average_sentiment"
+            elif metric in {"average_claim_strength", "avg_claim_strength", "mean_claim_strength"}:
+                value = _plot_float(row.get("claim_strength_score", row.get("score")))
+                output_metric = "average_claim_strength"
+            else:
+                value = _plot_float(row.get("score", row.get("value")))
+                output_metric = "average_score"
+            if value is not None:
+                values[(entity, time_bin, output_metric)].append(value)
+    rows_by_key: dict[tuple[str, str], dict[str, Any]] = {}
+    for key, row_count in row_counts.items():
+        entity, time_bin = key
+        document_count = len(doc_sets.get(key, set())) or int(row_count)
+        rows_by_key[key] = {
+            "entity": entity,
+            "canonical_entity": entity,
+            "actor": entity,
+            "entity_label": entity,
+            "target_label": entity,
+            "series_name": entity,
+            "target_entity": entity,
+            "time_bin": time_bin,
+            "bucket": time_bin,
+            "month": time_bin,
+            "period": time_bin,
+            "time_period": time_bin,
+        }
+        if any(metric in normalized_metrics for metric in ("document_count", "doc_count")):
+            rows_by_key[key]["document_count"] = document_count
+            rows_by_key[key]["doc_count"] = document_count
+        if "claim_count" in normalized_metrics:
+            rows_by_key[key]["claim_count"] = int(row_count)
+        if "count" in normalized_metrics:
+            rows_by_key[key]["count"] = int(row_count)
+    for (entity, time_bin, metric), metric_values in values.items():
+        target = rows_by_key.setdefault(
+            (entity, time_bin),
+            {
+                "entity": entity,
+                "canonical_entity": entity,
+                "actor": entity,
+                "entity_label": entity,
+                "target_label": entity,
+                "series_name": entity,
+                "target_entity": entity,
+                "time_bin": time_bin,
+                "bucket": time_bin,
+                "month": time_bin,
+                "period": time_bin,
+                "time_period": time_bin,
+            },
+        )
+        target[metric] = round(sum(metric_values) / max(len(metric_values), 1), 6)
+    rows = list(rows_by_key.values())
+    for row in rows:
+        if "count" not in row:
+            row["count"] = row.get("document_count", row.get("claim_count", 1))
+    rows.sort(key=lambda row: (str(row.get("time_bin", "")), str(row.get("series_name", ""))))
+    return rows, skipped
+
+
+def _time_series_aggregate(params: dict[str, Any], deps: dict[str, ToolExecutionResult], context: AgentExecutionContext) -> ToolExecutionResult:
+    granularity = str(
+        params.get(
+            "bucket_granularity",
+            params.get("granularity", params.get("time_granularity", params.get("interval", _default_time_granularity()))),
+        )
+    ).strip().lower() or "month"
+    metric_series = _time_series_rows_from_metric_specs(params, deps, granularity=granularity)
+    if metric_series is not None:
+        rows, skipped_rows = metric_series
+        caveats = []
+        if skipped_rows:
+            caveats.append(f"Skipped {skipped_rows} metric rows that could not be assigned to a requested series or numeric metric.")
+        return ToolExecutionResult(payload={"rows": rows, "skipped_row_count": skipped_rows}, caveats=caveats)
+    document_series = _time_series_rows_from_document_series(params, deps, granularity=granularity)
+    if document_series is not None:
+        rows, skipped_rows = document_series
+        return ToolExecutionResult(payload={"rows": rows, "skipped_row_count": skipped_rows})
+    named_metric_series = _time_series_rows_from_named_metrics(params, deps, granularity=granularity)
+    if named_metric_series is not None:
+        rows, skipped_rows = named_metric_series
+        caveats = []
+        if skipped_rows:
+            caveats.append(f"Skipped {skipped_rows} time-series rows with unsupported entity labels or unusable series names.")
+        return ToolExecutionResult(payload={"rows": rows, "skipped_row_count": skipped_rows}, caveats=caveats)
+    preferred_source = _time_series_source_name(params)
+    source_rows = _dependency_rows_for_source(deps, preferred_source) if preferred_source else []
+    if not source_rows:
+        for result in deps.values():
+            payload = result.payload
+            if isinstance(payload, dict) and "rows" in payload:
+                source_rows = list(payload["rows"])
+                break
+    raw_group_by = params.get("group_by", params.get("series_key", ""))
+    if isinstance(raw_group_by, list):
+        group_candidates = [str(item) for item in raw_group_by]
+    else:
+        group_candidates = [str(raw_group_by or "")]
+    fallback_group = str(params.get("fallback_group_by", params.get("fallback_series_key", "")) or "")
+    group_candidates.extend([fallback_group, "series_name", "target_entity", "entity_label", "canonical_entity", "linked_entity", "actor", "attributed_actor", "entity_text", "entity", "label", "term"])
+    date_field = str(params.get("date_field", params.get("time_field", params.get("datetime_field", ""))) or "")
+    value_field = str(params.get("value_field", params.get("metric", "")) or "")
+    metric_rows = params.get("metrics")
+    if isinstance(metric_rows, list) and metric_rows:
+        first_metric = metric_rows[0] if isinstance(metric_rows[0], dict) else {}
+        if not value_field:
+            value_field = str(first_metric.get("field", first_metric.get("name", first_metric.get("metric", ""))) or "")
+    raw_entity_types = params.get("entity_types") or params.get("include_entity_types") or []
+    if isinstance(raw_entity_types, str):
+        allowed_labels = {raw_entity_types.upper()}
+    elif isinstance(raw_entity_types, list):
+        allowed_labels = {str(item).upper() for item in raw_entity_types if str(item).strip()}
+    else:
+        allowed_labels = set()
+    ignored_labels = {"DATE", "TIME", "CARDINAL", "ORDINAL", "QUANTITY", "MONEY", "PERCENT"}
+    grouped: defaultdict[tuple[str, str], float] = defaultdict(float)
+    grouped_value_counts: defaultdict[tuple[str, str], int] = defaultdict(int)
+    period_docs: defaultdict[str, set[str]] = defaultdict(set)
+    skipped_rows = 0
+    top_n = _int_param(params, "top_n", "top_k", "limit", default=100, maximum=5000)
+    aggregation = str(params.get("aggregation", params.get("agg", "")) or "").strip().lower()
+    for row in source_rows:
+        label = str(row.get("label", row.get("entity_type", "")) or "").upper()
+        if allowed_labels and label and label not in allowed_labels:
+            skipped_rows += 1
+            continue
+        if not allowed_labels and label in ignored_labels:
+            skipped_rows += 1
+            continue
+        entity = str(_first_nonempty_field(row, group_candidates)).strip()
+        if not entity and row.get("topic_id") is not None:
+            entity = f"topic_{row.get('topic_id')}"
+        if not entity:
+            entity = str(row.get("doc_id") or "__all__")
+        entity = _canonical_entity(entity)
+        if entity not in {"__all__"} and not entity.startswith("topic_") and not _valid_entity_surface(entity):
+            skipped_rows += 1
+            continue
+        timestamp = str(_first_nonempty_field(row, [date_field, "month", "period", "time_period", "date", "published_at", "time_bin"]))
+        time_bin = _time_bin(timestamp, granularity)
+        value = row.get(value_field) if value_field else None
+        if value in (None, ""):
+            value = row.get("count", row.get("mention_count", row.get("document_frequency", row.get("weight", row.get("score", 1)))))
+        numeric_value = _plot_float(value)
+        if numeric_value is None:
+            numeric_value = 1.0
+        grouped[(entity, time_bin)] += float(numeric_value)
+        grouped_value_counts[(entity, time_bin)] += 1
+        doc_id = str(row.get("doc_id", "")).strip()
+        if doc_id:
+            period_docs[time_bin].add(doc_id)
+    entity_totals: Counter[str] = Counter()
+    for (entity, _period_key), count in grouped.items():
+        entity_totals[entity] += float(count)
+    retained_entities = {
+        entity
+        for entity, _ in sorted(entity_totals.items(), key=lambda item: (item[1], item[0].lower()), reverse=True)[:top_n]
+    }
+    rows = []
+    normalize_by_docs = str(params.get("normalize_by", "")).strip().lower() in {"documents_per_period", "docs_per_period", "document_count"}
+    for (entity, time_bin), count in sorted(grouped.items()):
+        if entity not in retained_entities:
+            continue
+        value_count = max(grouped_value_counts.get((entity, time_bin), 1), 1)
+        aggregate_value = count / value_count if aggregation in {"mean", "avg", "average"} else count
+        period_doc_count = len(period_docs.get(time_bin, set()))
+        normalized = aggregate_value / max(period_doc_count, 1) if normalize_by_docs else aggregate_value
+        rendered_value = int(round(aggregate_value)) if float(aggregate_value).is_integer() else round(aggregate_value, 6)
+        rendered_count = int(round(count)) if float(count).is_integer() else round(count, 6)
+        row = {
+            "entity": entity,
+            "canonical_entity": entity,
+            "actor": entity,
+            "entity_label": entity,
+            "series_name": entity,
+            "time_bin": time_bin,
+            "bucket": time_bin,
+            "month": time_bin,
+            "period": time_bin,
+            "time_period": time_bin,
+            "count": rendered_count,
+            "mention_count": rendered_count,
+            "mention_count_normalized": round(normalized, 6),
+            "normalized_value": round(normalized, 6),
+        }
+        if value_field:
+            row[value_field] = rendered_value
+            if aggregation in {"mean", "avg", "average"}:
+                row[f"mean_{value_field}"] = rendered_value
+        rows.append(row)
+    rows.sort(key=lambda row: (str(row.get("time_bin", "")), -float(row.get("count", 0.0)), str(row.get("entity", ""))))
+    caveats = []
+    if skipped_rows:
+        caveats.append(f"Skipped {skipped_rows} time-series rows with unsupported entity labels or unusable series names.")
+    return ToolExecutionResult(payload={"rows": rows, "skipped_row_count": skipped_rows}, caveats=caveats)
 
 
 def _change_point_detect(params: dict[str, Any], deps: dict[str, ToolExecutionResult], context: AgentExecutionContext) -> ToolExecutionResult:
@@ -2999,20 +4432,44 @@ def _burst_detect(params: dict[str, Any], deps: dict[str, ToolExecutionResult], 
 
 
 def _claim_span_extract(params: dict[str, Any], deps: dict[str, ToolExecutionResult], context: AgentExecutionContext) -> ToolExecutionResult:
+    target_groups = _target_alias_groups(params, context)
+    focus_terms = _focus_terms(params)
+    fallback_keywords = sorted(CLAIM_KEYWORDS)
     rows = []
     for doc in _doc_rows(deps):
-        for sentence in simple_sentence_split(str(doc.get("text", ""))):
+        raw_sentences = doc.get("sentences")
+        if isinstance(raw_sentences, list) and raw_sentences:
+            sentences = [str(sentence).strip() for sentence in raw_sentences if str(sentence).strip()]
+        else:
+            sentences = simple_sentence_split(_row_analysis_text(doc))
+        for sentence in sentences:
             lowered = sentence.lower()
-            matched = [keyword for keyword in CLAIM_KEYWORDS if keyword in lowered]
-            if not matched:
+            target_entity, matched_alias = _match_target_alias(sentence, target_groups)
+            if target_groups and not target_entity:
+                continue
+            matched_claim_keywords = [keyword for keyword in fallback_keywords if keyword in lowered]
+            matched_focus_terms = [term for term in focus_terms if term.lower() in lowered]
+            if focus_terms:
+                if not matched_focus_terms:
+                    continue
+            elif not matched_claim_keywords:
                 continue
             rows.append(
                 {
                     "doc_id": str(doc.get("doc_id", "")),
                     "outlet": str(doc.get("outlet", doc.get("source", ""))),
                     "date": str(doc.get("date", doc.get("published_at", ""))),
+                    "published_at": str(doc.get("published_at", doc.get("date", ""))),
+                    "time_bin": _time_bin(str(doc.get("date", doc.get("published_at", "")))),
                     "excerpt": sentence[:320],
-                    "matched_keywords": matched,
+                    "claim_span": sentence,
+                    "text": sentence,
+                    "target_entity": target_entity,
+                    "entity_label": target_entity,
+                    "series_name": target_entity,
+                    "matched_alias": matched_alias,
+                    "matched_keywords": list(dict.fromkeys([*matched_claim_keywords, *matched_focus_terms])),
+                    "matched_focus_terms": matched_focus_terms,
                 }
             )
     return ToolExecutionResult(payload={"rows": rows})
@@ -3027,25 +4484,44 @@ def _claim_strength_score(params: dict[str, Any], deps: dict[str, ToolExecutionR
             break
     scored = []
     for row in spans:
-        excerpt = str(row.get("excerpt", "")).lower()
+        excerpt = str(row.get("claim_span", row.get("excerpt", ""))).lower()
         score = 0.3
         matched = {str(item).lower() for item in row.get("matched_keywords", []) if str(item).strip()}
+        focus_matched = {str(item).lower() for item in row.get("matched_focus_terms", []) if str(item).strip()}
         if "imminent" in matched or "likely" in matched:
             score += 0.35
         if matched.intersection({"predict", "predicted", "prediction", "forecast", "forecasted", "forecasts", "foresaw", "foresee"}):
             score += 0.25
         if matched.intersection({"warn", "warned", "warning", "anticipate", "anticipated", "anticipates", "expect", "expected", "expects"}):
             score += 0.15
-        scored.append({**row, "score": round(min(score, 1.0), 3)})
+        if focus_matched.intersection({"value", "worth", "quality", "performance", "legacy", "talent", "form"}):
+            score += 0.15
+        if focus_matched.intersection({"best", "greatest", "elite", "legend", "icon", "star", "dominance", "peak", "decline"}):
+            score += 0.2
+        claim_strength = round(min(score, 1.0), 3)
+        scored.append({**row, "score": claim_strength, "claim_strength_score": claim_strength})
     scored.sort(key=lambda item: float(item.get("score", 0.0)), reverse=True)
     return ToolExecutionResult(payload={"rows": scored})
 
 
 def _quote_extract(params: dict[str, Any], deps: dict[str, ToolExecutionResult], context: AgentExecutionContext) -> ToolExecutionResult:
     rows = []
+    document_lookup = {str(doc.get("doc_id", "")): doc for doc in _doc_rows(deps) if str(doc.get("doc_id", ""))}
     for doc in _doc_rows(deps):
-        for match in QUOTE_PATTERN.finditer(str(doc.get("text", ""))):
-            rows.append({"doc_id": doc["doc_id"], "quote": match.group(1), "text": str(doc.get("text", ""))[:500]})
+        text = _row_analysis_text(doc)
+        for match in QUOTE_PATTERN.finditer(text):
+            doc_id = str(doc.get("doc_id", ""))
+            source_doc = document_lookup.get(doc_id, doc)
+            rows.append(
+                {
+                    "doc_id": doc_id,
+                    "quote": match.group(1),
+                    "text": text[:500],
+                    "outlet": str(source_doc.get("outlet", source_doc.get("source", ""))),
+                    "time_bin": _time_bin(_row_timestamp(source_doc)),
+                    "published_at": _row_timestamp(source_doc),
+                }
+            )
     return ToolExecutionResult(payload={"rows": rows})
 
 
@@ -3060,7 +4536,8 @@ def _quote_attribute(params: dict[str, Any], deps: dict[str, ToolExecutionResult
     for row in rows:
         text = str(row.get("text", ""))
         speaker_match = SPEAKER_PATTERN.search(text)
-        attributed.append({**row, "speaker": speaker_match.group(1) if speaker_match else "unknown"})
+        speaker = speaker_match.group(1) if speaker_match else str(row.get("speaker", "unknown") or "unknown")
+        attributed.append({**row, "speaker": speaker, "attributed_actor": speaker})
     return ToolExecutionResult(payload={"rows": attributed})
 
 
@@ -3079,6 +4556,43 @@ NOUN_FREQUENCY_TASK_ALIASES = {
 }
 
 
+ENTITY_FREQUENCY_TASK_ALIASES = {
+    "actor_frequency",
+    "actor_distribution",
+    "actor_prominence",
+    "aggregate_named_entity_prominence_overall",
+    "aggregate_named_entity_time_series",
+    "document_frequency_by_entity",
+    "entity_distribution",
+    "entity_frequency",
+    "entity_frequency_distribution",
+    "entity_prominence",
+    "named_entity_distribution",
+    "named_entity_frequency",
+    "named_entity_frequency_distribution",
+    "named_entity_prominence",
+    "quote_attribution_frequency",
+}
+
+
+def _task_name(params: dict[str, Any]) -> str:
+    for key in ("task", "task_name", "operation", "purpose"):
+        value = str(params.get(key, "") or "").strip()
+        if value:
+            return value.lower()
+    return ""
+
+
+def _analysis_params(params: dict[str, Any]) -> dict[str, Any]:
+    payload = _payload_or_params(params)
+    merged = dict(payload)
+    nested = merged.get("params")
+    if isinstance(nested, dict):
+        for key, value in nested.items():
+            merged.setdefault(key, value)
+    return merged
+
+
 def _is_noun_frequency_task(task: str, params: dict[str, Any]) -> bool:
     if task in NOUN_FREQUENCY_TASK_ALIASES:
         return True
@@ -3093,6 +4607,25 @@ def _is_noun_frequency_task(task: str, params: dict[str, Any]) -> bool:
     return bool("frequency" in task and ("noun" in task or "NOUN" in upos_values or "PROPN" in upos_values))
 
 
+def _is_entity_frequency_task(task: str, params: dict[str, Any]) -> bool:
+    if _is_actor_prominence_merge_task(task):
+        return False
+    if task in ENTITY_FREQUENCY_TASK_ALIASES:
+        return True
+    if any(key in params for key in ("entity_source", "entity_field", "actor_field", "entities_node")):
+        return True
+    if "aggregate" in task and ("entity" in task or "actor" in task):
+        return True
+    return bool(
+        ("entity" in task or "actor" in task or "attribution" in task)
+        and ("frequency" in task or "prominence" in task or "distribution" in task)
+    )
+
+
+def _is_actor_prominence_merge_task(task: str) -> bool:
+    return "merge" in task and ("actor" in task or "entity" in task or "prominence" in task)
+
+
 def _int_param(params: dict[str, Any], *names: str, default: int, minimum: int = 1, maximum: int = 1000) -> int:
     for name in names:
         if params.get(name) in (None, ""):
@@ -3105,15 +4638,621 @@ def _int_param(params: dict[str, Any], *names: str, default: int, minimum: int =
     return max(minimum, min(maximum, default))
 
 
+def _payload_rows_from_all_dependencies(deps: dict[str, ToolExecutionResult]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for result in deps.values():
+        payload = result.payload if isinstance(result.payload, dict) else {}
+        for key in ("rows", "documents", "results"):
+            value = payload.get(key)
+            if isinstance(value, list):
+                rows.extend(dict(item) for item in value if isinstance(item, dict))
+    return rows
+
+
+def _first_nonempty_field(row: dict[str, Any], fields: Iterable[str]) -> Any:
+    for field in fields:
+        if not field:
+            continue
+        value = row.get(field)
+        if value not in (None, "") and str(value).strip():
+            return value
+    return ""
+
+
+def _target_aliases_for_name(name: str) -> list[str]:
+    canonical = _canonical_entity(name)
+    aliases = [canonical]
+    tokens = [token for token in re.findall(r"[A-Za-z][A-Za-z'.-]*", canonical) if token]
+    if len(tokens) >= 2:
+        last = tokens[-1].strip(".'-")
+        if len(last) >= 3 and last.lower() not in ENTITY_SURFACE_STOPWORDS and last.lower() not in {"president", "minister", "chancellor"}:
+            aliases.append(last)
+    return list(dict.fromkeys(alias for alias in aliases if alias))
+
+
+def _entity_like_phrases(text: str) -> list[str]:
+    phrases: list[str] = []
+    seen: set[str] = set()
+    for match in re.finditer(
+        r"\b(?:[A-Z][A-Za-z'.-]+|[A-Z]{2,})(?:\s+(?:[A-Z][A-Za-z'.-]+|[A-Z]{2,})){1,5}\b",
+        str(text or ""),
+    ):
+        phrase = _canonical_entity(match.group(0))
+        lowered = phrase.lower()
+        if lowered in seen or lowered in ENTITY_SURFACE_STOPWORDS:
+            continue
+        if not _valid_entity_surface(phrase):
+            continue
+        seen.add(lowered)
+        phrases.append(phrase)
+    return phrases
+
+
+def _comparison_side_phrases(text: str) -> list[str]:
+    phrase = r"(?:[A-Z][A-Za-z'.-]+|[A-Z]{2,})(?:\s+(?:[A-Z][A-Za-z'.-]+|[A-Z]{2,})){0,4}"
+    pattern = re.compile(
+        rf"\b(?P<left>{phrase})\s+(?:vs\.?|versus|compared\s+(?:with|to)|against|rather\s+than)\s+(?P<right>{phrase})\b",
+    )
+    phrases: list[str] = []
+    for match in pattern.finditer(str(text or "")):
+        for side in ("left", "right"):
+            candidate = _canonical_entity(match.group(side))
+            if candidate and _valid_entity_surface(candidate):
+                phrases.append(candidate)
+    return list(dict.fromkeys(phrases))
+
+
+def _inferred_comparison_targets(params: dict[str, Any], context: AgentExecutionContext | None = None) -> list[tuple[str, list[str]]]:
+    texts = [
+        str(params.get("question", "") or ""),
+        str(params.get("query", "") or ""),
+    ]
+    focus_text = str(params.get("query_focus", "") or "")
+    if context is not None:
+        texts.extend(
+            [
+                str(getattr(context.state, "rewritten_question", "") or ""),
+                str(getattr(context.state, "question", "") or ""),
+            ]
+        )
+    combined = " ".join(text for text in texts if text.strip())
+    if not combined.strip():
+        return []
+    has_comparison_signal = bool(
+        re.search(r"\b(vs\.?|versus|compared\s+(?:with|to)|between|rather\s+than|against)\b", combined, flags=re.IGNORECASE)
+    )
+    quoted = []
+    for left, right in re.findall(r'"([^"]{2,80})"|\'([^\']{2,80})\'', f"{combined} {focus_text}"):
+        value = (left or right).strip()
+        if value:
+            quoted.append(value)
+    candidates = quoted + (_comparison_side_phrases(combined) + _entity_like_phrases(combined) if has_comparison_signal else [])
+    groups: list[tuple[str, list[str]]] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        canonical = _canonical_entity(candidate)
+        lowered = canonical.lower()
+        if lowered in seen or not _valid_entity_surface(canonical):
+            continue
+        seen.add(lowered)
+        groups.append((canonical, _target_aliases_for_name(canonical)))
+    return groups[:6]
+
+
+def _target_alias_groups(params: dict[str, Any], context: AgentExecutionContext | None = None) -> list[tuple[str, list[str]]]:
+    raw_targets = params.get("targets", params.get("target_entities", params.get("entities", [])))
+    if isinstance(raw_targets, dict):
+        raw_targets = [raw_targets]
+    if isinstance(raw_targets, str):
+        raw_targets = [raw_targets]
+    groups: list[tuple[str, list[str]]] = []
+    if not isinstance(raw_targets, list):
+        return _inferred_comparison_targets(params, context)
+    for item in raw_targets:
+        canonical = ""
+        aliases: list[str] = []
+        if isinstance(item, dict):
+            canonical = str(item.get("canonical", item.get("entity", item.get("label", item.get("name", "")))) or "").strip()
+            raw_aliases = item.get("aliases", item.get("match_terms", item.get("terms", [])))
+            if isinstance(raw_aliases, str):
+                raw_aliases = [raw_aliases]
+            if isinstance(raw_aliases, list):
+                aliases.extend(str(alias).strip() for alias in raw_aliases if str(alias).strip())
+        else:
+            canonical = str(item or "").strip()
+        if canonical:
+            aliases = [*aliases, *_target_aliases_for_name(canonical)]
+        normalized_aliases = list(dict.fromkeys(alias for alias in aliases if alias))
+        if canonical and normalized_aliases:
+            groups.append((canonical, normalized_aliases))
+    return groups or _inferred_comparison_targets(params, context)
+
+
+def _alias_in_text(text: str, alias: str) -> bool:
+    if not text or not alias:
+        return False
+    pattern = rf"(?<![A-Za-z0-9]){re.escape(alias)}(?![A-Za-z0-9])"
+    return bool(re.search(pattern, text, flags=re.IGNORECASE))
+
+
+def _match_target_alias(text: Any, groups: list[tuple[str, list[str]]]) -> tuple[str, str]:
+    haystack = str(text or "")
+    for canonical, aliases in groups:
+        for alias in aliases:
+            if _alias_in_text(haystack, alias):
+                return canonical, alias
+    return "", ""
+
+
+def _series_identity_fields(row: dict[str, Any]) -> dict[str, Any]:
+    return {
+        field: row[field]
+        for field in ("target_entity", "entity_label", "series_name", "entity", "canonical_entity", "actor")
+        if field in row and str(row.get(field, "")).strip()
+    }
+
+
+def _canonical_entity(value: Any) -> str:
+    text = re.sub(r"\s+", " ", str(value or "")).strip(" \t\r\n\"',;:")
+    text = re.sub(r"^(the|a|an)\s+", "", text, flags=re.IGNORECASE)
+    text = re.sub(
+        r"\s+(today|yesterday|tomorrow|tonight|said|says|say)\s*$",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
+    return text[:160]
+
+
+def _entity_row_time_bin(row: dict[str, Any], timestamp_field: str = "") -> str:
+    raw = _first_nonempty_field(
+        row,
+        [timestamp_field, "month", "period", "time_bin", "date", "published_at", "timestamp"],
+    )
+    return _time_bin(str(raw))
+
+
+def _valid_entity_surface(entity: str) -> bool:
+    if not entity or len(entity) < 2:
+        return False
+    lowered = entity.lower()
+    if lowered in ENTITY_SURFACE_STOPWORDS:
+        return False
+    if re.fullmatch(r"[0-9a-f]{24,}", lowered):
+        return False
+    if re.fullmatch(r"[\d\s,./:-]+", entity):
+        return False
+    if re.fullmatch(r"[$€£]?\s*\d+(?:[.,]\d+)?\s*(?:k|m|bn|billion|million)?", lowered):
+        return False
+    if re.fullmatch(r"[a-z]+", entity):
+        return False
+    return bool(re.search(r"[A-Za-z]", entity))
+
+
+def _dependency_rows_for_source(deps: dict[str, ToolExecutionResult], source: str) -> list[dict[str, Any]]:
+    if source and source in deps:
+        payload = deps[source].payload if isinstance(deps[source].payload, dict) else {}
+        for key in ("rows", "documents", "results"):
+            rows = payload.get(key)
+            if isinstance(rows, list):
+                return [dict(item) for item in rows if isinstance(item, dict)]
+    return _payload_rows_from_all_dependencies(deps)
+
+
+def _series_definitions(params: dict[str, Any]) -> list[tuple[str, list[str]]]:
+    raw_series = params.get("series_definitions", params.get("series", []))
+    if isinstance(raw_series, dict):
+        raw_series = [raw_series]
+    if isinstance(raw_series, str):
+        raw_series = [raw_series]
+    groups: list[tuple[str, list[str]]] = []
+    if isinstance(raw_series, list):
+        for item in raw_series:
+            if isinstance(item, dict):
+                canonical = str(
+                    item.get(
+                        "series_name",
+                        item.get("name", item.get("label", item.get("entity", item.get("canonical", "")))),
+                    )
+                    or ""
+                ).strip()
+                aliases = [canonical]
+                raw_aliases = item.get("aliases", item.get("match_terms", item.get("terms", item.get("entity_terms", []))))
+                if isinstance(raw_aliases, str):
+                    raw_aliases = [raw_aliases]
+                if isinstance(raw_aliases, list):
+                    aliases.extend(str(alias).strip() for alias in raw_aliases if str(alias).strip())
+                entity = str(item.get("entity", "") or "").strip()
+                if entity:
+                    aliases.append(entity)
+            else:
+                canonical = str(item or "").strip()
+                aliases = [canonical]
+            aliases = list(dict.fromkeys(alias for alias in aliases if alias))
+            if canonical and aliases:
+                groups.append((canonical, aliases))
+    if groups:
+        return groups
+    return _target_alias_groups(params)
+
+
+def _row_series_name(row: dict[str, Any], groups: list[tuple[str, list[str]]]) -> str:
+    series_fields = [
+        "series_name",
+        "target_entity",
+        "entity_label",
+        "canonical_entity",
+        "linked_entity",
+        "entity",
+        "entity_text",
+        "actor",
+        "attributed_actor",
+        "speaker",
+        "label",
+        "term",
+    ]
+    for field in series_fields:
+        value = str(row.get(field, "") or "").strip()
+        if not value:
+            continue
+        if groups:
+            matched, _alias = _match_target_alias(value, groups)
+            if matched:
+                return matched
+        else:
+            canonical = _canonical_entity(value)
+            if canonical and _valid_entity_surface(canonical):
+                return canonical
+    if groups:
+        text = " ".join(str(row.get(field, "") or "") for field in ("claim_span", "excerpt", "text", "title"))
+        matched, _alias = _match_target_alias(text, groups)
+        if matched:
+            return matched
+    return ""
+
+
+def _metric_value(row: dict[str, Any], metric: dict[str, Any]) -> float | None:
+    aggregation = str(metric.get("aggregation", metric.get("agg", "")) or "").strip().lower()
+    if aggregation == "count":
+        return 1.0
+    metric_name = str(metric.get("name", "") or "").strip()
+    field_candidates = [
+        str(metric.get("field", "") or "").strip(),
+        str(metric.get("value_field", "") or "").strip(),
+        str(metric.get("metric", "") or "").strip(),
+        metric_name,
+        "score",
+        "value",
+        "count",
+        "mention_count",
+        "document_frequency",
+        "weight",
+    ]
+    for field in field_candidates:
+        if not field:
+            continue
+        value = _plot_float(row.get(field))
+        if value is not None:
+            return value
+    return None
+
+
+def _time_series_rows_from_metric_specs(
+    params: dict[str, Any],
+    deps: dict[str, ToolExecutionResult],
+    *,
+    granularity: str,
+) -> tuple[list[dict[str, Any]], int] | None:
+    raw_metrics = params.get("metrics")
+    if not isinstance(raw_metrics, list) or not raw_metrics:
+        return None
+    metrics = [metric for metric in raw_metrics if isinstance(metric, dict) and str(metric.get("name", "")).strip()]
+    if not metrics:
+        return None
+    groups = _series_definitions(params)
+    values: defaultdict[tuple[str, str, str], list[float]] = defaultdict(list)
+    aggregations: dict[str, str] = {}
+    doc_sets: defaultdict[tuple[str, str], set[str]] = defaultdict(set)
+    skipped = 0
+    for metric in metrics:
+        metric_name = str(metric.get("name", "") or "").strip()
+        aggregations[metric_name] = str(metric.get("aggregation", metric.get("agg", "sum")) or "sum").strip().lower()
+        source = str(metric.get("source", metric.get("source_node", metric.get("source_node_id", ""))) or "").strip()
+        for row in _dependency_rows_for_source(deps, source):
+            series = _row_series_name(row, groups)
+            if not series:
+                skipped += 1
+                continue
+            timestamp = str(_first_nonempty_field(row, ["published_at", "date", "time_bin", "month", "period", "time_period"]))
+            time_bin = _time_bin(timestamp, granularity)
+            value = _metric_value(row, metric)
+            if value is None:
+                skipped += 1
+                continue
+            values[(series, time_bin, metric_name)].append(value)
+            doc_id = str(row.get("doc_id", "") or "").strip()
+            if doc_id:
+                doc_sets[(series, time_bin)].add(doc_id)
+    if not values:
+        return [], skipped
+    rows_by_key: dict[tuple[str, str], dict[str, Any]] = {}
+    for (series, time_bin, metric_name), metric_values in values.items():
+        target = rows_by_key.setdefault(
+            (series, time_bin),
+            {
+                "series_name": series,
+                "target_entity": series,
+                "entity": series,
+                "canonical_entity": series,
+                "time_bin": time_bin,
+                "bucket": time_bin,
+                "month": time_bin,
+                "period": time_bin,
+                "time_period": time_bin,
+            },
+        )
+        aggregation = aggregations.get(metric_name, "sum")
+        if aggregation in {"mean", "avg", "average"}:
+            target[metric_name] = round(sum(metric_values) / max(len(metric_values), 1), 6)
+        elif aggregation == "max":
+            target[metric_name] = max(metric_values)
+        elif aggregation == "min":
+            target[metric_name] = min(metric_values)
+        else:
+            total = sum(metric_values)
+            target[metric_name] = int(total) if float(total).is_integer() else round(total, 6)
+        target["document_frequency"] = len(doc_sets.get((series, time_bin), set()))
+    rows = list(rows_by_key.values())
+    for row in rows:
+        if "mention_count" in row:
+            row["count"] = row["mention_count"]
+    rows.sort(key=lambda row: (str(row.get("time_bin", "")), str(row.get("series_name", ""))))
+    return rows, skipped
+
+
+def _entity_frequency_rows(params: dict[str, Any], deps: dict[str, ToolExecutionResult], *, task: str) -> tuple[list[dict[str, Any]], dict[str, Any], list[str]]:
+    all_rows = _payload_rows_from_all_dependencies(deps)
+    mention_rows = [row for row in all_rows if str(row.get("doc_id", "")).strip()]
+    source_rows = mention_rows if any("entity" in row or "speaker" in row or "attributed_actor" in row for row in mention_rows) else all_rows
+    requested_entity_field = str(params.get("entity_field", params.get("actor_field", "")) or "").strip()
+    fallback_entity_field = str(params.get("fallback_entity_field", params.get("fallback_series_key", "")) or "").strip()
+    entity_fields = [
+        requested_entity_field,
+        fallback_entity_field,
+        str(params.get("linked_name_field", "") or "").strip(),
+        str(params.get("linked_id_field", "") or "").strip(),
+        str(params.get("entity_text_field", "") or "").strip(),
+        "canonical_entity",
+        "entity_canonical",
+        "linked_entity_name",
+        "linked_entity",
+        "linked_entity_id",
+        "entity_text",
+        "attributed_actor",
+        "actor",
+        "speaker",
+        "entity",
+        "name",
+        "label",
+    ]
+    timestamp_field = str(params.get("timestamp_field", params.get("published_at_field", params.get("time_field", ""))) or "").strip()
+    raw_entity_types = params.get("entity_types") or params.get("include_entity_types") or params.get("allowed_entity_labels") or []
+    if isinstance(raw_entity_types, str):
+        allowed_labels = {raw_entity_types.upper()}
+    elif isinstance(raw_entity_types, list):
+        allowed_labels = {str(item).upper() for item in raw_entity_types if str(item).strip()}
+    else:
+        allowed_labels = set()
+    ignored_labels = {"DATE", "TIME", "CARDINAL", "ORDINAL", "QUANTITY", "MONEY", "PERCENT"}
+    group_by_time = bool(params.get("group_by_time") or "time_series" in task or "over_time" in task or "monthly" in task)
+    top_n = _int_param(params, "top_n", "top_k", "limit", default=100, maximum=5000)
+    min_df = _int_param(params, "min_document_frequency", "min_doc_frequency", default=1, maximum=100000)
+    quote_mode = "quote" in task or str(params.get("actor_field", "")).strip() in {"attributed_actor", "speaker"}
+    mention_counts: Counter[tuple[str, str]] = Counter()
+    quote_counts: Counter[tuple[str, str]] = Counter()
+    doc_sets: defaultdict[tuple[str, str], set[str]] = defaultdict(set)
+    total_docs_by_time: defaultdict[str, set[str]] = defaultdict(set)
+    total_mentions = 0
+    skipped = 0
+    label_fields = [
+        str(params.get("entity_label_field", "") or "").strip(),
+        "label",
+        "entity_label",
+        "entity_type",
+        "type",
+    ]
+    for row in source_rows:
+        label = str(_first_nonempty_field(row, label_fields) or "").upper()
+        if allowed_labels and label and label not in allowed_labels:
+            skipped += 1
+            continue
+        if not allowed_labels and label in ignored_labels:
+            skipped += 1
+            continue
+        entity = _canonical_entity(_first_nonempty_field(row, entity_fields))
+        if not _valid_entity_surface(entity):
+            skipped += 1
+            continue
+        time_bin = _entity_row_time_bin(row, timestamp_field)
+        time_key = time_bin if group_by_time else "__overall__"
+        doc_id = str(row.get("doc_id", "")).strip()
+        key = (entity, time_key)
+        mention_counts[key] += 1
+        total_mentions += 1
+        if quote_mode or row.get("quote") not in (None, ""):
+            quote_counts[key] += 1
+        if doc_id:
+            doc_sets[key].add(doc_id)
+            total_docs_by_time[time_key].add(doc_id)
+    overall_doc_sets: defaultdict[str, set[str]] = defaultdict(set)
+    overall_mentions: Counter[str] = Counter()
+    for (entity, time_key), count in mention_counts.items():
+        overall_mentions[entity] += count
+        overall_doc_sets[entity].update(doc_sets.get((entity, time_key), set()))
+    eligible_entities = {
+        entity
+        for entity, docs in overall_doc_sets.items()
+        if len(docs) >= min_df or not any(doc_sets.values())
+    }
+    if not eligible_entities and min_df > 1:
+        eligible_entities = set(overall_mentions)
+        min_df = 1
+    ranked_entities = [
+        entity
+        for entity, _ in sorted(
+            overall_mentions.items(),
+            key=lambda item: (len(overall_doc_sets.get(item[0], set())), item[1], item[0].lower()),
+            reverse=True,
+        )
+        if entity in eligible_entities
+    ][:top_n]
+    ranked_set = set(ranked_entities)
+    rows: list[dict[str, Any]] = []
+    total_doc_count = len(set().union(*total_docs_by_time.values())) if total_docs_by_time else 0
+    for (entity, time_key), mention_count in sorted(
+        mention_counts.items(),
+        key=lambda item: (item[0][1], item[0][0].lower()),
+    ):
+        if entity not in ranked_set:
+            continue
+        docs = doc_sets.get((entity, time_key), set())
+        period_doc_count = len(total_docs_by_time.get(time_key, set())) if group_by_time else total_doc_count
+        doc_frequency = len(docs)
+        quote_count = quote_counts.get((entity, time_key), 0)
+        prominence_score = doc_frequency + (0.25 * mention_count) + (2.0 * quote_count)
+        row = {
+            "entity": entity,
+            "canonical_entity": entity,
+            "entity_text": entity,
+            "linked_entity": entity,
+            "actor": entity,
+            "attributed_actor": entity,
+            "mention_count": int(mention_count),
+            "count": int(mention_count),
+            "document_frequency": int(doc_frequency),
+            "doc_frequency": int(doc_frequency),
+            "quote_count": int(quote_count),
+            "prominence_score": round(prominence_score, 6),
+            "share_of_mentions": round(mention_count / max(total_mentions, 1), 6),
+            "share_of_docs": round(doc_frequency / max(period_doc_count, 1), 6),
+        }
+        row["mention_share"] = row["share_of_mentions"]
+        row["doc_share"] = row["share_of_docs"]
+        row["share_of_documents"] = row["share_of_docs"]
+        row["composite_prominence"] = row["prominence_score"]
+        row["mention_count_normalized"] = row["share_of_docs"]
+        if group_by_time:
+            row.update({"time_bin": time_key, "month": time_key, "period": time_key, "time_period": time_key})
+        rows.append(row)
+    if not group_by_time:
+        rows.sort(key=lambda row: (float(row.get("document_frequency", 0)), float(row.get("mention_count", 0))), reverse=True)
+        rows = rows[:top_n]
+        for rank, row in enumerate(rows, start=1):
+            row["rank"] = rank
+    else:
+        rows.sort(key=lambda row: (str(row.get("time_bin", "")), -float(row.get("prominence_score", 0)), str(row.get("entity", ""))))
+    caveats = []
+    if skipped:
+        caveats.append(f"Skipped {skipped} entity/actor rows with unsupported labels or unusable names.")
+    metadata = {
+        "provider": "analytics_entity_frequency",
+        "task": task,
+        "input_row_count": len(source_rows),
+        "entity_count": len(ranked_entities),
+        "group_by_time": group_by_time,
+        "min_document_frequency": min_df,
+    }
+    return rows, metadata, caveats
+
+
+def _merge_actor_prominence_rows(params: dict[str, Any], deps: dict[str, ToolExecutionResult]) -> tuple[list[dict[str, Any]], dict[str, Any], list[str]]:
+    aggregate_rows = _payload_rows_from_all_dependencies(deps)
+    combined: dict[tuple[str, str], dict[str, Any]] = {}
+    doc_sets: defaultdict[tuple[str, str], set[str]] = defaultdict(set)
+    for row in aggregate_rows:
+        actor = _canonical_entity(_first_nonempty_field(row, ["actor", "canonical_entity", "linked_entity", "attributed_actor", "entity_text", "entity", "speaker"]))
+        if not _valid_entity_surface(actor):
+            continue
+        month = _entity_row_time_bin(row)
+        key = (actor, month)
+        target = combined.setdefault(
+            key,
+            {
+                "actor": actor,
+                "entity": actor,
+                "canonical_entity": actor,
+                "entity_text": actor,
+                "linked_entity": actor,
+                "attributed_actor": actor,
+                "month": month,
+                "time_bin": month,
+                "period": month,
+                "time_period": month,
+            },
+        )
+        saw_numeric = False
+        for field in ("document_frequency", "doc_frequency", "mention_count", "quote_count", "count"):
+            value = _plot_float(row.get(field))
+            if value is not None:
+                canonical = "document_frequency" if field == "doc_frequency" else field
+                target[canonical] = float(target.get(canonical, 0.0) or 0.0) + value
+                saw_numeric = True
+        if not saw_numeric and any(name in row for name in ("entity", "canonical_entity", "linked_entity", "speaker", "attributed_actor")):
+            target["mention_count"] = float(target.get("mention_count", 0.0) or 0.0) + 1.0
+        if row.get("quote") not in (None, ""):
+            target["quote_count"] = float(target.get("quote_count", 0.0) or 0.0) + 1.0
+        doc_id = str(row.get("doc_id", "")).strip()
+        if doc_id:
+            doc_sets[key].add(doc_id)
+    rows = []
+    for key, row in combined.items():
+        if doc_sets.get(key):
+            row["document_frequency"] = max(float(row.get("document_frequency", 0.0) or 0.0), float(len(doc_sets[key])))
+        doc_frequency = float(row.get("document_frequency", 0.0) or 0.0)
+        mention_count = float(row.get("mention_count", row.get("count", 0.0)) or 0.0)
+        quote_count = float(row.get("quote_count", 0.0) or 0.0)
+        row["doc_mentions"] = doc_frequency
+        row["mentioned_in_doc"] = 1.0 if doc_frequency > 0 else 0.0
+        row["quoted_in_doc"] = 1.0 if quote_count > 0 else 0.0
+        row["count"] = mention_count
+        row["prominence_score"] = round(doc_frequency + (0.25 * mention_count) + (2.0 * quote_count), 6)
+        rows.append(row)
+    totals_by_month: defaultdict[str, dict[str, float]] = defaultdict(lambda: defaultdict(float))
+    for row in rows:
+        month = str(row.get("month", "unknown"))
+        totals_by_month[month]["mention_count"] += float(row.get("mention_count", row.get("count", 0.0)) or 0.0)
+        totals_by_month[month]["doc_mentions"] += float(row.get("doc_mentions", row.get("document_frequency", 0.0)) or 0.0)
+        totals_by_month[month]["quote_count"] += float(row.get("quote_count", 0.0) or 0.0)
+    for row in rows:
+        month = str(row.get("month", "unknown"))
+        totals = totals_by_month[month]
+        mention_count = float(row.get("mention_count", row.get("count", 0.0)) or 0.0)
+        doc_mentions = float(row.get("doc_mentions", row.get("document_frequency", 0.0)) or 0.0)
+        quote_count = float(row.get("quote_count", 0.0) or 0.0)
+        mention_share = mention_count / max(totals["mention_count"], 1.0)
+        doc_share = doc_mentions / max(totals["doc_mentions"], 1.0)
+        quote_share = quote_count / max(totals["quote_count"], 1.0)
+        row["mention_share"] = round(mention_share, 6)
+        row["share_of_mentions"] = row["mention_share"]
+        row["doc_share"] = round(doc_share, 6)
+        row["share_of_documents"] = row["doc_share"]
+        row["quote_share"] = round(quote_share, 6)
+        row["composite_prominence"] = round((0.45 * doc_share) + (0.35 * mention_share) + (0.20 * quote_share), 6)
+        row["mention_count_normalized"] = row["mention_share"]
+    rows.sort(key=lambda row: (str(row.get("month", "")), -float(row.get("prominence_score", 0.0)), str(row.get("actor", ""))))
+    return rows, {"provider": "analytics_actor_prominence_merge", "input_row_count": len(aggregate_rows)}, []
+
+
 def _build_evidence_table(params: dict[str, Any], deps: dict[str, ToolExecutionResult], context: AgentExecutionContext) -> ToolExecutionResult:
-    task = str(params.get("task", "")).strip().lower()
+    params = _analysis_params(params)
+    task = _task_name(params)
     if _is_noun_frequency_task(task, params):
         top_k = _int_param(params, "top_k", "limit", default=100, maximum=5000)
         documents = _text_rows(deps)
-        working_set_ref = str(params.get("working_set_ref", "") or _working_set_ref(deps)).strip()
-        documents_truncated = _dependency_payload_flag(deps, "documents_truncated")
+        working_set_ref = _resolve_working_set_ref(params, deps)
+        documents_truncated = _dependency_payload_flag(deps, "documents_truncated") or _dependency_payload_flag(deps, "working_set_truncated")
         full_document_count = _dependency_payload_int(deps, "document_count", len(documents))
-        if working_set_ref and documents_truncated:
+        if working_set_ref and (documents_truncated or not documents):
             noun_rows, full_metadata = _noun_frequency_rows_from_working_set(
                 context,
                 working_set_ref,
@@ -3121,13 +5260,23 @@ def _build_evidence_table(params: dict[str, Any], deps: dict[str, ToolExecutionR
             )
             caveats = [
                 (
-                    "Upstream fetched documents were only a preview, so noun distribution was computed by "
-                    "streaming the full working_set_ref in batches instead of using preview-only POS rows."
+                    "Noun distribution was computed by streaming the full working_set_ref in batches "
+                    "instead of relying on preview-only or ID-only upstream rows."
                 )
             ]
             if full_document_count and full_metadata.get("analyzed_document_count") != full_document_count:
                 caveats.append(
                     f"Expected {full_document_count} working-set documents but analyzed {full_metadata.get('analyzed_document_count', 0)}."
+                )
+            if full_metadata.get("analysis_document_limit") and full_document_count > int(full_metadata.get("analysis_document_limit") or 0):
+                caveats.append(
+                    f"Working-set linguistic aggregation was capped at {full_metadata.get('analysis_document_limit')} documents; "
+                    "set CORPUSAGENT2_WORKING_SET_ANALYSIS_MAX_DOCS=-1 for an uncapped offline run."
+                )
+            if full_metadata.get("provider_fallback_reason"):
+                caveats.append(
+                    "Provider POS tagging was skipped for this large working set: "
+                    f"{full_metadata.get('provider_fallback_reason')}."
                 )
             if not noun_rows:
                 caveats.append("No noun distribution rows were produced from the full working set.")
@@ -3147,6 +5296,33 @@ def _build_evidence_table(params: dict[str, Any], deps: dict[str, ToolExecutionR
             if isinstance(first, dict) and ("pos" in first or "lemma" in first):
                 pos_rows = [dict(item) for item in rows if isinstance(item, dict)]
                 break
+        if not pos_rows and documents:
+            noun_rows, heuristic_metadata = _noun_frequency_rows_from_documents(
+                documents,
+                top_k=top_k,
+                full_working_set=False,
+                working_set_ref=working_set_ref,
+            )
+            caveats = [] if noun_rows else ["No noun distribution rows were produced from the upstream documents."]
+            if noun_rows:
+                caveats.append(
+                    "No POS rows were provided, so noun distribution was computed with heuristic token/POS fallback over fetched documents."
+                )
+            if documents_truncated:
+                caveats.append(
+                    "Noun distribution is preview-only because upstream documents were truncated and no batch working_set_ref was available."
+                )
+            return ToolExecutionResult(
+                payload={"rows": noun_rows, "source_document_count": full_document_count, **heuristic_metadata},
+                evidence=[],
+                caveats=caveats,
+                metadata={
+                    "no_data": not noun_rows,
+                    "task": task,
+                    "preview_only": bool(documents_truncated),
+                    **heuristic_metadata,
+                },
+            )
         noun_rows = _noun_frequency_rows(documents, pos_rows, top_k=top_k)
         caveats = [] if noun_rows else ["No noun distribution rows were produced from the upstream documents and POS rows."]
         if documents_truncated:
@@ -3184,6 +5360,16 @@ def _build_evidence_table(params: dict[str, Any], deps: dict[str, ToolExecutionR
             evidence=[],
             caveats=caveats,
             metadata={"no_data": not summary_rows, "task": task},
+        )
+    if _is_entity_frequency_task(task, params):
+        entity_rows, entity_metadata, caveats = _entity_frequency_rows(params, deps, task=task)
+        if not entity_rows:
+            caveats = [*caveats, "No entity or actor frequency rows were produced from upstream rows."]
+        return ToolExecutionResult(
+            payload={"rows": entity_rows, **entity_metadata},
+            evidence=[],
+            caveats=caveats,
+            metadata={"no_data": not entity_rows, **entity_metadata},
         )
     rows = []
     search_score_lookup = {
@@ -3284,6 +5470,46 @@ def _fetch_yfinance_series_rows(
     return rows
 
 
+def _infer_external_series_bounds(left_rows: list[dict[str, Any]], key: str) -> tuple[str, str]:
+    values = []
+    for row in left_rows:
+        raw = str(row.get(key, row.get("time_bin", row.get("date", "")))).strip()
+        if not raw or raw.lower() in {"unknown", "unkn", "nan", "none", "nat"}:
+            continue
+        if re.fullmatch(r"\d{4}(-\d{2})?(-\d{2})?", raw):
+            values.append(raw)
+    if not values:
+        return "", ""
+    first = min(values)
+    last = max(values)
+
+    def _period_start(value: str) -> str:
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
+            return value
+        if re.fullmatch(r"\d{4}-\d{2}", value):
+            return f"{value}-01"
+        if re.fullmatch(r"\d{4}", value):
+            return f"{value}-01-01"
+        return ""
+
+    def _exclusive_period_end(value: str) -> str:
+        start_text = _period_start(value)
+        if not start_text:
+            return ""
+        start_date = pd.to_datetime(start_text, errors="coerce")
+        if pd.isna(start_date):
+            return ""
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
+            end_date = start_date + pd.Timedelta(days=1)
+        elif re.fullmatch(r"\d{4}-\d{2}", value):
+            end_date = start_date + pd.DateOffset(months=1)
+        else:
+            end_date = start_date + pd.DateOffset(years=1)
+        return str(end_date.date())
+
+    return _period_start(first), _exclusive_period_end(last)
+
+
 def _join_external_series(params: dict[str, Any], deps: dict[str, ToolExecutionResult], context: AgentExecutionContext) -> ToolExecutionResult:
     external_rows = list(params.get("series_rows", []))
     ticker = str(params.get("ticker", "")).strip() or _infer_market_ticker_from_text(
@@ -3304,6 +5530,16 @@ def _join_external_series(params: dict[str, Any], deps: dict[str, ToolExecutionR
 
     caveats: list[str] = []
     provider = "analytics"
+    left_key = str(params.get("left_key", "time_bin"))
+    right_key = str(params.get("right_key", left_key))
+    if ticker and (not start or not end):
+        inferred_start, inferred_end = _infer_external_series_bounds(left_rows, left_key)
+        if inferred_start and not start:
+            start = inferred_start
+        if inferred_end and not end:
+            end = inferred_end
+        if inferred_start or inferred_end:
+            caveats.append("Inferred external series date range from the internal corpus time bins.")
     if not external_rows and ticker:
         try:
             external_rows = _fetch_yfinance_series_rows(
@@ -3329,8 +5565,6 @@ def _join_external_series(params: dict[str, Any], deps: dict[str, ToolExecutionR
             metadata=_metadata(provider, f"{provider}_join_external_series", ticker=ticker),
         )
 
-    left_key = str(params.get("left_key", "time_bin"))
-    right_key = str(params.get("right_key", left_key))
     if left_key not in left_df.columns:
         if "date" in left_df.columns:
             left_df[left_key] = left_df["date"].astype(str).map(_time_bin)
@@ -3338,6 +5572,37 @@ def _join_external_series(params: dict[str, Any], deps: dict[str, ToolExecutionR
             return ToolExecutionResult(payload={"rows": left_rows}, caveats=[f"Join key '{left_key}' is missing from internal rows."])
     if right_key not in right_df.columns:
         return ToolExecutionResult(payload={"rows": left_rows}, caveats=[f"Join key '{right_key}' is missing from external series rows."])
+    if right_df[right_key].duplicated().any():
+        aggregations: dict[str, str] = {}
+        for column, method in (
+            ("ticker", "first"),
+            ("date", "last"),
+            ("market_open", "first"),
+            ("market_high", "max"),
+            ("market_low", "min"),
+            ("market_close", "last"),
+            ("market_volume", "sum"),
+            ("market_drawdown", "min"),
+        ):
+            if column in right_df.columns:
+                aggregations[column] = method
+        right_df = right_df.sort_values([right_key, "date"] if "date" in right_df.columns else [right_key])
+        if aggregations:
+            grouped_right = right_df.groupby(right_key, as_index=False).agg(aggregations)
+            if {"market_open", "market_close"}.issubset(grouped_right.columns):
+                grouped_right["market_return"] = grouped_right.apply(
+                    lambda row: round((float(row["market_close"]) - float(row["market_open"])) / float(row["market_open"]), 6)
+                    if float(row.get("market_open") or 0.0) else 0.0,
+                    axis=1,
+                )
+            elif "market_return" in right_df.columns:
+                returns = right_df.groupby(right_key, as_index=False)["market_return"].sum()
+                grouped_right = grouped_right.merge(returns, on=right_key, how="left")
+            right_df = grouped_right
+            caveats.append(f"Aggregated external series to one row per '{right_key}' before joining with corpus rows.")
+        else:
+            right_df = right_df.drop_duplicates(subset=[right_key], keep="last")
+            caveats.append(f"Deduplicated external series to one row per '{right_key}' before joining with corpus rows.")
 
     merged = left_df.merge(
         right_df,
@@ -3361,10 +5626,32 @@ PLOT_FIELD_ALIASES = {
     "x": ("time_bin", "date", "label", "name", "lemma", "entity", "term", "source", "doc_id"),
     "category": ("label", "name", "lemma", "entity", "term", "source", "outlet"),
     "date": ("date", "published_at", "time_bin"),
-    "time": ("time_bin", "date", "published_at"),
-    "time_bucket": ("time_bin", "date", "published_at"),
+    "published_at": ("published_at", "date", "time_bin", "month", "period", "time_period"),
+    "published_at_month": ("time_bin", "month", "period", "time_period", "published_at", "date"),
+    "published_month": ("time_bin", "month", "period", "time_period", "published_at", "date"),
+    "date_month": ("time_bin", "month", "period", "time_period", "published_at", "date"),
+    "time": ("time_bin", "period", "month", "date", "published_at"),
+    "time_bucket": ("time_bin", "period", "month", "date", "published_at"),
+    "bucket": ("bucket", "time_bin", "period", "month", "date", "published_at"),
+    "period": ("period", "time_bin", "month", "date", "published_at"),
+    "month": ("month", "time_bin", "period", "date", "published_at"),
+    "time_period": ("time_period", "time_bin", "period", "month", "date", "published_at"),
+    "year": ("year", "time_bin", "period", "date", "published_at"),
     "outlet": ("outlet", "source"),
     "source": ("source", "outlet"),
+    "actor": ("actor", "canonical_actor", "linked_entity", "attributed_actor", "entity", "speaker"),
+    "canonical_actor": ("canonical_actor", "actor", "canonical_entity", "linked_entity", "attributed_actor", "entity", "speaker"),
+    "canonical_entity": ("canonical_entity", "linked_entity", "entity", "actor", "entity_text"),
+    "entity_canonical": ("canonical_entity", "entity_canonical", "linked_entity", "entity", "actor", "entity_text"),
+    "entity_name": ("canonical_entity", "linked_entity", "entity", "actor", "entity_text", "name"),
+    "linked_entity_name": ("linked_entity_name", "canonical_entity", "linked_entity", "entity", "actor", "entity_text"),
+    "linked_entity_id": ("linked_entity_id", "linked_entity", "canonical_entity", "entity"),
+    "entity_text": ("entity_text", "canonical_entity", "entity", "linked_entity", "actor"),
+    "linked_entity": ("linked_entity", "entity", "actor", "attributed_actor", "speaker"),
+    "attributed_actor": ("attributed_actor", "speaker", "actor", "entity", "linked_entity"),
+    "speaker": ("speaker", "attributed_actor", "actor", "entity"),
+    "series": ("series_name", "target_entity", "entity", "actor", "linked_entity", "attributed_actor", "speaker", "label", "term"),
+    "series_name": ("series_name", "target_entity", "entity", "actor", "linked_entity", "label", "term"),
     "token": ("lemma", "term"),
     "term": ("lemma", "token"),
     "value": ("value", "count", "score", "weight", "mean", "intensity"),
@@ -3374,11 +5661,36 @@ PLOT_FIELD_ALIASES = {
     "frequency": ("count", "relative_frequency", "frequency", "freq"),
     "freq": ("count", "relative_frequency", "frequency"),
     "document_count": ("document_frequency", "count"),
+    "document_frequency": ("document_frequency", "count", "mention_count", "doc_mentions"),
+    "doc_count": ("doc_count", "document_count", "document_frequency", "count"),
     "doc_frequency": ("document_frequency", "count"),
     "df": ("document_frequency", "count"),
     "mentions": ("count", "document_frequency"),
-    "mention_count": ("count", "document_frequency"),
+    "mention_count": ("mention_count", "count", "document_frequency"),
     "entity_count": ("count", "document_frequency"),
+    "prominence": ("prominence_score", "document_frequency", "mention_count", "count"),
+    "prominence_score": ("prominence_score", "document_frequency", "mention_count", "count"),
+    "composite_prominence": ("composite_prominence", "prominence_score", "document_frequency", "mention_count", "count"),
+    "doc_share": ("doc_share", "share_of_docs", "document_frequency", "count"),
+    "share_of_documents": ("share_of_documents", "share_of_docs", "doc_share", "document_frequency", "count"),
+    "share_of_climate_docs": ("share_of_climate_docs", "share_of_documents", "doc_share", "mention_share", "share_of_mentions", "mention_count_normalized", "normalized_value", "count"),
+    "document_share": ("share_of_documents", "share_of_docs", "doc_share", "document_frequency", "count"),
+    "normalized_document_frequency": ("normalized_document_frequency", "normalized_value", "mention_count_normalized", "document_frequency", "count"),
+    "document_frequency_normalized": ("document_frequency_normalized", "normalized_value", "mention_count_normalized", "document_frequency", "count"),
+    "share_of_mentions": ("share_of_mentions", "mention_share", "mention_count", "count"),
+    "mention_share": ("mention_share", "share_of_mentions", "mention_count", "count"),
+    "avg_claim_sentiment": ("avg_claim_sentiment", "mean_sentiment_score", "sentiment_score", "average_sentiment", "mean_sentiment", "score", "mean"),
+    "mean_sentiment_score": ("mean_sentiment_score", "avg_claim_sentiment", "sentiment_score", "average_sentiment", "score", "mean"),
+    "avg_claim_strength": ("avg_claim_strength", "mean_claim_strength_score", "claim_strength_score", "average_strength", "mean_strength", "score", "mean"),
+    "mean_claim_strength_score": ("mean_claim_strength_score", "avg_claim_strength", "claim_strength_score", "average_strength", "score", "mean"),
+    "share_of_monthly_mentions": ("mention_share", "share_of_mentions", "normalized_value", "mention_count_normalized", "count"),
+    "share_of_monthly_entity_mentions": ("mention_share", "share_of_mentions", "normalized_value", "mention_count_normalized", "count"),
+    "monthly_mention_share": ("mention_share", "share_of_mentions", "normalized_value", "mention_count_normalized", "count"),
+    "monthly_entity_mention_share": ("mention_share", "share_of_mentions", "normalized_value", "mention_count_normalized", "count"),
+    "quote_share": ("quote_share", "quote_count", "count"),
+    "mention_count_normalized": ("mention_count_normalized", "share_of_docs", "mention_share", "count"),
+    "normalized_value": ("normalized_value", "mention_count_normalized", "share_of_docs", "mention_share", "doc_share", "count", "value"),
+    "quote_count": ("quote_count", "count"),
     "topic_weight": ("weight",),
     "sentiment": ("mean", "score", "value"),
 }
@@ -3405,6 +5717,10 @@ PLOT_Y_FIELD_PRIORITY = (
     "intensity",
     "relative_frequency",
     "document_frequency",
+    "normalized_value",
+    "mention_count_normalized",
+    "doc_share",
+    "mention_share",
     "frequency",
 )
 PLOT_NUMERIC_FIELD_EXCLUDES = {"rank", "id", "doc_id", "topic_id", "year", "month", "day"}
@@ -3456,6 +5772,10 @@ def _plot_field_has_numeric_values(rows: list[dict[str, Any]], field: str) -> bo
     return any(_plot_float(row.get(field)) is not None for row in rows)
 
 
+def _plot_field_has_nonzero_numeric_values(rows: list[dict[str, Any]], field: str) -> bool:
+    return any((number := _plot_float(row.get(field))) is not None and abs(number) > 1e-12 for row in rows)
+
+
 def _resolve_existing_plot_field(
     rows: list[dict[str, Any]],
     field: str,
@@ -3483,12 +5803,19 @@ def _resolve_existing_plot_field(
         for alias in alias_candidates
         if _normalize_plot_field_name(key) == _normalize_plot_field_name(alias) and key not in candidates
     )
+    valid_candidates: list[str] = []
     for candidate in candidates:
         if _plot_field_coverage(rows, candidate) <= 0:
             continue
         if require_numeric and not _plot_field_has_numeric_values(rows, candidate):
             continue
-        return candidate
+        valid_candidates.append(candidate)
+    if require_numeric:
+        for candidate in valid_candidates:
+            if _plot_field_has_nonzero_numeric_values(rows, candidate):
+                return candidate
+    if valid_candidates:
+        return valid_candidates[0]
     return None
 
 
@@ -3625,6 +5952,17 @@ def _write_svg_plot_fallback(
     return target
 
 
+def _image_has_visual_content(path: Path) -> bool:
+    try:
+        from PIL import Image
+
+        with Image.open(path) as image:
+            extrema = image.convert("RGB").getextrema()
+    except Exception:
+        return path.exists() and path.stat().st_size > 2048
+    return any((high - low) > 2 for low, high in extrema)
+
+
 def _plot_artifact(params: dict[str, Any], deps: dict[str, ToolExecutionResult], context: AgentExecutionContext) -> ToolExecutionResult:
     rows = []
     for result in deps.values():
@@ -3662,7 +6000,20 @@ def _plot_artifact(params: dict[str, Any], deps: dict[str, ToolExecutionResult],
         require_numeric=True,
         allow_infer=not requested_y_key,
     )
-    plot_field_caveats = [caveat for caveat in (x_caveat, y_caveat) if caveat]
+    requested_series_key = str(params.get("series", params.get("series_key", "")) or "").strip()
+    series_key = ""
+    series_caveat = None
+    if requested_series_key:
+        series_key, series_caveat = _resolve_plot_field(
+            structured_rows,
+            requested_series_key,
+            "series",
+            allow_infer=False,
+        )
+        if series_key and _plot_field_coverage(structured_rows, series_key) <= 0:
+            series_caveat = f"Plot requested series='{requested_series_key}', but upstream rows do not contain a compatible field; falling back to entity-like fields."
+            series_key = ""
+    plot_field_caveats = [caveat for caveat in (x_caveat, y_caveat, series_caveat) if caveat]
     if requested_x_key and _plot_field_coverage(structured_rows, x_key) <= 0:
         return ToolExecutionResult(
             payload={"rows": []},
@@ -3700,10 +6051,12 @@ def _plot_artifact(params: dict[str, Any], deps: dict[str, ToolExecutionResult],
     target = plot_dir / f"{plot_slug}.png"
     plot_name = str(params.get("title") or raw_plot_name).replace("_", " ").title()
     try:
-        import matplotlib
+        with MATPLOTLIB_PLOT_LOCK:
+            import matplotlib
 
-        matplotlib.use("Agg", force=True)
-        import matplotlib.pyplot as plt
+            matplotlib.use("Agg", force=True)
+            from matplotlib.backends.backend_agg import FigureCanvasAgg
+            from matplotlib.figure import Figure
     except Exception as exc:
         fallback_params = {**params, "x": x_key, "y": y_key}
         fallback_target = _write_svg_plot_fallback(params=fallback_params, rows=structured_rows, target=target, plot_name=plot_name)
@@ -3714,6 +6067,7 @@ def _plot_artifact(params: dict[str, Any], deps: dict[str, ToolExecutionResult],
                 "plot_name": plot_name,
                 "resolved_x": x_key,
                 "resolved_y": y_key,
+                "resolved_series": series_key,
                 "plotted_row_count": len(first),
                 "skipped_row_count": skipped_points,
             },
@@ -3724,23 +6078,33 @@ def _plot_artifact(params: dict[str, Any], deps: dict[str, ToolExecutionResult],
                 "reason": "matplotlib_unavailable",
                 "resolved_x": x_key,
                 "resolved_y": y_key,
+                "resolved_series": series_key,
                 "plotted_row_count": len(first),
                 "skipped_row_count": skipped_points,
             },
         )
     figure_height = max(5.6, min(14.0, 2.7 + (0.34 * len(first))))
-    figure, axis = plt.subplots(figsize=(13.2, figure_height), dpi=180)
+    figure = Figure(figsize=(13.2, figure_height), dpi=180)
+    FigureCanvasAgg(figure)
+    axis = figure.subplots()
     axis.grid(axis="x", color="#d9d2c3", linewidth=0.8, alpha=0.55)
     axis.grid(axis="y", visible=False)
     axis.tick_params(axis="both", labelsize=8.5, colors="#17312d")
     unique_time_bins = {
-        str(item.get("time_bin", "unknown"))
+        str(item.get(x_key, item.get("time_bin", "unknown")))
         for item in first
-        if item.get("time_bin") is not None
+        if item.get(x_key, item.get("time_bin")) is not None
     }
     topic_like = bool(first and "topic_id" in first[0] and any(item.get("top_terms") for item in first))
     market_overlay_like = bool(first and "market_close" in first[0] and any("count" in item or "score" in item for item in first))
-    time_series_like = bool(first and "time_bin" in first[0] and len(unique_time_bins) > 1)
+    requested_plot_type = str(params.get("plot_type", "") or "").strip().lower()
+    time_axis_like = x_key in {"time_bin", "month", "period", "date", "published_at", "year"}
+    time_series_like = bool(
+        first
+        and x_key
+        and len(unique_time_bins) > 1
+        and (requested_plot_type in {"line", "time_series", "timeseries"} or series_key or time_axis_like)
+    )
 
     if topic_like:
         labels = []
@@ -3782,22 +6146,28 @@ def _plot_artifact(params: dict[str, Any], deps: dict[str, ToolExecutionResult],
     elif time_series_like:
         series_by_entity: defaultdict[str, list[tuple[str, float]]] = defaultdict(list)
         for item in structured_rows:
-            entity = str(item.get("entity", item.get("label", item.get("term", "__all__"))))
+            entity = str(item.get(series_key, "")) if series_key else ""
+            if not entity:
+                entity = str(item.get("entity", item.get("actor", item.get("label", item.get("term", "__all__")))))
+            time_value = str(item.get(x_key, item.get("time_bin", "unknown")))
             value = _plot_float(item.get(y_key, item.get("count", item.get("score", item.get("weight", item.get("intensity", 0.0))))))
             if value is None:
                 continue
-            series_by_entity[entity].append((str(item.get("time_bin", "unknown")), value))
+            series_by_entity[entity].append((time_value, value))
         top_entities = sorted(
             series_by_entity.items(),
             key=lambda entry: sum(value for _, value in entry[1]),
             reverse=True,
         )[:5]
+        all_bins = sorted({time_bin for _, points in top_entities for time_bin, _ in points})
+        x_lookup = {time_bin: index for index, time_bin in enumerate(all_bins)}
+        x_values = list(range(len(all_bins)))
         palette = ["#0f766e", "#b45309", "#7c3aed", "#be123c", "#2563eb"]
         for index, (entity, points) in enumerate(top_entities):
-            ordered = sorted(points)
-            x_labels = [item[0] for item in ordered]
-            x_values = list(range(len(x_labels)))
-            y_values = [item[1] for item in ordered]
+            values_by_bin: defaultdict[str, float] = defaultdict(float)
+            for time_bin, value in points:
+                values_by_bin[time_bin] += value
+            y_values = [values_by_bin.get(time_bin, 0.0) for time_bin in all_bins]
             axis.plot(
                 x_values,
                 y_values,
@@ -3807,8 +6177,11 @@ def _plot_artifact(params: dict[str, Any], deps: dict[str, ToolExecutionResult],
                 label=entity,
             )
             axis.fill_between(x_values, y_values, alpha=0.08, color=palette[index % len(palette)])
-        if top_entities:
-            axis.set_xticks(list(range(len(x_labels))), x_labels, rotation=35, ha="right")
+        if top_entities and all_bins:
+            step = max(1, len(all_bins) // 12)
+            tick_values = [x_lookup[time_bin] for idx, time_bin in enumerate(all_bins) if idx % step == 0]
+            tick_labels = [time_bin for idx, time_bin in enumerate(all_bins) if idx % step == 0]
+            axis.set_xticks(tick_values, tick_labels, rotation=35, ha="right")
         axis.set_ylabel("Signal")
         handles, labels = axis.get_legend_handles_labels()
         if handles:
@@ -3854,9 +6227,19 @@ def _plot_artifact(params: dict[str, Any], deps: dict[str, ToolExecutionResult],
     figure.patch.set_facecolor("#fffdf8")
     axis.spines["top"].set_visible(False)
     axis.spines["right"].set_visible(False)
-    plt.tight_layout()
-    plt.savefig(target)
-    plt.close()
+    with MATPLOTLIB_PLOT_LOCK:
+        figure.tight_layout()
+        figure.savefig(target)
+    if not _image_has_visual_content(target):
+        try:
+            target.unlink(missing_ok=True)
+        except Exception:
+            pass
+        return ToolExecutionResult(
+            payload={"rows": []},
+            caveats=[*plot_field_caveats, "Generated plot image had no visible content, so it was discarded."],
+            metadata={"no_data": True, "no_data_reason": "Blank plot image generated."},
+        )
     return ToolExecutionResult(
         payload={
             "artifact_path": str(target),
@@ -3864,6 +6247,7 @@ def _plot_artifact(params: dict[str, Any], deps: dict[str, ToolExecutionResult],
             "plot_name": plot_name,
             "resolved_x": x_key,
             "resolved_y": y_key,
+            "resolved_series": series_key,
             "plotted_row_count": len(first),
             "skipped_row_count": skipped_points,
         },
@@ -3872,16 +6256,78 @@ def _plot_artifact(params: dict[str, Any], deps: dict[str, ToolExecutionResult],
         metadata={
             "resolved_x": x_key,
             "resolved_y": y_key,
+            "resolved_series": series_key,
             "plotted_row_count": len(first),
             "skipped_row_count": skipped_points,
         },
     )
 
 
+def _looks_like_python_code(code: str) -> bool:
+    text = str(code or "").strip()
+    if not text:
+        return False
+    try:
+        compile(text, "<python_runner>", "exec")
+    except SyntaxError:
+        return False
+    return True
+
+
 def _python_runner(params: dict[str, Any], deps: dict[str, ToolExecutionResult], context: AgentExecutionContext) -> ToolExecutionResult:
+    params = _analysis_params(params)
+    task = _task_name(params)
+    if _is_actor_prominence_merge_task(task):
+        merged_rows, merge_metadata, merge_caveats = _merge_actor_prominence_rows(params, deps)
+        return ToolExecutionResult(
+            payload={"rows": merged_rows, **merge_metadata, "exit_code": 0, "stdout": "", "stderr": ""},
+            caveats=merge_caveats if merged_rows else [*merge_caveats, "No actor prominence rows were available to merge."],
+            metadata={"no_data": not merged_rows, **merge_metadata},
+        )
+    if _is_entity_frequency_task(task, params):
+        entity_rows, entity_metadata, caveats = _entity_frequency_rows(params, deps, task=task)
+        if not entity_rows:
+            caveats = [*caveats, "No entity or actor rows were available for native python_runner aggregation."]
+        return ToolExecutionResult(
+            payload={"rows": entity_rows, **entity_metadata, "exit_code": 0, "stdout": "", "stderr": ""},
+            caveats=caveats,
+            metadata={"no_data": not entity_rows, **entity_metadata},
+        )
+    code = str(params.get("code", "")).strip()
+    if not _looks_like_python_code(code):
+        if any(
+            str(row.get("doc_id", "")).strip()
+            and any(name in row for name in ("entity", "canonical_entity", "linked_entity", "speaker", "attributed_actor"))
+            for row in _payload_rows_from_all_dependencies(deps)
+        ):
+            native_params = {
+                **params,
+                "task": "actor_prominence",
+                "group_by_time": params.get("group_by_time", "month"),
+                "entity_types": params.get("entity_types", ["PERSON", "ORG"]),
+                "top_n": params.get("top_n", params.get("limit", 100)),
+            }
+            entity_rows, entity_metadata, entity_caveats = _entity_frequency_rows(native_params, deps, task="actor_prominence")
+            if entity_rows:
+                return ToolExecutionResult(
+                    payload={"rows": entity_rows, **entity_metadata, "exit_code": 0, "stdout": "", "stderr": ""},
+                    caveats=entity_caveats,
+                    metadata={"no_data": False, **entity_metadata},
+                )
+        merged_rows, merge_metadata, merge_caveats = _merge_actor_prominence_rows(params, deps)
+        if merged_rows:
+            return ToolExecutionResult(
+                payload={"rows": merged_rows, **merge_metadata, "exit_code": 0, "stdout": "", "stderr": ""},
+                caveats=merge_caveats,
+                metadata={"no_data": False, **merge_metadata},
+            )
+        return ToolExecutionResult(
+            payload={"rows": [], "exit_code": 0, "stdout": "", "stderr": ""},
+            caveats=["python_runner received instructions that were not valid Python code; no sandbox execution was attempted."],
+            metadata={"no_data": True, "no_data_reason": "python_runner_non_python_code"},
+        )
     if context.python_runner is None:
         raise RuntimeError("python_runner is unavailable")
-    code = str(params.get("code", "")).strip()
     inputs_json = dict(params.get("inputs_json", {}))
     if not inputs_json:
         for key, result in deps.items():

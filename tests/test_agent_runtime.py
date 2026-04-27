@@ -170,6 +170,83 @@ def test_runtime_detects_external_series_from_market_series_node(tmp_path: Path)
     )
 
     assert runtime.orchestrator._has_external_series(snapshot) is True
+    summary = runtime.orchestrator._derive_summary(snapshot)
+    assert summary["external_series"]["row_count"] == 1
+    assert summary["external_series"]["first_close"] == 175.94
+
+
+def test_runtime_does_not_treat_blank_market_columns_as_external_series(tmp_path: Path) -> None:
+    runtime = build_test_runtime(
+        tmp_path=tmp_path,
+        documents=_sample_documents(),
+        search_rows_by_query=_search_rows(_sample_documents()),
+    )
+    snapshot = AgentExecutionSnapshot(
+        node_records=[],
+        node_results={
+            "market_series": ToolExecutionResult(
+                payload={"rows": [{"time_bin": "2018-03", "market_close": "", "ticker": ""}]},
+                metadata={"tool_name": "yfinance_join_external_series", "ticker": "CL=F"},
+            )
+        },
+        failures=[],
+        provenance_records=[],
+        selected_docs=[],
+        status="completed",
+    )
+
+    assert runtime.orchestrator._has_external_series(snapshot) is False
+    assert "external_series" not in runtime.orchestrator._derive_summary(snapshot)
+
+
+def test_planner_query_repair_replaces_scope_only_query_with_topic(tmp_path: Path) -> None:
+    runtime = build_test_runtime(
+        tmp_path=tmp_path,
+        documents=_sample_documents(),
+        search_rows_by_query=_search_rows(_sample_documents()),
+    )
+    orchestrator = runtime.orchestrator
+    fallback_query = orchestrator._compact_query_terms(
+        "How did the oil price change in America, and how did US media explain it?",
+        orchestrator._query_anchor_terms("How did the oil price change in America, and how did US media explain it?"),
+    )
+
+    assert fallback_query == "oil price"
+    assert orchestrator._repair_search_query("America", fallback_query) == "oil price"
+
+
+def test_search_inputs_apply_swiss_newspaper_source_scope(tmp_path: Path) -> None:
+    runtime = build_test_runtime(
+        tmp_path=tmp_path,
+        documents=_sample_documents(),
+        search_rows_by_query=_search_rows(_sample_documents()),
+    )
+
+    inputs = runtime.orchestrator._search_inputs_for_question(
+        "Which named entities dominate climate coverage in Swiss newspapers?",
+        query_text="climate",
+    )
+
+    assert inputs["query"].startswith("(climate) AND source:")
+    assert "swissinfoch" in inputs["query"]
+    assert "tagesanzeigerch" in inputs["query"]
+
+
+def test_search_inputs_replace_wildcard_source_scope(tmp_path: Path) -> None:
+    runtime = build_test_runtime(
+        tmp_path=tmp_path,
+        documents=_sample_documents(),
+        search_rows_by_query=_search_rows(_sample_documents()),
+    )
+
+    query = runtime.orchestrator._apply_source_scope_to_query(
+        "(climate) AND (source:*)",
+        "Which named entities dominate climate coverage in Swiss newspapers?",
+    )
+
+    assert "source:*" not in query
+    assert "source:" in query
+    assert "swissinfoch" in query
 
 
 def test_selected_docs_keep_retrieval_scores_after_fetch(tmp_path: Path) -> None:
@@ -1114,6 +1191,85 @@ def test_planner_search_budget_is_normalized_up_for_broad_scope_questions(tmp_pa
     assert search_node["inputs"].get("retrieval_strategy") == "exhaustive_analytic"
 
 
+def test_temporal_value_question_repairs_generic_plan_to_sentiment_series(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("CORPUSAGENT2_PROVIDER_ORDER_SENTIMENT", "heuristic")
+    docs = _sample_documents()
+    question = "How did the perceived value of Cristiano Ronaldo versus Lionel Messi evolve over time?"
+    llm = StaticLLMClient(
+        [
+            {
+                "action": "accept_with_assumptions",
+                "rewritten_question": question,
+                "assumptions": [],
+                "clarification_question": "",
+                "rejection_reason": "",
+                "message": "",
+            },
+            {
+                "action": "emit_plan_dag",
+                "rewritten_question": question,
+                "plan_dag": {
+                    "nodes": [
+                        {"node_id": "search", "capability": "db_search", "inputs": {"query": "Ronaldo Messi"}},
+                        {"node_id": "fetch", "capability": "fetch_documents", "depends_on": ["search"]},
+                        {"node_id": "working_set", "capability": "create_working_set", "depends_on": ["fetch"]},
+                        {"node_id": "keyterms", "capability": "extract_keyterms", "depends_on": ["fetch"]},
+                    ],
+                    "metadata": {"question_family": "generic"},
+                },
+                "assumptions": [],
+                "clarification_question": "",
+                "rejection_reason": "",
+                "message": "",
+            },
+            {
+                "answer_text": "done",
+                "caveats": [],
+                "unsupported_parts": [],
+                "claim_verdicts": [],
+                "evidence_items": [],
+                "artifacts_used": [],
+            },
+        ]
+    )
+    runtime = build_test_runtime(
+        tmp_path=tmp_path,
+        documents=docs,
+        search_rows_by_query=_search_rows(docs),
+        llm_client=llm,
+    )
+
+    manifest = runtime.handle_query(question, force_answer=True, no_cache=True)
+
+    capabilities = [node["capability"] for node in manifest.plan_dags[0]["nodes"]]
+    assert "sentiment" in capabilities
+    assert "time_series_aggregate" in capabilities
+    assert "change_point_detect" in capabilities
+    assert "plot_artifact" in capabilities
+    series_node = next(node for node in manifest.plan_dags[0]["nodes"] if node["capability"] == "time_series_aggregate")
+    assert series_node["inputs"]["metrics"] == ["average_sentiment", "document_count"]
+    plot_node = next(node for node in manifest.plan_dags[0]["nodes"] if node["capability"] == "plot_artifact" and "series" in node["depends_on"])
+    assert plot_node["inputs"]["y"] == "average_sentiment"
+
+
+def test_temporal_portrayal_detector_does_not_mutate_entity_trend_plans(tmp_path: Path) -> None:
+    runtime = build_test_runtime(
+        tmp_path=tmp_path,
+        documents=_sample_documents(),
+        search_rows_by_query={},
+    )
+
+    assert runtime.orchestrator._needs_temporal_portrayal_analysis(
+        "How did the perceived value of Ronaldo versus Messi evolve over time?"
+    )
+    assert not runtime.orchestrator._needs_temporal_portrayal_analysis(
+        "Which named entities dominate climate coverage in Swiss newspapers, and how did that change over time?"
+    )
+
+
 def test_queryless_planner_search_nodes_do_not_reuse_cache_across_questions(tmp_path: Path) -> None:
     docs = _sample_documents()
 
@@ -1263,6 +1419,40 @@ def test_derive_summary_does_not_fallback_to_raw_pos_when_noun_table_attempted_b
     summary = runtime.orchestrator._derive_summary(snapshot)
 
     assert "noun_distribution" not in summary
+
+
+def test_derive_summary_ignores_zero_summary_stats_when_analysis_rows_exist(tmp_path: Path) -> None:
+    runtime = build_test_runtime(
+        tmp_path=tmp_path,
+        documents=_sample_documents(),
+        search_rows_by_query=_search_rows(_sample_documents()),
+    )
+    snapshot = AgentExecutionSnapshot(
+        node_records=[],
+        node_results={
+            "summary": ToolExecutionResult(
+                payload={
+                    "rows": [
+                        {"metric": "matched_document_count", "value": 0},
+                        {"metric": "total_noun_tokens", "value": 0},
+                    ]
+                },
+                metadata={"task": "summary_stats"},
+            ),
+            "series": ToolExecutionResult(
+                payload={"rows": [{"entity": "Switzerland", "time_bin": "2017-01", "count": 4}]}
+            ),
+        },
+        failures=[],
+        provenance_records=[],
+        selected_docs=[],
+        status="completed",
+    )
+
+    summary = runtime.orchestrator._derive_summary(snapshot)
+
+    assert "summary_stats" not in summary
+    assert summary["entity_trend"] == [("Switzerland", 4)]
 
 
 def test_openai_style_plan_without_retrieval_backbone_falls_back_to_heuristic(tmp_path: Path, monkeypatch) -> None:
