@@ -33,7 +33,7 @@ from .agent_models import (
     LiveRunStatus,
     PlannerAction,
 )
-from .agent_policy import rejection_reason_for_question, rewrite_special_cases
+from .agent_policy import normalize_question_text, rejection_reason_for_question
 from .app_config import load_project_configuration
 from .llm_provider import LLMClient, LLMProviderConfig, OpenAICompatibleLLMClient
 from .retrieval_budgeting import infer_requested_output_limit, infer_retrieval_budget
@@ -370,45 +370,106 @@ class MagicBoxOrchestrator:
         stopwords = {
             "how", "did", "from", "into", "with", "what", "when", "which", "that", "this", "those",
             "coverage", "framing", "frame", "around", "during", "between", "across", "their", "there",
-            "correspond", "corresponded", "drawdowns", "stock", "media", "shift", "shifted",
+            "correspond", "corresponded", "media", "shift", "shifted",
         }
         filtered = [token for token in tokens if token.lower() not in stopwords]
         return " ".join(filtered[:8]).strip()
 
     def _query_anchor_terms(self, text: str) -> list[str]:
         anchors: list[str] = []
+        seen: set[str] = set()
+        blocked_terms: set[str] = set()
+        stopwords = {
+            "across",
+            "aggregate",
+            "aggregated",
+            "all",
+            "analysis",
+            "analyze",
+            "and",
+            "around",
+            "between",
+            "breakdown",
+            "collection",
+            "common",
+            "corpus",
+            "dataset",
+            "distribution",
+            "document",
+            "documents",
+            "during",
+            "for",
+            "from",
+            "frequency",
+            "how",
+            "include",
+            "included",
+            "including",
+            "individual",
+            "lemma",
+            "lemmas",
+            "most",
+            "noun",
+            "nouns",
+            "related",
+            "relevant",
+            "report",
+            "reports",
+            "result",
+            "results",
+            "row",
+            "rows",
+            "such",
+            "that",
+            "the",
+            "their",
+            "there",
+            "this",
+            "those",
+            "what",
+            "when",
+            "where",
+            "with",
+            "which",
+            "who",
+            "why",
+        }
+
+        def _add_anchor(token: str) -> None:
+            for part in re.findall(r"[A-Za-z][A-Za-z0-9]+", str(token or "")):
+                lowered = part.lower()
+                if len(lowered) < 3 or lowered in stopwords or lowered in seen or lowered in blocked_terms:
+                    continue
+                seen.add(lowered)
+                anchors.append(part)
+
+        for match in re.finditer(
+            r"['\"]?([A-Za-z][A-Za-z0-9-]+)['\"]?\s+(?:means|refers\s+to|interpreted\s+as)\s+['\"]?([A-Za-z][A-Za-z0-9-]+)['\"]?",
+            text,
+            flags=re.IGNORECASE,
+        ):
+            blocked_terms.update(part.lower() for part in re.findall(r"[A-Za-z][A-Za-z0-9]+", match.group(1)))
+            _add_anchor(match.group(2))
+        if anchors:
+            return anchors[:8]
         for match in re.finditer(r"\b[A-Z][A-Za-z0-9]*(?:-[A-Z]?[A-Za-z0-9]+)?\b", text):
-            token = match.group(0).strip()
-            lowered = token.lower()
-            if lowered in {"how", "what", "which", "who", "why", "when", "where"}:
-                continue
-            if token not in anchors:
-                anchors.append(token)
-            if "-" in token:
-                for part in token.split("-"):
-                    part = part.strip()
-                    if len(part) >= 3 and part not in anchors:
-                        anchors.append(part)
+            _add_anchor(match.group(0).strip())
+        if anchors:
+            return anchors[:8]
+        for token in re.findall(r"[A-Za-z][A-Za-z0-9-]+", text):
+            _add_anchor(token)
         return anchors[:8]
 
     def _infer_market_ticker(self, text: str) -> str:
-        aliases = {
-            "facebook": "META",
-            "meta": "META",
-            "amazon": "AMZN",
-            "aws": "AMZN",
-            "google": "GOOGL",
-            "alphabet": "GOOGL",
-            "apple": "AAPL",
-            "microsoft": "MSFT",
-            "tesla": "TSLA",
-            "nvidia": "NVDA",
-            "netflix": "NFLX",
-        }
-        lowered = text.lower()
-        for alias, ticker in aliases.items():
-            if alias in lowered:
-                return ticker
+        explicit_match = re.search(
+            r"\b(?:ticker|symbol)\s*[:=]?\s*\$?([A-Z]{1,5}(?:\.[A-Z])?)\b",
+            text,
+        )
+        if explicit_match:
+            return explicit_match.group(1)
+        cashtag_match = re.search(r"(?<![A-Za-z0-9])\$([A-Z]{1,5}(?:\.[A-Z])?)\b", text)
+        if cashtag_match:
+            return cashtag_match.group(1)
         return ""
 
     def _search_inputs_for_question(
@@ -444,16 +505,6 @@ class MagicBoxOrchestrator:
         assumptions: list[str] = []
         sufficient = False
 
-        has_broad_region = any(
-            pattern.search(lowered)
-            for pattern in (
-                re.compile(r"\beurope\b"),
-                re.compile(r"\beuropean\b"),
-                re.compile(r"\boverall europe\b"),
-                re.compile(r"\bacross europe\b"),
-                re.compile(r"\beurope-wide\b"),
-            )
-        )
         has_broad_aggregation = any(
             pattern.search(lowered)
             for pattern in (
@@ -465,7 +516,7 @@ class MagicBoxOrchestrator:
             )
         )
         has_explicit_range = bool(re.search(r"\b20\d{2}\s*-\s*20\d{2}\b", lowered)) or (
-            any(year in lowered for year in ("2016", "2017", "2018", "2019", "2020", "2021"))
+            bool(re.search(r"\b(?:19|20)\d{2}\b", lowered))
             and any(token in lowered for token in ("from", "between", "to", "-", "through"))
         )
         has_time_granularity = any(
@@ -487,16 +538,15 @@ class MagicBoxOrchestrator:
                 re.compile(r"\ball\b"),
             )
         )
-        asks_regional = any(token in state.question.lower() for token in ("region", "regions", "across regions"))
-        asks_outlet_types = "outlet type" in state.question.lower() or "outlet types" in state.question.lower()
+        asks_grouping = any(token in state.question.lower() for token in ("group", "groups", "region", "regions", "type", "types", "source", "sources", "outlet", "outlets"))
         asks_time_or_market_detail = any(
             token in state.question.lower()
-            for token in ("2016", "2017", "2018", "2019", "stock", "drawdown", "share price", "granular", "monthly", "weekly", "daily")
+            for token in ("stock", "drawdown", "share price", "market", "valuation", "granular", "monthly", "weekly", "daily")
         )
 
-        if has_broad_region and asks_regional:
+        if has_broad_aggregation and asks_grouping:
             sufficient = True
-            assumptions.append("Interpret the requested region scope as Europe-wide overall coverage rather than country-by-country subregions.")
+            assumptions.append("Interpret the requested group scope as an aggregate comparison over available metadata groups.")
         if has_broad_aggregation:
             sufficient = True
             assumptions.append("Prefer a quantitative aggregate summary where possible and note any metadata limits explicitly.")
@@ -508,9 +558,9 @@ class MagicBoxOrchestrator:
             assumptions.append("Use the requested time granularity for temporal aggregation and plots.")
         if has_all_scope:
             sufficient = True
-            assumptions.append("Cover all major scandal phases within the requested window rather than only the initial disclosure event.")
-        if asks_outlet_types and sufficient:
-            assumptions.append("Use available outlet/source metadata as the outlet-type proxy; if outlet-type labels are sparse, report the overall pattern and the limitation.")
+            assumptions.append("Cover the full requested scope rather than a small illustrative subset.")
+        if asks_grouping and sufficient:
+            assumptions.append("Use available metadata fields as grouping proxies; if labels are sparse, report the limitation.")
         return sufficient, assumptions
 
     def rephrase_or_clarify(self, state: AgentRunState) -> PlannerAction:
@@ -519,7 +569,7 @@ class MagicBoxOrchestrator:
             return PlannerAction(action="grounded_rejection", rejection_reason=rejection_reason)
 
         enriched_question = self._question_with_clarifications(state)
-        rewritten, assumptions = rewrite_special_cases(enriched_question)
+        rewritten, assumptions = normalize_question_text(enriched_question)
         if self.llm_client is None:
             self._record_llm_trace(
                 state,
@@ -754,6 +804,7 @@ class MagicBoxOrchestrator:
                 AgentPlanNode("search", "db_search", inputs=search_inputs),
                 AgentPlanNode("fetch", "fetch_documents", depends_on=["search"]),
                 AgentPlanNode("working_set", "create_working_set", depends_on=["fetch"]),
+                AgentPlanNode("entities", "ner", depends_on=["fetch"]),
                 AgentPlanNode("keyterms", "extract_keyterms", depends_on=["fetch"]),
                 AgentPlanNode("topics", "topic_model", inputs={"num_topics": 6}, depends_on=["fetch"]),
                 AgentPlanNode("sentiment", "sentiment", depends_on=["fetch"]),
@@ -1369,8 +1420,8 @@ class MagicBoxOrchestrator:
             answer_text = f"Most prominent entities in the retrieved slice are: {top}."
         elif evidence_rows:
             answer_text = (
-                "The strongest immediate pre-invasion prediction or warning evidence comes from the returned articles. "
-                "Higher-scoring rows are more explicit about near-term invasion."
+                "The strongest prediction or warning evidence comes from the returned documents. "
+                "Higher-scoring rows are more explicit according to heuristic claim-strength markers."
             )
             caveats.append(
                 "Warnings, scenarios, and explicit predictions are not identical; the evidence table is ranked by heuristic claim strength."
