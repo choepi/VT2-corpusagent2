@@ -61,6 +61,28 @@ SOURCE_SCOPE_ALIASES = {
         "watsonch",
     ),
 }
+EXPLICIT_SOURCE_SCOPE_ALIASES = (
+    {
+        "filters": ("nzz",),
+        "tokens": ("nzz",),
+        "patterns": (r"\bnzz(?:\.ch)?\b",),
+    },
+    {
+        "filters": ("tagesanzeiger",),
+        "tokens": ("tages", "anzeiger", "tagesanzeiger"),
+        "patterns": (r"\btages[\s-]*anzeiger(?:\.ch)?\b",),
+    },
+)
+TOPIC_QUERY_EXPANSIONS = (
+    {
+        "triggers": ("football", "soccer", "fussball", "fußball"),
+        "query": "football OR soccer OR fussball OR fußball",
+    },
+    {
+        "triggers": ("climate", "klima", "climat"),
+        "query": "climate OR klima OR climat OR klimawandel OR rechauffement OR réchauffement",
+    },
+)
 
 
 def _env_flag(name: str, default: bool) -> bool:
@@ -304,6 +326,10 @@ class MagicBoxOrchestrator:
             search_inputs["query"] = self._apply_source_scope_to_query(repaired_query, dag_text)
         if requires_retrieval_backbone:
             search_inputs.update(self._extract_date_window(dag_text))
+        if self._needs_source_comparison_analysis(dag_text):
+            search_inputs["retrieval_strategy"] = "exhaustive_analytic"
+            search_inputs["retrieve_all"] = True
+            search_inputs["top_k"] = 0
 
         normalized_nodes: list[AgentPlanNode] = []
         if requires_retrieval_backbone and not any(node.capability in self._SEARCH_BACKBONE_CAPABILITIES for node in dag.nodes):
@@ -344,6 +370,10 @@ class MagicBoxOrchestrator:
                         query_text,
                     )
                     normalized_search_inputs["query"] = self._apply_source_scope_to_query(repaired_query, dag_text)
+                if self._needs_source_comparison_analysis(dag_text):
+                    normalized_search_inputs["retrieval_strategy"] = "exhaustive_analytic"
+                    normalized_search_inputs["retrieve_all"] = True
+                    normalized_search_inputs["top_k"] = 0
                 node_inputs = normalized_search_inputs
             if node.capability == "fetch_documents" and search_node_id and not depends_on:
                 depends_on = [search_node_id]
@@ -372,6 +402,14 @@ class MagicBoxOrchestrator:
             self._ensure_temporal_portrayal_nodes(normalized_nodes, unique_node_id, dag_text)
             if metadata.get("question_family", "") in {"", "generic"}:
                 metadata["question_family"] = "temporal_portrayal_shift"
+        elif self._needs_entity_trend_analysis(dag_text):
+            self._ensure_entity_trend_nodes(normalized_nodes, unique_node_id, dag_text)
+            if metadata.get("question_family", "") in {"", "generic"}:
+                metadata["question_family"] = "entity_trend"
+        elif self._needs_source_comparison_analysis(dag_text):
+            self._ensure_source_comparison_nodes(normalized_nodes, unique_node_id)
+            if metadata.get("question_family", "") in {"", "generic"}:
+                metadata["question_family"] = "source_comparison"
         return AgentPlanDAG(nodes=normalized_nodes, metadata=metadata)
 
     def _needs_temporal_portrayal_analysis(self, text: str) -> bool:
@@ -405,6 +443,189 @@ class MagicBoxOrchestrator:
         )
         comparison = bool(re.search(r"\b(vs\.?|versus|compared? to|comparison|relative to)\b", lowered))
         return temporal and (portrayal or comparison)
+
+    def _needs_entity_trend_analysis(self, text: str) -> bool:
+        lowered = str(text or "").lower()
+        asks_entities = any(
+            phrase in lowered
+            for phrase in (
+                "named entities",
+                "named entity",
+                "which actors",
+                "actors dominated",
+                "actor dominated",
+                "entities dominate",
+                "entities dominated",
+            )
+        )
+        asks_change = any(term in lowered for term in ("over time", "change", "changed", "trend", "evolve", "evolved"))
+        return asks_entities and asks_change
+
+    def _needs_source_comparison_analysis(self, text: str) -> bool:
+        matches = self._explicit_source_scope_matches(text)
+        if not self._explicit_source_scope_is_active(text, matches) or len(matches) < 2:
+            return False
+        lowered = str(text or "").lower()
+        return bool(
+            re.search(r"\b(vs\.?|versus|compared? to|compare|differ(?:ent|ently)?|difference|between)\b", lowered)
+            or re.search(r"\b(?:report|reports|reported|coverage|cover)\b", lowered)
+        )
+
+    def _ensure_source_comparison_nodes(
+        self,
+        normalized_nodes: list[AgentPlanNode],
+        unique_node_id: Callable[[str], str],
+    ) -> None:
+        fetch_node_id = next((node.node_id for node in normalized_nodes if node.capability == "fetch_documents"), "")
+        if not fetch_node_id:
+            return
+        keyterms_node_id = next((node.node_id for node in normalized_nodes if node.capability == "extract_keyterms"), "")
+        if keyterms_node_id:
+            for node in normalized_nodes:
+                if node.node_id == keyterms_node_id:
+                    updated_inputs = dict(node.inputs)
+                    updated_inputs.setdefault("group_by", "outlet")
+                    updated_inputs.setdefault("top_k", 25)
+                    node.inputs = updated_inputs
+                    if not node.depends_on:
+                        node.depends_on = [fetch_node_id]
+                    break
+        else:
+            keyterms_node_id = unique_node_id("keyterms_by_source")
+            normalized_nodes.append(
+                AgentPlanNode(
+                    node_id=keyterms_node_id,
+                    capability="extract_keyterms",
+                    inputs={"group_by": "outlet", "top_k": 25},
+                    depends_on=[fetch_node_id],
+                )
+            )
+        has_plot = False
+        for node in normalized_nodes:
+            if node.capability == "plot_artifact" and keyterms_node_id in node.depends_on:
+                updated_inputs = dict(node.inputs)
+                updated_inputs.setdefault("plot_name", "source_keyterm_comparison")
+                updated_inputs.setdefault("plot_type", "bar")
+                updated_inputs.setdefault("x", "term")
+                updated_inputs.setdefault("y", "score")
+                updated_inputs.setdefault("series", "outlet")
+                updated_inputs.setdefault("top_k", 20)
+                node.inputs = updated_inputs
+                has_plot = True
+        if not has_plot:
+            normalized_nodes.append(
+                AgentPlanNode(
+                    node_id=unique_node_id("plot_keyterms"),
+                    capability="plot_artifact",
+                    inputs={
+                        "plot_name": "source_keyterm_comparison",
+                        "plot_type": "bar",
+                        "x": "term",
+                        "y": "score",
+                        "series": "outlet",
+                        "top_k": 20,
+                    },
+                    depends_on=[keyterms_node_id],
+                    optional=True,
+                )
+            )
+
+    def _ensure_entity_trend_nodes(
+        self,
+        normalized_nodes: list[AgentPlanNode],
+        unique_node_id: Callable[[str], str],
+        question_text: str,
+    ) -> None:
+        def first_node_id(capability: str) -> str:
+            return next((node.node_id for node in normalized_nodes if node.capability == capability), "")
+
+        fetch_node_id = first_node_id("fetch_documents")
+        if not fetch_node_id:
+            return
+
+        ner_node_id = first_node_id("ner")
+        if not ner_node_id:
+            ner_node_id = unique_node_id("ner")
+            normalized_nodes.append(
+                AgentPlanNode(
+                    node_id=ner_node_id,
+                    capability="ner",
+                    depends_on=[fetch_node_id],
+                )
+            )
+
+        entity_table_id = next(
+            (
+                node.node_id
+                for node in normalized_nodes
+                if node.capability == "build_evidence_table"
+                and str(node.inputs.get("task", "")).lower() in {"named_entity_frequency", "entity_frequency", "entity_prominence", "actor_prominence"}
+            ),
+            "",
+        )
+        if not entity_table_id:
+            entity_table_id = unique_node_id("entity_trend")
+            normalized_nodes.append(
+                AgentPlanNode(
+                    node_id=entity_table_id,
+                    capability="build_evidence_table",
+                    inputs={
+                        "task": "named_entity_frequency",
+                        "entity_field": "entity_text",
+                        "entity_label_field": "label",
+                        "entity_types": ["PERSON", "ORG", "GPE", "NORP", "EVENT"],
+                        "group_by_time": True,
+                        "time_field": "published_at",
+                        "top_k": 100,
+                    },
+                    depends_on=[ner_node_id],
+                )
+            )
+        else:
+            for node in normalized_nodes:
+                if node.node_id == entity_table_id:
+                    updated_inputs = dict(node.inputs)
+                    updated_inputs.setdefault("entity_field", "entity_text")
+                    updated_inputs.setdefault("entity_label_field", "label")
+                    updated_inputs.setdefault("entity_types", ["PERSON", "ORG", "GPE", "NORP", "EVENT"])
+                    updated_inputs.setdefault("group_by_time", True)
+                    updated_inputs.setdefault("time_field", "published_at")
+                    updated_inputs.setdefault("top_k", 100)
+                    node.inputs = updated_inputs
+                    if not node.depends_on:
+                        node.depends_on = [ner_node_id]
+                    break
+
+        plot_defaults = {
+            "plot_name": "entity_trend",
+            "plot_type": "line",
+            "x": "time_bin",
+            "y": "mention_count",
+            "series": "entity",
+            "top_k": 10,
+        }
+        has_plot = False
+        for node in normalized_nodes:
+            if node.capability == "plot_artifact" and (
+                entity_table_id in node.depends_on or first_node_id("time_series_aggregate") in node.depends_on
+            ):
+                updated_inputs = dict(node.inputs)
+                for key, value in plot_defaults.items():
+                    updated_inputs.setdefault(key, value)
+                node.inputs = updated_inputs
+                if entity_table_id not in node.depends_on:
+                    node.depends_on = [entity_table_id]
+                has_plot = True
+        if not has_plot:
+            normalized_nodes.append(
+                AgentPlanNode(
+                    node_id=unique_node_id("plot_entity_trend"),
+                    capability="plot_artifact",
+                    inputs=plot_defaults,
+                    depends_on=[entity_table_id],
+                    optional=True,
+                )
+            )
 
     def _ensure_temporal_portrayal_nodes(
         self,
@@ -532,19 +753,40 @@ class MagicBoxOrchestrator:
     def _compact_query_terms(self, text: str, preferred_terms: list[str]) -> str:
         found_terms: list[str] = []
         lowered = text.lower()
+        blocked_source_tokens = self._source_scope_query_tokens_for_question(text)
+        preferred_stopwords = {
+            "actor", "actors", "does", "perceived", "perception", "portrayal", "portrayed",
+        }
         for term in preferred_terms:
+            if term.lower() in blocked_source_tokens or term.lower() in preferred_stopwords:
+                continue
             if term.lower() in lowered and term not in found_terms:
                 found_terms.append(term)
         if found_terms:
-            return " ".join(found_terms)
+            compact = " ".join(found_terms)
+            return self._expand_topic_query(compact, text) or compact
         tokens = [token for token in re.findall(r"[A-Za-z][A-Za-z0-9\-]+", text) if len(token) > 2]
         stopwords = {
             "how", "did", "from", "into", "with", "what", "when", "which", "that", "this", "those",
             "coverage", "framing", "frame", "around", "during", "between", "across", "their", "there",
             "correspond", "corresponded", "media", "shift", "shifted",
+            "does",
+            "change", "changed", "changes", "changing", "evolve", "evolved", "evolution", "over", "time",
+            "different", "differently", "difference", "differences", "compare", "compared", "comparison", "versus",
+            "dominate", "dominates", "dominated", "dominant", "entity", "entities", "named", "actor", "actors",
+            "public", "discourse", "newspaper", "newspapers", "report", "reports", "reported",
+            "perceived", "perception", "portrayal", "portrayed",
         }
-        filtered = [token for token in tokens if token.lower() not in stopwords]
-        return " ".join(filtered[:8]).strip()
+        filtered = [token for token in tokens if token.lower() not in stopwords and token.lower() not in blocked_source_tokens]
+        compact = " ".join(filtered[:8]).strip()
+        return self._expand_topic_query(compact, text) or compact
+
+    def _expand_topic_query(self, query_text: str, question_text: str) -> str:
+        combined = f"{query_text} {question_text}".lower()
+        for expansion in TOPIC_QUERY_EXPANSIONS:
+            if any(re.search(rf"\b{re.escape(trigger)}\b", combined, flags=re.IGNORECASE) for trigger in expansion["triggers"]):
+                return str(expansion["query"])
+        return ""
 
     def _query_needs_topical_repair(self, planned_query: str, fallback_query: str) -> bool:
         planned_tokens = [token.lower() for token in re.findall(r"[A-Za-z][A-Za-z0-9]+", planned_query)]
@@ -582,19 +824,94 @@ class MagicBoxOrchestrator:
             return fallback
         return planned
 
+    def _explicit_source_scope_matches(self, text: str) -> list[dict[str, Any]]:
+        lowered = str(text or "").lower()
+        matches: list[dict[str, Any]] = []
+        for alias in EXPLICIT_SOURCE_SCOPE_ALIASES:
+            if any(re.search(pattern, lowered, flags=re.IGNORECASE) for pattern in alias["patterns"]):
+                matches.append(alias)
+        return matches
+
+    def _explicit_source_scope_is_active(self, text: str, matches: list[dict[str, Any]]) -> bool:
+        if not matches:
+            return False
+        lowered = str(text or "").lower()
+        if len(matches) >= 2 and re.search(r"\b(vs\.?|versus|compared? to|between|differ(?:ent|ently)|compare)\b", lowered):
+            return True
+        return bool(
+            re.search(
+                r"\b(?:newspapers?|media|press|outlets?|sources?|publisher|publishers|reports?|coverage)\b",
+                lowered,
+            )
+        )
+
     def _source_scope_filters_for_question(self, text: str) -> list[str]:
         lowered = str(text or "").lower()
+        filters: list[str] = []
         if re.search(r"\bswiss\s+(?:newspapers?|media|press|outlets?|sources?)\b", lowered) or re.search(
             r"\b(?:newspapers?|media|press|outlets?|sources?)\s+in\s+switzerland\b",
             lowered,
         ):
-            return list(SOURCE_SCOPE_ALIASES["swiss"])
-        return []
+            filters.extend(SOURCE_SCOPE_ALIASES["swiss"])
+        explicit_matches = self._explicit_source_scope_matches(text)
+        if self._explicit_source_scope_is_active(text, explicit_matches):
+            for match in explicit_matches:
+                filters.extend(str(item) for item in match["filters"])
+        return list(dict.fromkeys(item for item in filters if item))
+
+    def _source_scope_query_tokens_for_question(self, text: str) -> set[str]:
+        explicit_matches = self._explicit_source_scope_matches(text)
+        if not self._explicit_source_scope_is_active(text, explicit_matches):
+            return set()
+        blocked: set[str] = set()
+        for match in explicit_matches:
+            blocked.update(str(item).lower() for item in match["tokens"])
+        return blocked
+
+    def _remove_source_field_filters(self, query: str) -> str:
+        cleaned = re.sub(
+            r"\s*(?:AND|OR)?\s*\(?\s*source\s*:\s*\([^)]+\)\s*\)?",
+            " ",
+            str(query or ""),
+            flags=re.IGNORECASE,
+        )
+        cleaned = re.sub(
+            r"\s*(?:AND|OR)?\s*\(?\s*source\s*:\s*(?:\"[^\"]+\"|'[^']+'|[A-Za-z0-9_.-]+)\s*\)?",
+            " ",
+            cleaned,
+            flags=re.IGNORECASE,
+        )
+        return " ".join(cleaned.split()).strip()
+
+    def _remove_explicit_source_mentions_from_query(self, query: str, question_text: str) -> str:
+        cleaned = str(query or "").strip()
+        matches = self._explicit_source_scope_matches(question_text)
+        if not self._explicit_source_scope_is_active(question_text, matches):
+            return cleaned
+        for alias in matches:
+            for pattern in alias["patterns"]:
+                cleaned = re.sub(pattern, " ", cleaned, flags=re.IGNORECASE)
+            for token in alias["tokens"]:
+                cleaned = re.sub(rf"\b{re.escape(str(token))}\b", " ", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\b(?:vs\.?|versus|compared\s+to|compare|between)\b", " ", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\s+", " ", cleaned)
+        cleaned = re.sub(r"\(\s*\)", " ", cleaned)
+        cleaned = re.sub(r"\b(?:AND|OR)\s*(?=\)|$)", " ", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"^\s*(?:AND|OR)\b", " ", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\(\s*(?:AND|OR)\b", "(", cleaned, flags=re.IGNORECASE)
+        return " ".join(cleaned.split()).strip(" ()")
 
     def _apply_source_scope_to_query(self, query: str, question_text: str) -> str:
         cleaned_query = str(query or "").strip()
         if not cleaned_query:
             return cleaned_query
+        filters = self._source_scope_filters_for_question(question_text)
+        if filters:
+            cleaned_query = self._remove_source_field_filters(cleaned_query)
+            cleaned_query = self._remove_explicit_source_mentions_from_query(cleaned_query, question_text)
+            cleaned_query = self._expand_topic_query(cleaned_query, question_text) or cleaned_query
+            if not cleaned_query:
+                cleaned_query = self._compact_query_terms(question_text, self._query_anchor_terms(question_text)) or question_text
         if re.search(r"\bsource\s*:\s*\*", cleaned_query, flags=re.IGNORECASE):
             cleaned_query = re.sub(
                 r"\s*(?:AND|OR)?\s*\(?\s*source\s*:\s*\*\s*\)?",
@@ -605,7 +922,6 @@ class MagicBoxOrchestrator:
             cleaned_query = " ".join(cleaned_query.split()).strip()
         elif re.search(r"\bsource\s*:", cleaned_query, flags=re.IGNORECASE):
             return cleaned_query
-        filters = self._source_scope_filters_for_question(question_text)
         if not filters:
             return cleaned_query
         rendered = " OR ".join(f'"{item}"' for item in filters)
@@ -615,6 +931,7 @@ class MagicBoxOrchestrator:
         anchors: list[str] = []
         seen: set[str] = set()
         blocked_terms: set[str] = set()
+        blocked_source_tokens = self._source_scope_query_tokens_for_question(text)
         stopwords = {
             "across",
             "aggregate",
@@ -632,12 +949,21 @@ class MagicBoxOrchestrator:
             "breakdown",
             "collection",
             "common",
+            "compare",
+            "compared",
+            "comparison",
             "corpus",
+            "coverage",
             "dataset",
             "did",
+            "different",
+            "differently",
+            "difference",
+            "differences",
             "distribution",
             "document",
             "documents",
+            "does",
             "during",
             "for",
             "from",
@@ -658,10 +984,13 @@ class MagicBoxOrchestrator:
             "most",
             "noun",
             "nouns",
+            "actor",
+            "actors",
             "related",
             "relevant",
             "report",
             "reports",
+            "reported",
             "result",
             "results",
             "row",
@@ -684,6 +1013,13 @@ class MagicBoxOrchestrator:
             "why",
             "change",
             "changed",
+            "changes",
+            "changing",
+            "evolve",
+            "evolved",
+            "evolution",
+            "over",
+            "time",
             "america",
             "american",
             "usa",
@@ -703,12 +1039,23 @@ class MagicBoxOrchestrator:
             "dominated",
             "public",
             "discourse",
+            "perceived",
+            "perception",
+            "portrayal",
+            "portrayed",
+            "versus",
         }
 
         def _add_anchor(token: str) -> None:
             for part in re.findall(r"[A-Za-z][A-Za-z0-9]+", str(token or "")):
                 lowered = part.lower()
-                if len(lowered) < 3 or lowered in stopwords or lowered in seen or lowered in blocked_terms:
+                if (
+                    len(lowered) < 3
+                    or lowered in stopwords
+                    or lowered in blocked_source_tokens
+                    or lowered in seen
+                    or lowered in blocked_terms
+                ):
                     continue
                 seen.add(lowered)
                 anchors.append(part)
@@ -724,8 +1071,6 @@ class MagicBoxOrchestrator:
             return anchors[:8]
         for match in re.finditer(r"\b[A-Z][A-Za-z0-9]*(?:-[A-Z]?[A-Za-z0-9]+)?\b", text):
             _add_anchor(match.group(0).strip())
-        if anchors:
-            return anchors[:8]
         for token in re.findall(r"[A-Za-z][A-Za-z0-9-]+", text):
             _add_anchor(token)
         return anchors[:8]
@@ -769,7 +1114,7 @@ class MagicBoxOrchestrator:
             search_inputs["query"] = self._apply_source_scope_to_query(str(merged_inputs["query"]), question_text)
         elif str(search_inputs.get("query", "")).strip():
             search_inputs["query"] = self._apply_source_scope_to_query(str(search_inputs["query"]), question_text)
-        for key in ("date_from", "date_to", "year_balance", "retrieve_all", "retrieval_strategy"):
+        for key in ("top_k", "lexical_top_k", "dense_top_k", "fallback_top_k", "rerank_top_k", "date_from", "date_to", "year_balance", "retrieve_all", "retrieval_strategy"):
             if key in merged_inputs and merged_inputs.get(key) not in (None, ""):
                 search_inputs[key] = merged_inputs[key]
         if "date_from" not in search_inputs and "date_to" not in search_inputs:
@@ -1018,11 +1363,83 @@ class MagicBoxOrchestrator:
                     AgentPlanNode("fetch", "fetch_documents", depends_on=["search"]),
                     AgentPlanNode("working_set", "create_working_set", depends_on=["fetch"]),
                     AgentPlanNode("ner", "ner", depends_on=["fetch"]),
-                    AgentPlanNode("series", "time_series_aggregate", depends_on=["ner"]),
-                    AgentPlanNode("changes", "change_point_detect", depends_on=["series"], optional=True),
-                    AgentPlanNode("plot", "plot_artifact", inputs={"plot_name": "entity_trend"}, depends_on=["series"], optional=True),
+                    AgentPlanNode(
+                        "entity_trend",
+                        "build_evidence_table",
+                        inputs={
+                            "task": "named_entity_frequency",
+                            "entity_field": "entity_text",
+                            "entity_label_field": "label",
+                            "entity_types": ["PERSON", "ORG", "GPE", "NORP", "EVENT"],
+                            "group_by_time": True,
+                            "time_field": "published_at",
+                            "top_k": 100,
+                        },
+                        depends_on=["ner"],
+                    ),
+                    AgentPlanNode("changes", "change_point_detect", depends_on=["entity_trend"], optional=True),
+                    AgentPlanNode(
+                        "plot",
+                        "plot_artifact",
+                        inputs={
+                            "plot_name": "entity_trend",
+                            "plot_type": "line",
+                            "x": "time_bin",
+                            "y": "mention_count",
+                            "series": "entity",
+                            "top_k": 10,
+                        },
+                        depends_on=["entity_trend"],
+                        optional=True,
+                    ),
                 ],
                 metadata={"question_family": "entity_trend"},
+            )
+            return PlannerAction(
+                action="emit_plan_dag",
+                rewritten_question=state.rewritten_question or rewritten,
+                assumptions=list(heuristic_assumptions),
+                plan_dag=dag,
+            )
+        if self._needs_source_comparison_analysis(rewritten):
+            search_inputs = self._search_inputs_for_question(
+                rewritten,
+                query_text=query_text,
+                overrides={"retrieval_strategy": "exhaustive_analytic", "retrieve_all": True, "top_k": 0},
+            )
+            dag = AgentPlanDAG(
+                nodes=[
+                    AgentPlanNode("search", "db_search", inputs=search_inputs),
+                    AgentPlanNode("fetch", "fetch_documents", depends_on=["search"]),
+                    AgentPlanNode("working_set", "create_working_set", depends_on=["fetch"]),
+                    AgentPlanNode(
+                        "keyterms_by_source",
+                        "extract_keyterms",
+                        inputs={"group_by": "outlet", "top_k": 25},
+                        depends_on=["fetch"],
+                    ),
+                    AgentPlanNode(
+                        "plot_keyterms",
+                        "plot_artifact",
+                        inputs={
+                            "plot_name": "source_keyterm_comparison",
+                            "plot_type": "bar",
+                            "x": "term",
+                            "y": "score",
+                            "series": "outlet",
+                            "top_k": 20,
+                        },
+                        depends_on=["keyterms_by_source"],
+                        optional=True,
+                    ),
+                    AgentPlanNode(
+                        "summary",
+                        "build_evidence_table",
+                        inputs={"task": "summary_stats"},
+                        depends_on=["fetch", "keyterms_by_source"],
+                    ),
+                ],
+                metadata={"question_family": "source_comparison"},
             )
             return PlannerAction(
                 action="emit_plan_dag",
@@ -1103,14 +1520,19 @@ class MagicBoxOrchestrator:
                                 "right_key": "time_bin",
                                 "how": "left",
                             },
-                            depends_on=["series"],
+                            depends_on=["series", "fetch"],
                         )
                     )
                     nodes.append(
                         AgentPlanNode(
                             "plot_market",
                             "plot_artifact",
-                            inputs={"plot_name": f"{market_ticker.lower()}_market_overlay"},
+                            inputs={
+                                "plot_name": f"{market_ticker.lower()}_market_overlay",
+                                "plot_type": "line",
+                                "x": "time_bin",
+                                "y": "market_close",
+                            },
                             depends_on=["market_series"],
                             optional=True,
                         )
@@ -1484,6 +1906,7 @@ class MagicBoxOrchestrator:
                         "rewritten_question": state.rewritten_question,
                         "summary": summary,
                         "evidence_rows": evidence_rows,
+                        "tool_caveats": self._snapshot_caveats(snapshot),
                         "failures": [item.to_dict() for item in snapshot.failures],
                         "has_external_series": self._has_external_series(snapshot),
                     },
@@ -1566,6 +1989,27 @@ class MagicBoxOrchestrator:
                 }
             )
         return fallback_rows
+
+    def _snapshot_caveats(self, snapshot: AgentExecutionSnapshot) -> list[str]:
+        caveats: list[str] = []
+        for result in snapshot.node_results.values():
+            for caveat in result.caveats:
+                caveat_text = str(caveat).strip()
+                if caveat_text:
+                    caveats.append(caveat_text)
+
+            metadata = result.metadata if isinstance(result.metadata, dict) else {}
+            for key in ("no_data_reason", "reason", "warning"):
+                reason_text = str(metadata.get(key, "")).strip()
+                if reason_text:
+                    caveats.append(reason_text)
+
+            payload = result.payload if isinstance(result.payload, dict) else {}
+            for key in ("no_data_reason", "reason", "warning"):
+                reason_text = str(payload.get(key, "")).strip()
+                if reason_text:
+                    caveats.append(reason_text)
+        return list(dict.fromkeys(caveats))
 
     @staticmethod
     def _summary_float(value: Any) -> float | None:
@@ -1766,6 +2210,9 @@ class MagicBoxOrchestrator:
                 answer.answer_text = f"{answer.answer_text.rstrip()} {note}".strip()
         if answer.evidence_items:
             answer.evidence_items = list(answer.evidence_items)[:10]
+        for caveat in self._snapshot_caveats(snapshot):
+            if caveat not in answer.caveats:
+                answer.caveats.append(caveat)
         return answer
 
     def _fallback_synthesis(
@@ -1775,7 +2222,9 @@ class MagicBoxOrchestrator:
         summary: dict[str, Any],
         snapshot: AgentExecutionSnapshot,
     ) -> FinalAnswerPayload:
-        caveats = [failure.message for failure in snapshot.failures]
+        snapshot_caveats = self._snapshot_caveats(snapshot)
+        caveats = [failure.message for failure in snapshot.failures] + snapshot_caveats
+        unsupported_parts = [failure.message for failure in snapshot.failures if not failure.retriable]
         if "noun_distribution" in summary:
             top = ", ".join(f"{term} ({count})" for term, count in summary["noun_distribution"][:8])
             answer_text = f"Top noun lemmas in the retrieved slice are: {top}."
@@ -1816,7 +2265,16 @@ class MagicBoxOrchestrator:
                 "Warnings, scenarios, and explicit predictions are not identical; the evidence table is ranked by heuristic claim strength."
             )
         else:
-            answer_text = "The agent completed the available analysis steps and returned the grounded artifacts for inspection."
+            if snapshot_caveats:
+                answer_text = (
+                    "The run could not produce a supported answer from the corpus outputs. "
+                    f"{snapshot_caveats[0]}"
+                )
+            else:
+                answer_text = "The run could not produce a supported answer from the corpus outputs."
+            unsupported_parts.append(
+                "The requested answer is unsupported because no evidence rows, retrieved documents, or answer-bearing analysis rows were returned."
+            )
         return FinalAnswerPayload(
             answer_text=answer_text,
             evidence_items=evidence_rows,
@@ -1825,7 +2283,7 @@ class MagicBoxOrchestrator:
                 for record in snapshot.node_records
                 for artifact in record.artifacts_used
             ],
-            unsupported_parts=[failure.message for failure in snapshot.failures if not failure.retriable],
+            unsupported_parts=list(dict.fromkeys(item for item in unsupported_parts if item)),
             caveats=list(dict.fromkeys(item for item in caveats if item)),
             claim_verdicts=[],
         )

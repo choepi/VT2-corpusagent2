@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 from pathlib import Path
 
@@ -81,3 +82,22 @@ def test_summarize_tool_result_distinguishes_input_docs_and_no_data() -> None:
     assert summary["output_documents"] == 0
     assert summary["no_data"] is True
     assert summary["no_data_reason"] == "No rows available for plotting."
+
+
+def test_node_artifact_preserves_artifacts_and_caveats(tmp_path: Path) -> None:
+    executor = AsyncPlanExecutor(ToolRegistry())
+    plot_path = tmp_path / "plots" / "chart.png"
+    result = ToolExecutionResult(
+        payload={"artifact_path": str(plot_path), "rows": []},
+        artifacts=[str(plot_path)],
+        caveats=["No rows available for plotting."],
+        unsupported_parts=["Plot could not be generated."],
+        metadata={"no_data": True},
+    )
+
+    artifact_path = executor._write_node_artifact(tmp_path, AgentPlanNode("plot", "plot_artifact"), result)
+    payload = json.loads(Path(artifact_path).read_text(encoding="utf-8"))
+
+    assert payload["artifacts"] == [str(plot_path)]
+    assert payload["caveats"] == ["No rows available for plotting."]
+    assert payload["unsupported_parts"] == ["Plot could not be generated."]

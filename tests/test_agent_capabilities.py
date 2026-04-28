@@ -17,6 +17,7 @@ from corpusagent2.agent_capabilities import (
     _create_working_set,
     _db_search,
     _fetch_documents,
+    _extract_keyterms,
     _join_external_series,
     _lang_id,
     _plot_artifact,
@@ -1312,6 +1313,46 @@ def test_time_series_aggregate_handles_named_average_metrics(tmp_path: Path) -> 
     assert result.payload["rows"][0]["target_label"] == "Cristiano Ronaldo"
 
 
+def test_time_series_aggregate_falls_back_to_overall_series_for_ungrouped_sentiment(tmp_path: Path) -> None:
+    context = AgentExecutionContext(
+        run_id="run",
+        artifacts_dir=tmp_path,
+        search_backend=None,
+        working_store=InMemoryWorkingSetStore(),
+        runtime=None,
+    )
+    deps = {
+        "sentiment": ToolExecutionResult(
+            payload={
+                "rows": [
+                    {"doc_id": "d1", "label": "negative", "published_at": "2018-03-19", "score": -0.8},
+                    {"doc_id": "d2", "label": "negative", "published_at": "2018-03-20", "score": -0.6},
+                    {"doc_id": "d3", "label": "positive", "published_at": "2018-04-01", "score": 0.4},
+                ]
+            }
+        )
+    }
+
+    result = _time_series_aggregate(
+        {
+            "documents_node": "sentiment",
+            "time_field": "published_at",
+            "group_by": "target_label",
+            "metrics": ["average_sentiment", "document_count"],
+            "bucket_granularity": "month",
+        },
+        deps,
+        context,
+    )
+
+    rows = {row["time_bin"]: row for row in result.payload["rows"]}
+    assert rows["2018-03"]["target_label"] == "__all__"
+    assert rows["2018-03"]["average_sentiment"] == -0.7
+    assert rows["2018-03"]["document_count"] == 2
+    assert rows["2018-04"]["average_sentiment"] == 0.4
+    assert result.payload["skipped_row_count"] == 0
+
+
 def test_python_runner_refuses_prose_instead_of_executing_invalid_code(tmp_path: Path) -> None:
     context = AgentExecutionContext(
         run_id="run",
@@ -1507,6 +1548,46 @@ def test_query_anchor_terms_strip_source_filters() -> None:
     assert sources == ["nzz", "tagesanzeiger"]
 
 
+def test_query_anchor_terms_drop_climate_scaffold_with_source_filter() -> None:
+    query = '(climate coverage over time) AND source:("swissinfoch" OR "nzzch")'
+
+    anchors = agent_capabilities._query_anchor_terms(query)
+    sources = agent_capabilities._query_source_filters(query)
+
+    assert anchors == ["climate"]
+    assert sources == ["swissinfoch", "nzzch"]
+
+
+def test_exhaustive_search_reports_absent_source_scope(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(agent_capabilities, "_queryable_sql_store", lambda context: (object(), ""))
+    monkeypatch.setattr(agent_capabilities, "_sql_search_rows", lambda **kwargs: [])
+    context = AgentExecutionContext(
+        run_id="run",
+        artifacts_dir=tmp_path,
+        search_backend=_EmptySearchBackend(),
+        working_store=InMemoryWorkingSetStore(),
+        runtime=_RuntimeWithMetadata(
+            [
+                {"doc_id": "doc-1", "title": "Football", "text": "football", "published_at": "2020-01-01", "source": "www.swissinfo.ch"},
+                {"doc_id": "doc-2", "title": "Football", "text": "football", "published_at": "2020-01-02", "source": "uk.reuters.com"},
+            ]
+        ),
+    )
+
+    result = _db_search(
+        {
+            "query": '(football OR soccer OR fussball) AND source:("nzz" OR "tagesanzeiger")',
+            "retrieval_strategy": "exhaustive_analytic",
+            "top_k": 0,
+        },
+        {},
+        context,
+    )
+
+    assert result.payload["result_count"] == 0
+    assert any("requested outlets may be absent" in caveat.lower() for caveat in result.caveats)
+
+
 def test_local_exhaustive_applies_source_filters(tmp_path: Path) -> None:
     context = AgentExecutionContext(
         run_id="run",
@@ -1700,6 +1781,152 @@ def test_noun_distribution_streams_full_working_set_when_fetch_is_preview(tmp_pa
     assert result.metadata["full_working_set"] is True
 
 
+def test_extract_keyterms_groups_by_outlet(tmp_path: Path) -> None:
+    context = AgentExecutionContext(
+        run_id="run",
+        artifacts_dir=tmp_path,
+        search_backend=_EmptySearchBackend(),
+        working_store=InMemoryWorkingSetStore(),
+        runtime=None,
+    )
+    deps = {
+        "fetch": ToolExecutionResult(
+            payload={
+                "documents": [
+                    {
+                        "doc_id": "nzz-1",
+                        "title": "Football",
+                        "text": "football club tactics player transfer match tactics club",
+                        "published_at": "2022-01-01",
+                        "source": "NZZ",
+                        "outlet": "NZZ",
+                    },
+                    {
+                        "doc_id": "nzz-2",
+                        "title": "Football",
+                        "text": "football club player tactics league match club",
+                        "published_at": "2022-01-02",
+                        "source": "NZZ",
+                        "outlet": "NZZ",
+                    },
+                    {
+                        "doc_id": "ta-1",
+                        "title": "Football",
+                        "text": "football fan stadium derby ticket supporter stadium",
+                        "published_at": "2022-01-03",
+                        "source": "Tages-Anzeiger",
+                        "outlet": "Tages-Anzeiger",
+                    },
+                    {
+                        "doc_id": "ta-2",
+                        "title": "Football",
+                        "text": "football supporter stadium crowd ticket derby crowd",
+                        "published_at": "2022-01-04",
+                        "source": "Tages-Anzeiger",
+                        "outlet": "Tages-Anzeiger",
+                    },
+                ],
+                "document_count": 4,
+                "returned_document_count": 4,
+                "documents_truncated": False,
+            }
+        )
+    }
+
+    result = _extract_keyterms({"group_by": "outlet", "top_k": 5}, deps, context)
+
+    outlets = {row["outlet"] for row in result.payload["rows"]}
+    assert {"NZZ", "Tages-Anzeiger"}.issubset(outlets)
+    assert all(row["document_count"] == 2 for row in result.payload["rows"] if row["outlet"] in outlets)
+    assert result.metadata["group_by"] == "outlet"
+
+
+def test_extract_keyterms_streams_truncated_working_set(tmp_path: Path) -> None:
+    store = InMemoryWorkingSetStore()
+    store.record_working_set("run", "all_docs", [{"doc_id": "doc-1"}, {"doc_id": "doc-2"}])
+    store.document_lookup.update(
+        {
+            "doc-1": {
+                "doc_id": "doc-1",
+                "title": "",
+                "text": "preview only climate policy",
+                "published_at": "2022-01-01",
+                "source": "NZZ",
+            },
+            "doc-2": {
+                "doc_id": "doc-2",
+                "title": "",
+                "text": "emissions law referendum climate emissions law",
+                "published_at": "2022-01-02",
+                "source": "Tages-Anzeiger",
+            },
+        }
+    )
+    context = AgentExecutionContext(
+        run_id="run",
+        artifacts_dir=tmp_path,
+        search_backend=_EmptySearchBackend(),
+        working_store=store,
+        runtime=None,
+    )
+    fetch_preview = ToolExecutionResult(
+        payload={
+            "documents": [store.document_lookup["doc-1"]],
+            "working_set_ref": "all_docs",
+            "document_count": 2,
+            "returned_document_count": 1,
+            "documents_truncated": True,
+        }
+    )
+
+    result = _extract_keyterms({"top_k": 10}, {"fetch": fetch_preview}, context)
+
+    terms = {row["term"] for row in result.payload["rows"]}
+    assert {"emissions", "law"}.intersection(terms)
+    assert result.metadata["documents_from"] == "working_set_ref"
+    assert result.metadata["analyzed_document_count"] == 2
+    assert any("preview" in caveat.lower() for caveat in result.caveats)
+
+
+def test_join_external_series_returns_standalone_market_rows_when_internal_rows_empty(monkeypatch, tmp_path: Path) -> None:
+    captured: dict[str, str] = {}
+
+    def fake_fetch_yfinance_series_rows(*, ticker: str, start: str, end: str, interval: str = "1d") -> list[dict]:
+        captured.update({"ticker": ticker, "start": start, "end": end, "interval": interval})
+        return [
+            {"ticker": ticker, "date": "2018-01-01", "time_bin": "2018-01", "market_close": 60.0},
+            {"ticker": ticker, "date": "2018-02-01", "time_bin": "2018-02", "market_close": 64.0},
+        ]
+
+    monkeypatch.setattr(agent_capabilities, "_fetch_yfinance_series_rows", fake_fetch_yfinance_series_rows)
+    context = AgentExecutionContext(
+        run_id="run",
+        artifacts_dir=tmp_path,
+        search_backend=_EmptySearchBackend(),
+        working_store=InMemoryWorkingSetStore(),
+        runtime=None,
+        state=SimpleNamespace(question="How did the oil price change?", rewritten_question="How did the oil price change?"),
+    )
+    deps = {
+        "series": ToolExecutionResult(payload={"rows": []}),
+        "fetch": ToolExecutionResult(
+            payload={
+                "documents": [
+                    {"doc_id": "doc-1", "published_at": "2018-01-15", "text": "oil price rose"},
+                    {"doc_id": "doc-2", "published_at": "2018-02-20", "text": "oil price fell"},
+                ]
+            }
+        ),
+    }
+
+    result = _join_external_series({"ticker": "CL=F", "left_key": "time_bin", "right_key": "time_bin"}, deps, context)
+
+    assert [row["market_close"] for row in result.payload["rows"]] == [60.0, 64.0]
+    assert captured["start"] == "2018-01-15"
+    assert captured["end"] == "2018-02-21"
+    assert any("standalone" in caveat.lower() for caveat in result.caveats)
+
+
 def test_noun_distribution_streaming_filters_function_words(monkeypatch, tmp_path: Path) -> None:
     monkeypatch.setattr(agent_capabilities, "_load_spacy_model", lambda: None)
     store = InMemoryWorkingSetStore()
@@ -1866,6 +2093,12 @@ def test_large_working_set_noun_distribution_uses_uncapped_sql_when_enabled(monk
     assert rows == [{"lemma": "club", "count": 10}]
     assert captured["max_documents"] is None
     assert metadata["provider"] == "postgres_token_aggregate"
+
+
+def test_working_set_analysis_default_is_uncapped(monkeypatch) -> None:
+    monkeypatch.delenv("CORPUSAGENT2_WORKING_SET_ANALYSIS_MAX_DOCS", raising=False)
+
+    assert agent_capabilities._working_set_analysis_max_documents() is None
 
 
 def test_large_working_set_noun_distribution_respects_explicit_sql_cap(monkeypatch, tmp_path: Path) -> None:
@@ -2322,7 +2555,10 @@ def test_time_series_aggregate_defaults_to_month_granularity(monkeypatch, tmp_pa
 
     result = _time_series_aggregate({}, deps, context)
 
-    assert {"entity": "negative", "time_bin": "2018-03", "count": -2} in result.payload["rows"]
+    assert any(
+        row["entity"] == "negative" and row["time_bin"] == "2018-03" and row["count"] == -1.4
+        for row in result.payload["rows"]
+    )
     assert any(row["time_bin"] == "2018-04" for row in result.payload["rows"])
 
 

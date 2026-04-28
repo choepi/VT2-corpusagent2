@@ -263,11 +263,14 @@ def _sql_aggregate_text_char_limit() -> int:
 
 
 def _working_set_analysis_max_documents() -> int | None:
-    raw = os.getenv("CORPUSAGENT2_WORKING_SET_ANALYSIS_MAX_DOCS", "2000").strip()
+    configured = os.getenv("CORPUSAGENT2_WORKING_SET_ANALYSIS_MAX_DOCS")
+    if configured is None:
+        return None
+    raw = configured.strip()
     try:
         value = int(raw)
     except ValueError:
-        return 2000
+        return None
     if value < 0:
         return None
     return max(1, value)
@@ -338,14 +341,30 @@ QUERY_ANCHOR_STOPWORDS = {
     "being",
     "between",
     "breakdown",
+    "change",
+    "changed",
+    "changes",
+    "changing",
     "collection",
     "common",
     "complete",
+    "compare",
+    "compared",
+    "comparison",
     "corpus",
+    "coverage",
     "could",
     "daily",
     "dataset",
     "did",
+    "different",
+    "differently",
+    "difference",
+    "differences",
+    "dominate",
+    "dominates",
+    "dominated",
+    "dominant",
     "distribution",
     "document",
     "documents",
@@ -354,6 +373,9 @@ QUERY_ANCHOR_STOPWORDS = {
     "each",
     "entire",
     "every",
+    "evolve",
+    "evolved",
+    "evolution",
     "for",
     "frame",
     "framing",
@@ -378,6 +400,7 @@ QUERY_ANCHOR_STOPWORDS = {
     "noun",
     "nouns",
     "overall",
+    "over",
     "record",
     "records",
     "related",
@@ -399,6 +422,7 @@ QUERY_ANCHOR_STOPWORDS = {
     "their",
     "there",
     "this",
+    "time",
     "toward",
     "towards",
     "under",
@@ -417,6 +441,7 @@ QUERY_ANCHOR_STOPWORDS = {
     "with",
     "would",
     "yearly",
+    "versus",
 }
 
 
@@ -484,6 +509,36 @@ def _row_matches_source_filters(source: Any, filters: list[str]) -> bool:
     return any(item in normalized for item in filters)
 
 
+def _source_filter_match_counts(context: "AgentExecutionContext", filters: list[str]) -> dict[str, int]:
+    if not filters or context.runtime is None:
+        return {}
+    try:
+        metadata = context.runtime.load_metadata()
+    except Exception:
+        return {}
+    if metadata is None or metadata.empty or "source" not in metadata.columns:
+        return {}
+    normalized_sources = metadata["source"].fillna("").astype(str).map(_normalize_source_filter)
+    counts: dict[str, int] = {}
+    for item in filters:
+        counts[item] = int(normalized_sources.str.contains(re.escape(item), regex=True, na=False).sum())
+    return counts
+
+
+def _source_filtered_no_data_caveat(context: "AgentExecutionContext", filters: list[str]) -> str:
+    counts = _source_filter_match_counts(context, filters)
+    if counts and not any(counts.values()):
+        rendered = ", ".join(filters)
+        return f"No corpus documents matched the requested source filters ({rendered}); the requested outlets may be absent from this corpus."
+    if counts:
+        rendered_counts = ", ".join(f"{source}={count}" for source, count in counts.items())
+        return (
+            "No documents matched both the requested source filters and the main query terms. "
+            f"Corpus source-filter coverage: {rendered_counts}."
+        )
+    return f"No documents matched source filters: {', '.join(filters)}."
+
+
 def _query_anchor_terms(query: str) -> list[str]:
     text = _query_without_field_filters(str(query or "")).strip()
     if not text:
@@ -505,13 +560,11 @@ def _query_anchor_terms(query: str) -> list[str]:
     for match in re.finditer(r"\b[A-Z][A-Za-z0-9]*(?:-[A-Z]?[A-Za-z0-9]+)?\b", text):
         token = match.group(0).strip()
         _add_query_anchor(preferred, preferred_seen, token, blocked=blocked_terms)
-    if preferred:
-        return preferred[:8]
     fallback: list[str] = []
-    fallback_seen: set[str] = set()
+    fallback_seen: set[str] = set(preferred_seen)
     for token in re.findall(r"[A-Za-z][A-Za-z0-9-]+", text):
         _add_query_anchor(fallback, fallback_seen, token, blocked=blocked_terms)
-    return fallback[:8]
+    return [*preferred, *fallback][:8]
 
 
 def _query_or_groups(query: str) -> list[str]:
@@ -713,21 +766,35 @@ def _analysis_document_rows_from_deps(
     max_documents: int | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any], list[str]]:
     documents = _doc_rows(deps)
-    if documents:
-        return documents, {"analyzed_document_count": len(documents), "documents_from": "dependency_rows"}, []
     working_set_ref = _working_set_ref(deps)
+    documents_truncated = _dependency_payload_flag(deps, "documents_truncated") or _dependency_payload_flag(deps, "working_set_truncated")
+    if documents and not (documents_truncated and working_set_ref):
+        return documents, {"analyzed_document_count": len(documents), "documents_from": "dependency_rows"}, []
     if not working_set_ref:
+        if documents:
+            caveats = [
+                "Upstream documents were marked truncated, but no working_set_ref was available; analysis used preview rows only."
+            ] if documents_truncated else []
+            return documents, {
+                "analyzed_document_count": len(documents),
+                "documents_from": "dependency_rows",
+                "preview_only": bool(documents_truncated),
+            }, caveats
         return [], {"analyzed_document_count": 0, "documents_from": "none"}, []
     rows = [
         _with_cleaned_document_text(row)
         for row in _iter_working_set_documents(context, working_set_ref, max_documents=max_documents)
     ]
     working_set_count = _count_working_set(context, working_set_ref, len(rows))
-    caveats = ["No fetched document rows were available, so documents were streamed from working_set_ref for analysis."]
+    caveats = [
+        "Upstream fetched documents were only a preview, so documents were streamed from working_set_ref for analysis."
+        if documents_truncated
+        else "No fetched document rows were available, so documents were streamed from working_set_ref for analysis."
+    ]
     if max_documents is not None and working_set_count > max_documents:
         caveats.append(
-            f"Entity analysis was capped at {max_documents} documents from a working set of {working_set_count}; "
-            "set CORPUSAGENT2_ENTITY_ANALYSIS_MAX_DOCS=-1 for an uncapped offline run."
+            f"Working-set analysis was capped at {max_documents} documents from a working set of {working_set_count}; "
+            "set the relevant *_ANALYSIS_MAX_DOCS environment variable to -1 for an uncapped offline run."
         )
     return rows, {
         "analyzed_document_count": len(rows),
@@ -2418,7 +2485,11 @@ def _db_search(params: dict[str, Any], deps: dict[str, ToolExecutionResult], con
             if duplicates_removed > 0:
                 caveats.append(f"Suppressed {duplicates_removed} near-duplicate SQL retrieval hits.")
         else:
-            caveats.append("Exhaustive SQL retrieval did not find documents matching the main query entities.")
+            caveats.append(
+                _source_filtered_no_data_caveat(context, source_filters)
+                if source_filters
+                else "Exhaustive SQL retrieval did not find documents matching the main query entities."
+            )
         return _search_result(
             context=context,
             query=query,
@@ -2574,7 +2645,7 @@ def _db_search(params: dict[str, Any], deps: dict[str, ToolExecutionResult], con
                 "Primary search backend failed after source filters were stripped for fallback retrieval, "
                 f"and SQL fallback found no matching documents: {primary_error}"
             )
-            caveats.append(f"No documents matched source filters: {', '.join(source_filters)}.")
+            caveats.append(_source_filtered_no_data_caveat(context, source_filters))
             return ToolExecutionResult(
                 payload={
                     "results": [],
@@ -2663,7 +2734,12 @@ def _sql_query_search(params: dict[str, Any], deps: dict[str, ToolExecutionResul
                 top_k=0,
                 retrieval_mode="sql",
             )
-            caveats = [] if rows else ["Exhaustive SQL retrieval did not find documents matching the main query entities."]
+            source_filters = _query_source_filters(query)
+            caveats = [] if rows else [
+                _source_filtered_no_data_caveat(context, source_filters)
+                if source_filters
+                else "Exhaustive SQL retrieval did not find documents matching the main query entities."
+            ]
             if rows:
                 caveats.append(
                     f"Exhaustive analytical retrieval used full lexical Postgres materialization and returned {len(rows)} matching documents."
@@ -3432,19 +3508,62 @@ def _entity_link(params: dict[str, Any], deps: dict[str, ToolExecutionResult], c
 
 
 def _extract_keyterms(params: dict[str, Any], deps: dict[str, ToolExecutionResult], context: AgentExecutionContext) -> ToolExecutionResult:
-    joined = "\n".join(_row_analysis_text(row) for row in _doc_rows(deps))
-    keyterms = []
-    seen: set[str] = set()
+    rows, source_metadata, source_caveats = _analysis_document_rows_from_deps(
+        deps,
+        context,
+        max_documents=_working_set_analysis_max_documents(),
+    )
     requested_top_k = _int_param(params, "top_k", "limit", default=25, maximum=500)
-    for term, score in textrank_keywords(joined, top_k=max(requested_top_k * 4, 25)):
-        normalized = str(term or "").strip().lower()
-        if normalized in seen or not _valid_noun_lemma(normalized, min_length=3):
-            continue
-        seen.add(normalized)
-        keyterms.append({"term": normalized, "score": float(score)})
-        if len(keyterms) >= requested_top_k:
-            break
-    return ToolExecutionResult(payload={"rows": keyterms})
+    group_by = str(params.get("group_by", params.get("group_field", "")) or "").strip()
+
+    def _keyterms_for_bucket(bucket_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        joined = "\n".join(_row_analysis_text(row) for row in bucket_rows)
+        bucket_keyterms = []
+        seen: set[str] = set()
+        for term, score in textrank_keywords(joined, top_k=max(requested_top_k * 4, 25)):
+            normalized = str(term or "").strip().lower()
+            if normalized in seen or not _valid_noun_lemma(normalized, min_length=3):
+                continue
+            seen.add(normalized)
+            bucket_keyterms.append({"term": normalized, "score": float(score)})
+            if len(bucket_keyterms) >= requested_top_k:
+                break
+        return bucket_keyterms
+
+    if group_by:
+        buckets: defaultdict[str, list[dict[str, Any]]] = defaultdict(list)
+        for row in rows:
+            group_value = str(_first_nonempty_field(row, [group_by, "outlet" if group_by == "source" else "", "source" if group_by == "outlet" else ""]) or "").strip()
+            if not group_value:
+                group_value = "__unknown__"
+            buckets[group_value].append(row)
+        grouped_rows: list[dict[str, Any]] = []
+        for group_value, bucket_rows in sorted(buckets.items(), key=lambda item: item[0].lower()):
+            for rank, item in enumerate(_keyterms_for_bucket(bucket_rows), start=1):
+                grouped_rows.append(
+                    {
+                        **item,
+                        "rank": rank,
+                        group_by: group_value,
+                        "source": group_value if group_by == "source" else group_value if group_by == "outlet" else str(bucket_rows[0].get("source", "")),
+                        "outlet": group_value if group_by == "outlet" else str(bucket_rows[0].get("outlet", bucket_rows[0].get("source", ""))),
+                        "document_count": len(bucket_rows),
+                    }
+                )
+        return ToolExecutionResult(
+            payload={"rows": grouped_rows, **source_metadata},
+            caveats=source_caveats,
+            metadata={"no_data": not grouped_rows, "group_by": group_by, **source_metadata},
+        )
+
+    keyterms = []
+    for rank, item in enumerate(_keyterms_for_bucket(rows), start=1):
+        keyterms.append({**item, "rank": rank, "document_count": len(rows)})
+    return ToolExecutionResult(
+        payload={"rows": keyterms, **source_metadata},
+        caveats=source_caveats,
+        metadata={"no_data": not keyterms, **source_metadata},
+    )
 
 
 def _extract_svo_triples(params: dict[str, Any], deps: dict[str, ToolExecutionResult], context: AgentExecutionContext) -> ToolExecutionResult:
@@ -4149,8 +4268,6 @@ def _time_series_rows_from_named_metrics(
             "attributed_actor",
             "entity_text",
             "entity",
-            "label",
-            "term",
         ]
     )
     date_field = str(params.get("date_field", params.get("time_field", params.get("datetime_field", ""))) or "")
@@ -4162,7 +4279,9 @@ def _time_series_rows_from_named_metrics(
         entity = _canonical_entity(_first_nonempty_field(row, group_candidates))
         if not entity and row.get("topic_id") is not None:
             entity = f"topic_{row.get('topic_id')}"
-        if not entity or (entity not in {"__all__"} and not entity.startswith("topic_") and not _valid_entity_surface(entity)):
+        if not entity:
+            entity = "__all__"
+        if entity not in {"__all__"} and not entity.startswith("topic_") and not _valid_series_surface(entity):
             skipped += 1
             continue
         timestamp = str(_first_nonempty_field(row, [date_field, "month", "period", "time_period", "date", "published_at", "time_bin"]))
@@ -4313,7 +4432,7 @@ def _time_series_aggregate(params: dict[str, Any], deps: dict[str, ToolExecution
         if not entity:
             entity = str(row.get("doc_id") or "__all__")
         entity = _canonical_entity(entity)
-        if entity not in {"__all__"} and not entity.startswith("topic_") and not _valid_entity_surface(entity):
+        if entity not in {"__all__"} and not entity.startswith("topic_") and not _valid_series_surface(entity):
             skipped_rows += 1
             continue
         timestamp = str(_first_nonempty_field(row, [date_field, "month", "period", "time_period", "date", "published_at", "time_bin"]))
@@ -4827,6 +4946,21 @@ def _valid_entity_surface(entity: str) -> bool:
     if re.fullmatch(r"[a-z]+", entity):
         return False
     return bool(re.search(r"[A-Za-z]", entity))
+
+
+def _valid_series_surface(series: str) -> bool:
+    if not series or len(series) < 2:
+        return False
+    if _valid_entity_surface(series):
+        return True
+    lowered = series.lower()
+    if lowered in ENTITY_SURFACE_STOPWORDS:
+        return False
+    if re.fullmatch(r"[0-9a-f]{24,}", lowered):
+        return False
+    if re.fullmatch(r"[\d\s,./:-]+", series):
+        return False
+    return bool(re.search(r"[A-Za-z]", series))
 
 
 def _dependency_rows_for_source(deps: dict[str, ToolExecutionResult], source: str) -> list[dict[str, Any]]:
@@ -5473,7 +5607,12 @@ def _fetch_yfinance_series_rows(
 def _infer_external_series_bounds(left_rows: list[dict[str, Any]], key: str) -> tuple[str, str]:
     values = []
     for row in left_rows:
-        raw = str(row.get(key, row.get("time_bin", row.get("date", "")))).strip()
+        raw = str(
+            _first_nonempty_field(
+                row,
+                [key, "time_bin", "date", "published_at", "month", "period", "time_period"],
+            )
+        ).strip()
         if not raw or raw.lower() in {"unknown", "unkn", "nan", "none", "nat"}:
             continue
         if re.fullmatch(r"\d{4}(-\d{2})?(-\d{2})?", raw):
@@ -5519,21 +5658,26 @@ def _join_external_series(params: dict[str, Any], deps: dict[str, ToolExecutionR
     end = str(params.get("end", params.get("date_to", ""))).strip()
     interval = str(params.get("interval", "1d")).strip() or "1d"
     left_rows: list[dict[str, Any]] = []
+    bound_rows: list[dict[str, Any]] = []
     for result in deps.values():
         payload = result.payload
         if isinstance(payload, dict) and "rows" in payload:
             left_rows = list(payload["rows"])
             if left_rows:
                 break
-    if not left_rows:
-        return ToolExecutionResult(payload={"rows": []}, caveats=["No internal rows available to join with external series."])
+        if isinstance(payload, dict):
+            for key in ("documents", "results"):
+                values = payload.get(key)
+                if isinstance(values, list) and values and not bound_rows:
+                    bound_rows = [dict(item) for item in values if isinstance(item, dict)]
+                    break
 
     caveats: list[str] = []
     provider = "analytics"
     left_key = str(params.get("left_key", "time_bin"))
     right_key = str(params.get("right_key", left_key))
     if ticker and (not start or not end):
-        inferred_start, inferred_end = _infer_external_series_bounds(left_rows, left_key)
+        inferred_start, inferred_end = _infer_external_series_bounds(left_rows or bound_rows, left_key)
         if inferred_start and not start:
             start = inferred_start
         if inferred_end and not end:
@@ -5551,6 +5695,21 @@ def _join_external_series(params: dict[str, Any], deps: dict[str, ToolExecutionR
             provider = "yfinance"
         except Exception as exc:
             caveats.append(f"External market series fetch failed for ticker '{ticker}': {exc}")
+    if not left_rows:
+        if external_rows:
+            caveats.append(
+                "No internal aggregate rows were available to join, so the external series is returned as a standalone time series."
+            )
+            return ToolExecutionResult(
+                payload={"rows": external_rows},
+                caveats=caveats,
+                metadata=_metadata(provider, f"{provider}_external_series", ticker=ticker, interval=interval),
+            )
+        return ToolExecutionResult(
+            payload={"rows": []},
+            caveats=caveats or ["No internal rows or external series rows were available."],
+            metadata={"no_data": True, "ticker": ticker, "interval": interval},
+        )
 
     left_df = pd.DataFrame(left_rows)
     right_df = pd.DataFrame(external_rows)

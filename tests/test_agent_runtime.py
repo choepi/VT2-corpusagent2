@@ -7,6 +7,7 @@ import time
 
 from corpusagent2 import agent_capabilities
 from corpusagent2.agent_backends import InMemoryWorkingSetStore
+from corpusagent2.agent_models import AgentRunState
 from corpusagent2.api import build_app
 from corpusagent2.agent_executor import AgentExecutionSnapshot
 from corpusagent2.python_runner_service import PythonRunnerResult, SandboxArtifact
@@ -227,9 +228,104 @@ def test_search_inputs_apply_swiss_newspaper_source_scope(tmp_path: Path) -> Non
         query_text="climate",
     )
 
-    assert inputs["query"].startswith("(climate) AND source:")
+    assert inputs["query"].startswith("(climate OR klima OR climat")
+    assert ") AND source:" in inputs["query"]
     assert "swissinfoch" in inputs["query"]
     assert "tagesanzeigerch" in inputs["query"]
+
+
+def test_search_inputs_keep_topic_and_filter_explicit_source_comparison(tmp_path: Path) -> None:
+    runtime = build_test_runtime(
+        tmp_path=tmp_path,
+        documents=_sample_documents(),
+        search_rows_by_query=_search_rows(_sample_documents()),
+    )
+
+    inputs = runtime.orchestrator._search_inputs_for_question(
+        "How does NZZ vs Tages-Anzeiger report on football differently?",
+        query_text="NZZ Tages Anzeiger football",
+    )
+    topic_part = inputs["query"].split("AND source:", 1)[0].lower()
+
+    assert "football" in topic_part
+    assert "nzz" not in topic_part
+    assert "tages" not in topic_part
+    assert "source:" in inputs["query"]
+    assert "nzz" in inputs["query"]
+    assert "tagesanzeiger" in inputs["query"]
+
+
+def test_search_inputs_expand_multilingual_topic_aliases_for_scoped_queries(tmp_path: Path) -> None:
+    runtime = build_test_runtime(
+        tmp_path=tmp_path,
+        documents=_sample_documents(),
+        search_rows_by_query=_search_rows(_sample_documents()),
+    )
+
+    football_inputs = runtime.orchestrator._search_inputs_for_question(
+        "How does NZZ vs Tages-Anzeiger report on football differently?",
+        query_text="football",
+    )
+    climate_inputs = runtime.orchestrator._search_inputs_for_question(
+        "Which named entities dominate climate coverage in Swiss newspapers?",
+        query_text="climate",
+    )
+
+    assert "football OR soccer OR fussball" in football_inputs["query"]
+    assert "source:" in football_inputs["query"]
+    assert "climate OR klima OR climat" in climate_inputs["query"]
+    assert "source:" in climate_inputs["query"]
+
+
+def test_entity_trend_heuristic_uses_entity_frequency_table(tmp_path: Path) -> None:
+    docs = _sample_documents()
+    runtime = build_test_runtime(tmp_path=tmp_path, documents=docs, search_rows_by_query=_search_rows(docs))
+    question = "Which named entities dominate climate coverage in Swiss newspapers, and how did that change over time?"
+
+    action = runtime.orchestrator._heuristic_plan(AgentRunState(question=question, rewritten_question=question))
+    assert action.plan_dag is not None
+    nodes = action.plan_dag.nodes
+    search_node = next(node for node in nodes if node.capability == "db_search")
+    table_node = next(node for node in nodes if node.capability == "build_evidence_table")
+    plot_node = next(node for node in nodes if node.capability == "plot_artifact")
+
+    topic_part = str(search_node.inputs["query"]).split("AND source:", 1)[0].lower()
+    assert "climate" in topic_part
+    assert "klima" in topic_part
+    assert "coverage" not in topic_part
+    assert search_node.inputs["query"].startswith("(climate OR klima OR climat")
+    assert table_node.inputs["task"] == "named_entity_frequency"
+    assert table_node.inputs["group_by_time"] is True
+    assert plot_node.inputs["x"] == "time_bin"
+    assert plot_node.inputs["y"] == "mention_count"
+    assert plot_node.inputs["series"] == "entity"
+
+
+def test_source_comparison_heuristic_groups_keyterms_by_outlet(tmp_path: Path) -> None:
+    docs = _sample_documents()
+    runtime = build_test_runtime(tmp_path=tmp_path, documents=docs, search_rows_by_query=_search_rows(docs))
+    question = "How does NZZ vs Tages-Anzeiger report on football differently?"
+
+    action = runtime.orchestrator._heuristic_plan(AgentRunState(question=question, rewritten_question=question))
+    assert action.plan_dag is not None
+    nodes = action.plan_dag.nodes
+    search_node = next(node for node in nodes if node.capability == "db_search")
+    keyterms_node = next(node for node in nodes if node.capability == "extract_keyterms")
+    plot_node = next(node for node in nodes if node.capability == "plot_artifact")
+
+    topic_part = str(search_node.inputs["query"]).split("AND source:", 1)[0].lower()
+    assert "football" in topic_part
+    assert "soccer" in topic_part
+    assert "fussball" in topic_part
+    assert "nzz" not in topic_part
+    assert "tages" not in topic_part
+    assert search_node.inputs["retrieve_all"] is True
+    assert int(search_node.inputs["top_k"]) == 0
+    assert search_node.inputs["retrieval_strategy"] == "exhaustive_analytic"
+    assert keyterms_node.inputs["group_by"] == "outlet"
+    assert plot_node.inputs["x"] == "term"
+    assert plot_node.inputs["y"] == "score"
+    assert plot_node.inputs["series"] == "outlet"
 
 
 def test_search_inputs_replace_wildcard_source_scope(tmp_path: Path) -> None:
@@ -1419,6 +1515,53 @@ def test_derive_summary_does_not_fallback_to_raw_pos_when_noun_table_attempted_b
     summary = runtime.orchestrator._derive_summary(snapshot)
 
     assert "noun_distribution" not in summary
+
+
+def test_fallback_synthesis_surfaces_no_data_tool_caveats(tmp_path: Path) -> None:
+    docs = _sample_documents()
+    runtime = build_test_runtime(
+        tmp_path=tmp_path,
+        documents=docs,
+        search_rows_by_query=_search_rows(docs),
+    )
+    runtime.llm_client = None
+    runtime.orchestrator.llm_client = None
+    caveat = (
+        "No corpus documents matched the requested source filters (nzz, tagesanzeiger); "
+        "the requested outlets may be absent from this corpus."
+    )
+    snapshot = AgentExecutionSnapshot(
+        node_records=[],
+        node_results={
+            "search": ToolExecutionResult(
+                payload={"rows": [], "results": []},
+                caveats=[caveat],
+                metadata={"no_data": True, "no_data_reason": caveat},
+            ),
+            "plot": ToolExecutionResult(
+                payload={"rows": []},
+                caveats=["No rows available for plotting."],
+                metadata={"no_data": True},
+            ),
+        },
+        failures=[],
+        provenance_records=[],
+        selected_docs=[],
+        status="completed",
+    )
+    state = AgentRunState(
+        question="How does NZZ vs Tages-Anzeiger report on football differently?",
+        rewritten_question="Compare NZZ and Tages-Anzeiger football coverage.",
+        force_answer=True,
+    )
+
+    answer = runtime.orchestrator.synthesize(state, snapshot)
+
+    assert "could not produce a supported answer" in answer.answer_text
+    assert caveat in answer.answer_text
+    assert caveat in answer.caveats
+    assert "No rows available for plotting." in answer.caveats
+    assert any("no evidence rows" in item for item in answer.unsupported_parts)
 
 
 def test_derive_summary_ignores_zero_summary_stats_when_analysis_rows_exist(tmp_path: Path) -> None:
