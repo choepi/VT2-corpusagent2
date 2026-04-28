@@ -401,8 +401,12 @@ QUERY_ANCHOR_STOPWORDS = {
     "nouns",
     "overall",
     "over",
+    "perception",
+    "perceptions",
+    "perceived",
     "record",
     "records",
+    "relative",
     "related",
     "relevant",
     "report",
@@ -437,6 +441,7 @@ QUERY_ANCHOR_STOPWORDS = {
     "while",
     "who",
     "whole",
+    "within",
     "why",
     "with",
     "would",
@@ -749,11 +754,25 @@ def _text_rows(dependency_results: dict[str, ToolExecutionResult]) -> list[dict[
 
 
 def _entity_analysis_max_documents() -> int | None:
-    raw = os.getenv("CORPUSAGENT2_ENTITY_ANALYSIS_MAX_DOCS", "2000").strip()
+    raw_env = os.getenv("CORPUSAGENT2_ENTITY_ANALYSIS_MAX_DOCS")
+    if raw_env is None:
+        return None
+    raw = raw_env.strip()
     try:
         value = int(raw)
     except ValueError:
-        return 2000
+        return None
+    if value < 0:
+        return None
+    return max(1, value)
+
+
+def _entity_provider_max_documents() -> int | None:
+    raw = os.getenv("CORPUSAGENT2_ENTITY_PROVIDER_MAX_DOCS", "5000").strip()
+    try:
+        value = int(raw)
+    except ValueError:
+        return 5000
     if value < 0:
         return None
     return max(1, value)
@@ -1754,12 +1773,8 @@ def _sql_search_rows(
     if top_k > 0:
         sql += " LIMIT %s"
         params.append(int(top_k))
-    try:
-        with store._connect() as conn:
-            with conn.cursor() as cursor:
-                cursor.execute(sql, tuple(params))
-                rows = cursor.fetchall()
-    except Exception:
+
+    def _run_relaxed_anchor_search() -> list[Any]:
         hit_parts: list[str] = []
         like_score_parts: list[str] = []
         score_params: list[Any] = []
@@ -1799,7 +1814,17 @@ def _sql_search_rows(
         with store._connect() as conn:
             with conn.cursor() as cursor:
                 cursor.execute(fallback_sql, tuple(fallback_params))
+                return cursor.fetchall()
+
+    try:
+        with store._connect() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(sql, tuple(params))
                 rows = cursor.fetchall()
+    except Exception:
+        rows = _run_relaxed_anchor_search()
+    if not rows:
+        rows = _run_relaxed_anchor_search()
     if not rows:
         return []
     max_score = max((_coerce_score(row[5]) for row in rows), default=0.0)
@@ -3370,6 +3395,16 @@ def _ner(params: dict[str, Any], deps: dict[str, ToolExecutionResult], context: 
     )
     entities: list[dict[str, Any]] = []
     providers = _provider_order("ner", ["spacy", "stanza", "flair", "regex"])
+    provider_limit = _entity_provider_max_documents()
+    provider_order_explicit = os.getenv("CORPUSAGENT2_PROVIDER_ORDER_NER") is not None
+    working_set_count = int(source_metadata.get("working_set_document_count") or source_metadata.get("analyzed_document_count") or len(rows))
+    if provider_limit is not None and working_set_count > provider_limit and not provider_order_explicit:
+        providers = ["regex"]
+        source_caveats.append(
+            f"Provider NER was skipped for this large working set: working_set_document_count {working_set_count} "
+            f"exceeds CORPUSAGENT2_ENTITY_PROVIDER_MAX_DOCS={provider_limit}. "
+            "Set CORPUSAGENT2_ENTITY_PROVIDER_MAX_DOCS=-1 or CORPUSAGENT2_PROVIDER_ORDER_NER to force provider NER."
+        )
     used_provider = "regex"
     for provider in providers:
         try:
@@ -4107,10 +4142,16 @@ def _time_series_source_name(params: dict[str, Any]) -> str:
         params.get(
             "metrics_source",
             params.get(
-                "documents_node",
+                "entities_source",
                 params.get(
-                    "documents_source",
-                    params.get("source", params.get("source_node", params.get("source_node_id", ""))),
+                    "annotations_source",
+                    params.get(
+                        "documents_node",
+                        params.get(
+                            "documents_source",
+                            params.get("source", params.get("source_node", params.get("source_node_id", ""))),
+                        ),
+                    ),
                 ),
             ),
         )
@@ -4243,6 +4284,12 @@ def _time_series_rows_from_named_metrics(
         "doc_count",
         "claim_count",
         "count",
+        "mention_count",
+        "document_frequency",
+        "doc_frequency",
+        "share_of_documents",
+        "share_of_docs",
+        "doc_share",
         "average_score",
         "avg_score",
         "mean_score",
@@ -4270,12 +4317,35 @@ def _time_series_rows_from_named_metrics(
             "entity",
         ]
     )
+    raw_entity_types = params.get("entity_types") or params.get("include_entity_types") or params.get("allowed_entity_labels") or []
+    if isinstance(raw_entity_types, str):
+        allowed_labels = {raw_entity_types.upper()}
+    elif isinstance(raw_entity_types, list):
+        allowed_labels = {str(item).upper() for item in raw_entity_types if str(item).strip()}
+    else:
+        allowed_labels = set()
+    ignored_labels = {"DATE", "TIME", "CARDINAL", "ORDINAL", "QUANTITY", "MONEY", "PERCENT"}
+    label_fields = [
+        str(params.get("entity_label_field", "") or "").strip(),
+        "label",
+        "entity_label",
+        "entity_type",
+        "type",
+    ]
     date_field = str(params.get("date_field", params.get("time_field", params.get("datetime_field", ""))) or "")
     values: defaultdict[tuple[str, str, str], list[float]] = defaultdict(list)
     doc_sets: defaultdict[tuple[str, str], set[str]] = defaultdict(set)
+    period_doc_sets: defaultdict[str, set[str]] = defaultdict(set)
     row_counts: Counter[tuple[str, str]] = Counter()
     skipped = 0
     for row in source_rows:
+        label = str(_first_nonempty_field(row, label_fields) or "").upper()
+        if allowed_labels and label and label not in allowed_labels:
+            skipped += 1
+            continue
+        if not allowed_labels and label in ignored_labels:
+            skipped += 1
+            continue
         entity = _canonical_entity(_first_nonempty_field(row, group_candidates))
         if not entity and row.get("topic_id") is not None:
             entity = f"topic_{row.get('topic_id')}"
@@ -4291,8 +4361,20 @@ def _time_series_rows_from_named_metrics(
         doc_id = str(row.get("doc_id", "") or "").strip()
         if doc_id:
             doc_sets[key].add(doc_id)
+            period_doc_sets[time_bin].add(doc_id)
         for metric in normalized_metrics:
-            if metric in {"document_count", "doc_count", "claim_count", "count"}:
+            if metric in {
+                "document_count",
+                "doc_count",
+                "claim_count",
+                "count",
+                "mention_count",
+                "document_frequency",
+                "doc_frequency",
+                "share_of_documents",
+                "share_of_docs",
+                "doc_share",
+            }:
                 continue
             if metric in {"average_sentiment", "avg_sentiment", "mean_sentiment"}:
                 value = _plot_float(row.get("sentiment_score", row.get("score")))
@@ -4330,6 +4412,18 @@ def _time_series_rows_from_named_metrics(
             rows_by_key[key]["claim_count"] = int(row_count)
         if "count" in normalized_metrics:
             rows_by_key[key]["count"] = int(row_count)
+        if "mention_count" in normalized_metrics:
+            rows_by_key[key]["mention_count"] = int(row_count)
+            rows_by_key[key].setdefault("count", int(row_count))
+        if any(metric in normalized_metrics for metric in ("document_frequency", "doc_frequency")):
+            rows_by_key[key]["document_frequency"] = document_count
+            rows_by_key[key]["doc_frequency"] = document_count
+        if any(metric in normalized_metrics for metric in ("share_of_documents", "share_of_docs", "doc_share")):
+            period_document_count = len(period_doc_sets.get(time_bin, set())) or document_count
+            share = round(document_count / max(period_document_count, 1), 6)
+            rows_by_key[key]["share_of_documents"] = share
+            rows_by_key[key]["share_of_docs"] = share
+            rows_by_key[key]["doc_share"] = share
     for (entity, time_bin, metric), metric_values in values.items():
         target = rows_by_key.setdefault(
             (entity, time_bin),
@@ -5883,6 +5977,8 @@ PLOT_Y_FIELD_PRIORITY = (
     "frequency",
 )
 PLOT_NUMERIC_FIELD_EXCLUDES = {"rank", "id", "doc_id", "topic_id", "year", "month", "day"}
+PLOT_NULL_AXIS_LABELS = {"", "unknown", "unkn", "__unknown__", "none", "null", "nan", "nat", "n/a", "na", "-", "--"}
+PLOT_TIME_AXIS_FIELDS = {"time_bin", "month", "period", "date", "published_at", "year", "time_period", "bucket"}
 
 
 def _normalize_plot_field_name(value: str) -> str:
@@ -5933,6 +6029,15 @@ def _plot_field_has_numeric_values(rows: list[dict[str, Any]], field: str) -> bo
 
 def _plot_field_has_nonzero_numeric_values(rows: list[dict[str, Any]], field: str) -> bool:
     return any((number := _plot_float(row.get(field))) is not None and abs(number) > 1e-12 for row in rows)
+
+
+def _plot_axis_label_is_usable(value: Any, *, time_axis_like: bool = False) -> bool:
+    text = str(value if value is not None else "").strip()
+    if text.lower() in PLOT_NULL_AXIS_LABELS:
+        return False
+    if time_axis_like and text.strip("_").lower() in PLOT_NULL_AXIS_LABELS:
+        return False
+    return True
 
 
 def _resolve_existing_plot_field(
@@ -6193,15 +6298,32 @@ def _plot_artifact(params: dict[str, Any], deps: dict[str, ToolExecutionResult],
             caveats=["No numeric field was available for plotting."],
             metadata={"no_data": True, "no_data_reason": "No numeric plot field available."},
         )
-    points, skipped_points = _prepare_plot_points(structured_rows, x_key=x_key, y_key=y_key, limit=limit)
+    requested_plot_type = str(params.get("plot_type", "") or "").strip().lower()
+    time_axis_like = x_key in PLOT_TIME_AXIS_FIELDS or requested_plot_type in {"line", "time_series", "timeseries"}
+    axis_filtered_rows = [
+        row
+        for row in structured_rows
+        if _plot_axis_label_is_usable(row.get(x_key) if x_key else None, time_axis_like=time_axis_like)
+    ]
+    skipped_axis_rows = len(structured_rows) - len(axis_filtered_rows)
+    if not axis_filtered_rows:
+        return ToolExecutionResult(
+            payload={"rows": []},
+            caveats=[f"Plot field '{x_key}' did not contain usable axis labels."],
+            metadata={"no_data": True, "no_data_reason": f"Missing usable plot x values: {x_key}"},
+        )
+    points, skipped_points = _prepare_plot_points(axis_filtered_rows, x_key=x_key, y_key=y_key, limit=limit)
     if not points:
         return ToolExecutionResult(
             payload={"rows": []},
             caveats=[f"Plot field '{y_key}' did not contain numeric values in the selected rows."],
             metadata={"no_data": True, "no_data_reason": f"Missing usable plot y values: {y_key}"},
         )
+    if skipped_axis_rows:
+        plot_field_caveats.append(f"Skipped {skipped_axis_rows} row(s) with empty or placeholder labels for '{x_key}'.")
     if skipped_points:
         plot_field_caveats.append(f"Skipped {skipped_points} row(s) without numeric values for '{y_key}'.")
+    total_skipped_rows = skipped_axis_rows + skipped_points
     first = [dict(point["row"]) for point in points]
     plot_dir = context.artifacts_dir / "plots"
     plot_dir.mkdir(parents=True, exist_ok=True)
@@ -6218,7 +6340,7 @@ def _plot_artifact(params: dict[str, Any], deps: dict[str, ToolExecutionResult],
             from matplotlib.figure import Figure
     except Exception as exc:
         fallback_params = {**params, "x": x_key, "y": y_key}
-        fallback_target = _write_svg_plot_fallback(params=fallback_params, rows=structured_rows, target=target, plot_name=plot_name)
+        fallback_target = _write_svg_plot_fallback(params=fallback_params, rows=axis_filtered_rows, target=target, plot_name=plot_name)
         return ToolExecutionResult(
             payload={
                 "artifact_path": str(fallback_target),
@@ -6228,7 +6350,7 @@ def _plot_artifact(params: dict[str, Any], deps: dict[str, ToolExecutionResult],
                 "resolved_y": y_key,
                 "resolved_series": series_key,
                 "plotted_row_count": len(first),
-                "skipped_row_count": skipped_points,
+                "skipped_row_count": total_skipped_rows,
             },
             artifacts=[str(fallback_target)],
             caveats=[*plot_field_caveats, f"matplotlib unavailable; generated SVG fallback plot instead: {exc}"],
@@ -6239,7 +6361,7 @@ def _plot_artifact(params: dict[str, Any], deps: dict[str, ToolExecutionResult],
                 "resolved_y": y_key,
                 "resolved_series": series_key,
                 "plotted_row_count": len(first),
-                "skipped_row_count": skipped_points,
+                "skipped_row_count": total_skipped_rows,
             },
         )
     figure_height = max(5.6, min(14.0, 2.7 + (0.34 * len(first))))
@@ -6256,8 +6378,6 @@ def _plot_artifact(params: dict[str, Any], deps: dict[str, ToolExecutionResult],
     }
     topic_like = bool(first and "topic_id" in first[0] and any(item.get("top_terms") for item in first))
     market_overlay_like = bool(first and "market_close" in first[0] and any("count" in item or "score" in item for item in first))
-    requested_plot_type = str(params.get("plot_type", "") or "").strip().lower()
-    time_axis_like = x_key in {"time_bin", "month", "period", "date", "published_at", "year"}
     time_series_like = bool(
         first
         and x_key
@@ -6304,11 +6424,13 @@ def _plot_artifact(params: dict[str, Any], deps: dict[str, ToolExecutionResult],
             axis.legend(handles_1 + handles_2, labels_1 + labels_2, loc="best", fontsize=8, frameon=True)
     elif time_series_like:
         series_by_entity: defaultdict[str, list[tuple[str, float]]] = defaultdict(list)
-        for item in structured_rows:
+        for item in axis_filtered_rows:
             entity = str(item.get(series_key, "")) if series_key else ""
             if not entity:
                 entity = str(item.get("entity", item.get("actor", item.get("label", item.get("term", "__all__")))))
             time_value = str(item.get(x_key, item.get("time_bin", "unknown")))
+            if not _plot_axis_label_is_usable(time_value, time_axis_like=True):
+                continue
             value = _plot_float(item.get(y_key, item.get("count", item.get("score", item.get("weight", item.get("intensity", 0.0))))))
             if value is None:
                 continue
@@ -6408,7 +6530,7 @@ def _plot_artifact(params: dict[str, Any], deps: dict[str, ToolExecutionResult],
             "resolved_y": y_key,
             "resolved_series": series_key,
             "plotted_row_count": len(first),
-            "skipped_row_count": skipped_points,
+            "skipped_row_count": total_skipped_rows,
         },
         artifacts=[str(target)],
         caveats=plot_field_caveats,
@@ -6417,7 +6539,7 @@ def _plot_artifact(params: dict[str, Any], deps: dict[str, ToolExecutionResult],
             "resolved_y": y_key,
             "resolved_series": series_key,
             "plotted_row_count": len(first),
-            "skipped_row_count": skipped_points,
+            "skipped_row_count": total_skipped_rows,
         },
     )
 

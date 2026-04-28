@@ -20,6 +20,7 @@ from corpusagent2.agent_capabilities import (
     _extract_keyterms,
     _join_external_series,
     _lang_id,
+    _ner,
     _plot_artifact,
     _sql_query_search,
     _time_series_aggregate,
@@ -579,6 +580,40 @@ def test_plot_artifact_resolves_month_and_series_aliases(tmp_path: Path) -> None
     assert result.payload["resolved_y"] == "document_frequency"
     assert result.payload["resolved_series"] == "linked_entity"
     assert agent_capabilities._image_has_visual_content(Path(result.payload["artifact_path"]))
+
+
+def test_plot_artifact_skips_placeholder_time_axis_labels(tmp_path: Path) -> None:
+    context = AgentExecutionContext(
+        run_id="run",
+        artifacts_dir=tmp_path,
+        search_backend=None,
+        working_store=InMemoryWorkingSetStore(),
+        runtime=None,
+    )
+    deps = {
+        "table": ToolExecutionResult(
+            payload={
+                "rows": [
+                    {"time_bin": "2017-01", "entity": "__all__", "count": 4},
+                    {"time_bin": "unkn", "entity": "__all__", "count": 999},
+                    {"time_bin": "unknown", "entity": "__all__", "count": 888},
+                    {"time_bin": "2017-02", "entity": "__all__", "count": 6},
+                ]
+            }
+        )
+    }
+
+    result = _plot_artifact(
+        {"plot_type": "line", "x": "time_bin", "y": "count", "series": "entity", "title": "Timeline"},
+        deps,
+        context,
+    )
+
+    assert result.artifacts
+    assert [row["time_bin"] for row in result.payload["rows"]] == ["2017-01", "2017-02"]
+    assert result.payload["plotted_row_count"] == 2
+    assert result.payload["skipped_row_count"] == 2
+    assert any("placeholder labels" in caveat for caveat in result.caveats)
 
 
 def test_plot_artifact_outputs_nonblank_images_when_called_concurrently(tmp_path: Path) -> None:
@@ -1353,6 +1388,53 @@ def test_time_series_aggregate_falls_back_to_overall_series_for_ungrouped_sentim
     assert result.payload["skipped_row_count"] == 0
 
 
+def test_time_series_aggregate_prefers_entity_source_over_document_source(tmp_path: Path) -> None:
+    context = AgentExecutionContext(
+        run_id="run",
+        artifacts_dir=tmp_path,
+        search_backend=None,
+        working_store=InMemoryWorkingSetStore(),
+        runtime=None,
+    )
+    deps = {
+        "docs": ToolExecutionResult(
+            payload={"rows": [{"doc_id": "a" * 32, "text": "document text", "published_at": "2022-01-01"}]}
+        ),
+        "entities": ToolExecutionResult(
+            payload={
+                "rows": [
+                    {"doc_id": "doc-1", "linked_entity": "City Council", "label": "ORG", "published_at": "2022-01-01"},
+                    {"doc_id": "doc-2", "linked_entity": "City Council", "label": "ORG", "published_at": "2022-01-15"},
+                    {"doc_id": "doc-3", "linked_entity": "Mayor Lee", "label": "PERSON", "published_at": "2022-01-20"},
+                    {"doc_id": "doc-4", "linked_entity": "Zurich", "label": "GPE", "published_at": "2022-01-22"},
+                ]
+            }
+        ),
+    }
+
+    result = _time_series_aggregate(
+        {
+            "documents_source": "docs",
+            "entities_source": "entities",
+            "time_field": "published_at",
+            "entity_field": "linked_entity",
+            "entity_types": ["PERSON", "ORG"],
+            "metrics": ["mention_count", "document_frequency", "share_of_documents"],
+            "granularity": "month",
+        },
+        deps,
+        context,
+    )
+
+    rows = result.payload["rows"]
+    council = next(row for row in rows if row["series_name"] == "City Council")
+    assert council["mention_count"] == 2
+    assert council["document_frequency"] == 2
+    assert council["share_of_documents"] == 0.666667
+    assert all(row["series_name"] != "Zurich" for row in rows)
+    assert result.payload["skipped_row_count"] == 1
+
+
 def test_python_runner_refuses_prose_instead_of_executing_invalid_code(tmp_path: Path) -> None:
     context = AgentExecutionContext(
         run_id="run",
@@ -1458,6 +1540,18 @@ def test_query_anchor_terms_drop_analytic_scaffold_words_for_exhaustive_question
     assert "nouns" not in anchors
     assert "reports" not in anchors
     assert "corpus" not in anchors
+
+
+def test_query_anchor_terms_drop_comparative_filler_words() -> None:
+    anchors = agent_capabilities._query_anchor_terms(
+        "Cristiano Ronaldo Lionel Messi perceptions relative value within"
+    )
+
+    assert "perceptions" not in anchors
+    assert "relative" not in anchors
+    assert "within" not in anchors
+    assert "ronaldo" in anchors
+    assert "messi" in anchors
 
 
 def test_query_anchor_terms_split_hyphenated_topic_terms_and_drop_filler() -> None:
@@ -1779,6 +1873,51 @@ def test_noun_distribution_streams_full_working_set_when_fetch_is_preview(tmp_pa
     assert rows_by_lemma["banana"]["document_frequency"] == 3
     assert result.payload["analyzed_document_count"] == 3
     assert result.metadata["full_working_set"] is True
+
+
+def test_entity_analysis_default_is_uncapped(monkeypatch) -> None:
+    monkeypatch.delenv("CORPUSAGENT2_ENTITY_ANALYSIS_MAX_DOCS", raising=False)
+
+    assert agent_capabilities._entity_analysis_max_documents() is None
+
+
+def test_ner_streams_full_working_set_when_fetch_is_preview(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.delenv("CORPUSAGENT2_ENTITY_ANALYSIS_MAX_DOCS", raising=False)
+    monkeypatch.delenv("CORPUSAGENT2_PROVIDER_ORDER_NER", raising=False)
+    monkeypatch.setenv("CORPUSAGENT2_ENTITY_PROVIDER_MAX_DOCS", "2")
+    store = InMemoryWorkingSetStore()
+    store.record_working_set("run", "all_docs", [{"doc_id": f"doc-{idx}"} for idx in range(1, 4)])
+    store.document_lookup.update(
+        {
+            "doc-1": {"doc_id": "doc-1", "title": "", "text": "Alice met Bob.", "published_at": "2022-01-01", "source": "NZZ"},
+            "doc-2": {"doc_id": "doc-2", "title": "", "text": "Carol visited Zurich.", "published_at": "2022-01-02", "source": "NZZ"},
+            "doc-3": {"doc_id": "doc-3", "title": "", "text": "Daniel spoke in Bern.", "published_at": "2022-01-03", "source": "TA"},
+        }
+    )
+    context = AgentExecutionContext(
+        run_id="run",
+        artifacts_dir=tmp_path,
+        search_backend=_EmptySearchBackend(),
+        working_store=store,
+        runtime=None,
+    )
+    fetch_preview = ToolExecutionResult(
+        payload={
+            "documents": [store.document_lookup["doc-1"]],
+            "working_set_ref": "all_docs",
+            "document_count": 3,
+            "returned_document_count": 1,
+            "documents_truncated": True,
+        }
+    )
+
+    result = _ner({}, {"fetch": fetch_preview}, context)
+
+    assert result.metadata["analyzed_document_count"] == 3
+    assert result.metadata["analysis_document_limit"] is None
+    assert result.metadata["provider"] == "regex"
+    assert not any("capped" in caveat.lower() for caveat in result.caveats)
+    assert any("provider ner was skipped" in caveat.lower() for caveat in result.caveats)
 
 
 def test_extract_keyterms_groups_by_outlet(tmp_path: Path) -> None:

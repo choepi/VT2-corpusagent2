@@ -56,9 +56,11 @@
         <div class="controls">
           <label><input id="forceAnswer" type="checkbox" /> Force answer</label>
           <label><input id="noCache" type="checkbox" /> No cache</label>
+          <label><input id="notifyOnFinish" type="checkbox" checked /> Browser notification</label>
           <button id="runButton" type="button">Run Query</button>
           <button id="abortButton" type="button" class="ghost-button">Abort Current</button>
           <button id="abortAllButton" type="button" class="ghost-button">Abort All</button>
+          <button id="printReportButton" type="button" class="ghost-button">Print / Save PDF</button>
         </div>
       </section>
 
@@ -86,53 +88,7 @@
         <ul id="clarificationHistory"></ul>
       </section>
 
-      <section class="top-grid">
-        <article class="card runtime-card">
-          <div class="section-head">
-            <h2>Runtime Profile</h2>
-            <span id="runtimeModeBadge" class="pill subtle">Loading</span>
-          </div>
-          <div class="llm-settings-panel">
-            <div class="llm-settings-head">
-              <h3>Backend LLM Controls</h3>
-              <span class="pill subtle">Applies to future runs</span>
-            </div>
-            <div class="llm-settings-grid">
-              <div>
-                <label for="llmProvider">Provider</label>
-                <select id="llmProvider">
-                  <option value="uncloseai">UncloseAI / Hermes</option>
-                  <option value="openai">OpenAI</option>
-                </select>
-              </div>
-              <div>
-                <label for="plannerModelInput">Planner model</label>
-                <input id="plannerModelInput" type="text" placeholder="gpt-4.1-mini" />
-              </div>
-              <div>
-                <label for="synthesisModelInput">Synthesis model</label>
-                <input id="synthesisModelInput" type="text" placeholder="gpt-4.1-mini" />
-              </div>
-            </div>
-            <div class="controls llm-settings-controls">
-              <button id="applyLlmSettingsButton" type="button">Apply LLM Settings</button>
-              <button id="resetLlmSettingsButton" type="button" class="ghost-button">Reset To Startup</button>
-            </div>
-            <p id="llmSettingsNote" class="muted">
-              The UI controls update the backend process for future runs only. Restarting the backend returns to the startup `.env` defaults unless you also change them there.
-            </p>
-          </div>
-          <div id="runtimeSummary" class="metric-stack"></div>
-          <h3>Retrieval Health</h3>
-          <div id="retrievalHealth" class="metric-stack"></div>
-          <h3>Installed Providers</h3>
-          <div id="providersInstalled" class="chip-wrap"></div>
-          <h3>Provider Order</h3>
-          <div id="providerOrder" class="chip-wrap"></div>
-          <h3>Execution Notes</h3>
-          <ul id="runtimeNotes"></ul>
-        </article>
-
+      <section class="run-top-grid">
         <article class="card status-card">
           <div class="section-head">
             <h2>Run Status</h2>
@@ -156,6 +112,14 @@
               <span class="metric-label">Total Time</span>
               <strong id="totalTimeCount">n/a</strong>
             </div>
+            <div>
+              <span class="metric-label">Run ID</span>
+              <strong id="runIdText">not saved yet</strong>
+            </div>
+            <div>
+              <span class="metric-label">Saved</span>
+              <strong id="runSavedText">no manifest yet</strong>
+            </div>
           </div>
           <h3>Active Steps</h3>
           <ul id="activeSteps"></ul>
@@ -168,16 +132,7 @@
         </article>
       </section>
 
-      <section class="card transcript-card">
-        <div class="section-head">
-          <h2>Execution Transcript</h2>
-          <span class="pill subtle">Exact tool calls</span>
-        </div>
-        <div id="toolCallSummary" class="metric-strip transcript-strip"></div>
-        <div id="toolCalls" class="stack-panel scroll-panel medium-scroll"></div>
-      </section>
-
-      <section class="main-grid">
+      <section class="main-grid output-grid">
         <article class="card answer-card">
           <div class="section-head">
             <h2>Grounded Answer</h2>
@@ -200,7 +155,92 @@
           <div id="claimVerdicts" class="stack-panel scroll-panel compact-scroll"></div>
         </article>
 
-        <article class="card magic-card">
+        <article class="card artifact-card">
+          <div class="section-head">
+            <h2>Artifacts And Plots</h2>
+            <span class="pill subtle">Inspector</span>
+          </div>
+          <h3>Plots</h3>
+          <div id="plotGallery" class="plot-grid scroll-panel medium-scroll"></div>
+          <h3>Artifacts</h3>
+          <div id="artifactList" class="stack-panel scroll-panel compact-scroll"></div>
+        </article>
+      </section>
+
+      <section class="card evidence-card">
+        <div class="section-head">
+          <h2>Evidence Panel</h2>
+          <span class="pill subtle">Visible on every run</span>
+        </div>
+        <div id="evidenceTable" class="table-scroll"></div>
+        <h3>Selected Documents</h3>
+        <div id="selectedDocs" class="stack-panel scroll-panel tall-scroll"></div>
+      </section>
+
+      <details class="advanced-details">
+        <summary>
+          <span>Advanced Stats And Provenance</span>
+          <small>Runtime profile, exact tool calls, planner DAG, and raw LLM traces</small>
+        </summary>
+
+        <section class="top-grid advanced-grid">
+          <article class="card runtime-card">
+            <div class="section-head">
+              <h2>Runtime Profile</h2>
+              <span id="runtimeModeBadge" class="pill subtle">Loading</span>
+            </div>
+            <div class="llm-settings-panel">
+              <div class="llm-settings-head">
+                <h3>Backend LLM Controls</h3>
+                <span class="pill subtle">Applies to future runs</span>
+              </div>
+              <div class="llm-settings-grid">
+                <div>
+                  <label for="llmProvider">Provider</label>
+                  <select id="llmProvider">
+                    <option value="uncloseai">UncloseAI / Hermes</option>
+                    <option value="openai">OpenAI</option>
+                  </select>
+                </div>
+                <div>
+                  <label for="plannerModelInput">Planner model</label>
+                  <input id="plannerModelInput" type="text" placeholder="gpt-4.1-mini" />
+                </div>
+                <div>
+                  <label for="synthesisModelInput">Synthesis model</label>
+                  <input id="synthesisModelInput" type="text" placeholder="gpt-4.1-mini" />
+                </div>
+              </div>
+              <div class="controls llm-settings-controls">
+                <button id="applyLlmSettingsButton" type="button">Apply LLM Settings</button>
+                <button id="resetLlmSettingsButton" type="button" class="ghost-button">Reset To Startup</button>
+              </div>
+              <p id="llmSettingsNote" class="muted">
+                The UI controls update the backend process for future runs only. Restarting the backend returns to the startup `.env` defaults unless you also change them there.
+              </p>
+            </div>
+            <div id="runtimeSummary" class="metric-stack"></div>
+            <h3>Retrieval Health</h3>
+            <div id="retrievalHealth" class="metric-stack"></div>
+            <h3>Installed Providers</h3>
+            <div id="providersInstalled" class="chip-wrap"></div>
+            <h3>Provider Order</h3>
+            <div id="providerOrder" class="chip-wrap"></div>
+            <h3>Execution Notes</h3>
+            <ul id="runtimeNotes"></ul>
+          </article>
+
+          <article class="card transcript-card">
+            <div class="section-head">
+              <h2>Execution Transcript</h2>
+              <span class="pill subtle">Exact tool calls</span>
+            </div>
+            <div id="toolCallSummary" class="metric-strip transcript-strip"></div>
+            <div id="toolCalls" class="stack-panel scroll-panel medium-scroll"></div>
+          </article>
+        </section>
+
+        <section class="card magic-card">
           <div class="section-head">
             <h2>Magic Box Trace</h2>
             <span class="pill subtle">Planner transparency</span>
@@ -211,31 +251,8 @@
           <div id="planNodes" class="stack-panel scroll-panel compact-scroll"></div>
           <h3>Raw LLM Outputs</h3>
           <div id="llmTraces" class="stack-panel scroll-panel tall-scroll"></div>
-        </article>
-      </section>
-
-      <section class="evidence-grid">
-        <article class="card evidence-card">
-          <div class="section-head">
-            <h2>Evidence Panel</h2>
-            <span class="pill subtle">Visible on every run</span>
-          </div>
-          <div id="evidenceTable" class="table-scroll"></div>
-          <h3>Selected Documents</h3>
-          <div id="selectedDocs" class="stack-panel scroll-panel tall-scroll"></div>
-        </article>
-
-        <article class="card artifact-card">
-          <div class="section-head">
-            <h2>Artifacts And Plots</h2>
-            <span class="pill subtle">Inspector</span>
-          </div>
-          <h3>Artifacts</h3>
-          <div id="artifactList" class="stack-panel scroll-panel compact-scroll"></div>
-          <h3>Plots</h3>
-          <div id="plotGallery" class="plot-grid scroll-panel medium-scroll"></div>
-        </article>
-      </section>
+        </section>
+      </details>
     </main>
 
     <div id="plotModal" class="modal-overlay hidden" aria-hidden="true" hidden>
