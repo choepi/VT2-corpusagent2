@@ -7,7 +7,7 @@ import time
 
 from corpusagent2 import agent_capabilities
 from corpusagent2.agent_backends import InMemoryWorkingSetStore
-from corpusagent2.agent_models import AgentRunState
+from corpusagent2.agent_models import AgentPlanDAG, AgentPlanNode, AgentRunState
 from corpusagent2.api import build_app
 from corpusagent2.agent_executor import AgentExecutionSnapshot
 from corpusagent2.python_runner_service import PythonRunnerResult, SandboxArtifact
@@ -232,7 +232,7 @@ def test_planner_query_repair_compacts_overconstrained_comparative_entity_query(
     assert repaired == "Ronaldo Messi value"
 
 
-def test_search_inputs_apply_swiss_newspaper_source_scope(tmp_path: Path) -> None:
+def test_search_inputs_do_not_invent_swiss_newspaper_source_aliases(tmp_path: Path) -> None:
     runtime = build_test_runtime(
         tmp_path=tmp_path,
         documents=_sample_documents(),
@@ -244,10 +244,8 @@ def test_search_inputs_apply_swiss_newspaper_source_scope(tmp_path: Path) -> Non
         query_text="climate",
     )
 
-    assert inputs["query"].startswith("(climate OR klima OR climat")
-    assert ") AND source:" in inputs["query"]
-    assert "swissinfoch" in inputs["query"]
-    assert "tagesanzeigerch" in inputs["query"]
+    assert inputs["query"].startswith("climate OR klima OR climat")
+    assert "source:" not in inputs["query"]
 
 
 def test_search_inputs_keep_topic_and_filter_explicit_source_comparison(tmp_path: Path) -> None:
@@ -267,8 +265,8 @@ def test_search_inputs_keep_topic_and_filter_explicit_source_comparison(tmp_path
     assert "nzz" not in topic_part
     assert "tages" not in topic_part
     assert "source:" in inputs["query"]
-    assert "nzz" in inputs["query"]
-    assert "tagesanzeiger" in inputs["query"]
+    assert '"NZZ"' in inputs["query"]
+    assert '"Tages-Anzeiger"' in inputs["query"]
 
 
 def test_search_inputs_expand_multilingual_topic_aliases_for_scoped_queries(tmp_path: Path) -> None:
@@ -290,7 +288,7 @@ def test_search_inputs_expand_multilingual_topic_aliases_for_scoped_queries(tmp_
     assert "football OR soccer OR fussball" in football_inputs["query"]
     assert "source:" in football_inputs["query"]
     assert "climate OR klima OR climat" in climate_inputs["query"]
-    assert "source:" in climate_inputs["query"]
+    assert "source:" not in climate_inputs["query"]
 
 
 def test_entity_trend_heuristic_uses_entity_frequency_table(tmp_path: Path) -> None:
@@ -309,7 +307,7 @@ def test_entity_trend_heuristic_uses_entity_frequency_table(tmp_path: Path) -> N
     assert "climate" in topic_part
     assert "klima" in topic_part
     assert "coverage" not in topic_part
-    assert search_node.inputs["query"].startswith("(climate OR klima OR climat")
+    assert search_node.inputs["query"].startswith("climate OR klima OR climat")
     assert table_node.inputs["task"] == "named_entity_frequency"
     assert table_node.inputs["group_by_time"] is True
     assert plot_node.inputs["x"] == "time_bin"
@@ -357,8 +355,51 @@ def test_search_inputs_replace_wildcard_source_scope(tmp_path: Path) -> None:
     )
 
     assert "source:*" not in query
-    assert "source:" in query
-    assert "swissinfoch" in query
+    assert "source:" not in query
+    assert "climate OR klima OR climat" in query
+
+
+def test_normalize_plan_reuses_broad_working_set_for_subsumed_search(tmp_path: Path) -> None:
+    runtime = build_test_runtime(
+        tmp_path=tmp_path,
+        documents=_sample_documents(),
+        search_rows_by_query=_search_rows(_sample_documents()),
+    )
+    dag = AgentPlanDAG(
+        nodes=[
+            AgentPlanNode(
+                node_id="n1",
+                capability="db_search",
+                inputs={
+                    "query": '("Donald Trump" OR "President Trump" OR "candidate Trump" OR Trump)',
+                    "retrieve_all": True,
+                    "top_k": 0,
+                },
+            ),
+            AgentPlanNode(
+                node_id="n14",
+                capability="db_search",
+                inputs={
+                    "query": '("Donald Trump" OR "President Trump" OR Trump) AND (stocks OR equities OR market OR markets OR VIX OR volatility)',
+                    "retrieve_all": True,
+                    "top_k": 0,
+                },
+            ),
+            AgentPlanNode("n15", "fetch_documents", depends_on=["n14"], inputs={}),
+        ],
+    )
+
+    normalized = runtime.orchestrator._normalize_plan_dag(
+        dag,
+        question_text="How did sentiment toward Donald Trump relate to U.S. equity-market volatility?",
+    )
+    n14 = next(node for node in normalized.nodes if node.node_id == "n14")
+
+    assert n14.capability == "filter_working_set"
+    assert n14.tool_name == "working_set_filter"
+    assert n14.depends_on == ["n1"]
+    assert n14.inputs["source_node_id"] == "n1"
+    assert "stocks OR equities" in n14.inputs["query"]
 
 
 def test_selected_docs_keep_retrieval_scores_after_fetch(tmp_path: Path) -> None:
@@ -1543,7 +1584,7 @@ def test_fallback_synthesis_surfaces_no_data_tool_caveats(tmp_path: Path) -> Non
     runtime.llm_client = None
     runtime.orchestrator.llm_client = None
     caveat = (
-        "No corpus documents matched the requested source filters (nzz, tagesanzeiger); "
+        "No corpus documents matched the requested source filters (NZZ, Tages-Anzeiger); "
         "the requested outlets may be absent from this corpus."
     )
     snapshot = AgentExecutionSnapshot(
