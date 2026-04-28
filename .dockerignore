@@ -1,0 +1,13 @@
+.git
+.venv
+.pytest_cache
+__pycache__
+*.pyc
+data
+deploy/data
+outputs
+log
+out
+VT2-corpusagent2
+node_modules
+
