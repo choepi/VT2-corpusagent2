@@ -13,6 +13,7 @@ from corpusagent2 import agent_capabilities
 from corpusagent2.agent_capabilities import (
     AgentExecutionContext,
     _build_evidence_table,
+    _change_point_detect,
     _clean_normalize,
     _create_working_set,
     _db_search,
@@ -289,6 +290,79 @@ def test_filter_working_set_narrows_existing_working_set_without_new_search() ->
     assert result.payload["results"][0]["doc_id"] == "doc-1"
     assert result.payload["source_working_set_ref"] == "broad"
     assert result.metadata["filtered_from_working_set"] is True
+
+
+def test_filter_working_set_applies_nested_payload_filters() -> None:
+    store = InMemoryWorkingSetStore()
+    store.document_lookup.update(
+        {
+            "doc-1": {
+                "doc_id": "doc-1",
+                "title": "Climate report",
+                "text": "Climate policy story.",
+                "published_at": "2018-02-01",
+                "source": "example.ch",
+            },
+            "doc-2": {
+                "doc_id": "doc-2",
+                "title": "Climate report",
+                "text": "Climate policy story.",
+                "published_at": "2018-02-01",
+                "source": "example.com",
+            },
+        }
+    )
+    store.record_working_set(
+        "run",
+        "broad",
+        [{"doc_id": "doc-1", "rank": 1, "score": 1.0}, {"doc_id": "doc-2", "rank": 2, "score": 0.9}],
+    )
+    context = AgentExecutionContext(
+        run_id="run",
+        artifacts_dir=Path("."),
+        search_backend=None,
+        working_store=store,
+        runtime=None,
+    )
+    deps = {"working_set": ToolExecutionResult(payload={"working_set_ref": "broad", "document_count": 2})}
+
+    result = _filter_working_set(
+        {"payload": {"working_set": "working_set", "filters": {"source_contains": ".ch"}}},
+        deps,
+        context,
+    )
+
+    assert result.payload["document_count"] == 1
+    assert result.payload["results"][0]["doc_id"] == "doc-1"
+
+
+def test_filter_working_set_structured_filters_fail_closed_when_metadata_absent() -> None:
+    store = InMemoryWorkingSetStore()
+    store.document_lookup["doc-1"] = {
+        "doc_id": "doc-1",
+        "title": "Climate report",
+        "text": "Climate policy story.",
+        "published_at": "2018-02-01",
+        "source": "example.ch",
+    }
+    store.record_working_set("run", "broad", [{"doc_id": "doc-1", "rank": 1, "score": 1.0}])
+    context = AgentExecutionContext(
+        run_id="run",
+        artifacts_dir=Path("."),
+        search_backend=None,
+        working_store=store,
+        runtime=None,
+    )
+    deps = {"working_set": ToolExecutionResult(payload={"working_set_ref": "broad", "document_count": 1})}
+
+    result = _filter_working_set(
+        {"payload": {"working_set": "working_set", "filters": {"source_country": "Switzerland"}}},
+        deps,
+        context,
+    )
+
+    assert result.payload["document_count"] == 0
+    assert "source_country" in " ".join(result.caveats)
 
 
 def test_clean_normalize_lang_id_and_working_set_flow_preserves_documents() -> None:
@@ -632,6 +706,46 @@ def test_plot_artifact_resolves_month_and_series_aliases(tmp_path: Path) -> None
     assert agent_capabilities._image_has_visual_content(Path(result.payload["artifact_path"]))
 
 
+def test_plot_artifact_keeps_temporal_bins_for_grouped_period_series(tmp_path: Path) -> None:
+    context = AgentExecutionContext(
+        run_id="run",
+        artifacts_dir=tmp_path,
+        search_backend=None,
+        working_store=InMemoryWorkingSetStore(),
+        runtime=None,
+    )
+    rows = [
+        {"period": month, "canonical_entity": entity, "mention_count_normalized": value}
+        for month, values in [
+            ("2017-01", {"SPUR": 0.52, "Federal Council": 0.31, "Paris Agreement": 0.26}),
+            ("2017-02", {"SPUR": 0.42, "Federal Council": 0.36, "Paris Agreement": 0.21}),
+            ("2017-03", {"SPUR": 0.28, "Federal Council": 0.46, "Paris Agreement": 0.34}),
+        ]
+        for entity, value in values.items()
+    ]
+    deps = {"table": ToolExecutionResult(payload={"rows": rows})}
+
+    result = _plot_artifact(
+        {
+            "x": "period",
+            "y": "mention_count_normalized",
+            "series": "canonical_entity",
+            "top_k": 3,
+            "title": "Entity Trend",
+        },
+        deps,
+        context,
+    )
+
+    assert result.artifacts
+    assert result.payload["plot_kind"] == "time_series"
+    assert result.payload["resolved_x"] == "period"
+    assert result.payload["resolved_y"] == "mention_count_normalized"
+    assert result.payload["plotted_row_count"] == len(rows)
+    assert {row["period"] for row in result.payload["rows"]} == {"2017-01", "2017-02", "2017-03"}
+    assert agent_capabilities._image_has_visual_content(Path(result.payload["artifact_path"]))
+
+
 def test_plot_artifact_skips_placeholder_time_axis_labels(tmp_path: Path) -> None:
     context = AgentExecutionContext(
         run_id="run",
@@ -664,6 +778,33 @@ def test_plot_artifact_skips_placeholder_time_axis_labels(tmp_path: Path) -> Non
     assert result.payload["plotted_row_count"] == 2
     assert result.payload["skipped_row_count"] == 2
     assert any("placeholder labels" in caveat for caveat in result.caveats)
+
+
+def test_change_point_detect_skips_placeholder_time_labels(tmp_path: Path) -> None:
+    context = AgentExecutionContext(
+        run_id="run",
+        artifacts_dir=tmp_path,
+        search_backend=None,
+        working_store=InMemoryWorkingSetStore(),
+        runtime=None,
+    )
+    deps = {
+        "series": ToolExecutionResult(
+            payload={
+                "rows": [
+                    {"time_bin": "2017-01", "entity": "Trump", "count": 1},
+                    {"time_bin": "unkn", "entity": "Trump", "count": 999},
+                    {"time_bin": "2017-02", "entity": "Trump", "count": 12},
+                ]
+            }
+        )
+    }
+
+    result = _change_point_detect({}, deps, context)
+
+    assert result.payload["skipped_row_count"] == 1
+    assert all(row["time_bin"] != "unkn" for row in result.payload["rows"])
+    assert any("placeholder" in caveat for caveat in result.caveats)
 
 
 def test_plot_artifact_outputs_nonblank_images_when_called_concurrently(tmp_path: Path) -> None:
@@ -1604,6 +1745,19 @@ def test_query_anchor_terms_drop_comparative_filler_words() -> None:
     assert "messi" in anchors
 
 
+def test_query_anchor_terms_drop_temporal_sentiment_scaffold_words() -> None:
+    anchors = agent_capabilities._query_anchor_terms(
+        "Donald Trump sentiment toward the 2016 campaign through his presidency"
+    )
+
+    assert anchors == ["donald", "trump"]
+    assert "sentiment" not in anchors
+    assert "campaign" not in anchors
+    assert "through" not in anchors
+    assert "his" not in anchors
+    assert "presidency" not in anchors
+
+
 def test_query_anchor_terms_split_hyphenated_topic_terms_and_drop_filler() -> None:
     query = (
         "What is the frequency distribution of individual noun lemmas across "
@@ -1678,6 +1832,40 @@ def test_sql_websearch_query_clauses_preserve_and_between_or_groups() -> None:
     assert "ronaldo" in clauses[0]
     assert " OR " in clauses[0]
     assert "value OR worth" in clauses[1]
+
+
+def test_sql_websearch_query_text_does_not_flatten_nested_or_inside_and() -> None:
+    query = (
+        '"housing affordability" OR "affordable housing" OR '
+        '((housing OR rent* OR renter* OR mortgage* OR home* OR "house prices" OR "housing costs") '
+        'AND (affordab* OR unaffordab* OR expensive OR "cost burden*" OR "price pressure*"))'
+    )
+    anchors = agent_capabilities._query_anchor_terms(query)
+
+    query_text = agent_capabilities._sql_websearch_query_text(query, anchors)
+
+    assert "housing affordability OR affordable housing" in query_text
+    assert " OR home " not in f" {query_text} "
+    assert "housing rent renter mortgage home house prices costs" in query_text
+    assert "affordab unaffordab expensive cost burden price pressure" in query_text
+    assert agent_capabilities._min_required_anchor_hits(query, anchors, top_k=0) > 1
+
+
+def test_row_matches_query_expression_respects_nested_boolean_constraints() -> None:
+    query = (
+        '"housing affordability" OR "affordable housing" OR '
+        '((housing OR rent* OR renter* OR mortgage* OR home* OR "house prices" OR "housing costs") '
+        'AND (affordab* OR unaffordab* OR expensive OR "cost burden*" OR "price pressure*"))'
+    )
+
+    assert agent_capabilities._row_matches_query_expression(
+        {"title": "Apple HomeKit", "text": "Apple wants to automate home accessories and smart speakers."},
+        query,
+    ) is False
+    assert agent_capabilities._row_matches_query_expression(
+        {"title": "Housing costs", "text": "Renters face unaffordable housing and a growing cost burden."},
+        query,
+    ) is True
 
 
 def test_query_anchor_terms_strip_source_filters() -> None:
@@ -1970,6 +2158,80 @@ def test_ner_streams_full_working_set_when_fetch_is_preview(tmp_path: Path, monk
     assert any("provider ner was skipped" in caveat.lower() for caveat in result.caveats)
 
 
+def test_sentiment_streams_full_working_set_when_fetch_is_preview(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("CORPUSAGENT2_PROVIDER_ORDER_SENTIMENT", "heuristic")
+    monkeypatch.delenv("CORPUSAGENT2_SENTIMENT_ANALYSIS_MAX_DOCS", raising=False)
+    store = InMemoryWorkingSetStore()
+    store.record_working_set("run", "all_docs", [{"doc_id": f"doc-{idx}"} for idx in range(1, 4)])
+    store.document_lookup.update(
+        {
+            "doc-1": {"doc_id": "doc-1", "title": "", "text": "Good progress.", "published_at": "2022-01-01", "source": "NZZ"},
+            "doc-2": {"doc_id": "doc-2", "title": "", "text": "Bad decline.", "published_at": "2022-01-02", "source": "NZZ"},
+            "doc-3": {"doc_id": "doc-3", "title": "", "text": "Strong gain.", "published_at": "2022-01-03", "source": "TA"},
+        }
+    )
+    context = AgentExecutionContext(
+        run_id="run",
+        artifacts_dir=tmp_path,
+        search_backend=_EmptySearchBackend(),
+        working_store=store,
+        runtime=None,
+    )
+    fetch_preview = ToolExecutionResult(
+        payload={
+            "documents": [store.document_lookup["doc-1"]],
+            "working_set_ref": "all_docs",
+            "document_count": 3,
+            "returned_document_count": 1,
+            "documents_truncated": True,
+        }
+    )
+
+    result = agent_capabilities._sentiment({}, {"fetch": fetch_preview}, context)
+
+    assert len(result.payload["rows"]) == 3
+    assert result.metadata["analyzed_document_count"] == 3
+    assert result.metadata["documents_from"] == "working_set_ref"
+    assert any("working_set_ref" in caveat for caveat in result.caveats)
+
+
+def test_topic_model_streams_full_working_set_when_fetch_is_preview(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("CORPUSAGENT2_PROVIDER_ORDER_TOPIC_MODEL", "heuristic")
+    monkeypatch.delenv("CORPUSAGENT2_TOPIC_MODEL_ANALYSIS_MAX_DOCS", raising=False)
+    store = InMemoryWorkingSetStore()
+    store.record_working_set("run", "all_docs", [{"doc_id": f"doc-{idx}"} for idx in range(1, 4)])
+    store.document_lookup.update(
+        {
+            "doc-1": {"doc_id": "doc-1", "title": "", "text": "climate emissions policy", "published_at": "2022-01-01", "source": "NZZ"},
+            "doc-2": {"doc_id": "doc-2", "title": "", "text": "housing rent affordability", "published_at": "2022-02-01", "source": "NZZ"},
+            "doc-3": {"doc_id": "doc-3", "title": "", "text": "football club league", "published_at": "2022-03-01", "source": "TA"},
+        }
+    )
+    context = AgentExecutionContext(
+        run_id="run",
+        artifacts_dir=tmp_path,
+        search_backend=_EmptySearchBackend(),
+        working_store=store,
+        runtime=None,
+    )
+    fetch_preview = ToolExecutionResult(
+        payload={
+            "documents": [store.document_lookup["doc-1"]],
+            "working_set_ref": "all_docs",
+            "document_count": 3,
+            "returned_document_count": 1,
+            "documents_truncated": True,
+        }
+    )
+
+    result = _topic_model({}, {"fetch": fetch_preview}, context)
+
+    assert result.metadata["analyzed_document_count"] == 3
+    assert result.metadata["documents_from"] == "working_set_ref"
+    assert {row["time_bin"] for row in result.payload["rows"]} == {"2022-01", "2022-02", "2022-03"}
+    assert any("working_set_ref" in caveat for caveat in result.caveats)
+
+
 def test_extract_keyterms_groups_by_outlet(tmp_path: Path) -> None:
     context = AgentExecutionContext(
         run_id="run",
@@ -2256,6 +2518,12 @@ def test_large_working_set_noun_distribution_can_skip_spacy(monkeypatch, tmp_pat
     assert rows
     assert metadata["provider"] == "heuristic_batch"
     assert "exceeds CORPUSAGENT2_NOUN_SPACY_MAX_DOCS" in metadata["provider_fallback_reason"]
+
+
+def test_noun_spacy_default_is_uncapped(monkeypatch) -> None:
+    monkeypatch.delenv("CORPUSAGENT2_NOUN_SPACY_MAX_DOCS", raising=False)
+
+    assert agent_capabilities._noun_spacy_max_documents() is None
 
 
 def test_large_working_set_noun_distribution_uses_uncapped_sql_when_enabled(monkeypatch, tmp_path: Path) -> None:
