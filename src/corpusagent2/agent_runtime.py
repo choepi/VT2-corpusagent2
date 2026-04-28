@@ -46,33 +46,81 @@ from .tool_registry import ToolRegistry
 from .python_runner_service import DockerPythonRunnerService
 
 TERMINAL_RUN_STATUSES = {"completed", "partial", "failed", "rejected", "needs_clarification", "aborted"}
-SOURCE_SCOPE_ALIASES = {
-    "swiss": (
-        "swissinfoch",
-        "nzzch",
-        "tagesanzeigerch",
-        "blickch",
-        "letempsch",
-        "20minch",
-        "20minuten",
-        "20minutench",
-        "srfch",
-        "rtsch",
-        "watsonch",
-    ),
+SOURCE_CANDIDATE_LEADING_NOISE = {
+    "and",
+    "between",
+    "compare",
+    "compared",
+    "comparison",
+    "did",
+    "difference",
+    "differences",
+    "do",
+    "does",
+    "how",
+    "media",
+    "newspaper",
+    "newspapers",
+    "outlet",
+    "outlets",
+    "press",
+    "source",
+    "sources",
+    "versus",
+    "vs",
+    "what",
+    "which",
 }
-EXPLICIT_SOURCE_SCOPE_ALIASES = (
-    {
-        "filters": ("nzz",),
-        "tokens": ("nzz",),
-        "patterns": (r"\bnzz(?:\.ch)?\b",),
-    },
-    {
-        "filters": ("tagesanzeiger",),
-        "tokens": ("tages", "anzeiger", "tagesanzeiger"),
-        "patterns": (r"\btages[\s-]*anzeiger(?:\.ch)?\b",),
-    },
-)
+SOURCE_CANDIDATE_TRAILING_NOISE = {
+    "about",
+    "and",
+    "compare",
+    "compared",
+    "comparison",
+    "cover",
+    "coverage",
+    "covers",
+    "differ",
+    "different",
+    "differently",
+    "during",
+    "explain",
+    "explained",
+    "explains",
+    "frame",
+    "framed",
+    "frames",
+    "in",
+    "media",
+    "newspaper",
+    "newspapers",
+    "news",
+    "on",
+    "only",
+    "outlet",
+    "outlets",
+    "over",
+    "press",
+    "report",
+    "reported",
+    "reports",
+    "source",
+    "sources",
+    "write",
+    "writes",
+    "wrote",
+}
+SOURCE_CANDIDATE_GENERIC_VALUES = {
+    "media",
+    "news",
+    "newspaper",
+    "newspapers",
+    "outlet",
+    "outlets",
+    "press",
+    "source",
+    "sources",
+}
 TOPIC_QUERY_EXPANSIONS = (
     {
         "triggers": ("football", "soccer", "fussball", "fußball"),
@@ -219,6 +267,7 @@ class MagicBoxOrchestrator:
     _SEARCH_BACKBONE_CAPABILITIES = {"db_search", "sql_query_search"}
     _DOC_RETRIEVAL_BACKBONE_CAPABILITIES = {
         "create_working_set",
+        "filter_working_set",
         "clean_normalize",
         "entity_link",
         "extract_keyterms",
@@ -283,6 +332,130 @@ class MagicBoxOrchestrator:
         if str(payload.get("rejection_reason", "")).strip():
             return True
         return False
+
+    def _search_node_is_full_population(self, node: AgentPlanNode) -> bool:
+        inputs = dict(node.inputs or {})
+        try:
+            top_k = int(inputs.get("top_k", 0) or 0)
+        except (TypeError, ValueError):
+            top_k = 0
+        return bool(inputs.get("retrieve_all")) or top_k == 0
+
+    def _search_reuse_terms(self, query: str) -> set[str]:
+        stopwords = {
+            "a",
+            "an",
+            "and",
+            "by",
+            "candidate",
+            "for",
+            "from",
+            "in",
+            "not",
+            "of",
+            "on",
+            "or",
+            "president",
+            "the",
+            "to",
+            "with",
+        }
+        return {
+            token.lower()
+            for token in re.findall(r"[A-Za-z][A-Za-z0-9]+", str(query or ""))
+            if len(token) >= 3 and token.lower() not in stopwords
+        }
+
+    def _search_query_can_filter_from(self, broad_query: str, narrow_query: str) -> bool:
+        broad = str(broad_query or "").strip()
+        narrow = str(narrow_query or "").strip()
+        if not broad or not narrow or broad == narrow:
+            return False
+        if not re.search(r"\bAND\b", narrow, flags=re.IGNORECASE):
+            return False
+        broad_terms = self._search_reuse_terms(broad)
+        narrow_terms = self._search_reuse_terms(narrow)
+        if len(broad_terms) < 1 or len(narrow_terms) <= len(broad_terms):
+            return False
+        overlap = len(broad_terms & narrow_terms) / max(1, min(len(broad_terms), len(narrow_terms)))
+        return overlap >= 0.5
+
+    def _same_search_constraints(self, first: AgentPlanNode, second: AgentPlanNode) -> bool:
+        first_inputs = dict(first.inputs or {})
+        second_inputs = dict(second.inputs or {})
+        for key in ("date_from", "date_to", "year_balance"):
+            first_value = str(first_inputs.get(key, "") or "").strip()
+            second_value = str(second_inputs.get(key, "") or "").strip()
+            if first_value and second_value and first_value != second_value:
+                return False
+        first_source = "source:" in str(first_inputs.get("query", "")).lower()
+        second_source = "source:" in str(second_inputs.get("query", "")).lower()
+        return first_source == second_source or not first_source
+
+    def _reuse_subsumed_search_branches(self, nodes: list[AgentPlanNode]) -> list[AgentPlanNode]:
+        search_nodes = [
+            node
+            for node in nodes
+            if node.capability in self._SEARCH_BACKBONE_CAPABILITIES and self._search_node_is_full_population(node)
+        ]
+        if len(search_nodes) < 2:
+            return nodes
+        replacements: dict[str, str] = {}
+        for narrow in search_nodes:
+            narrow_query = str(narrow.inputs.get("query", "") if isinstance(narrow.inputs, dict) else "").strip()
+            if not narrow_query:
+                continue
+            broad_candidates = [
+                broad
+                for broad in search_nodes
+                if broad.node_id != narrow.node_id
+                and self._same_search_constraints(broad, narrow)
+                and self._search_query_can_filter_from(
+                    str(broad.inputs.get("query", "") if isinstance(broad.inputs, dict) else ""),
+                    narrow_query,
+                )
+            ]
+            if not broad_candidates:
+                continue
+            broad = min(
+                broad_candidates,
+                key=lambda item: len(self._search_reuse_terms(str(item.inputs.get("query", "")))),
+            )
+            replacements[narrow.node_id] = broad.node_id
+
+        if not replacements:
+            return nodes
+        rewritten: list[AgentPlanNode] = []
+        for node in nodes:
+            if node.node_id in replacements:
+                broad_node_id = replacements[node.node_id]
+                inputs = dict(node.inputs)
+                filtered_inputs = {
+                    "query": str(inputs.get("query", "")).strip(),
+                    "source_node_id": broad_node_id,
+                    "working_set_source_node_id": broad_node_id,
+                }
+                for key in ("date_from", "date_to", "batch_size"):
+                    if inputs.get(key) not in (None, ""):
+                        filtered_inputs[key] = inputs[key]
+                rewritten.append(
+                    AgentPlanNode(
+                        node_id=node.node_id,
+                        capability="filter_working_set",
+                        tool_name="working_set_filter",
+                        inputs=filtered_inputs,
+                        depends_on=[broad_node_id],
+                        optional=node.optional,
+                        cacheable=node.cacheable,
+                        description=(
+                            node.description
+                            or "Filter an existing broad retrieval working set instead of running a second full-corpus search."
+                        ),
+                    )
+                )
+                continue
+            rewritten.append(node)
+        return rewritten
 
     def _normalize_plan_dag(self, dag: AgentPlanDAG, question_text: str = "") -> AgentPlanDAG:
         existing_ids = {node.node_id for node in dag.nodes}
@@ -410,6 +583,7 @@ class MagicBoxOrchestrator:
             self._ensure_source_comparison_nodes(normalized_nodes, unique_node_id)
             if metadata.get("question_family", "") in {"", "generic"}:
                 metadata["question_family"] = "source_comparison"
+        normalized_nodes = self._reuse_subsumed_search_branches(normalized_nodes)
         return AgentPlanDAG(nodes=normalized_nodes, metadata=metadata)
 
     def _needs_temporal_portrayal_analysis(self, text: str) -> bool:
@@ -868,35 +1042,90 @@ class MagicBoxOrchestrator:
             return fallback
         return planned
 
+    def _source_candidate_tokens(self, text: str) -> list[str]:
+        return re.findall(r"[A-Za-z0-9]+(?:[._'-][A-Za-z0-9]+)*", str(text or ""))
+
+    def _trim_source_candidate(self, text: str) -> str:
+        cleaned = re.sub(r"\bsource\s*:\s*", " ", str(text or ""), flags=re.IGNORECASE)
+        cleaned = re.sub(r"^[\s\"'`({\[]+|[\s\"'`)}\].,;:!?]+$", "", cleaned)
+        cleaned = re.sub(
+            r"^(?:how\s+(?:does|do|did)\s+|what\s+(?:does|do|did)\s+|which\s+|compare\s+|comparison\s+of\s+|difference\s+between\s+|between\s+)",
+            "",
+            cleaned,
+            flags=re.IGNORECASE,
+        )
+        cleaned = re.sub(
+            r"\s+\b(?:report|reports|reported|cover|covers|covered|coverage|write|writes|wrote|explain|explains|explained|frame|frames|framed|differ|differs|different|differently|compare|compared|comparison|on|about|over|during|from|only)\b.*$",
+            "",
+            cleaned,
+            flags=re.IGNORECASE,
+        )
+        tokens = self._source_candidate_tokens(cleaned)
+        while tokens and tokens[0].lower().rstrip(".") in SOURCE_CANDIDATE_LEADING_NOISE:
+            tokens = tokens[1:]
+        while tokens and tokens[-1].lower().rstrip(".") in SOURCE_CANDIDATE_TRAILING_NOISE:
+            tokens = tokens[:-1]
+        topic_tail_tokens = {
+            str(trigger).lower()
+            for expansion in TOPIC_QUERY_EXPANSIONS
+            for trigger in expansion.get("triggers", ())
+        }
+        while len(tokens) > 1 and tokens[-1].lower().rstrip(".") in topic_tail_tokens:
+            tokens = tokens[:-1]
+        if not tokens:
+            return ""
+        if tokens[0].isupper() and len(tokens[0]) <= 8 and any(token.islower() for token in tokens[1:]):
+            tokens = tokens[:1]
+        else:
+            prefix: list[str] = []
+            for token in tokens:
+                token_clean = token.strip("._'")
+                if not token_clean:
+                    continue
+                if token_clean.isupper() or token_clean[:1].isupper() or "-" in token_clean:
+                    prefix.append(token)
+                    continue
+                break
+            if prefix and len(prefix) < len(tokens) and (len(prefix) >= 2 or len(tokens) > 4):
+                tokens = prefix
+        candidate = " ".join(tokens).strip()
+        if not candidate:
+            return ""
+        if candidate.lower() in SOURCE_CANDIDATE_GENERIC_VALUES:
+            return ""
+        return candidate
+
+    def _source_scope_candidate_names(self, text: str) -> list[str]:
+        value = str(text or "").strip()
+        if not value:
+            return []
+        candidates: list[str] = []
+        patterns = (
+            r"(.+?)\s+\bvs\.?\b\s+(.+?)(?=\s+\b(?:report|reports|reported|cover|covers|coverage|write|writes|wrote|differ|differs|differently|on|about|over|during)\b|[?.!,;]|$)",
+            r"(.+?)\s+\bversus\b\s+(.+?)(?=\s+\b(?:report|reports|reported|cover|covers|coverage|write|writes|wrote|differ|differs|differently|on|about|over|during)\b|[?.!,;]|$)",
+            r"\b(?:compare|comparison\s+of|difference\s+between|between)\b\s+(.+?)\s+\b(?:and|with|to)\b\s+(.+?)(?=\s+\b(?:report|reports|reported|cover|covers|coverage|write|writes|wrote|differ|differs|differently|on|about|over|during)\b|[?.!,;]|$)",
+        )
+        for pattern in patterns:
+            for match in re.finditer(pattern, value, flags=re.IGNORECASE):
+                left = self._trim_source_candidate(match.group(1))
+                right = self._trim_source_candidate(match.group(2))
+                for candidate in (left, right):
+                    if candidate and candidate.lower() not in {item.lower() for item in candidates}:
+                        candidates.append(candidate)
+        return candidates
+
     def _explicit_source_scope_matches(self, text: str) -> list[dict[str, Any]]:
-        lowered = str(text or "").lower()
         matches: list[dict[str, Any]] = []
-        for alias in EXPLICIT_SOURCE_SCOPE_ALIASES:
-            if any(re.search(pattern, lowered, flags=re.IGNORECASE) for pattern in alias["patterns"]):
-                matches.append(alias)
+        for candidate in self._source_scope_candidate_names(text):
+            tokens = tuple(token.lower().rstrip(".") for token in self._source_candidate_tokens(candidate))
+            matches.append({"filters": (candidate,), "tokens": tokens, "candidate": candidate})
         return matches
 
     def _explicit_source_scope_is_active(self, text: str, matches: list[dict[str, Any]]) -> bool:
-        if not matches:
-            return False
-        lowered = str(text or "").lower()
-        if len(matches) >= 2 and re.search(r"\b(vs\.?|versus|compared? to|between|differ(?:ent|ently)|compare)\b", lowered):
-            return True
-        return bool(
-            re.search(
-                r"\b(?:newspapers?|media|press|outlets?|sources?|publisher|publishers|reports?|coverage)\b",
-                lowered,
-            )
-        )
+        return bool(matches)
 
     def _source_scope_filters_for_question(self, text: str) -> list[str]:
-        lowered = str(text or "").lower()
         filters: list[str] = []
-        if re.search(r"\bswiss\s+(?:newspapers?|media|press|outlets?|sources?)\b", lowered) or re.search(
-            r"\b(?:newspapers?|media|press|outlets?|sources?)\s+in\s+switzerland\b",
-            lowered,
-        ):
-            filters.extend(SOURCE_SCOPE_ALIASES["swiss"])
         explicit_matches = self._explicit_source_scope_matches(text)
         if self._explicit_source_scope_is_active(text, explicit_matches):
             for match in explicit_matches:
@@ -932,10 +1161,13 @@ class MagicBoxOrchestrator:
         matches = self._explicit_source_scope_matches(question_text)
         if not self._explicit_source_scope_is_active(question_text, matches):
             return cleaned
-        for alias in matches:
-            for pattern in alias["patterns"]:
-                cleaned = re.sub(pattern, " ", cleaned, flags=re.IGNORECASE)
-            for token in alias["tokens"]:
+        for source_match in matches:
+            candidate = str(source_match.get("candidate", "")).strip()
+            if candidate:
+                phrase_pattern = r"[\s._'-]+".join(re.escape(token) for token in self._source_candidate_tokens(candidate))
+                if phrase_pattern:
+                    cleaned = re.sub(rf"\b{phrase_pattern}\b", " ", cleaned, flags=re.IGNORECASE)
+            for token in source_match["tokens"]:
                 cleaned = re.sub(rf"\b{re.escape(str(token))}\b", " ", cleaned, flags=re.IGNORECASE)
         cleaned = re.sub(r"\b(?:vs\.?|versus|compared\s+to|compare|between)\b", " ", cleaned, flags=re.IGNORECASE)
         cleaned = re.sub(r"\s+", " ", cleaned)
@@ -967,7 +1199,7 @@ class MagicBoxOrchestrator:
         elif re.search(r"\bsource\s*:", cleaned_query, flags=re.IGNORECASE):
             return cleaned_query
         if not filters:
-            return cleaned_query
+            return self._expand_topic_query(cleaned_query, question_text) or cleaned_query
         rendered = " OR ".join(f'"{item}"' for item in filters)
         return f"({cleaned_query}) AND source:({rendered})"
 
@@ -1656,6 +1888,9 @@ class MagicBoxOrchestrator:
                     "Size retrieval budgets to the question, and never use tiny default retrieval budgets for broad analytical questions. "
                     "When using db_search for ranked retrieval, set top_k and, when helpful, lexical_top_k, dense_top_k, rerank_top_k, and use_rerank based on the scope needed to answer the question faithfully. "
                     "When retrieve_all is true, top_k is only a fallback budget and must not be treated as the analyzed population size. "
+                    "Avoid parallel overlapping retrieve_all db_search branches. If a narrower corpus slice can be derived from a broader retrieved working set, use filter_working_set instead of launching another full-corpus db_search. "
+                    "For outlet/source-scoped questions, add source filters only when the user names specific outlets or the corpus metadata clearly supplies source names; do not invent backend alias lists for broad phrases like a country's newspapers. "
+                    "If outlet spellings or aliases may be needed, surface them in the plan assumptions and keep the source terms separate from the topical retrieval query. "
                     "For analytical frequency tables, use build_evidence_table with supported task names exactly: noun_frequency_distribution for noun/POS lemma counts, and summary_stats for compact aggregate summaries. "
                     "noun_frequency_distribution rows contain lemma, count, relative_frequency, document_frequency, and rank; plot them with x='lemma' and y='count'. "
                     "Do not invent near-synonym task names such as aggregate_token_frequencies unless a tool catalog entry explicitly documents them. "
@@ -1688,6 +1923,8 @@ class MagicBoxOrchestrator:
             "Allowed actions: ask_clarification, emit_plan_dag, grounded_rejection. "
             "If action is emit_plan_dag, plan_dag.nodes must contain at least one executable node with node_id, capability, optional tool_name, inputs, and depends_on. "
             "Choose retrieval budgets and retrieval_strategy values that match question scope instead of relying on tiny generic defaults. "
+            "Avoid redundant parallel full-corpus searches; use filter_working_set for narrower slices that can be derived from an existing broad retrieve_all working set. "
+            "Do not invent source/outlet aliases for broad geographic media phrases; use source filters only for explicit outlet names or metadata-backed source names. "
             "Use documented build_evidence_table task names, especially noun_frequency_distribution for noun/POS lemma counts, and do not plot document evidence rows as aggregate plots."
         )
         try:
