@@ -137,6 +137,7 @@ ENTITY_SURFACE_STOPWORDS = {
     "said", "say", "says", "told", "reported", "announced", "asked", "added",
     "report", "reports", "article", "articles", "story", "stories", "news",
 }
+NULL_AXIS_LABELS = {"", "unknown", "unkn", "__unknown__", "none", "null", "nan", "nat", "n/a", "na", "-", "--"}
 TEMPLATE_TERM_STOPWORDS = {
     "taboola", "window", "push", "container", "placement", "target_type", "target", "type", "mode",
     "mix", "thumbnail", "thumbnails", "interstitial", "gallery", "caption", "close", "photo", "image",
@@ -144,6 +145,10 @@ TEMPLATE_TERM_STOPWORDS = {
     "script", "function", "return", "var", "let", "const", "try", "catch", "error", "undefined",
     "tmr", "banner",
 }
+
+
+def _is_placeholder_axis_label(value: Any) -> bool:
+    return str(value or "").strip().lower() in NULL_AXIS_LABELS
 MACHINE_PAYLOAD_MARKERS = {
     "analytics",
     "article_type",
@@ -244,11 +249,11 @@ def _analysis_text_char_limit() -> int:
 
 
 def _noun_spacy_max_documents() -> int | None:
-    raw = os.getenv("CORPUSAGENT2_NOUN_SPACY_MAX_DOCS", "10000").strip()
+    raw = os.getenv("CORPUSAGENT2_NOUN_SPACY_MAX_DOCS", "-1").strip()
     try:
         value = int(raw)
     except ValueError:
-        return 10000
+        return None
     if value < 0:
         return None
     return max(0, value)
@@ -324,6 +329,8 @@ QUERY_ANCHOR_STOPWORDS = {
     "aggregate",
     "aggregated",
     "all",
+    "america",
+    "american",
     "analysed",
     "analysis",
     "analyze",
@@ -332,15 +339,20 @@ QUERY_ANCHOR_STOPWORDS = {
     "association",
     "associations",
     "associated",
+    "attitude",
+    "attitudes",
     "around",
     "article",
     "articles",
+    "actor",
+    "actors",
     "available",
     "before",
     "been",
     "being",
     "between",
     "breakdown",
+    "administration",
     "change",
     "changed",
     "changes",
@@ -376,6 +388,9 @@ QUERY_ANCHOR_STOPWORDS = {
     "evolve",
     "evolved",
     "evolution",
+    "explain",
+    "explained",
+    "explains",
     "for",
     "frame",
     "framing",
@@ -383,7 +398,10 @@ QUERY_ANCHOR_STOPWORDS = {
     "frequency",
     "from",
     "full",
+    "heightened",
+    "her",
     "have",
+    "his",
     "how",
     "identified",
     "identifying",
@@ -393,43 +411,79 @@ QUERY_ANCHOR_STOPWORDS = {
     "including",
     "individual",
     "into",
+    "its",
     "lemma",
     "lemmas",
+    "media",
     "monthly",
     "most",
+    "news",
+    "newspaper",
+    "newspapers",
     "noun",
     "nouns",
     "overall",
+    "outlet",
+    "outlets",
     "over",
+    "pattern",
+    "patterns",
+    "period",
+    "periods",
     "perception",
     "perceptions",
     "perceived",
+    "portrayal",
+    "portrayed",
+    "presidency",
+    "public",
     "record",
     "records",
     "relative",
     "related",
+    "relation",
+    "relations",
+    "relationship",
+    "relationships",
     "relevant",
+    "discourse",
     "report",
     "reports",
     "result",
     "results",
     "row",
     "rows",
+    "sentiment",
     "shift",
     "shifted",
     "should",
+    "specific",
+    "state",
+    "states",
     "stories",
     "story",
+    "subperiod",
+    "subperiods",
     "such",
+    "swiss",
+    "switzerland",
     "that",
     "the",
     "their",
     "there",
     "this",
+    "through",
     "time",
+    "tone",
+    "tones",
     "toward",
     "towards",
+    "trend",
+    "trends",
     "under",
+    "until",
+    "united",
+    "usa",
     "used",
     "using",
     "weekly",
@@ -551,6 +605,12 @@ def _query_anchor_terms(query: str) -> list[str]:
     resolved_terms: list[str] = []
     resolved_seen: set[str] = set()
     blocked_terms: set[str] = set()
+    if re.search(r"\b(?:19|20)\d{2}\b", text) and re.search(
+        r"\b(?:from|since|starting|started|beginning|began|after|through|until|to)\b",
+        text,
+        flags=re.IGNORECASE,
+    ):
+        blocked_terms.update({"campaign", "presidency", "administration"})
     for match in re.finditer(
         r"['\"]?([A-Za-z][A-Za-z0-9-]+)['\"]?\s+(?:means|refers\s+to|interpreted\s+as)\s+['\"]?([A-Za-z][A-Za-z0-9-]+)['\"]?",
         text,
@@ -559,7 +619,7 @@ def _query_anchor_terms(query: str) -> list[str]:
         blocked_terms.update(part.lower() for part in re.findall(r"[A-Za-z][A-Za-z0-9]+", match.group(1)))
         _add_query_anchor(resolved_terms, resolved_seen, match.group(2), blocked=blocked_terms)
     if resolved_terms:
-        return resolved_terms[:8]
+        return resolved_terms[:16]
     preferred: list[str] = []
     preferred_seen: set[str] = set()
     for match in re.finditer(r"\b[A-Z][A-Za-z0-9]*(?:-[A-Z]?[A-Za-z0-9]+)?\b", text):
@@ -569,20 +629,20 @@ def _query_anchor_terms(query: str) -> list[str]:
     fallback_seen: set[str] = set(preferred_seen)
     for token in re.findall(r"[A-Za-z][A-Za-z0-9-]+", text):
         _add_query_anchor(fallback, fallback_seen, token, blocked=blocked_terms)
-    return [*preferred, *fallback][:8]
+    return [*preferred, *fallback][:16]
 
 
 def _query_or_groups(query: str) -> list[str]:
-    text = _query_without_field_filters(str(query or "")).strip()
+    text = _strip_wrapping_parentheses(_query_without_field_filters(str(query or "")).strip())
     if not text or not re.search(r"\bOR\b|\|", text, flags=re.IGNORECASE):
         return []
     groups: list[str] = []
     seen: set[str] = set()
-    for raw_group in re.split(r"\s+\bOR\b\s+|\s*\|\s*", text, flags=re.IGNORECASE):
+    for raw_group in _split_top_level_boolean(text, "OR"):
         anchors = _query_anchor_terms(raw_group)
         if not anchors:
             continue
-        group = " ".join(anchors[:6]).strip()
+        group = " ".join(anchors[:16]).strip()
         if group and group not in seen:
             seen.add(group)
             groups.append(group)
@@ -608,17 +668,22 @@ def _strip_wrapping_parentheses(text: str) -> str:
     return value
 
 
-def _split_top_level_and_groups(query: str) -> list[str]:
-    text = _query_without_field_filters(str(query or "")).strip()
-    if not text:
-        return []
+def _split_top_level_boolean(text: str, operator: str) -> list[str]:
+    value = str(text or "").strip()
+    operator = str(operator or "").strip().upper()
+    if not value or operator not in {"AND", "OR"}:
+        return [value] if value else []
+    separator_pattern = re.compile(
+        rf"(?:\s+\b{re.escape(operator)}\b\s+|\s*\|\s*)" if operator == "OR" else rf"\s+\b{re.escape(operator)}\b\s+",
+        flags=re.IGNORECASE,
+    )
     groups: list[str] = []
     start = 0
     depth = 0
     quote: str | None = None
     index = 0
-    while index < len(text):
-        char = text[index]
+    while index < len(value):
+        char = value[index]
         if quote:
             if char == quote:
                 quote = None
@@ -636,15 +701,23 @@ def _split_top_level_and_groups(query: str) -> list[str]:
             depth = max(0, depth - 1)
             index += 1
             continue
-        if depth == 0 and re.match(r"\s+AND\s+", text[index:], flags=re.IGNORECASE):
-            groups.append(_strip_wrapping_parentheses(text[start:index]))
-            match = re.match(r"\s+AND\s+", text[index:], flags=re.IGNORECASE)
-            index += len(match.group(0)) if match else 5
-            start = index
-            continue
+        if depth == 0:
+            match = separator_pattern.match(value, index)
+            if match:
+                groups.append(_strip_wrapping_parentheses(value[start:index]))
+                index = match.end()
+                start = index
+                continue
         index += 1
-    groups.append(_strip_wrapping_parentheses(text[start:]))
+    groups.append(_strip_wrapping_parentheses(value[start:]))
     return [group for group in groups if group]
+
+
+def _split_top_level_and_groups(query: str) -> list[str]:
+    text = _strip_wrapping_parentheses(_query_without_field_filters(str(query or "")).strip())
+    if not text:
+        return []
+    return _split_top_level_boolean(text, "AND")
 
 
 def _sql_websearch_query_text(query: str, tokens: list[str]) -> str:
@@ -678,22 +751,23 @@ def _row_matches_query_expression(row: dict[str, Any], query: str) -> bool:
     ).lower()
     if not text.strip():
         return False
-    groups = _split_top_level_and_groups(query)
-    if not groups:
-        anchors = _query_anchor_terms(query)
-        return _anchor_hit_count(text, anchors) >= _min_required_anchor_hits(query, anchors, top_k=0)
-    for group in groups:
-        or_groups = _query_or_groups(group)
-        if or_groups:
-            if not any(_anchor_hit_count(text, anchors.split()) >= 1 for anchors in or_groups):
-                return False
-            continue
-        anchors = _query_anchor_terms(group)
+
+    def matches_expression(expression: str) -> bool:
+        current = _strip_wrapping_parentheses(_query_without_field_filters(str(expression or "")).strip())
+        if not current:
+            return True
+        and_groups = _split_top_level_boolean(current, "AND")
+        if len(and_groups) > 1:
+            return all(matches_expression(group) for group in and_groups)
+        or_groups = _split_top_level_boolean(current, "OR")
+        if len(or_groups) > 1:
+            return any(matches_expression(group) for group in or_groups)
+        anchors = _query_anchor_terms(current)
         if not anchors:
-            continue
-        if _anchor_hit_count(text, anchors) < _min_required_anchor_hits(group, anchors, top_k=0):
-            return False
-    return True
+            return True
+        return _anchor_hit_count(text, anchors) >= _min_exhaustive_anchor_hits(anchors)
+
+    return matches_expression(query)
 
 
 def _payload_or_params(params: dict[str, Any]) -> dict[str, Any]:
@@ -779,7 +853,19 @@ def _text_rows(dependency_results: dict[str, ToolExecutionResult]) -> list[dict[
 
 
 def _entity_analysis_max_documents() -> int | None:
-    raw_env = os.getenv("CORPUSAGENT2_ENTITY_ANALYSIS_MAX_DOCS")
+    return _optional_positive_int_env("CORPUSAGENT2_ENTITY_ANALYSIS_MAX_DOCS")
+
+
+def _topic_model_analysis_max_documents() -> int | None:
+    return _optional_positive_int_env("CORPUSAGENT2_TOPIC_MODEL_ANALYSIS_MAX_DOCS")
+
+
+def _sentiment_analysis_max_documents() -> int | None:
+    return _optional_positive_int_env("CORPUSAGENT2_SENTIMENT_ANALYSIS_MAX_DOCS")
+
+
+def _optional_positive_int_env(name: str) -> int | None:
+    raw_env = os.getenv(name)
     if raw_env is None:
         return None
     raw = raw_env.strip()
@@ -793,11 +879,11 @@ def _entity_analysis_max_documents() -> int | None:
 
 
 def _entity_provider_max_documents() -> int | None:
-    raw = os.getenv("CORPUSAGENT2_ENTITY_PROVIDER_MAX_DOCS", "5000").strip()
+    raw = os.getenv("CORPUSAGENT2_ENTITY_PROVIDER_MAX_DOCS", "-1").strip()
     try:
         value = int(raw)
     except ValueError:
-        return 5000
+        return None
     if value < 0:
         return None
     return max(1, value)
@@ -885,6 +971,7 @@ def _looks_like_plan_node_ref(value: str) -> bool:
 def _resolve_working_set_ref(params: dict[str, Any], dependency_results: dict[str, ToolExecutionResult]) -> str:
     for key in (
         "working_set_ref",
+        "working_set",
         "working_set_from",
         "working_set_source",
         "working_set_source_node",
@@ -903,6 +990,15 @@ def _resolve_working_set_ref(params: dict[str, Any], dependency_results: dict[st
             continue
         return raw
     return _working_set_ref(dependency_results)
+
+
+def _merged_payload_params(params: dict[str, Any]) -> dict[str, Any]:
+    payload = params.get("payload") if isinstance(params.get("payload"), dict) else {}
+    merged = dict(payload)
+    for key, value in params.items():
+        if key != "payload":
+            merged[key] = value
+    return merged
 
 
 def _dependency_payload_flag(dependency_results: dict[str, ToolExecutionResult], key: str) -> bool:
@@ -1221,7 +1317,12 @@ def _min_exhaustive_anchor_hits(anchors: list[str]) -> int:
 def _min_required_anchor_hits(query: str, anchors: list[str], *, top_k: int) -> int:
     if top_k > 0:
         return 1
-    if len(_query_or_groups(query)) > 1:
+    or_groups = _query_or_groups(query)
+    raw_or_groups = _split_top_level_boolean(
+        _strip_wrapping_parentheses(_query_without_field_filters(str(query or "")).strip()),
+        "OR",
+    )
+    if len(or_groups) > 1 and not any(re.search(r"\bAND\b", group, flags=re.IGNORECASE) for group in raw_or_groups):
         return 1
     return _min_exhaustive_anchor_hits(anchors)
 
@@ -1290,7 +1391,7 @@ def _noun_frequency_rows_from_working_set(
     analysis_max_documents = _working_set_analysis_max_documents()
     if analysis_max_documents is not None and working_set_count > analysis_max_documents:
         prefer_spacy = False
-    if not prefer_spacy and _env_flag("CORPUSAGENT2_USE_SQL_TOKEN_AGGREGATE", False):
+    if _env_flag("CORPUSAGENT2_USE_SQL_TOKEN_AGGREGATE", False):
         sql_max_documents = analysis_max_documents if _working_set_analysis_limit_explicit() else None
         sql_result = _sql_noun_frequency_rows_from_working_set(
             context,
@@ -1301,9 +1402,7 @@ def _noun_frequency_rows_from_working_set(
         if sql_result is not None:
             rows, metadata = sql_result
             metadata["working_set_document_count"] = working_set_count
-            metadata["provider_fallback_reason"] = (
-                f"working_set_document_count {working_set_count} exceeds CORPUSAGENT2_NOUN_SPACY_MAX_DOCS={spacy_limit}"
-            )
+            metadata["provider_fallback_reason"] = "CORPUSAGENT2_USE_SQL_TOKEN_AGGREGATE=true"
             return rows, metadata
     rows, metadata = _noun_frequency_rows_from_documents(
         _iter_working_set_documents(context, working_set_ref, max_documents=analysis_max_documents),
@@ -2302,23 +2401,25 @@ def _score_display(value: Any) -> str:
 
 
 def _time_bin(value: str, granularity: str | None = None) -> str:
-    text = str(value)
+    text = str(value).strip()
+    if _is_placeholder_axis_label(text):
+        return "unknown"
     mode = str(granularity or _default_time_granularity()).strip().lower() or "month"
     if mode == "day":
         if len(text) >= 10 and text[4] == "-" and text[7] == "-":
             return text[:10]
         if len(text) >= 7 and text[4] == "-":
             return text[:7]
-        if len(text) >= 4:
+        if re.match(r"^\d{4}", text):
             return text[:4]
         return "unknown"
     if len(text) >= 7 and text[4] == "-":
         return text[:7]
     if mode == "month":
-        if len(text) >= 4:
+        if re.match(r"^\d{4}", text):
             return text[:4]
         return "unknown"
-    if len(text) >= 4:
+    if re.match(r"^\d{4}", text):
         return text[:4]
     return "unknown"
 
@@ -3045,8 +3146,92 @@ def _create_working_set(params: dict[str, Any], deps: dict[str, ToolExecutionRes
     )
 
 
+STRUCTURED_FILTER_ALIASES = {
+    "source": ("source", "outlet", "source_domain", "publisher"),
+    "outlet": ("outlet", "source", "source_domain", "publisher"),
+    "source_name": ("source", "outlet", "source_domain", "publisher"),
+    "publisher": ("publisher", "source", "outlet", "source_domain"),
+    "domain": ("source_domain", "source", "outlet"),
+    "language": ("language", "lang"),
+    "lang": ("lang", "language"),
+    "published_at": ("published_at", "date"),
+    "date": ("date", "published_at"),
+}
+
+
+def _normalise_structured_filter_key(key: str) -> tuple[str, str]:
+    raw = str(key or "").strip()
+    for suffix, mode in (
+        ("_contains", "contains"),
+        ("_in", "in"),
+        ("_equals", "equals"),
+        ("_eq", "equals"),
+    ):
+        if raw.endswith(suffix):
+            return raw[: -len(suffix)], mode
+    return raw, "contains"
+
+
+def _filter_expected_values(value: Any, mode: str) -> list[str]:
+    if isinstance(value, dict):
+        for key in ("contains", "in", "equals", "eq", "value", "values"):
+            if key in value:
+                next_mode = "contains" if key == "contains" else mode
+                return _filter_expected_values(value.get(key), next_mode)
+        return []
+    if isinstance(value, (list, tuple, set)):
+        return [str(item).strip() for item in value if str(item).strip()]
+    text = str(value).strip()
+    return [text] if text else []
+
+
+def _row_filter_actual_values(row: dict[str, Any], key: str) -> tuple[list[str], bool]:
+    base_key, _ = _normalise_structured_filter_key(key)
+    candidate_keys = STRUCTURED_FILTER_ALIASES.get(base_key, (base_key,))
+    values: list[str] = []
+    supported = False
+    for candidate in candidate_keys:
+        if candidate not in row:
+            continue
+        supported = True
+        value = row.get(candidate)
+        if isinstance(value, (list, tuple, set)):
+            values.extend(str(item).strip() for item in value if str(item).strip())
+        elif value not in (None, ""):
+            values.append(str(value).strip())
+    return values, supported
+
+
+def _structured_filter_matches(row: dict[str, Any], filters: dict[str, Any]) -> tuple[bool, set[str]]:
+    unsupported: set[str] = set()
+    for raw_key, expected in filters.items():
+        key, mode = _normalise_structured_filter_key(str(raw_key))
+        actual_values, supported = _row_filter_actual_values(row, key)
+        expected_values = _filter_expected_values(expected, mode)
+        if not expected_values:
+            continue
+        if not supported:
+            unsupported.add(key)
+            return False, unsupported
+        actual_norm = [_normalize_source_filter(value) for value in actual_values]
+        expected_norm = [_normalize_source_filter(value) for value in expected_values]
+        if mode == "equals":
+            matched = any(actual == expected_value for actual in actual_norm for expected_value in expected_norm)
+        elif mode == "in":
+            expected_set = set(expected_norm)
+            matched = any(actual in expected_set for actual in actual_norm)
+        else:
+            matched = any(expected_value in actual for actual in actual_norm for expected_value in expected_norm)
+        if not matched:
+            return False, unsupported
+    return True, unsupported
+
+
 def _filter_working_set(params: dict[str, Any], deps: dict[str, ToolExecutionResult], context: AgentExecutionContext) -> ToolExecutionResult:
+    params = _merged_payload_params(params)
     query = str(params.get("query", "") or "").strip()
+    filters = params.get("filters", params.get("filter", {}))
+    filters = dict(filters) if isinstance(filters, dict) else {}
     upstream_ref = str(params.get("working_set_ref", "") or _resolve_working_set_ref(params, deps)).strip()
     if not upstream_ref:
         return ToolExecutionResult(
@@ -3054,7 +3239,7 @@ def _filter_working_set(params: dict[str, Any], deps: dict[str, ToolExecutionRes
             caveats=["No upstream working_set_ref was available for working-set filtering."],
             metadata={"no_data": True, "no_data_reason": "missing_working_set_ref"},
         )
-    if not query:
+    if not query and not filters:
         count = _count_working_set(context, upstream_ref, 0)
         preview_ids = _fetch_working_set_ids(context, upstream_ref, limit=_result_preview_limit())
         return ToolExecutionResult(
@@ -3084,6 +3269,7 @@ def _filter_working_set(params: dict[str, Any], deps: dict[str, ToolExecutionRes
         )
 
     filtered_rows: list[dict[str, Any]] = []
+    unsupported_filter_keys: set[str] = set()
     offset = 0
     while True:
         batch = fetcher(context.run_id, upstream_ref, limit=batch_size, offset=offset)
@@ -3096,7 +3282,12 @@ def _filter_working_set(params: dict[str, Any], deps: dict[str, ToolExecutionRes
                 continue
             if date_to and published_at and published_at > date_to:
                 continue
-            if _row_matches_query_expression(row, query):
+            if filters:
+                filter_matched, unsupported = _structured_filter_matches(row, filters)
+                unsupported_filter_keys.update(unsupported)
+                if not filter_matched:
+                    continue
+            if not query or _row_matches_query_expression(row, query):
                 filtered_rows.append(
                     {
                         "doc_id": str(row.get("doc_id", "")).strip(),
@@ -3133,10 +3324,22 @@ def _filter_working_set(params: dict[str, Any], deps: dict[str, ToolExecutionRes
     result_count = materialized_count or len(deduped)
     caveats = [
         (
-            f"Filtered upstream working_set_ref='{upstream_ref}' with the requested query instead of running "
+            f"Filtered upstream working_set_ref='{upstream_ref}' with the requested query/metadata filters instead of running "
             f"another full-corpus retrieval; matched {result_count} of {total or offset} upstream documents."
         )
     ]
+    if filters:
+        caveats.append(
+            "Applied structured working-set filters: "
+            + json.dumps(filters, ensure_ascii=False, sort_keys=True)
+            + "."
+        )
+    if unsupported_filter_keys:
+        caveats.append(
+            "Requested working-set filters could not be evaluated from available document metadata: "
+            + ", ".join(sorted(unsupported_filter_keys))
+            + "."
+        )
     if not deduped:
         caveats.append("Working-set filter found no documents matching the requested narrowing query.")
     payload = {
@@ -3764,7 +3967,11 @@ def _extract_svo_triples(params: dict[str, Any], deps: dict[str, ToolExecutionRe
 
 
 def _topic_model(params: dict[str, Any], deps: dict[str, ToolExecutionResult], context: AgentExecutionContext) -> ToolExecutionResult:
-    rows = _doc_rows(deps)
+    rows, source_metadata, source_caveats = _analysis_document_rows_from_deps(
+        deps,
+        context,
+        max_documents=_topic_model_analysis_max_documents(),
+    )
     providers = _provider_order("topic_model", ["textacy", "gensim", "heuristic"])
     payload: list[dict[str, Any]] = []
     used_provider = "heuristic"
@@ -3870,8 +4077,9 @@ def _topic_model(params: dict[str, Any], deps: dict[str, ToolExecutionResult], c
                 }
             )
     return ToolExecutionResult(
-        payload={"rows": payload},
-        metadata=_metadata(used_provider, f"{used_provider}_topic_model"),
+        payload={"rows": payload, **source_metadata},
+        caveats=source_caveats,
+        metadata={**_metadata(used_provider, f"{used_provider}_topic_model"), "no_data": not payload, **source_metadata},
     )
 
 
@@ -4038,7 +4246,11 @@ def _targeted_text_units(
 
 def _sentiment(params: dict[str, Any], deps: dict[str, ToolExecutionResult], context: AgentExecutionContext) -> ToolExecutionResult:
     rows = []
-    docs = _doc_rows(deps)
+    docs, source_metadata, source_caveats = _analysis_document_rows_from_deps(
+        deps,
+        context,
+        max_documents=_sentiment_analysis_max_documents(),
+    )
     units = _targeted_text_units(docs, params, context)
     providers = _provider_order("sentiment", ["flair", "textblob", "heuristic"])
     used_provider = "heuristic"
@@ -4130,8 +4342,9 @@ def _sentiment(params: dict[str, Any], deps: dict[str, ToolExecutionResult], con
                 }
             )
     return ToolExecutionResult(
-        payload={"rows": rows},
-        metadata=_metadata(used_provider, f"{used_provider}_sentiment"),
+        payload={"rows": rows, **source_metadata},
+        caveats=source_caveats,
+        metadata={**_metadata(used_provider, f"{used_provider}_sentiment"), "no_data": not rows, **source_metadata},
     )
 
 
@@ -4741,10 +4954,14 @@ def _change_point_detect(params: dict[str, Any], deps: dict[str, ToolExecutionRe
             series = list(payload["rows"])
             break
     by_entity: defaultdict[str, list[tuple[str, float]]] = defaultdict(list)
+    skipped_rows = 0
     for row in series:
-        by_entity[str(row.get("entity", "__all__"))].append(
-            (str(row.get("time_bin", "unknown")), float(row.get("count", row.get("score", 0.0))))
-        )
+        entity = str(row.get("entity", "__all__"))
+        time_bin = str(row.get("time_bin", "unknown"))
+        if _is_placeholder_axis_label(entity) or _is_placeholder_axis_label(time_bin):
+            skipped_rows += 1
+            continue
+        by_entity[entity].append((time_bin, float(row.get("count", row.get("score", 0.0)))))
     changes = []
     for entity, items in by_entity.items():
         ordered = sorted(items)
@@ -4757,14 +4974,23 @@ def _change_point_detect(params: dict[str, Any], deps: dict[str, ToolExecutionRe
             delta = values[idx] - values[idx - 1]
             if abs(delta) >= threshold:
                 changes.append({"entity": entity, "time_bin": ordered[idx][0], "delta": delta})
-    return ToolExecutionResult(payload={"rows": changes})
+    caveats = []
+    if skipped_rows:
+        caveats.append(f"Skipped {skipped_rows} rows with missing or placeholder change-point labels.")
+    return ToolExecutionResult(payload={"rows": changes, "skipped_row_count": skipped_rows}, caveats=caveats)
 
 
 def _burst_detect(params: dict[str, Any], deps: dict[str, ToolExecutionResult], context: AgentExecutionContext) -> ToolExecutionResult:
     series = _time_series_aggregate(params, deps, context).payload["rows"]
     by_entity: defaultdict[str, list[tuple[str, float]]] = defaultdict(list)
+    skipped_rows = 0
     for row in series:
-        by_entity[str(row.get("entity", "__all__"))].append((str(row.get("time_bin", "unknown")), float(row.get("count", 0))))
+        entity = str(row.get("entity", "__all__"))
+        time_bin = str(row.get("time_bin", "unknown"))
+        if _is_placeholder_axis_label(entity) or _is_placeholder_axis_label(time_bin):
+            skipped_rows += 1
+            continue
+        by_entity[entity].append((time_bin, float(row.get("count", 0))))
     bursts = []
     for entity, items in by_entity.items():
         values = [value for _, value in items]
@@ -4786,7 +5012,10 @@ def _burst_detect(params: dict[str, Any], deps: dict[str, ToolExecutionResult], 
                         "end": time_bin,
                     }
                 )
-    return ToolExecutionResult(payload={"rows": bursts})
+    caveats = []
+    if skipped_rows:
+        caveats.append(f"Skipped {skipped_rows} rows with missing or placeholder burst labels.")
+    return ToolExecutionResult(payload={"rows": bursts, "skipped_row_count": skipped_rows}, caveats=caveats)
 
 
 def _claim_span_extract(params: dict[str, Any], deps: dict[str, ToolExecutionResult], context: AgentExecutionContext) -> ToolExecutionResult:
@@ -5427,6 +5656,7 @@ def _entity_frequency_rows(params: dict[str, Any], deps: dict[str, ToolExecution
     total_docs_by_time: defaultdict[str, set[str]] = defaultdict(set)
     total_mentions = 0
     skipped = 0
+    skipped_time = 0
     label_fields = [
         str(params.get("entity_label_field", "") or "").strip(),
         "label",
@@ -5448,6 +5678,9 @@ def _entity_frequency_rows(params: dict[str, Any], deps: dict[str, ToolExecution
             continue
         time_bin = _entity_row_time_bin(row, timestamp_field)
         time_key = time_bin if group_by_time else "__overall__"
+        if group_by_time and _is_placeholder_axis_label(time_key):
+            skipped_time += 1
+            continue
         doc_id = str(row.get("doc_id", "")).strip()
         key = (entity, time_key)
         mention_counts[key] += 1
@@ -5527,6 +5760,8 @@ def _entity_frequency_rows(params: dict[str, Any], deps: dict[str, ToolExecution
     caveats = []
     if skipped:
         caveats.append(f"Skipped {skipped} entity/actor rows with unsupported labels or unusable names.")
+    if skipped_time:
+        caveats.append(f"Skipped {skipped_time} entity/actor rows with missing or placeholder time values.")
     metadata = {
         "provider": "analytics_entity_frequency",
         "task": task,
@@ -6122,8 +6357,9 @@ PLOT_Y_FIELD_PRIORITY = (
     "frequency",
 )
 PLOT_NUMERIC_FIELD_EXCLUDES = {"rank", "id", "doc_id", "topic_id", "year", "month", "day"}
-PLOT_NULL_AXIS_LABELS = {"", "unknown", "unkn", "__unknown__", "none", "null", "nan", "nat", "n/a", "na", "-", "--"}
+PLOT_NULL_AXIS_LABELS = NULL_AXIS_LABELS
 PLOT_TIME_AXIS_FIELDS = {"time_bin", "month", "period", "date", "published_at", "year", "time_period", "bucket"}
+PLOT_TIME_VALUE_PATTERN = re.compile(r"^\d{4}(?:[-/]\d{1,2}(?:[-/]\d{1,2})?)?(?:[ T]\d{1,2}:\d{2}(?::\d{2})?)?$")
 
 
 def _normalize_plot_field_name(value: str) -> str:
@@ -6183,6 +6419,34 @@ def _plot_axis_label_is_usable(value: Any, *, time_axis_like: bool = False) -> b
     if time_axis_like and text.strip("_").lower() in PLOT_NULL_AXIS_LABELS:
         return False
     return True
+
+
+def _plot_field_looks_time_like(rows: list[dict[str, Any]], field: str) -> bool:
+    if not field:
+        return False
+    normalized = str(field).strip().lower()
+    if normalized in PLOT_TIME_AXIS_FIELDS or any(token in normalized for token in ("time", "date", "month", "period", "year")):
+        return True
+    sampled = 0
+    matched = 0
+    for row in rows:
+        value = row.get(field)
+        if not _plot_axis_label_is_usable(value, time_axis_like=True):
+            continue
+        sampled += 1
+        if PLOT_TIME_VALUE_PATTERN.match(str(value).strip()):
+            matched += 1
+        if sampled >= 50:
+            break
+    return bool(sampled and matched / sampled >= 0.8)
+
+
+def _infer_plot_series_field(rows: list[dict[str, Any]]) -> str:
+    for candidate in PLOT_FIELD_ALIASES["series"]:
+        resolved = _resolve_existing_plot_field(rows, candidate, require_numeric=False)
+        if resolved and _plot_field_coverage(rows, resolved) > 0:
+            return resolved
+    return ""
 
 
 def _resolve_existing_plot_field(
@@ -6305,6 +6569,65 @@ def _prepare_plot_points(
         if len(points) >= limit:
             break
     return points, skipped
+
+
+def _time_series_plot_series(row: dict[str, Any], series_key: str) -> str:
+    if series_key:
+        label = str(row.get(series_key, "")).strip()
+        if _plot_axis_label_is_usable(label):
+            return _plot_label(label, width=34)
+    for fallback in (
+        "canonical_entity",
+        "linked_entity",
+        "entity",
+        "actor",
+        "target_entity",
+        "target_label",
+        "series_name",
+        "label",
+        "term",
+    ):
+        label = str(row.get(fallback, "")).strip()
+        if _plot_axis_label_is_usable(label):
+            return _plot_label(label, width=34)
+    return "All rows"
+
+
+def _prepare_time_series_plot_data(
+    rows: list[dict[str, Any]],
+    *,
+    x_key: str,
+    y_key: str,
+    series_key: str,
+    series_limit: int,
+) -> tuple[list[dict[str, Any]], list[tuple[str, list[tuple[str, float, dict[str, Any]]]]], list[str], int]:
+    series_by_label: defaultdict[str, list[tuple[str, float, dict[str, Any]]]] = defaultdict(list)
+    skipped = 0
+    for row in rows:
+        time_value = str(row.get(x_key, row.get("time_bin", ""))).strip()
+        if not _plot_axis_label_is_usable(time_value, time_axis_like=True):
+            skipped += 1
+            continue
+        value = _plot_float(row.get(y_key, row.get("count", row.get("score", row.get("weight", row.get("intensity", 0.0))))))
+        if value is None:
+            skipped += 1
+            continue
+        series_by_label[_time_series_plot_series(row, series_key)].append((time_value, value, row))
+    top_series = sorted(
+        series_by_label.items(),
+        key=lambda entry: sum(value for _, value, _ in entry[1]),
+        reverse=True,
+    )[: max(1, series_limit)]
+    all_bins = sorted({time_bin for _, points in top_series for time_bin, _, _ in points})
+    plotted_rows: list[dict[str, Any]] = []
+    for series_label, points in top_series:
+        for time_bin, value, row in sorted(points, key=lambda item: item[0]):
+            plotted_row = dict(row)
+            plotted_row["_plot_series"] = series_label
+            plotted_row["_plot_time_bin"] = time_bin
+            plotted_row["_plot_value"] = value
+            plotted_rows.append(plotted_row)
+    return plotted_rows, top_series, all_bins, skipped
 
 
 def _svg_escape(value: object) -> str:
@@ -6444,7 +6767,12 @@ def _plot_artifact(params: dict[str, Any], deps: dict[str, ToolExecutionResult],
             metadata={"no_data": True, "no_data_reason": "No numeric plot field available."},
         )
     requested_plot_type = str(params.get("plot_type", "") or "").strip().lower()
-    time_axis_like = x_key in PLOT_TIME_AXIS_FIELDS or requested_plot_type in {"line", "time_series", "timeseries"}
+    time_axis_like = (
+        requested_plot_type in {"line", "time_series", "timeseries"}
+        or _plot_field_looks_time_like(structured_rows, x_key)
+    )
+    if not series_key and time_axis_like:
+        series_key = _infer_plot_series_field(structured_rows)
     axis_filtered_rows = [
         row
         for row in structured_rows
@@ -6457,8 +6785,34 @@ def _plot_artifact(params: dict[str, Any], deps: dict[str, ToolExecutionResult],
             caveats=[f"Plot field '{x_key}' did not contain usable axis labels."],
             metadata={"no_data": True, "no_data_reason": f"Missing usable plot x values: {x_key}"},
         )
-    points, skipped_points = _prepare_plot_points(axis_filtered_rows, x_key=x_key, y_key=y_key, limit=limit)
-    if not points:
+    topic_like_source = bool(axis_filtered_rows and "topic_id" in axis_filtered_rows[0] and any(item.get("top_terms") for item in axis_filtered_rows))
+    market_overlay_like_source = bool(
+        axis_filtered_rows and "market_close" in axis_filtered_rows[0] and any("count" in item or "score" in item for item in axis_filtered_rows)
+    )
+    time_series_like = bool(
+        axis_filtered_rows
+        and x_key
+        and not topic_like_source
+        and not market_overlay_like_source
+        and (requested_plot_type in {"line", "time_series", "timeseries"} or (series_key and time_axis_like))
+    )
+    points: list[dict[str, Any]] = []
+    skipped_points = 0
+    time_series_data: tuple[list[dict[str, Any]], list[tuple[str, list[tuple[str, float, dict[str, Any]]]]], list[str], int] | None = None
+    if time_series_like:
+        series_limit = _int_param(params, "series_top_k", "max_series", default=5, maximum=12)
+        time_series_data = _prepare_time_series_plot_data(
+            axis_filtered_rows,
+            x_key=x_key,
+            y_key=y_key,
+            series_key=series_key,
+            series_limit=series_limit,
+        )
+        first, _, _, skipped_points = time_series_data
+    else:
+        points, skipped_points = _prepare_plot_points(axis_filtered_rows, x_key=x_key, y_key=y_key, limit=limit)
+        first = [dict(point["row"]) for point in points]
+    if not first:
         return ToolExecutionResult(
             payload={"rows": []},
             caveats=[f"Plot field '{y_key}' did not contain numeric values in the selected rows."],
@@ -6467,9 +6821,20 @@ def _plot_artifact(params: dict[str, Any], deps: dict[str, ToolExecutionResult],
     if skipped_axis_rows:
         plot_field_caveats.append(f"Skipped {skipped_axis_rows} row(s) with empty or placeholder labels for '{x_key}'.")
     if skipped_points:
-        plot_field_caveats.append(f"Skipped {skipped_points} row(s) without numeric values for '{y_key}'.")
+        if time_series_like:
+            plot_field_caveats.append(f"Skipped {skipped_points} row(s) without usable time-series values.")
+        else:
+            plot_field_caveats.append(f"Skipped {skipped_points} row(s) without numeric values for '{y_key}'.")
     total_skipped_rows = skipped_axis_rows + skipped_points
-    first = [dict(point["row"]) for point in points]
+    plot_kind = (
+        "topic_bar"
+        if topic_like_source
+        else "market_overlay"
+        if market_overlay_like_source
+        else "time_series"
+        if time_series_like
+        else "bar"
+    )
     plot_dir = context.artifacts_dir / "plots"
     plot_dir.mkdir(parents=True, exist_ok=True)
     raw_plot_name = str(params.get("plot_name") or params.get("title") or "plot").strip() or "plot"
@@ -6494,6 +6859,7 @@ def _plot_artifact(params: dict[str, Any], deps: dict[str, ToolExecutionResult],
                 "resolved_x": x_key,
                 "resolved_y": y_key,
                 "resolved_series": series_key,
+                "plot_kind": plot_kind,
                 "plotted_row_count": len(first),
                 "skipped_row_count": total_skipped_rows,
             },
@@ -6505,30 +6871,20 @@ def _plot_artifact(params: dict[str, Any], deps: dict[str, ToolExecutionResult],
                 "resolved_x": x_key,
                 "resolved_y": y_key,
                 "resolved_series": series_key,
+                "plot_kind": plot_kind,
                 "plotted_row_count": len(first),
                 "skipped_row_count": total_skipped_rows,
             },
         )
-    figure_height = max(5.6, min(14.0, 2.7 + (0.34 * len(first))))
+    figure_height = 6.6 if time_series_like else max(5.6, min(14.0, 2.7 + (0.34 * len(first))))
     figure = Figure(figsize=(13.2, figure_height), dpi=180)
     FigureCanvasAgg(figure)
     axis = figure.subplots()
     axis.grid(axis="x", color="#d9d2c3", linewidth=0.8, alpha=0.55)
     axis.grid(axis="y", visible=False)
     axis.tick_params(axis="both", labelsize=8.5, colors="#17312d")
-    unique_time_bins = {
-        str(item.get(x_key, item.get("time_bin", "unknown")))
-        for item in first
-        if item.get(x_key, item.get("time_bin")) is not None
-    }
     topic_like = bool(first and "topic_id" in first[0] and any(item.get("top_terms") for item in first))
     market_overlay_like = bool(first and "market_close" in first[0] and any("count" in item or "score" in item for item in first))
-    time_series_like = bool(
-        first
-        and x_key
-        and len(unique_time_bins) > 1
-        and (requested_plot_type in {"line", "time_series", "timeseries"} or series_key or time_axis_like)
-    )
 
     if topic_like:
         labels = []
@@ -6568,30 +6924,13 @@ def _plot_artifact(params: dict[str, Any], deps: dict[str, ToolExecutionResult],
         if handles_1 or handles_2:
             axis.legend(handles_1 + handles_2, labels_1 + labels_2, loc="best", fontsize=8, frameon=True)
     elif time_series_like:
-        series_by_entity: defaultdict[str, list[tuple[str, float]]] = defaultdict(list)
-        for item in axis_filtered_rows:
-            entity = str(item.get(series_key, "")) if series_key else ""
-            if not entity:
-                entity = str(item.get("entity", item.get("actor", item.get("label", item.get("term", "__all__")))))
-            time_value = str(item.get(x_key, item.get("time_bin", "unknown")))
-            if not _plot_axis_label_is_usable(time_value, time_axis_like=True):
-                continue
-            value = _plot_float(item.get(y_key, item.get("count", item.get("score", item.get("weight", item.get("intensity", 0.0))))))
-            if value is None:
-                continue
-            series_by_entity[entity].append((time_value, value))
-        top_entities = sorted(
-            series_by_entity.items(),
-            key=lambda entry: sum(value for _, value in entry[1]),
-            reverse=True,
-        )[:5]
-        all_bins = sorted({time_bin for _, points in top_entities for time_bin, _ in points})
+        _, top_entities, all_bins, _ = time_series_data or ([], [], [], 0)
         x_lookup = {time_bin: index for index, time_bin in enumerate(all_bins)}
         x_values = list(range(len(all_bins)))
-        palette = ["#0f766e", "#b45309", "#7c3aed", "#be123c", "#2563eb"]
+        palette = ["#0f766e", "#b45309", "#7c3aed", "#be123c", "#2563eb", "#0f4c81", "#7c2d12", "#166534"]
         for index, (entity, points) in enumerate(top_entities):
             values_by_bin: defaultdict[str, float] = defaultdict(float)
-            for time_bin, value in points:
+            for time_bin, value, _ in points:
                 values_by_bin[time_bin] += value
             y_values = [values_by_bin.get(time_bin, 0.0) for time_bin in all_bins]
             axis.plot(
@@ -6608,10 +6947,10 @@ def _plot_artifact(params: dict[str, Any], deps: dict[str, ToolExecutionResult],
             tick_values = [x_lookup[time_bin] for idx, time_bin in enumerate(all_bins) if idx % step == 0]
             tick_labels = [time_bin for idx, time_bin in enumerate(all_bins) if idx % step == 0]
             axis.set_xticks(tick_values, tick_labels, rotation=35, ha="right")
-        axis.set_ylabel("Signal")
+        axis.set_ylabel(y_key.replace("_", " ").title() or "Signal")
         handles, labels = axis.get_legend_handles_labels()
         if handles:
-            axis.legend(loc="best", fontsize=8, frameon=True)
+            axis.legend(loc="upper left", bbox_to_anchor=(1.01, 1.0), fontsize=8, frameon=True)
     else:
         labels = [point["label"] for point in points]
         values = [float(point["value"]) for point in points]
@@ -6674,6 +7013,7 @@ def _plot_artifact(params: dict[str, Any], deps: dict[str, ToolExecutionResult],
             "resolved_x": x_key,
             "resolved_y": y_key,
             "resolved_series": series_key,
+            "plot_kind": plot_kind,
             "plotted_row_count": len(first),
             "skipped_row_count": total_skipped_rows,
         },
@@ -6683,6 +7023,7 @@ def _plot_artifact(params: dict[str, Any], deps: dict[str, ToolExecutionResult],
             "resolved_x": x_key,
             "resolved_y": y_key,
             "resolved_series": series_key,
+            "plot_kind": plot_kind,
             "plotted_row_count": len(first),
             "skipped_row_count": total_skipped_rows,
         },

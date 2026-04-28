@@ -216,6 +216,78 @@ def test_planner_query_repair_replaces_scope_only_query_with_topic(tmp_path: Pat
     assert orchestrator._repair_search_query("America", fallback_query) == "oil price"
 
 
+def test_planner_query_repair_drops_analysis_scaffold_from_entity_query(tmp_path: Path) -> None:
+    runtime = build_test_runtime(
+        tmp_path=tmp_path,
+        documents=_sample_documents(),
+        search_rows_by_query=_search_rows(_sample_documents()),
+    )
+    orchestrator = runtime.orchestrator
+    fallback_query = orchestrator._compact_query_terms(
+        "How did sentiment toward Donald Trump change from the 2016 campaign through his presidency?",
+        orchestrator._query_anchor_terms(
+            "How did sentiment toward Donald Trump change from the 2016 campaign through his presidency?"
+        ),
+    )
+
+    assert fallback_query == "Donald Trump"
+    assert (
+        orchestrator._repair_search_query(
+            "Donald Trump sentiment toward campaign through his presidency",
+            fallback_query,
+        )
+        == "Donald Trump"
+    )
+
+
+def test_single_year_open_ended_range_keeps_open_date_to(tmp_path: Path) -> None:
+    runtime = build_test_runtime(
+        tmp_path=tmp_path,
+        documents=_sample_documents(),
+        search_rows_by_query=_search_rows(_sample_documents()),
+    )
+    orchestrator = runtime.orchestrator
+
+    assert orchestrator._extract_date_window("from the 2016 campaign through his presidency") == {
+        "date_from": "2016-01-01"
+    }
+    assert orchestrator._extract_date_window("Ukraine war in 2022") == {
+        "date_from": "2022-01-01",
+        "date_to": "2022-12-31",
+    }
+
+
+def test_plan_normalization_removes_planner_invented_same_year_end_for_open_range(tmp_path: Path) -> None:
+    runtime = build_test_runtime(
+        tmp_path=tmp_path,
+        documents=_sample_documents(),
+        search_rows_by_query=_search_rows(_sample_documents()),
+    )
+    question = "How did sentiment toward Donald Trump change from the 2016 campaign through his presidency?"
+    dag = AgentPlanDAG(
+        nodes=[
+            AgentPlanNode(
+                "search",
+                "db_search",
+                inputs={
+                    "query": "Donald Trump sentiment toward campaign through his presidency",
+                    "date_from": "2016-01-01",
+                    "date_to": "2016-12-31",
+                    "retrieve_all": True,
+                    "top_k": 0,
+                },
+            )
+        ],
+    )
+
+    normalized = runtime.orchestrator._normalize_plan_dag(dag, question_text=question)
+    search_inputs = normalized.nodes[0].inputs
+
+    assert search_inputs["query"] == "Donald Trump"
+    assert search_inputs["date_from"] == "2016-01-01"
+    assert "date_to" not in search_inputs
+
+
 def test_planner_query_repair_compacts_overconstrained_comparative_entity_query(tmp_path: Path) -> None:
     runtime = build_test_runtime(
         tmp_path=tmp_path,
@@ -267,6 +339,53 @@ def test_search_inputs_keep_topic_and_filter_explicit_source_comparison(tmp_path
     assert "source:" in inputs["query"]
     assert '"NZZ"' in inputs["query"]
     assert '"Tages-Anzeiger"' in inputs["query"]
+
+
+def test_source_scope_does_not_treat_year_range_as_outlets(tmp_path: Path) -> None:
+    runtime = build_test_runtime(
+        tmp_path=tmp_path,
+        documents=_sample_documents(),
+        search_rows_by_query=_search_rows(_sample_documents()),
+    )
+    question = "How did portrayals of the American president in Republican media change between 2015 and 2018?"
+
+    assert runtime.orchestrator._source_scope_filters_for_question(question) == []
+    query = runtime.orchestrator._apply_source_scope_to_query(
+        "Republican portrayals president",
+        question,
+    )
+
+    assert "source:" not in query
+    assert "2015" not in query
+    assert "2018" not in query
+    repaired = runtime.orchestrator._apply_source_scope_to_query(
+        '(Republican portrayals president) AND source:("2015" OR "2018")',
+        question,
+    )
+
+    assert "source:" not in repaired
+    assert "2015" not in repaired
+    assert "2018" not in repaired
+
+
+def test_source_scope_does_not_treat_entity_vs_as_outlets(tmp_path: Path) -> None:
+    runtime = build_test_runtime(
+        tmp_path=tmp_path,
+        documents=_sample_documents(),
+        search_rows_by_query=_search_rows(_sample_documents()),
+    )
+    question = "How did the perceived value of Cristiano Ronaldo vs Lionel Messi evolve over time?"
+
+    assert runtime.orchestrator._source_scope_filters_for_question(question) == []
+    repaired = runtime.orchestrator._apply_source_scope_to_query(
+        '(source) AND source:("perceptions of the relative value of Cristiano Ronaldo" OR "Lionel Messi")',
+        question,
+    )
+
+    assert "source:" not in repaired
+    assert repaired != "source"
+    assert "Ronaldo" in repaired
+    assert "Messi" in repaired
 
 
 def test_search_inputs_expand_multilingual_topic_aliases_for_scoped_queries(tmp_path: Path) -> None:
@@ -340,6 +459,65 @@ def test_source_comparison_heuristic_groups_keyterms_by_outlet(tmp_path: Path) -
     assert plot_node.inputs["x"] == "term"
     assert plot_node.inputs["y"] == "score"
     assert plot_node.inputs["series"] == "outlet"
+
+
+def test_entity_trend_normalization_removes_unrequested_quote_branch(tmp_path: Path) -> None:
+    runtime = build_test_runtime(
+        tmp_path=tmp_path,
+        documents=_sample_documents(),
+        search_rows_by_query=_search_rows(_sample_documents()),
+    )
+    dag = AgentPlanDAG(
+        nodes=[
+            AgentPlanNode("n1", "db_search", inputs={"query": "housing affordability actors", "retrieve_all": True}),
+            AgentPlanNode("n2", "fetch_documents", depends_on=["n1"], inputs={}),
+            AgentPlanNode("n3", "ner", depends_on=["n2"], inputs={}),
+            AgentPlanNode(
+                "n4",
+                "build_evidence_table",
+                depends_on=["n3"],
+                inputs={"payload": {"task_name": "entity_frequency_distribution"}},
+            ),
+            AgentPlanNode("quotes", "quote_extract", depends_on=["n2"], inputs={}),
+            AgentPlanNode("speaker_series", "time_series_aggregate", depends_on=["quotes"], inputs={}),
+            AgentPlanNode("combine", "python_runner", depends_on=["n4", "speaker_series"], inputs={}),
+        ]
+    )
+
+    normalized = runtime.orchestrator._normalize_plan_dag(
+        dag,
+        "Identify the main actors who were most prominent in housing affordability discourse and how their prominence changed over time.",
+    )
+
+    capabilities = {node.node_id: node.capability for node in normalized.nodes}
+    assert "quotes" not in capabilities
+    assert "speaker_series" not in capabilities
+    assert "combine" not in capabilities
+    entity_node = next(node for node in normalized.nodes if node.node_id == "n4")
+    assert entity_node.inputs["group_by_time"] is True
+    assert any(node.capability == "plot_artifact" and "n4" in node.depends_on for node in normalized.nodes)
+
+
+def test_entity_trend_keeps_quote_branch_when_user_asks_for_speakers(tmp_path: Path) -> None:
+    runtime = build_test_runtime(
+        tmp_path=tmp_path,
+        documents=_sample_documents(),
+        search_rows_by_query=_search_rows(_sample_documents()),
+    )
+    dag = AgentPlanDAG(
+        nodes=[
+            AgentPlanNode("n1", "db_search", inputs={"query": "housing affordability actors", "retrieve_all": True}),
+            AgentPlanNode("n2", "fetch_documents", depends_on=["n1"], inputs={}),
+            AgentPlanNode("quotes", "quote_extract", depends_on=["n2"], inputs={}),
+        ]
+    )
+
+    normalized = runtime.orchestrator._normalize_plan_dag(
+        dag,
+        "Which actors and quoted speakers dominated housing affordability discourse, and how did this change over time?",
+    )
+
+    assert any(node.node_id == "quotes" for node in normalized.nodes)
 
 
 def test_search_inputs_replace_wildcard_source_scope(tmp_path: Path) -> None:
@@ -987,6 +1165,99 @@ def test_broad_scope_clarification_prevents_repeat_question_loop(tmp_path: Path)
     assert manifest.status in {"completed", "partial"}
     assert not manifest.clarification_questions
     assert any("aggregate comparison over available metadata groups" in item for item in manifest.assumptions)
+
+
+def test_unresolved_source_scope_guardrail_blocks_scoped_answer(tmp_path: Path) -> None:
+    docs = _sample_documents()
+    llm = StaticLLMClient(
+        [
+            {
+                "action": "accept_with_assumptions",
+                "rewritten_question": "Identify dominant named entities in climate coverage in Swiss newspapers over time.",
+                "assumptions": ["Swiss newspapers means sources labeled as Swiss."],
+                "message": "",
+            },
+            {
+                "action": "ask_clarification",
+                "rewritten_question": "Identify dominant named entities in climate coverage in Swiss newspapers over time.",
+                "clarification_question": "Which exact Swiss newspaper source names should be used?",
+                "assumptions": [
+                    "The corpus has a source field, but it is unclear which source values correspond to Swiss newspapers.",
+                    "Named-entity extraction is feasible, but restricting to Swiss newspapers needs either explicit source names or confirmation that the corpus already contains only Swiss newspapers.",
+                ],
+                "message": "",
+            },
+        ]
+    )
+    runtime = build_test_runtime(
+        tmp_path=tmp_path,
+        documents=docs,
+        search_rows_by_query=_search_rows(docs),
+        llm_client=llm,
+    )
+
+    manifest = runtime.handle_query(
+        "Which named entities dominate climate coverage in Swiss newspapers, and how did that change over time?",
+        force_answer=True,
+        no_cache=True,
+    )
+
+    assert manifest.status in {"completed", "partial"}
+    assert "source scope could not be resolved" in manifest.final_answer.answer_text.lower()
+    assert any("source-scoped" in item for item in manifest.final_answer.unsupported_parts)
+
+
+def test_described_source_scope_guardrail_blocks_unfiltered_answer(tmp_path: Path) -> None:
+    docs = _sample_documents()
+    llm = StaticLLMClient(
+        [
+            {
+                "action": "accept_with_assumptions",
+                "rewritten_question": "Identify dominant entities in climate coverage in Swiss newspapers.",
+                "assumptions": ["The corpus is either already scoped to Swiss newspapers or has usable source metadata."],
+                "message": "",
+            },
+            {
+                "action": "emit_plan_dag",
+                "rewritten_question": "Identify dominant entities in climate coverage in Swiss newspapers.",
+                "plan_dag": {
+                    "nodes": [
+                        {
+                            "node_id": "search",
+                            "capability": "db_search",
+                            "inputs": {"query": "climate", "top_k": 10, "retrieval_mode": "hybrid"},
+                        },
+                        {"node_id": "fetch", "capability": "fetch_documents", "depends_on": ["search"]},
+                    ]
+                },
+                "assumptions": ["No explicit outlet names were provided, so the plan does not add a source filter."],
+                "message": "",
+            },
+            {
+                "answer_text": "Swiss newspaper climate coverage is dominated by Trump and Paris.",
+                "evidence_items": [],
+                "artifacts_used": [],
+                "unsupported_parts": [],
+                "caveats": [],
+                "claim_verdicts": [],
+            },
+        ]
+    )
+    runtime = build_test_runtime(
+        tmp_path=tmp_path,
+        documents=docs,
+        search_rows_by_query=_search_rows(docs),
+        llm_client=llm,
+    )
+
+    manifest = runtime.handle_query(
+        "Which named entities dominate climate coverage in Swiss newspapers, and how did that change over time?",
+        force_answer=True,
+        no_cache=True,
+    )
+
+    assert "source scope could not be resolved" in manifest.final_answer.answer_text.lower()
+    assert any("source-scoped" in item for item in manifest.final_answer.unsupported_parts)
 
 
 def test_multi_year_monthly_clarification_is_accepted_as_sufficient(tmp_path: Path) -> None:
@@ -1653,6 +1924,85 @@ def test_derive_summary_ignores_zero_summary_stats_when_analysis_rows_exist(tmp_
 
     assert "summary_stats" not in summary
     assert summary["entity_trend"] == [("Switzerland", 4)]
+
+
+def test_derive_summary_uses_time_series_value_field_for_entity_trends(tmp_path: Path) -> None:
+    runtime = build_test_runtime(
+        tmp_path=tmp_path,
+        documents=_sample_documents(),
+        search_rows_by_query=_search_rows(_sample_documents()),
+    )
+    snapshot = AgentExecutionSnapshot(
+        node_records=[],
+        node_results={
+            "entity_trend": ToolExecutionResult(
+                payload={
+                    "rows": [
+                        {"entity": "Greenpeace", "time_bin": "2017-01", "mention_count": 30},
+                        {"entity": "Greenpeace", "time_bin": "2017-02", "mention_count": 40},
+                        {"entity": "World Bank", "time_bin": "2017-01", "mention_count": 5},
+                        {"entity": "World Bank", "time_bin": "2017-02", "mention_count": 6},
+                    ]
+                },
+                metadata={"task": "named_entity_frequency", "group_by_time": True},
+            )
+        },
+        failures=[],
+        provenance_records=[],
+        selected_docs=[],
+        status="completed",
+    )
+
+    summary = runtime.orchestrator._derive_summary(snapshot)
+
+    assert summary["entity_trend"][:2] == [("Greenpeace", 70), ("World Bank", 11)]
+    time_series = summary["entity_trend_time_series"]
+    assert time_series["time_field"] == "time_bin"
+    assert time_series["series_field"] == "entity"
+    assert time_series["value_field"] == "mention_count"
+    assert time_series["period_count"] == 2
+    assert time_series["top_series"][0] == {"series": "Greenpeace", "total": 70}
+    assert time_series["sampled_points"]["Greenpeace"] == [
+        {"period": "2017-01", "value": 30},
+        {"period": "2017-02", "value": 40},
+    ]
+    assert summary["time_series_summaries"]["entity_trend"]["value_field"] == "mention_count"
+
+
+def test_derive_summary_adds_generic_time_series_summary(tmp_path: Path) -> None:
+    runtime = build_test_runtime(
+        tmp_path=tmp_path,
+        documents=_sample_documents(),
+        search_rows_by_query=_search_rows(_sample_documents()),
+    )
+    snapshot = AgentExecutionSnapshot(
+        node_records=[],
+        node_results={
+            "source_sentiment_series": ToolExecutionResult(
+                payload={
+                    "rows": [
+                        {"outlet": "Outlet A", "time_bin": "2018-01", "average_sentiment": -0.3},
+                        {"outlet": "Outlet A", "time_bin": "2018-02", "average_sentiment": -0.1},
+                        {"outlet": "Outlet B", "time_bin": "2018-01", "average_sentiment": 0.2},
+                    ]
+                }
+            )
+        },
+        failures=[],
+        provenance_records=[],
+        selected_docs=[],
+        status="completed",
+    )
+
+    summary = runtime.orchestrator._derive_summary(snapshot)
+
+    generic = summary["time_series_summaries"]["source_sentiment_series"]
+    assert generic["series_field"] == "outlet"
+    assert generic["value_field"] == "average_sentiment"
+    assert generic["sampled_points"]["Outlet A"] == [
+        {"period": "2018-01", "value": -0.3},
+        {"period": "2018-02", "value": -0.1},
+    ]
 
 
 def test_openai_style_plan_without_retrieval_backbone_falls_back_to_heuristic(tmp_path: Path, monkeypatch) -> None:

@@ -537,6 +537,16 @@ class MagicBoxOrchestrator:
                 for key in ("query", "date_from", "date_to", "year_balance", "retrieve_all", "retrieval_strategy"):
                     if key in merged_node_inputs and merged_node_inputs.get(key) not in (None, ""):
                         normalized_search_inputs[key] = merged_node_inputs[key]
+                question_window = self._extract_date_window(dag_text)
+                if "date_from" in question_window:
+                    normalized_search_inputs["date_from"] = question_window["date_from"]
+                if "date_to" in question_window:
+                    normalized_search_inputs["date_to"] = question_window["date_to"]
+                elif "date_from" in question_window:
+                    inferred_year = str(question_window["date_from"])[:4]
+                    planned_date_to = str(normalized_search_inputs.get("date_to", "") or "")
+                    if planned_date_to.startswith(inferred_year):
+                        normalized_search_inputs.pop("date_to", None)
                 if query_text:
                     repaired_query = self._repair_search_query(
                         str(normalized_search_inputs.get("query", "")),
@@ -576,6 +586,7 @@ class MagicBoxOrchestrator:
             if metadata.get("question_family", "") in {"", "generic"}:
                 metadata["question_family"] = "temporal_portrayal_shift"
         elif self._needs_entity_trend_analysis(dag_text):
+            normalized_nodes = self._strip_unrequested_quote_nodes(normalized_nodes, dag_text)
             self._ensure_entity_trend_nodes(normalized_nodes, unique_node_id, dag_text)
             if metadata.get("question_family", "") in {"", "generic"}:
                 metadata["question_family"] = "entity_trend"
@@ -626,14 +637,76 @@ class MagicBoxOrchestrator:
                 "named entities",
                 "named entity",
                 "which actors",
+                "main actors",
+                "prominent actors",
                 "actors dominated",
                 "actor dominated",
                 "entities dominate",
                 "entities dominated",
             )
         )
+        if not asks_entities and re.search(r"\bactors?\b", lowered):
+            asks_entities = bool(
+                re.search(
+                    r"\b(?:main|most|prominent|prominence|dominant|dominate|dominated|leading|top|central|key)\b",
+                    lowered,
+                )
+            )
         asks_change = any(term in lowered for term in ("over time", "change", "changed", "trend", "evolve", "evolved"))
         return asks_entities and asks_change
+
+    def _has_explicit_quote_intent(self, text: str) -> bool:
+        return bool(
+            re.search(
+                r"\b(?:quote|quotes|quoted|quotation|speaker|speakers|said|says|told|according to|spokes(?:man|woman|person|people)|attribut(?:e|ed|ion))\b",
+                str(text or ""),
+                flags=re.IGNORECASE,
+            )
+        )
+
+    def _strip_unrequested_quote_nodes(
+        self,
+        nodes: list[AgentPlanNode],
+        question_text: str,
+    ) -> list[AgentPlanNode]:
+        if self._has_explicit_quote_intent(question_text):
+            return nodes
+        quote_capabilities = {"quote_extract", "quote_attribute"}
+        removable_after_quote = {
+            "build_evidence_table",
+            "change_point_detect",
+            "plot_artifact",
+            "python_runner",
+            "time_series_aggregate",
+        }
+        removed: set[str] = {node.node_id for node in nodes if node.capability in quote_capabilities}
+        changed = True
+        while changed:
+            changed = False
+            for node in nodes:
+                if node.node_id in removed:
+                    continue
+                if not any(dep in removed for dep in node.depends_on):
+                    continue
+                if node.capability in removable_after_quote:
+                    removed.add(node.node_id)
+                    changed = True
+        if not removed:
+            return nodes
+        return [
+            AgentPlanNode(
+                node_id=node.node_id,
+                capability=node.capability,
+                tool_name=node.tool_name,
+                inputs=node.inputs,
+                depends_on=[dep for dep in node.depends_on if dep not in removed],
+                optional=node.optional,
+                cacheable=node.cacheable,
+                description=node.description,
+            )
+            for node in nodes
+            if node.node_id not in removed
+        ]
 
     def _needs_source_comparison_analysis(self, text: str) -> bool:
         matches = self._explicit_source_scope_matches(text)
@@ -713,6 +786,12 @@ class MagicBoxOrchestrator:
         def first_node_id(capability: str) -> str:
             return next((node.node_id for node in normalized_nodes if node.capability == capability), "")
 
+        def merged_inputs(node: AgentPlanNode) -> dict[str, Any]:
+            payload = node.inputs.get("payload")
+            if not isinstance(payload, dict):
+                return dict(node.inputs)
+            return {**payload, **{key: value for key, value in node.inputs.items() if key != "payload"}}
+
         fetch_node_id = first_node_id("fetch_documents")
         if not fetch_node_id:
             return
@@ -733,7 +812,8 @@ class MagicBoxOrchestrator:
                 node.node_id
                 for node in normalized_nodes
                 if node.capability == "build_evidence_table"
-                and str(node.inputs.get("task", "")).lower() in {"named_entity_frequency", "entity_frequency", "entity_prominence", "actor_prominence"}
+                and str(merged_inputs(node).get("task", merged_inputs(node).get("task_name", ""))).lower()
+                in {"named_entity_frequency", "entity_frequency", "entity_frequency_distribution", "entity_prominence", "actor_prominence"}
             ),
             "",
         )
@@ -918,6 +998,12 @@ class MagicBoxOrchestrator:
             return {}
         if len(year_values) == 1:
             year = year_values[0]
+            if re.search(
+                r"\b(?:from|since|starting|started|beginning|began|after|through|until|to)\b",
+                text,
+                flags=re.IGNORECASE,
+            ):
+                return {"date_from": f"{year}-01-01"}
             return {"date_from": f"{year}-01-01", "date_to": f"{year}-12-31"}
         return {
             "date_from": f"{year_values[0]}-01-01",
@@ -928,10 +1014,21 @@ class MagicBoxOrchestrator:
         found_terms: list[str] = []
         lowered = text.lower()
         blocked_source_tokens = self._source_scope_query_tokens_for_question(text)
+        temporal_scope_terms: set[str] = set()
+        if re.search(r"\b(?:19|20)\d{2}\b", text) and re.search(
+            r"\b(?:from|since|starting|started|beginning|began|after|through|until|to)\b",
+            text,
+            flags=re.IGNORECASE,
+        ):
+            temporal_scope_terms.update({"campaign", "presidency", "administration"})
         preferred_stopwords = {
             "actor", "actors", "does", "perceived", "perception", "portrayal", "portrayed",
-            "perceptions", "relative", "within",
-        }
+            "perceptions", "relative", "within", "sentiment", "tone", "tones", "attitude",
+            "attitudes", "through", "until", "since", "presidency", "administration",
+            "term", "terms", "period", "periods", "relationship", "relationships",
+            "relation", "relations", "pattern", "patterns", "trend", "trends",
+            "toward", "towards",
+        } | temporal_scope_terms
         for term in preferred_terms:
             if term.lower() in blocked_source_tokens or term.lower() in preferred_stopwords:
                 continue
@@ -952,7 +1049,12 @@ class MagicBoxOrchestrator:
             "public", "discourse", "newspaper", "newspapers", "report", "reports", "reported",
             "perceived", "perception", "portrayal", "portrayed",
             "perceptions", "relative", "within",
-        }
+            "sentiment", "tone", "tones", "attitude", "attitudes", "through", "until", "since",
+            "presidency", "administration", "term", "terms", "period", "periods",
+            "relationship", "relationships", "relation", "relations", "pattern", "patterns",
+            "trend", "trends", "heightened", "elevated", "specific", "subperiod", "subperiods",
+            "his", "her", "its", "our", "your", "toward", "towards",
+        } | temporal_scope_terms
         filtered = [token for token in tokens if token.lower() not in stopwords and token.lower() not in blocked_source_tokens]
         compact = " ".join(filtered[:8]).strip()
         return self._expand_topic_query(compact, text) or compact
@@ -989,6 +1091,67 @@ class MagicBoxOrchestrator:
         if len(planned_tokens) <= 2 and all(token in broad_scope_tokens for token in planned_tokens):
             topical_tokens = [token for token in fallback_tokens if token not in broad_scope_tokens]
             return len(topical_tokens) >= 2
+        query_scaffold_tokens = {
+            *broad_scope_tokens,
+            "actor",
+            "actors",
+            "attitude",
+            "attitudes",
+            "campaign",
+            "change",
+            "changed",
+            "changes",
+            "changing",
+            "coverage",
+            "did",
+            "does",
+            "elevated",
+            "evolve",
+            "evolved",
+            "evolution",
+            "explain",
+            "explained",
+            "framing",
+            "heightened",
+            "her",
+            "his",
+            "its",
+            "pattern",
+            "patterns",
+            "period",
+            "periods",
+            "portrayal",
+            "portrayed",
+            "presidency",
+            "relation",
+            "relations",
+            "relationship",
+            "relationships",
+            "sentiment",
+            "specific",
+            "subperiod",
+            "subperiods",
+            "term",
+            "terms",
+            "through",
+            "tone",
+            "tones",
+            "trend",
+            "trends",
+            "until",
+        }
+        planned_set = set(planned_tokens)
+        fallback_set = set(fallback_tokens)
+        if fallback_set and fallback_set.issubset(planned_set):
+            extras = planned_set - fallback_set
+            noisy_extras = extras & query_scaffold_tokens
+            meaningful_extras = extras - query_scaffold_tokens
+            if noisy_extras and (not meaningful_extras or len(noisy_extras) >= 2):
+                return True
+        if len(fallback_tokens) >= 2 and len(planned_tokens) >= len(fallback_tokens) + 3:
+            overlap = len(planned_set & fallback_set)
+            if overlap >= min(2, len(fallback_set)) and len(planned_set & query_scaffold_tokens) >= 2:
+                return True
         return False
 
     def _compact_comparison_entity_query(self, query_text: str) -> str:
@@ -1093,11 +1256,22 @@ class MagicBoxOrchestrator:
             return ""
         if candidate.lower() in SOURCE_CANDIDATE_GENERIC_VALUES:
             return ""
+        if re.fullmatch(r"(?:18|19|20)\d{2}", candidate):
+            return ""
+        if not re.search(r"[A-Za-z]", candidate):
+            return ""
         return candidate
 
     def _source_scope_candidate_names(self, text: str) -> list[str]:
         value = str(text or "").strip()
         if not value:
+            return []
+        source_context = re.search(
+            r"\b(?:media|newspaper|newspapers|press|outlet|outlets|source|sources|report|reports|reported|cover|covers|coverage|write|writes|wrote)\b",
+            value,
+            flags=re.IGNORECASE,
+        )
+        if not source_context:
             return []
         candidates: list[str] = []
         patterns = (
@@ -1140,6 +1314,32 @@ class MagicBoxOrchestrator:
         for match in explicit_matches:
             blocked.update(str(item).lower() for item in match["tokens"])
         return blocked
+
+    def _described_source_scope_phrases(self, text: str) -> list[str]:
+        value = str(text or "").strip()
+        if not value:
+            return []
+        descriptors: list[str] = []
+        source_noun = r"(?:media|newspapers?|press|outlets?|sources?)"
+        descriptor = r"[A-Za-z0-9&.'-]+(?:\s+[A-Za-z0-9&.'-]+){0,4}"
+        patterns = (
+            rf"\b(?:in|from|by|among|across|within|of)\s+(?:the\s+)?(?P<descriptor>{descriptor})\s+{source_noun}\b",
+            rf"\b(?P<descriptor>{descriptor})\s+{source_noun}\s+(?:reported|reports|report|covered|covers|cover|explained|explains|explain|portrayed|portrays|portray|framed|frames|frame|wrote|writes|write)\b",
+        )
+        for pattern in patterns:
+            for match in re.finditer(pattern, value, flags=re.IGNORECASE):
+                phrase = " ".join(str(match.group("descriptor")).split()).strip(" ,.;:!?()[]{}")
+                lowered = phrase.lower()
+                if not phrase or lowered in SOURCE_CANDIDATE_GENERIC_VALUES:
+                    continue
+                if lowered in {"social", "news", "mainstream", "online", "legacy", "traditional"}:
+                    continue
+                if lowered not in {item.lower() for item in descriptors}:
+                    descriptors.append(phrase)
+        return descriptors
+
+    def _question_requests_described_source_scope(self, text: str) -> bool:
+        return bool(self._described_source_scope_phrases(text))
 
     def _remove_source_field_filters(self, query: str) -> str:
         cleaned = re.sub(
@@ -1197,7 +1397,15 @@ class MagicBoxOrchestrator:
             )
             cleaned_query = " ".join(cleaned_query.split()).strip()
         elif re.search(r"\bsource\s*:", cleaned_query, flags=re.IGNORECASE):
-            return cleaned_query
+            if not filters:
+                cleaned_query = self._remove_source_field_filters(cleaned_query)
+                cleaned_query = " ".join(cleaned_query.split()).strip()
+                if not cleaned_query:
+                    cleaned_query = self._compact_query_terms(question_text, self._query_anchor_terms(question_text)) or question_text
+                elif cleaned_query.lower().strip("() ") in SOURCE_CANDIDATE_GENERIC_VALUES:
+                    cleaned_query = self._compact_query_terms(question_text, self._query_anchor_terms(question_text)) or cleaned_query
+            else:
+                return cleaned_query
         if not filters:
             return self._expand_topic_query(cleaned_query, question_text) or cleaned_query
         rendered = " OR ".join(f'"{item}"' for item in filters)
@@ -1208,6 +1416,12 @@ class MagicBoxOrchestrator:
         seen: set[str] = set()
         blocked_terms: set[str] = set()
         blocked_source_tokens = self._source_scope_query_tokens_for_question(text)
+        if re.search(r"\b(?:19|20)\d{2}\b", text) and re.search(
+            r"\b(?:from|since|starting|started|beginning|began|after|through|until|to)\b",
+            text,
+            flags=re.IGNORECASE,
+        ):
+            blocked_terms.update({"campaign", "presidency", "administration"})
         stopwords = {
             "across",
             "aggregate",
@@ -1245,8 +1459,11 @@ class MagicBoxOrchestrator:
             "from",
             "frequency",
             "how",
+            "attitude",
+            "attitudes",
             "explained",
             "explain",
+            "her",
             "identified",
             "identifying",
             "identify",
@@ -1254,7 +1471,9 @@ class MagicBoxOrchestrator:
             "included",
             "including",
             "individual",
+            "his",
             "it",
+            "its",
             "lemma",
             "lemmas",
             "most",
@@ -1271,6 +1490,7 @@ class MagicBoxOrchestrator:
             "results",
             "row",
             "rows",
+            "sentiment",
             "such",
             "that",
             "the",
@@ -1278,6 +1498,14 @@ class MagicBoxOrchestrator:
             "there",
             "this",
             "those",
+            "through",
+            "tone",
+            "tones",
+            "toward",
+            "towards",
+            "trend",
+            "trends",
+            "until",
             "used",
             "using",
             "what",
@@ -1315,6 +1543,23 @@ class MagicBoxOrchestrator:
             "dominated",
             "public",
             "discourse",
+            "presidency",
+            "administration",
+            "term",
+            "terms",
+            "period",
+            "periods",
+            "relationship",
+            "relationships",
+            "relation",
+            "relations",
+            "pattern",
+            "patterns",
+            "heightened",
+            "elevated",
+            "specific",
+            "subperiod",
+            "subperiods",
             "perceived",
             "perception",
             "perceptions",
@@ -2179,7 +2424,8 @@ class MagicBoxOrchestrator:
                     "Return JSON with keys answer_text, evidence_items, artifacts_used, unsupported_parts, caveats, claim_verdicts. "
                     "Use only the provided summaries, tool outputs, and evidence. "
                     "Do not claim direct correspondence to stock-price moves or external market behavior unless an external series was explicitly attached. "
-                    "When has_external_series is true and summary.external_series is present, use that compact external-series summary and do not say the external series is missing."
+                    "When has_external_series is true and summary.external_series is present, use that compact external-series summary and do not say the external series is missing. "
+                    "When summary contains entity_trend_time_series or time_series_summaries, treat those as valid temporal analysis rows; do not say a time breakdown is missing solely because evidence_rows are only examples."
                 ),
             },
             {
@@ -2188,6 +2434,7 @@ class MagicBoxOrchestrator:
                     {
                         "question": state.question,
                         "rewritten_question": state.rewritten_question,
+                        "assumptions": list(state.assumptions),
                         "summary": summary,
                         "evidence_rows": evidence_rows,
                         "tool_caveats": self._snapshot_caveats(snapshot),
@@ -2377,6 +2624,152 @@ class MagicBoxOrchestrator:
             ],
         }
 
+    @staticmethod
+    def _summary_field_from_rows(rows: list[dict[str, Any]], candidates: tuple[str, ...]) -> str:
+        observed: set[str] = set()
+        for row in rows[:50]:
+            if isinstance(row, dict):
+                observed.update(str(key) for key in row.keys())
+        for candidate in candidates:
+            if candidate in observed:
+                return candidate
+        return ""
+
+    @staticmethod
+    def _summary_display_number(value: float) -> int | float:
+        if value.is_integer():
+            return int(value)
+        return round(value, 4)
+
+    def _grouped_time_series_summary(
+        self,
+        rows: list[dict[str, Any]],
+        *,
+        max_series: int = 8,
+        max_points_per_series: int = 12,
+    ) -> dict[str, Any]:
+        time_field = self._summary_field_from_rows(
+            rows,
+            ("time_bin", "period", "month", "published_month", "date", "published_at", "year"),
+        )
+        series_field = self._summary_field_from_rows(
+            rows,
+            (
+                "entity",
+                "canonical_entity",
+                "entity_text",
+                "actor",
+                "source",
+                "outlet",
+                "publisher",
+                "target_label",
+                "label",
+                "term",
+                "topic",
+                "series",
+            ),
+        )
+        value_field = self._summary_field_from_rows(
+            rows,
+            (
+                "mention_count",
+                "document_count",
+                "doc_count",
+                "count",
+                "frequency",
+                "value",
+                "average_sentiment",
+                "avg_sentiment",
+                "score",
+                "sentiment_score",
+            ),
+        )
+        if not time_field or not series_field or not value_field:
+            return {}
+
+        totals: dict[str, float] = {}
+        period_values: dict[str, dict[str, float]] = {}
+        valid_rows: list[tuple[str, str, float]] = []
+        skipped_rows = 0
+        for row in rows:
+            if not isinstance(row, dict):
+                skipped_rows += 1
+                continue
+            period = str(row.get(time_field, "")).strip()
+            series = str(row.get(series_field, "")).strip()
+            value = self._summary_float(row.get(value_field))
+            if (
+                not period
+                or period.lower() in {"unknown", "none", "null"}
+                or not series
+                or series.lower() in {"unknown", "none", "null"}
+                or value is None
+            ):
+                skipped_rows += 1
+                continue
+            valid_rows.append((period, series, value))
+            totals[series] = totals.get(series, 0.0) + value
+            bucket = period_values.setdefault(period, {})
+            bucket[series] = bucket.get(series, 0.0) + value
+
+        if not valid_rows:
+            return {}
+
+        top_series = sorted(totals.items(), key=lambda item: (-item[1], item[0]))[:max_series]
+        top_names = {series for series, _ in top_series}
+        points_by_series: dict[str, list[dict[str, Any]]] = {series: [] for series in top_names}
+        for period, series, value in sorted(valid_rows, key=lambda item: (item[1], item[0])):
+            if series not in top_names:
+                continue
+            points_by_series.setdefault(series, []).append(
+                {
+                    "period": period,
+                    "value": self._summary_display_number(value),
+                }
+            )
+
+        sampled_points: dict[str, list[dict[str, Any]]] = {}
+        for series, points in points_by_series.items():
+            if len(points) <= max_points_per_series:
+                sampled_points[series] = points
+            else:
+                split = max_points_per_series // 2
+                sampled_points[series] = points[:split] + points[-(max_points_per_series - split) :]
+
+        period_leaders = []
+        for period, values in sorted(period_values.items()):
+            leader, value = max(values.items(), key=lambda item: (item[1], item[0]))
+            period_leaders.append(
+                {
+                    "period": period,
+                    "series": leader,
+                    "value": self._summary_display_number(value),
+                }
+            )
+        if len(period_leaders) > 12:
+            period_leaders_sample = period_leaders[:6] + period_leaders[-6:]
+        else:
+            period_leaders_sample = period_leaders
+
+        return {
+            "time_field": time_field,
+            "series_field": series_field,
+            "value_field": value_field,
+            "row_count": len(valid_rows),
+            "skipped_row_count": skipped_rows,
+            "period_count": len(period_values),
+            "series_count": len(totals),
+            "top_series": [
+                {
+                    "series": series,
+                    "total": self._summary_display_number(total),
+                }
+                for series, total in top_series
+            ],
+            "sampled_points": sampled_points,
+            "period_leaders_sample": period_leaders_sample,
+        }
+
     def _derive_summary(self, snapshot: AgentExecutionSnapshot) -> dict[str, Any]:
         summary: dict[str, Any] = {}
         external_summary = self._external_series_summary(snapshot)
@@ -2405,6 +2798,11 @@ class MagicBoxOrchestrator:
             if not rows:
                 continue
             first = rows[0]
+            temporal_summary = self._grouped_time_series_summary(
+                [dict(row) for row in rows if isinstance(row, dict)]
+            )
+            if temporal_summary:
+                summary.setdefault("time_series_summaries", {})[node_id] = temporal_summary
             if (
                 "lemma" in first
                 and "count" in first
@@ -2436,11 +2834,29 @@ class MagicBoxOrchestrator:
                 summary["noun_distribution"] = sorted(counts.items(), key=lambda item: item[1], reverse=True)[:15]
                 summary["noun_distribution_source"] = "raw_pos_fallback"
             elif "entity" in first and "time_bin" in first:
-                grouped: dict[str, int] = {}
-                for row in rows:
-                    entity = str(row.get("entity", ""))
-                    grouped[entity] = grouped.get(entity, 0) + int(row.get("count", 1))
-                summary["entity_trend"] = sorted(grouped.items(), key=lambda item: item[1], reverse=True)[:15]
+                if temporal_summary and temporal_summary.get("series_field") == "entity":
+                    summary["entity_trend"] = [
+                        (str(item.get("series", "")), item.get("total", 0))
+                        for item in temporal_summary.get("top_series", [])[:15]
+                    ]
+                    summary["entity_trend_time_series"] = temporal_summary
+                else:
+                    grouped: dict[str, float] = {}
+                    value_field = self._summary_field_from_rows(
+                        [dict(row) for row in rows if isinstance(row, dict)],
+                        ("mention_count", "document_count", "doc_count", "count", "frequency", "value"),
+                    )
+                    for row in rows:
+                        if not isinstance(row, dict):
+                            continue
+                        entity = str(row.get("entity", "")).strip()
+                        value = self._summary_float(row.get(value_field)) if value_field else None
+                        if entity and value is not None:
+                            grouped[entity] = grouped.get(entity, 0.0) + value
+                    summary["entity_trend"] = [
+                        (entity, self._summary_display_number(value))
+                        for entity, value in sorted(grouped.items(), key=lambda item: item[1], reverse=True)[:15]
+                    ]
             elif "term" in first and "score" in first:
                 summary["keyterms"] = rows[:15]
             elif "topic_id" in first and "top_terms" in first:
@@ -2475,7 +2891,46 @@ class MagicBoxOrchestrator:
         snapshot: AgentExecutionSnapshot,
         answer: FinalAnswerPayload,
     ) -> FinalAnswerPayload:
-        question_text = f"{state.question} {state.rewritten_question}".lower()
+        raw_question_text = f"{state.question} {state.rewritten_question}"
+        question_text = raw_question_text.lower()
+        assumptions_text = " ".join(str(item) for item in state.assumptions).lower()
+        unresolved_source_scope = any(
+            marker in assumptions_text
+            for marker in (
+                "unclear which source values correspond",
+                "needs either explicit source names",
+                "requires explicit source names",
+                "source scope could not be resolved",
+                "explicit outlet names were provided",
+                "explicit outlet names were not provided",
+                "does not add a source filter",
+                "without inventing outlet aliases",
+                "either already scoped to",
+            )
+        )
+        requested_described_source_scope = self._question_requests_described_source_scope(raw_question_text)
+        has_source_filter = any(
+            "source:" in str(result.payload.get("query", "") if isinstance(result.payload, dict) else "").lower()
+            or str(result.metadata.get("filtered_from_working_set", "")).lower() == "true"
+            for result in snapshot.node_results.values()
+        )
+        if (unresolved_source_scope or requested_described_source_scope) and not has_source_filter:
+            note = (
+                "The requested source scope could not be resolved from corpus metadata or explicit outlet names; "
+                "the analysis rows are therefore not a supported source-scoped answer."
+            )
+            unsupported = "The requested source-scoped comparison/coverage subset is unsupported without explicit source names or usable source metadata."
+            if note not in answer.caveats:
+                answer.caveats.append(note)
+            if unsupported not in answer.unsupported_parts:
+                answer.unsupported_parts.append(unsupported)
+            lowered_answer = answer.answer_text.lower()
+            if "source scope could not be resolved" not in lowered_answer and "not a supported source-scoped answer" not in lowered_answer:
+                answer.answer_text = (
+                    "I cannot answer the requested source-scoped question as stated because the source scope could not be resolved. "
+                    "The unscoped corpus analysis found: "
+                    + answer.answer_text.lstrip()
+                ).strip()
         needs_market_guardrail = any(
             term in question_text
             for term in ["stock", "drawdown", "share price", "valuation", "market", "oil price", "oil prices", "crude oil", "gas price", "gas prices"]
