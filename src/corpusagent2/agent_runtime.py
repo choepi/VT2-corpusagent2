@@ -3367,8 +3367,10 @@ class AgentRuntime:
         force_answer: bool = False,
         no_cache: bool = False,
         clarification_history: list[str] | None = None,
+        run_id: str | None = None,
     ) -> AgentRunManifest:
-        run_id = f"agent_{uuid.uuid4().hex[:12]}"
+        run_id = run_id or f"agent_{uuid.uuid4().hex[:12]}"
+        self._register_cancel_event(run_id)
         try:
             return self._run_query(
                 run_id,
