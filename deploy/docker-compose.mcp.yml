@@ -1,0 +1,41 @@
+services:
+  corpusagent2-mcp:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.mcp
+      args:
+        CORPUSAGENT2_DOCKER_DOWNLOAD_PROVIDER_ASSETS: ${CORPUSAGENT2_DOCKER_DOWNLOAD_PROVIDER_ASSETS:-true}
+    container_name: corpusagent2_mcp
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      opensearch:
+        condition: service_healthy
+    env_file:
+      - ../.env
+    environment:
+      CORPUSAGENT2_PROJECT_ROOT: /app
+      CORPUSAGENT2_MCP_TRANSPORT: streamable-http
+      CORPUSAGENT2_MCP_HOST: 0.0.0.0
+      CORPUSAGENT2_MCP_PORT: ${CORPUSAGENT2_MCP_PORT:-8765}
+      CORPUSAGENT2_MCP_PATH: ${CORPUSAGENT2_MCP_PATH:-/mcp}
+      CORPUSAGENT2_MCP_JOB_STORE: postgres
+      CORPUSAGENT2_MCP_PG_DSN: ${CORPUSAGENT2_MCP_PG_DSN:-postgresql://corpus:corpus@postgres:5432/corpus_db}
+      CORPUSAGENT2_PG_DSN: ${CORPUSAGENT2_MCP_PG_DSN:-postgresql://corpus:corpus@postgres:5432/corpus_db}
+      CORPUSAGENT2_OPENSEARCH_URL: ${CORPUSAGENT2_MCP_OPENSEARCH_URL:-https://opensearch:9200}
+      CORPUSAGENT2_OPENSEARCH_USERNAME: ${CORPUSAGENT2_OPENSEARCH_USERNAME:-admin}
+      CORPUSAGENT2_OPENSEARCH_PASSWORD: ${CORPUSAGENT2_OPENSEARCH_PASSWORD:-VerySecurePassword123!}
+      CORPUSAGENT2_OPENSEARCH_VERIFY_SSL: "false"
+      CORPUSAGENT2_REQUIRE_BACKEND_SERVICES: "true"
+      CORPUSAGENT2_ALLOW_LOCAL_FALLBACK: "false"
+      CORPUSAGENT2_MCP_MAX_CONCURRENT_JOBS: ${CORPUSAGENT2_MCP_MAX_CONCURRENT_JOBS:-1}
+      CORPUSAGENT2_MCP_WORKER_POLL_SECONDS: ${CORPUSAGENT2_MCP_WORKER_POLL_SECONDS:-2}
+      CORPUSAGENT2_MCP_HEARTBEAT_SECONDS: ${CORPUSAGENT2_MCP_HEARTBEAT_SECONDS:-5}
+      CORPUSAGENT2_MCP_STALE_RUNNING_SECONDS: ${CORPUSAGENT2_MCP_STALE_RUNNING_SECONDS:-900}
+    ports:
+      - "127.0.0.1:${CORPUSAGENT2_MCP_PORT:-8765}:8765"
+    volumes:
+      - ../data:/app/data:ro
+      - ../outputs:/app/outputs
+    gpus: all

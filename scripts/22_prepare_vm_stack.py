@@ -20,6 +20,7 @@ from urllib.parse import urlparse
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEPLOY_ROOT = REPO_ROOT / "deploy"
 COMPOSE_FILE = DEPLOY_ROOT / "docker-compose.yml"
+MCP_COMPOSE_FILE = DEPLOY_ROOT / "docker-compose.mcp.yml"
 DEFAULT_DOCKER_DATA_DIR = DEPLOY_ROOT / "data"
 DEFAULT_PG_HOST = "127.0.0.1"
 DEFAULT_PG_PORT = 5432
@@ -628,6 +629,28 @@ def _ensure_docker_services(*, with_dashboards: bool) -> None:
     _wait_for_opensearch(timeout_s=240.0)
 
 
+def _ensure_mcp_service(*, build: bool) -> None:
+    compose_command = _docker_compose_command()
+    _ensure_docker_engine_ready()
+    env = _project_env()
+    command = compose_command + [
+        "-f",
+        str(COMPOSE_FILE),
+        "-f",
+        str(MCP_COMPOSE_FILE),
+        "up",
+        "-d",
+    ]
+    if build:
+        command.append("--build")
+    command.append("corpusagent2-mcp")
+    _run(command, cwd=REPO_ROOT, env=env)
+    print(
+        "[ready] MCP server requested at "
+        f"http://127.0.0.1:{env.get('CORPUSAGENT2_MCP_PORT', '8765')}{env.get('CORPUSAGENT2_MCP_PATH', '/mcp')}"
+    )
+
+
 def _maybe_run_script(
     python_exe: Path,
     script_name: str,
@@ -668,6 +691,13 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--with-dashboards", action="store_true", help="Start OpenSearch Dashboards as well.")
     parser.add_argument("--start-api", action="store_true", help="Start the FastAPI backend after preparation completes.")
     parser.add_argument(
+        "--setup-mcp-only",
+        action="store_true",
+        help="Only start existing Docker services plus the MCP job server; do not run data, ingest, dense, or indexing steps.",
+    )
+    parser.add_argument("--start-mcp", action="store_true", help="Start the Docker-hosted MCP job server after stack preparation.")
+    parser.add_argument("--no-mcp-build", action="store_true", help="Do not rebuild the MCP Docker image before starting it.")
+    parser.add_argument(
         "--retrieval-profile",
         choices=["no-dense", "hybrid"],
         default=_env_value("CORPUSAGENT2_VM_RETRIEVAL_PROFILE", DEFAULT_RETRIEVAL_PROFILE),
@@ -687,6 +717,32 @@ def main(argv: Iterable[str] | None = None) -> None:
     command_env = _project_env()
     command_env.update(profile_env)
     _upsert_dotenv(REPO_ROOT / ".env", profile_env)
+    if args.setup_mcp_only:
+        if args.skip_docker:
+            raise BootstrapError("--setup-mcp-only requires Docker; remove --skip-docker.")
+        _ensure_docker_services(with_dashboards=args.with_dashboards)
+        _ensure_mcp_service(build=not args.no_mcp_build)
+        elapsed_s = time.perf_counter() - started
+        summary_path = _write_summary(
+            {
+                "repo_root": str(REPO_ROOT),
+                "retrieval_profile": args.retrieval_profile,
+                "docker_compose": str(COMPOSE_FILE),
+                "mcp_docker_compose": str(MCP_COMPOSE_FILE),
+                "docker_data_dir": str(_project_env()["CORPUSAGENT2_DOCKER_DATA_DIR"]),
+                "data_prepared": False,
+                "docker_prepared": True,
+                "mcp_started": True,
+                "mcp_url": f"http://127.0.0.1:{command_env.get('CORPUSAGENT2_MCP_PORT', '8765')}{command_env.get('CORPUSAGENT2_MCP_PATH', '/mcp')}",
+                "total_elapsed_seconds": round(elapsed_s, 3),
+            }
+        )
+        print("")
+        print("MCP-only preparation complete.")
+        print(f"Total time: {_format_duration(elapsed_s)}")
+        print(f"Summary: {summary_path}")
+        return
+
     python_exe = _ensure_venv_and_deps(skip_provider_assets=args.skip_provider_assets)
     _ensure_data_pipeline(
         python_exe,
@@ -809,6 +865,8 @@ def main(argv: Iterable[str] | None = None) -> None:
             force=opensearch_needs_refresh,
             should_skip=not opensearch_needs_refresh,
         )
+        if args.start_mcp:
+            _ensure_mcp_service(build=not args.no_mcp_build)
 
     elapsed_s = time.perf_counter() - started
     summary_path = _write_summary(
@@ -817,9 +875,11 @@ def main(argv: Iterable[str] | None = None) -> None:
             "retrieval_profile": args.retrieval_profile,
             "venv_python": str(python_exe),
             "docker_compose": str(COMPOSE_FILE),
+            "mcp_docker_compose": str(MCP_COMPOSE_FILE),
             "docker_data_dir": str(_project_env()["CORPUSAGENT2_DOCKER_DATA_DIR"]),
             "data_prepared": not args.skip_data,
             "docker_prepared": not args.skip_docker,
+            "mcp_started": bool(args.start_mcp and not args.skip_docker),
             "postgres_summary": str(postgres_ingest_summary) if postgres_ingest_summary.exists() else "",
             "pgvector_backfill_summary": str(pgvector_backfill_summary) if pgvector_backfill_summary.exists() else "",
             "pgvector_index_summary": str(pgvector_index_summary) if pgvector_index_summary.exists() else "",
