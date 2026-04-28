@@ -9,9 +9,11 @@ const accessGateButton = document.getElementById("accessGateButton");
 const questionInput = document.getElementById("question");
 const forceAnswerInput = document.getElementById("forceAnswer");
 const noCacheInput = document.getElementById("noCache");
+const notifyOnFinishInput = document.getElementById("notifyOnFinish");
 const runButton = document.getElementById("runButton");
 const abortButton = document.getElementById("abortButton");
 const abortAllButton = document.getElementById("abortAllButton");
+const printReportButton = document.getElementById("printReportButton");
 const continueButton = document.getElementById("continueButton");
 const clarificationPanel = document.getElementById("clarificationPanel");
 const clarificationPrompt = document.getElementById("clarificationPrompt");
@@ -38,6 +40,8 @@ const activeCount = document.getElementById("activeCount");
 const completedCount = document.getElementById("completedCount");
 const failedCount = document.getElementById("failedCount");
 const totalTimeCount = document.getElementById("totalTimeCount");
+const runIdText = document.getElementById("runIdText");
+const runSavedText = document.getElementById("runSavedText");
 const activeSteps = document.getElementById("activeSteps");
 const completedSteps = document.getElementById("completedSteps");
 const failedSteps = document.getElementById("failedSteps");
@@ -67,15 +71,20 @@ let currentRunId = "";
 let currentStatus = "idle";
 let currentRunStartedAtUtc = "";
 let currentRunFinishedAtUtc = "";
+let currentManifestSavedPath = "";
+let latestManifest = null;
 let latestRuntimeInfo = null;
 let providerDefaults = {};
 let submissionInFlight = false;
 let activePollSessionId = 0;
+let notificationPermissionRequested = false;
+const notifiedRunIds = new Set();
 const POLL_INTERVAL_MS = 250;
 const MANIFEST_FETCH_RETRY_DELAY_MS = 400;
 const MANIFEST_FETCH_MAX_ATTEMPTS = 5;
 const UI_STATE_KEY = "corpusagent2-ui-state-v2";
 const ACCESS_GATE_SESSION_KEY = "corpusagent2-access-gate-ok";
+const TERMINAL_RUN_STATUSES = ["completed", "partial", "failed", "rejected", "needs_clarification", "aborted"];
 
 const runtimeConfig = window.CORPUSAGENT2_CONFIG || {};
 const accessGateConfig = runtimeConfig.accessGate || {};
@@ -151,6 +160,7 @@ function saveUiState() {
     question: questionInput.value,
     forceAnswer: forceAnswerInput.checked,
     noCache: noCacheInput.checked,
+    notifyOnFinish: notifyOnFinishInput.checked,
     llmProvider: llmProviderSelect.value,
     plannerModel: plannerModelInput.value,
     synthesisModel: synthesisModelInput.value,
@@ -174,6 +184,7 @@ function restoreUiState() {
     questionInput.value = payload.question || questionInput.value;
     forceAnswerInput.checked = Boolean(payload.forceAnswer);
     noCacheInput.checked = Boolean(payload.noCache);
+    notifyOnFinishInput.checked = payload.notifyOnFinish !== false;
     llmProviderSelect.value = payload.llmProvider || llmProviderSelect.value;
     plannerModelInput.value = payload.plannerModel || plannerModelInput.value;
     synthesisModelInput.value = payload.synthesisModel || synthesisModelInput.value;
@@ -191,14 +202,33 @@ function hasActiveRun() {
   return ["queued", "running", "aborting"].includes(currentStatus) && Boolean(currentRunId);
 }
 
+function isTerminalStatus(status) {
+  return TERMINAL_RUN_STATUSES.includes(String(status || ""));
+}
+
+function canPrintReport() {
+  return Boolean(currentRunId) && isTerminalStatus(currentStatus) && !submissionInFlight;
+}
+
+function updateRunSaveDisplay() {
+  runIdText.textContent = currentRunId || "not saved yet";
+  runIdText.title = currentRunId || "";
+  const saved = Boolean(latestManifest || currentManifestSavedPath);
+  runSavedText.textContent = saved ? "manifest saved" : currentRunId ? "running" : "no manifest yet";
+  runSavedText.title = currentManifestSavedPath || "";
+}
+
 function updateControlState() {
   runButton.disabled = submissionInFlight || hasActiveRun();
   abortButton.disabled = !hasActiveRun();
   continueButton.disabled = submissionInFlight || !pendingClarificationQuestion;
   applyLlmSettingsButton.disabled = submissionInFlight || hasActiveRun();
   resetLlmSettingsButton.disabled = submissionInFlight || hasActiveRun();
+  printReportButton.disabled = !canPrintReport();
   runButton.textContent = submissionInFlight ? "Submitting..." : hasActiveRun() ? "Run In Progress" : "Run Query";
   continueButton.textContent = submissionInFlight ? "Submitting..." : "Continue With Clarification";
+  printReportButton.textContent = hasActiveRun() ? "PDF After Run" : "Print / Save PDF";
+  updateRunSaveDisplay();
 }
 
 function defaultModelsForProvider(providerName) {
@@ -417,13 +447,51 @@ function updateRunTotalTimeDisplay() {
     totalTimeCount.textContent = "n/a";
     return;
   }
-  const isTerminal = ["completed", "partial", "failed", "rejected", "needs_clarification", "aborted"].includes(currentStatus);
+  const isTerminal = isTerminalStatus(currentStatus);
   const finishedAt = isTerminal ? parseUtcTimestamp(currentRunFinishedAtUtc || "") : Date.now();
   if (finishedAt === null || finishedAt < startedAt) {
     totalTimeCount.textContent = "n/a";
     return;
   }
   totalTimeCount.textContent = formatDurationMs(finishedAt - startedAt) || "n/a";
+}
+
+async function ensureNotificationPermission() {
+  if (!notifyOnFinishInput.checked || !("Notification" in window)) {
+    return;
+  }
+  if (Notification.permission === "default" && !notificationPermissionRequested) {
+    notificationPermissionRequested = true;
+    try {
+      await Notification.requestPermission();
+    } catch (error) {
+      console.warn("Notification permission request failed", error);
+    }
+  }
+}
+
+function notifyRunFinished(manifest, statusPayload) {
+  if (!notifyOnFinishInput.checked || !("Notification" in window) || Notification.permission !== "granted") {
+    return;
+  }
+  const runId = manifest?.run_id || statusPayload?.run_id || currentRunId;
+  if (!runId || notifiedRunIds.has(runId)) {
+    return;
+  }
+  notifiedRunIds.add(runId);
+  const status = manifest?.status || statusPayload?.status || currentStatus;
+  const question = manifest?.question || manifest?.question_spec?.original_question || questionInput.value || "CorpusAgent2 run";
+  const title = status === "completed" || status === "partial" ? "CorpusAgent2 run finished" : `CorpusAgent2 run ${status}`;
+  const body = `${question.slice(0, 140)}\nRun ID: ${runId}`;
+  const notification = new Notification(title, {
+    body,
+    tag: `corpusagent2-${runId}`,
+    requireInteraction: status !== "completed",
+  });
+  notification.onclick = () => {
+    window.focus();
+    notification.close();
+  };
 }
 
 function collectToolCallTotals(rows) {
@@ -458,6 +526,557 @@ function collectArtifacts(manifest) {
   const fromNodes = (manifest.node_records || []).flatMap((record) => record.artifacts_used || []);
   const fromAnswer = manifest.final_answer?.artifacts_used || [];
   return [...new Set([...fromNodes, ...fromAnswer].filter(Boolean))];
+}
+
+function reportScalar(value) {
+  if (value === null || value === undefined || value === "") {
+    return "";
+  }
+  if (typeof value === "object") {
+    return JSON.stringify(value);
+  }
+  return String(value);
+}
+
+function reportList(items, emptyText = "None") {
+  const rows = Array.isArray(items) ? items : [];
+  if (!rows.length) {
+    return `<p class="muted">${escapeHtml(emptyText)}</p>`;
+  }
+  return `<ul>${rows.map((item) => `<li>${escapeHtml(reportScalar(item))}</li>`).join("")}</ul>`;
+}
+
+function reportPre(value, emptyText = "none") {
+  const isEmpty =
+    value === null ||
+    value === undefined ||
+    value === "" ||
+    (Array.isArray(value) && value.length === 0) ||
+    (typeof value === "object" && !Array.isArray(value) && Object.keys(value).length === 0);
+  return `<pre>${isEmpty ? escapeHtml(emptyText) : formatJson(value)}</pre>`;
+}
+
+function reportTextBlock(value, emptyText = "None") {
+  const text = String(value || "").trim();
+  return text ? `<pre>${escapeHtml(text)}</pre>` : `<p class="muted">${escapeHtml(emptyText)}</p>`;
+}
+
+function reportMetricRows(rows) {
+  return `
+    <div class="report-metrics">
+      ${rows
+        .map(
+          ([label, value]) => `
+            <div>
+              <span>${escapeHtml(label)}</span>
+              <strong>${escapeHtml(reportScalar(value))}</strong>
+            </div>
+          `
+        )
+        .join("")}
+    </div>
+  `;
+}
+
+function reportTable(headers, rows, rowFormatter, emptyText = "No rows") {
+  const safeRows = Array.isArray(rows) ? rows : [];
+  if (!safeRows.length) {
+    return `<p class="muted">${escapeHtml(emptyText)}</p>`;
+  }
+  return `
+    <table>
+      <thead>
+        <tr>${headers.map((header) => `<th>${escapeHtml(header)}</th>`).join("")}</tr>
+      </thead>
+      <tbody>
+        ${safeRows
+          .map((row, index) => {
+            const cells = rowFormatter(row, index);
+            return `<tr>${cells.map((cell) => `<td>${escapeHtml(reportScalar(cell))}</td>`).join("")}</tr>`;
+          })
+          .join("")}
+      </tbody>
+    </table>
+  `;
+}
+
+function reportArtifactLink(runId, path) {
+  const fileName = String(path || "").split(/[/\\]/).pop() || path;
+  return `<a href="${artifactUrl(runId, path)}">${escapeHtml(fileName)}</a><br><span class="muted">${escapeHtml(path)}</span>`;
+}
+
+function reportArtifacts(manifest) {
+  const artifacts = collectArtifacts(manifest);
+  if (!artifacts.length) {
+    return '<p class="muted">No artifacts were recorded for this run.</p>';
+  }
+  return `
+    <ul>
+      ${artifacts.map((path) => `<li>${reportArtifactLink(manifest.run_id, path)}</li>`).join("")}
+    </ul>
+  `;
+}
+
+function reportPlots(manifest) {
+  const plots = collectArtifacts(manifest).filter((path) => /\.(png|jpg|jpeg|svg)$/i.test(path));
+  if (!plots.length) {
+    return '<p class="muted">No plot artifacts were generated for this run.</p>';
+  }
+  return `
+    <div class="report-plots">
+      ${plots
+        .map((path) => {
+          const fileName = String(path || "").split(/[/\\]/).pop() || path;
+          return `
+            <figure>
+              <img src="${artifactUrl(manifest.run_id, path)}" alt="${escapeHtml(fileName)}">
+              <figcaption>${escapeHtml(fileName)}</figcaption>
+              <p class="muted">${escapeHtml(path)}</p>
+            </figure>
+          `;
+        })
+        .join("")}
+    </div>
+  `;
+}
+
+function buildPrintableReportHtml(manifest) {
+  const finalAnswer = manifest.final_answer || {};
+  const metadata = manifest.metadata || {};
+  const runtimeInfo = metadata.runtime_info || latestRuntimeInfo || {};
+  const llm = runtimeInfo.llm || {};
+  const device = runtimeInfo.device || {};
+  const retrieval = runtimeInfo.retrieval || {};
+  const toolTotals = collectToolCallTotals(manifest.tool_calls || []);
+  const nodeDuration = formatDurationMs(totalNodeDurationMs(manifest.node_records || [])) || "n/a";
+  const title = `CorpusAgent2 analysis - ${manifest.run_id || "run"}`;
+  const generatedAt = new Date().toLocaleString();
+  const plotCount = collectArtifacts(manifest).filter((path) => /\.(png|jpg|jpeg|svg)$/i.test(path)).length;
+
+  const plannerActionBlocks = (manifest.planner_actions || [])
+    .map(
+      (action, index) => `
+        <article class="report-card">
+          <h3>${index + 1}. ${escapeHtml(action.action || "planner action")}</h3>
+          <p><strong>Rewrite:</strong> ${escapeHtml(action.rewritten_question || "")}</p>
+          ${action.message ? `<p><strong>Message:</strong> ${escapeHtml(action.message)}</p>` : ""}
+          ${action.clarification_question ? `<p><strong>Clarification:</strong> ${escapeHtml(action.clarification_question)}</p>` : ""}
+          <h4>Assumptions</h4>
+          ${reportList(action.assumptions || [])}
+          ${action.rejection_reason ? `<p><strong>Rejection:</strong> ${escapeHtml(action.rejection_reason)}</p>` : ""}
+        </article>
+      `
+    )
+    .join("");
+
+  const planBlocks = (manifest.plan_dags || [])
+    .flatMap((dag, dagIndex) =>
+      (dag.nodes || []).map(
+        (node) => `
+          <article class="report-card">
+            <h3>Plan ${dagIndex + 1}: ${escapeHtml(node.capability || "")}</h3>
+            <p><strong>Node:</strong> ${escapeHtml(node.node_id || node.id || "")}</p>
+            <p><strong>Depends on:</strong> ${escapeHtml((node.depends_on || []).join(", ") || "none")}</p>
+            <h4>Inputs</h4>
+            ${reportPre(node.inputs || {})}
+          </article>
+        `
+      )
+    )
+    .join("");
+
+  const toolCallBlocks = (manifest.tool_calls || [])
+    .map(
+      (row, index) => `
+        <article class="report-card">
+          <h3>${index + 1}. ${escapeHtml(row.tool_name || row.capability || row.node_id || "tool")}</h3>
+          ${reportMetricRows([
+            ["Status", row.status || ""],
+            ["Provider", row.provider || ""],
+            ["Capability", row.capability || ""],
+            ["Node", row.node_id || ""],
+            ["Duration", stepDurationLabel(row) || ""],
+            ["Cache hit", row.cache_hit ? "yes" : "no"],
+          ])}
+          <p><strong>Call:</strong></p>
+          <pre>${escapeHtml(row.call_signature || "")}</pre>
+          ${row.tool_reason ? `<p><strong>Resolution:</strong> ${escapeHtml(row.tool_reason)}</p>` : ""}
+          ${row.error ? `<p class="danger"><strong>Error:</strong> ${escapeHtml(row.error)}</p>` : ""}
+          ${row.summary?.no_data_reason ? `<p><strong>No data:</strong> ${escapeHtml(row.summary.no_data_reason)}</p>` : ""}
+          <h4>Inputs</h4>
+          ${reportPre(row.inputs || {})}
+          <h4>Output Preview</h4>
+          ${reportPre(row.summary?.payload_preview || {})}
+          <h4>Artifacts</h4>
+          ${reportList(row.artifacts || [])}
+          ${
+            row.summary?.stdout_preview || row.summary?.stderr_preview
+              ? `<h4>Sandbox Output</h4>${reportTextBlock(
+                  [
+                    row.summary.stdout_preview ? `stdout:\n${row.summary.stdout_preview}` : "",
+                    row.summary.stderr_preview ? `stderr:\n${row.summary.stderr_preview}` : "",
+                  ]
+                    .filter(Boolean)
+                    .join("\n\n")
+                )}`
+              : ""
+          }
+        </article>
+      `
+    )
+    .join("");
+
+  const llmTraceBlocks = (metadata.llm_traces || [])
+    .map((trace, index) => {
+      const messages = Array.isArray(trace.messages)
+        ? trace.messages.map((item) => `${item.role}: ${String(item.content || "")}`).join("\n\n")
+        : "";
+      return `
+        <article class="report-card">
+          <h3>${index + 1}. ${escapeHtml(trace.stage || "LLM trace")}</h3>
+          ${reportMetricRows([
+            ["Provider", trace.provider_name || ""],
+            ["Model", trace.model || ""],
+            ["Fallback", trace.used_fallback ? "yes" : "no"],
+          ])}
+          ${trace.error ? `<p class="danger"><strong>Error:</strong> ${escapeHtml(trace.error)}</p>` : ""}
+          ${trace.note ? `<p><strong>Note:</strong> ${escapeHtml(trace.note)}</p>` : ""}
+          <h4>Prompt Messages</h4>
+          ${reportTextBlock(messages)}
+          <h4>Raw Output</h4>
+          ${reportTextBlock(trace.raw_text || "")}
+          <h4>Parsed JSON</h4>
+          ${reportPre(trace.parsed_json || {})}
+        </article>
+      `;
+    })
+    .join("");
+
+  return `<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>${escapeHtml(title)}</title>
+    <style>
+      :root {
+        --ink: #171512;
+        --muted: #625d55;
+        --border: #d8d0c3;
+        --paper: #fffaf2;
+        --soft: #f4efe6;
+        --accent: #0e6b5b;
+        --danger: #9f2f2f;
+      }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        color: var(--ink);
+        background: #f5efe2;
+        font-family: Georgia, "Times New Roman", serif;
+        line-height: 1.35;
+      }
+      main { max-width: 1120px; margin: 0 auto; padding: 28px; }
+      header {
+        border: 1px solid var(--border);
+        background: var(--paper);
+        border-radius: 20px;
+        padding: 22px;
+        margin-bottom: 18px;
+      }
+      h1 { margin: 0 0 8px; font-size: 2.2rem; line-height: 1; }
+      h2 {
+        margin: 28px 0 12px;
+        border-bottom: 2px solid var(--border);
+        padding-bottom: 6px;
+        page-break-after: avoid;
+      }
+      h3, h4 { margin: 14px 0 8px; page-break-after: avoid; }
+      .muted { color: var(--muted); }
+      .danger { color: var(--danger); }
+      .report-card {
+        border: 1px solid var(--border);
+        background: rgba(255, 250, 242, 0.86);
+        border-radius: 16px;
+        padding: 14px;
+        margin: 12px 0;
+        break-inside: avoid;
+      }
+      .report-metrics {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+        gap: 8px;
+        margin: 12px 0;
+      }
+      .report-metrics > div {
+        border: 1px solid var(--border);
+        border-radius: 12px;
+        background: #fff;
+        padding: 9px;
+      }
+      .report-metrics span { display: block; color: var(--muted); font-size: 0.86rem; }
+      .report-metrics strong { overflow-wrap: anywhere; }
+      pre {
+        white-space: pre-wrap;
+        overflow-wrap: anywhere;
+        border: 1px solid var(--border);
+        border-radius: 12px;
+        background: var(--soft);
+        padding: 10px;
+        font-family: "Cascadia Code", Consolas, monospace;
+        font-size: 0.82rem;
+      }
+      table {
+        width: 100%;
+        border-collapse: collapse;
+        table-layout: fixed;
+        margin: 10px 0;
+        font-size: 0.88rem;
+      }
+      th, td {
+        border: 1px solid var(--border);
+        padding: 7px;
+        text-align: left;
+        vertical-align: top;
+        overflow-wrap: anywhere;
+      }
+      th { background: var(--soft); }
+      ul { margin-top: 8px; padding-left: 20px; }
+      li { margin-bottom: 6px; overflow-wrap: anywhere; }
+      a { color: var(--accent); }
+      .report-plots {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+        gap: 14px;
+      }
+      figure {
+        margin: 0;
+        border: 1px solid var(--border);
+        border-radius: 16px;
+        padding: 10px;
+        background: #fff;
+        break-inside: avoid;
+      }
+      figure img {
+        width: 100%;
+        max-height: 520px;
+        object-fit: contain;
+        border: 1px solid var(--border);
+        border-radius: 10px;
+        display: block;
+      }
+      figcaption { margin-top: 8px; font-weight: 700; }
+      .report-actions {
+        display: flex;
+        gap: 10px;
+        margin-top: 16px;
+      }
+      button {
+        border: 0;
+        border-radius: 999px;
+        padding: 10px 14px;
+        background: var(--accent);
+        color: #fff;
+        font: inherit;
+        cursor: pointer;
+      }
+      .appendix pre { font-size: 0.68rem; }
+      @page { margin: 14mm; }
+      @media print {
+        body { background: #fff; }
+        main { max-width: none; padding: 0; }
+        header, .report-card, figure { box-shadow: none; }
+        .no-print { display: none !important; }
+        a { color: inherit; text-decoration: none; }
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <header>
+        <p class="muted">CorpusAgent2 Full Analysis Report</p>
+        <h1>${escapeHtml(manifest.question || manifest.question_spec?.original_question || "Run analysis")}</h1>
+        ${reportMetricRows([
+          ["Run ID", manifest.run_id || ""],
+          ["Status", manifest.status || ""],
+          ["Generated", generatedAt],
+          ["Created", manifest.created_at_utc || ""],
+          ["Executor time", nodeDuration],
+          ["Plots", plotCount],
+        ])}
+        <div class="report-actions no-print">
+          <button type="button" onclick="window.print()">Print / Save PDF</button>
+          <button type="button" onclick="window.close()">Close</button>
+        </div>
+        <p class="muted no-print">Use the browser print dialog and choose "Save as PDF" to download the report.</p>
+      </header>
+
+      <section>
+        <h2>Grounded Answer</h2>
+        ${reportTextBlock(finalAnswer.answer_text || "")}
+        <h3>Caveats</h3>
+        ${reportList(finalAnswer.caveats || [])}
+        <h3>Unsupported Parts</h3>
+        ${reportList(finalAnswer.unsupported_parts || [])}
+        <h3>Claim Verdicts</h3>
+        ${reportTable(
+          ["Verdict", "Claim", "Evidence"],
+          finalAnswer.claim_verdicts || [],
+          (row) => [row.verdict || row.label || "", row.claim || "", row.evidence || ""],
+          "No claim verdicts"
+        )}
+      </section>
+
+      <section>
+        <h2>Run Summary</h2>
+        ${reportMetricRows([
+          ["LLM provider", llm.provider_name || ""],
+          ["Planner model", llm.planner_model || ""],
+          ["Synthesis model", llm.synthesis_model || ""],
+          ["Fallback warnings", (llm.warnings || []).join("; ")],
+          ["Device", device.recommended_device || ""],
+          ["Retrieval mode", retrieval.default_mode || ""],
+          ["Tool calls", toolTotals.totalCalls],
+          ["Completed calls", toolTotals.completedCalls],
+          ["Failed calls", toolTotals.failedCalls],
+          ["Input docs seen", toolTotals.inputDocumentsSeen],
+          ["Output items", toolTotals.outputItems],
+        ])}
+        <h3>Assumptions</h3>
+        ${reportList(manifest.assumptions || [])}
+      </section>
+
+      <section>
+        <h2>Plots</h2>
+        ${reportPlots(manifest)}
+      </section>
+
+      <section>
+        <h2>Artifacts</h2>
+        ${reportArtifacts(manifest)}
+      </section>
+
+      <section>
+        <h2>Execution Transcript</h2>
+        ${toolCallBlocks || '<p class="muted">No tool calls recorded.</p>'}
+      </section>
+
+      <section>
+        <h2>Planner Actions</h2>
+        ${plannerActionBlocks || '<p class="muted">No planner actions recorded.</p>'}
+      </section>
+
+      <section>
+        <h2>Plan DAG</h2>
+        ${planBlocks || '<p class="muted">No plan nodes recorded.</p>'}
+      </section>
+
+      <section>
+        <h2>Evidence Rows</h2>
+        ${reportTable(
+          ["Doc", "Outlet", "Date", "Excerpt", "Score"],
+          manifest.evidence_table || finalAnswer.evidence_items || [],
+          (row) => [
+            row.doc_id || "",
+            row.outlet || row.source || "",
+            row.date || row.published_at || "",
+            row.excerpt || row.snippet || "",
+            row.score_display || formatScore(row.score ?? ""),
+          ],
+          "No evidence rows"
+        )}
+      </section>
+
+      <section>
+        <h2>Selected Documents</h2>
+        ${reportTable(
+          ["Doc", "Outlet", "Date", "Score", "Snippet"],
+          manifest.selected_docs || [],
+          (row) => [
+            row.doc_id || "",
+            row.outlet || row.source || row.source_domain || "",
+            row.published_at || row.date || row.year || "",
+            formatScore(row.score_display ?? row.score ?? ""),
+            row.snippet || row.text || row.body || row.title || "",
+          ],
+          "No selected documents"
+        )}
+      </section>
+
+      <section>
+        <h2>Raw LLM Outputs</h2>
+        ${llmTraceBlocks || '<p class="muted">No LLM traces recorded.</p>'}
+      </section>
+
+      <section>
+        <h2>Node Records</h2>
+        ${reportTable(
+          ["Node", "Capability", "Tool", "Provider", "Status", "Duration", "Artifacts", "Caveats"],
+          manifest.node_records || [],
+          (row) => [
+            row.node_id || "",
+            row.capability || "",
+            row.tool_name || "",
+            row.provider || "",
+            row.status || "",
+            formatDurationMs(row.duration_ms || 0),
+            (row.artifacts_used || []).join("\n"),
+            (row.caveats || []).join("\n"),
+          ],
+          "No node records"
+        )}
+      </section>
+
+      <section class="appendix">
+        <h2>Full Manifest JSON</h2>
+        ${reportPre(manifest)}
+      </section>
+    </main>
+    <script>
+      (function () {
+        const timeout = new Promise((resolve) => setTimeout(resolve, 3500));
+        const imagePromises = Array.from(document.images).map((image) => {
+          if (image.complete) {
+            return Promise.resolve();
+          }
+          return new Promise((resolve) => {
+            image.onload = resolve;
+            image.onerror = resolve;
+          });
+        });
+        Promise.race([Promise.all(imagePromises), timeout]).then(() => {
+          setTimeout(() => window.print(), 250);
+        });
+      })();
+    <\/script>
+  </body>
+</html>`;
+}
+
+async function printCurrentRunReport() {
+  if (!currentRunId) {
+    detailText.textContent = "No completed run is available to print yet.";
+    return;
+  }
+  const reportWindow = window.open("", "_blank");
+  if (!reportWindow) {
+    detailText.textContent = "Could not open the PDF report window. Allow pop-ups for this page and try again.";
+    return;
+  }
+  reportWindow.document.write("<p>Building CorpusAgent2 report...</p>");
+  try {
+    const base = apiBaseInput.value.replace(/\/$/, "");
+    const manifest = latestManifest || (await fetchManifestWithRetry(base, currentRunId));
+    latestManifest = manifest;
+    reportWindow.document.open();
+    reportWindow.document.write(buildPrintableReportHtml(manifest));
+    reportWindow.document.close();
+    detailText.textContent = "PDF report opened. Use Save as PDF in the print dialog to download it.";
+  } catch (error) {
+    reportWindow.document.open();
+    reportWindow.document.write(`<pre>Could not build report: ${escapeHtml(error.message)}</pre>`);
+    reportWindow.document.close();
+    detailText.textContent = `PDF report failed: ${error.message}`;
+  }
 }
 
 function openPlotModal(src, caption) {
@@ -562,6 +1181,8 @@ function clearRestoredRunState() {
   currentStatus = "idle";
   currentRunStartedAtUtc = "";
   currentRunFinishedAtUtc = "";
+  currentManifestSavedPath = "";
+  latestManifest = null;
   pendingClarificationQuestion = "";
   saveUiState();
   renderClarificationState();
@@ -851,6 +1472,9 @@ function renderAnswerPayload(finalAnswer) {
 }
 
 function renderManifest(manifest) {
+  latestManifest = manifest;
+  currentManifestSavedPath = manifest?.artifacts_dir ? `${manifest.artifacts_dir}/run_manifest.json` : currentManifestSavedPath;
+  updateRunSaveDisplay();
   renderAnswerPayload(manifest.final_answer || {});
   renderEvidence(manifest.evidence_table || manifest.final_answer?.evidence_items || []);
   renderSelectedDocs(manifest.selected_docs || []);
@@ -876,10 +1500,16 @@ function renderManifest(manifest) {
 function setStatus(payload) {
   const status = payload.status || "unknown";
   currentStatus = status;
+  if (payload.run_id) {
+    currentRunId = String(payload.run_id);
+  }
+  if (payload.final_manifest_path) {
+    currentManifestSavedPath = String(payload.final_manifest_path);
+  }
   if (payload.started_at_utc) {
     currentRunStartedAtUtc = String(payload.started_at_utc);
   }
-  if (["completed", "partial", "failed", "rejected", "needs_clarification", "aborted"].includes(status)) {
+  if (isTerminalStatus(status)) {
     currentRunFinishedAtUtc = String(payload.updated_at_utc || new Date().toISOString());
   } else {
     currentRunFinishedAtUtc = "";
@@ -1043,8 +1673,10 @@ async function submitQuery({ preserveClarificationHistory = false } = {}) {
   const pollSessionId = activePollSessionId;
   currentRunStartedAtUtc = "";
   currentRunFinishedAtUtc = "";
+  currentManifestSavedPath = "";
   updateRunTotalTimeDisplay();
   updateControlState();
+  void ensureNotificationPermission();
   if (pollTimer) {
     clearInterval(pollTimer);
     pollTimer = null;
@@ -1059,6 +1691,7 @@ async function submitQuery({ preserveClarificationHistory = false } = {}) {
     renderClarificationState();
     saveUiState();
   }
+  latestManifest = null;
   resetManifestPanels("Waiting for result...");
   currentRunId = "";
   setStatus({
@@ -1116,7 +1749,7 @@ async function pollRun(runId, pollSessionId = activePollSessionId) {
     currentRunId = runId;
     setStatus(statusPayload);
 
-    if (["completed", "partial", "failed", "rejected", "needs_clarification", "aborted"].includes(statusPayload.status)) {
+    if (isTerminalStatus(statusPayload.status)) {
       clearInterval(pollTimer);
       pollTimer = null;
       const manifest = await fetchManifestWithRetry(base, runId);
@@ -1124,6 +1757,7 @@ async function pollRun(runId, pollSessionId = activePollSessionId) {
         return;
       }
       renderManifest(manifest);
+      notifyRunFinished(manifest, statusPayload);
       const manifestHistory = manifest.metadata?.clarification_history || [];
       if (Array.isArray(manifestHistory) && manifestHistory.length > 0) {
         clarificationHistory = manifestHistory;
@@ -1202,6 +1836,14 @@ abortAllButton.addEventListener("click", async () => {
   }
 });
 
+printReportButton.addEventListener("click", async () => {
+  try {
+    await printCurrentRunReport();
+  } catch (error) {
+    detailText.textContent = `PDF report failed: ${error.message}`;
+  }
+});
+
 applyLlmSettingsButton.addEventListener("click", async () => {
   try {
     await applyLlmSettings();
@@ -1269,6 +1911,7 @@ window.addEventListener("keydown", (event) => {
   questionInput,
   forceAnswerInput,
   noCacheInput,
+  notifyOnFinishInput,
   llmProviderSelect,
   plannerModelInput,
   synthesisModelInput,

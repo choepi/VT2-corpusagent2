@@ -216,6 +216,22 @@ def test_planner_query_repair_replaces_scope_only_query_with_topic(tmp_path: Pat
     assert orchestrator._repair_search_query("America", fallback_query) == "oil price"
 
 
+def test_planner_query_repair_compacts_overconstrained_comparative_entity_query(tmp_path: Path) -> None:
+    runtime = build_test_runtime(
+        tmp_path=tmp_path,
+        documents=_sample_documents(),
+        search_rows_by_query=_search_rows(_sample_documents()),
+    )
+    orchestrator = runtime.orchestrator
+
+    repaired = orchestrator._repair_search_query(
+        "Cristiano Ronaldo Lionel Messi perceptions relative value within",
+        "Cristiano Ronaldo Lionel Messi",
+    )
+
+    assert repaired == "Ronaldo Messi value"
+
+
 def test_search_inputs_apply_swiss_newspaper_source_scope(tmp_path: Path) -> None:
     runtime = build_test_runtime(
         tmp_path=tmp_path,

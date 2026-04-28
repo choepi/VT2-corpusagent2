@@ -756,6 +756,7 @@ class MagicBoxOrchestrator:
         blocked_source_tokens = self._source_scope_query_tokens_for_question(text)
         preferred_stopwords = {
             "actor", "actors", "does", "perceived", "perception", "portrayal", "portrayed",
+            "perceptions", "relative", "within",
         }
         for term in preferred_terms:
             if term.lower() in blocked_source_tokens or term.lower() in preferred_stopwords:
@@ -776,6 +777,7 @@ class MagicBoxOrchestrator:
             "dominate", "dominates", "dominated", "dominant", "entity", "entities", "named", "actor", "actors",
             "public", "discourse", "newspaper", "newspapers", "report", "reports", "reported",
             "perceived", "perception", "portrayal", "portrayed",
+            "perceptions", "relative", "within",
         }
         filtered = [token for token in tokens if token.lower() not in stopwords and token.lower() not in blocked_source_tokens]
         compact = " ".join(filtered[:8]).strip()
@@ -815,11 +817,53 @@ class MagicBoxOrchestrator:
             return len(topical_tokens) >= 2
         return False
 
+    def _compact_comparison_entity_query(self, query_text: str) -> str:
+        text = str(query_text or "").strip()
+        lowered = text.lower()
+        if not re.search(
+            r"\b(?:evolve|evolved|value|valuation|worth|perceived|perception|perceptions|portrayal|portrayed|relative)\b",
+            lowered,
+        ):
+            return ""
+        capitalized = [
+            token
+            for token in re.findall(r"\b[A-Z][A-Za-z0-9]*(?:-[A-Z]?[A-Za-z0-9]+)?\b", text)
+            if token.lower()
+            not in {
+                "how",
+                "what",
+                "which",
+                "when",
+                "where",
+                "why",
+                "american",
+                "swiss",
+                "republican",
+            }
+        ]
+        if len(capitalized) < 3:
+            return ""
+        if len(capitalized) >= 4:
+            entity_terms = capitalized[1::2]
+        else:
+            entity_terms = capitalized[1:]
+        topic_terms: list[str] = []
+        for token in re.findall(r"[A-Za-z][A-Za-z0-9]+", text):
+            lowered_token = token.lower()
+            if lowered_token in {"value", "valuation", "worth", "market", "contract", "salary", "transfer", "price"}:
+                if lowered_token not in {item.lower() for item in topic_terms}:
+                    topic_terms.append(lowered_token)
+        compacted = [*entity_terms[:4], *topic_terms[:3]]
+        return " ".join(dict.fromkeys(term for term in compacted if term)).strip()
+
     def _repair_search_query(self, planned_query: str, fallback_query: str) -> str:
         planned = str(planned_query or "").strip()
         fallback = str(fallback_query or "").strip()
         if not planned:
             return fallback
+        compacted_comparison = self._compact_comparison_entity_query(planned)
+        if compacted_comparison:
+            return compacted_comparison
         if fallback and self._query_needs_topical_repair(planned, fallback):
             return fallback
         return planned
@@ -1041,9 +1085,12 @@ class MagicBoxOrchestrator:
             "discourse",
             "perceived",
             "perception",
+            "perceptions",
             "portrayal",
             "portrayed",
+            "relative",
             "versus",
+            "within",
         }
 
         def _add_anchor(token: str) -> None:
