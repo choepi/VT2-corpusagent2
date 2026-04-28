@@ -212,7 +212,16 @@ class AsyncPlanExecutor:
 
     def _write_node_artifact(self, artifacts_dir: Path, node: AgentPlanNode, result: ToolExecutionResult) -> str:
         target = artifacts_dir / "nodes" / f"{node.node_id}.json"
-        write_json(target, {"payload": _compact_payload_for_storage(result.payload), "metadata": _safe_json(result.metadata)})
+        write_json(
+            target,
+            {
+                "payload": _compact_payload_for_storage(result.payload),
+                "metadata": _safe_json(result.metadata),
+                "artifacts": list(result.artifacts_used),
+                "caveats": list(result.caveats),
+                "unsupported_parts": list(result.unsupported_parts),
+            },
+        )
         return str(target)
 
     def _emit_event(self, context: AgentExecutionContext, payload: dict[str, Any]) -> None:
