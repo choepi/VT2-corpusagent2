@@ -671,6 +671,31 @@ def _sql_websearch_query_clauses(query: str, tokens: list[str]) -> list[str]:
     return [query_text] if query_text else []
 
 
+def _row_matches_query_expression(row: dict[str, Any], query: str) -> bool:
+    text = " ".join(
+        str(row.get(field, "") or "")
+        for field in ("title", "text", "cleaned_text", "snippet", "source", "outlet")
+    ).lower()
+    if not text.strip():
+        return False
+    groups = _split_top_level_and_groups(query)
+    if not groups:
+        anchors = _query_anchor_terms(query)
+        return _anchor_hit_count(text, anchors) >= _min_required_anchor_hits(query, anchors, top_k=0)
+    for group in groups:
+        or_groups = _query_or_groups(group)
+        if or_groups:
+            if not any(_anchor_hit_count(text, anchors.split()) >= 1 for anchors in or_groups):
+                return False
+            continue
+        anchors = _query_anchor_terms(group)
+        if not anchors:
+            continue
+        if _anchor_hit_count(text, anchors) < _min_required_anchor_hits(group, anchors, top_k=0):
+            return False
+    return True
+
+
 def _payload_or_params(params: dict[str, Any]) -> dict[str, Any]:
     payload = params.get("payload")
     if not isinstance(payload, dict):
@@ -3017,6 +3042,126 @@ def _create_working_set(params: dict[str, Any], deps: dict[str, ToolExecutionRes
             "working_set_doc_ids": list(doc_ids),
             "document_count": len(doc_ids),
         }
+    )
+
+
+def _filter_working_set(params: dict[str, Any], deps: dict[str, ToolExecutionResult], context: AgentExecutionContext) -> ToolExecutionResult:
+    query = str(params.get("query", "") or "").strip()
+    upstream_ref = str(params.get("working_set_ref", "") or _resolve_working_set_ref(params, deps)).strip()
+    if not upstream_ref:
+        return ToolExecutionResult(
+            payload={"results": [], "document_count": 0},
+            caveats=["No upstream working_set_ref was available for working-set filtering."],
+            metadata={"no_data": True, "no_data_reason": "missing_working_set_ref"},
+        )
+    if not query:
+        count = _count_working_set(context, upstream_ref, 0)
+        preview_ids = _fetch_working_set_ids(context, upstream_ref, limit=_result_preview_limit())
+        return ToolExecutionResult(
+            payload={
+                "results": [{"doc_id": doc_id} for doc_id in preview_ids],
+                "working_set_ref": upstream_ref,
+                "document_count": count,
+                "preview_count": len(preview_ids),
+                "results_truncated": count > len(preview_ids),
+            },
+            metadata={"working_set_ref": upstream_ref, "full_result_count": count},
+        )
+
+    date_from = str(params.get("date_from", "") or "").strip()
+    date_to = str(params.get("date_to", "") or "").strip()
+    try:
+        batch_size = max(1, int(params.get("batch_size") or os.getenv("CORPUSAGENT2_WORKING_SET_FILTER_BATCH_SIZE", "5000")))
+    except ValueError:
+        batch_size = 5000
+    total = _count_working_set(context, upstream_ref, 0)
+    fetcher = getattr(context.working_store, "fetch_working_set_documents", None)
+    if not callable(fetcher):
+        return ToolExecutionResult(
+            payload={"results": [], "document_count": 0, "source_working_set_ref": upstream_ref},
+            caveats=["The configured working-set store cannot fetch working-set documents for filtering."],
+            metadata={"no_data": True, "no_data_reason": "working_set_fetch_unavailable"},
+        )
+
+    filtered_rows: list[dict[str, Any]] = []
+    offset = 0
+    while True:
+        batch = fetcher(context.run_id, upstream_ref, limit=batch_size, offset=offset)
+        if not batch:
+            break
+        for raw_row in batch:
+            row = _with_cleaned_document_text(dict(raw_row))
+            published_at = str(row.get("published_at", row.get("date", "")) or "")
+            if date_from and published_at and published_at < date_from:
+                continue
+            if date_to and published_at and published_at > date_to:
+                continue
+            if _row_matches_query_expression(row, query):
+                filtered_rows.append(
+                    {
+                        "doc_id": str(row.get("doc_id", "")).strip(),
+                        "title": str(row.get("title", "")),
+                        "snippet": str(row.get("text", row.get("cleaned_text", "")))[:360],
+                        "outlet": str(row.get("outlet", row.get("source", ""))),
+                        "source": str(row.get("source", row.get("outlet", ""))),
+                        "date": published_at,
+                        "score": _coerce_score(row.get("score", 0.0)),
+                    }
+                )
+        offset += len(batch)
+        if total and offset >= total:
+            break
+
+    deduped: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    for row in filtered_rows:
+        doc_id = str(row.get("doc_id", "")).strip()
+        if not doc_id or doc_id in seen_ids:
+            continue
+        seen_ids.add(doc_id)
+        row["rank"] = len(deduped) + 1
+        deduped.append(row)
+
+    label, materialized_count = _materialize_result_working_set(
+        context,
+        query=f"{upstream_ref}\n{query}",
+        retrieval_mode="working_set_filter",
+        rows=deduped,
+    )
+    preview_limit = _result_preview_limit()
+    preview_rows = deduped[:preview_limit]
+    result_count = materialized_count or len(deduped)
+    caveats = [
+        (
+            f"Filtered upstream working_set_ref='{upstream_ref}' with the requested query instead of running "
+            f"another full-corpus retrieval; matched {result_count} of {total or offset} upstream documents."
+        )
+    ]
+    if not deduped:
+        caveats.append("Working-set filter found no documents matching the requested narrowing query.")
+    payload = {
+        "results": preview_rows,
+        "query": query,
+        "source_working_set_ref": upstream_ref,
+        "working_set_ref": label,
+        "retrieval_mode": "working_set_filter",
+        "retrieval_strategy": "working_set_filter",
+        "result_count": result_count,
+        "document_count": result_count,
+        "preview_count": len(preview_rows),
+        "results_truncated": result_count > len(preview_rows),
+    }
+    return ToolExecutionResult(
+        payload=payload,
+        evidence=preview_rows,
+        caveats=caveats,
+        metadata={
+            "working_set_ref": label,
+            "source_working_set_ref": upstream_ref,
+            "full_result_count": result_count,
+            "filtered_from_working_set": True,
+            "payload_truncated": result_count > len(preview_rows),
+        },
     )
 
 
@@ -6652,6 +6797,7 @@ def build_agent_registry() -> ToolRegistry:
         ("postgres_sql_search", "sql_query_search", "backend", 99, _sql_query_search),
         ("postgres_fetch_documents", "fetch_documents", "backend", 99, _fetch_documents),
         ("working_set_store", "create_working_set", "backend", 98, _create_working_set),
+        ("working_set_filter", "filter_working_set", "backend", 97, _filter_working_set),
         ("lang_id", "lang_id", "textacy", 91, _lang_id),
         ("clean_normalize", "clean_normalize", "textacy", 90, _clean_normalize),
         ("tokenize", "tokenize", "spacy", 89, _tokenize_docs),

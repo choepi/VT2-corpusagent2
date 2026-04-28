@@ -18,6 +18,7 @@ from corpusagent2.agent_capabilities import (
     _db_search,
     _fetch_documents,
     _extract_keyterms,
+    _filter_working_set,
     _join_external_series,
     _lang_id,
     _ner,
@@ -239,6 +240,55 @@ def test_fetch_documents_resolves_node_id_working_set_ref_from_dependency_payloa
 
     assert result.payload["working_set_ref"] == "actual_ref"
     assert result.payload["documents"][0]["doc_id"] == "doc-1"
+
+
+def test_filter_working_set_narrows_existing_working_set_without_new_search() -> None:
+    store = InMemoryWorkingSetStore()
+    store.document_lookup.update(
+        {
+            "doc-1": {
+                "doc_id": "doc-1",
+                "title": "Trump and market volatility",
+                "text": "Donald Trump coverage discussed stocks, equities, markets, and VIX volatility.",
+                "published_at": "2018-02-01",
+                "source": "example.com",
+            },
+            "doc-2": {
+                "doc_id": "doc-2",
+                "title": "Trump rally",
+                "text": "Donald Trump held a political rally focused on campaign donors.",
+                "published_at": "2018-02-02",
+                "source": "example.com",
+            },
+        }
+    )
+    store.record_working_set(
+        "run",
+        "broad",
+        [{"doc_id": "doc-1", "rank": 1, "score": 1.0}, {"doc_id": "doc-2", "rank": 2, "score": 0.9}],
+    )
+    context = AgentExecutionContext(
+        run_id="run",
+        artifacts_dir=Path("."),
+        search_backend=None,
+        working_store=store,
+        runtime=None,
+    )
+    deps = {"search": ToolExecutionResult(payload={"working_set_ref": "broad", "document_count": 2})}
+
+    result = _filter_working_set(
+        {
+            "source_node_id": "search",
+            "query": '("Donald Trump" OR Trump) AND (stocks OR equities OR market OR markets OR VIX OR volatility)',
+        },
+        deps,
+        context,
+    )
+
+    assert result.payload["document_count"] == 1
+    assert result.payload["results"][0]["doc_id"] == "doc-1"
+    assert result.payload["source_working_set_ref"] == "broad"
+    assert result.metadata["filtered_from_working_set"] is True
 
 
 def test_clean_normalize_lang_id_and_working_set_flow_preserves_documents() -> None:
