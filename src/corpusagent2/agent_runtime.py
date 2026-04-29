@@ -249,6 +249,50 @@ def _merge_tool_call_rows(existing_rows: list[dict[str, Any]], payload: dict[str
     return existing_rows
 
 
+def _runtime_corpus_info(project_root: Path, retrieval_health: dict[str, Any]) -> dict[str, Any]:
+    env_name = os.getenv("CORPUSAGENT2_CORPUS_NAME", "").strip()
+    hf_dataset = os.getenv("CORPUSAGENT2_HF_DATASET", "").strip()
+    hf_config = os.getenv("CORPUSAGENT2_HF_CONFIG", "").strip()
+    hf_split = os.getenv("CORPUSAGENT2_HF_SPLIT", "").strip()
+    pg_table = pg_table_from_env(default="article_corpus")
+    local_source = ""
+    source_sha256 = ""
+
+    summary_path = project_root / "outputs" / "stage_ccnews_summary.json"
+    try:
+        summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    except Exception:
+        summary = {}
+    files = summary.get("files") if isinstance(summary, dict) else None
+    if isinstance(files, list) and files:
+        first_file = files[0] if isinstance(files[0], dict) else {}
+        local_source = str(first_file.get("source") or first_file.get("destination") or "").strip()
+        source_sha256 = str(first_file.get("sha256") or "").strip()
+        source_name = Path(local_source).name.lower() if local_source else ""
+        if not hf_dataset and "cc_news" in source_name:
+            hf_dataset = "vblagoje/cc_news"
+            hf_split = hf_split or "train"
+
+    name = env_name or hf_dataset or (Path(local_source).name if local_source else pg_table)
+    display_parts = [name]
+    if hf_config:
+        display_parts.append(hf_config)
+    if hf_split and hf_dataset:
+        display_parts.append(hf_split)
+    display_name = " / ".join(part for part in display_parts if part)
+    return {
+        "name": name,
+        "display_name": display_name,
+        "hf_dataset": hf_dataset,
+        "hf_config": hf_config,
+        "hf_split": hf_split,
+        "pg_table": pg_table,
+        "local_source": local_source,
+        "source_sha256": source_sha256,
+        "document_count": int(retrieval_health.get("document_count") or 0),
+    }
+
+
 @dataclass(slots=True)
 class AgentRuntimeConfig:
     project_root: Path
@@ -3173,6 +3217,7 @@ class AgentRuntime:
             if capability.startswith("CORPUSAGENT2_PROVIDER_ORDER_")
         }
         retrieval_health = self.runtime.retrieval_health()
+        corpus_info = _runtime_corpus_info(self.config.project_root, retrieval_health)
         configured_default_mode = os.getenv("CORPUSAGENT2_DEFAULT_RETRIEVAL_MODE", "").strip().lower()
         if not configured_default_mode:
             configured_default_mode = (
@@ -3219,6 +3264,7 @@ class AgentRuntime:
             },
             "providers_installed": provider_modules,
             "provider_order": provider_orders,
+            "corpus": corpus_info,
             "capability_count": len(self.registry.list_tools()),
             "retrieval": {
                 "backend": self.runtime.retrieval_backend,
@@ -3241,6 +3287,7 @@ class AgentRuntime:
                 "GPU is mainly relevant for torch- or Flair-backed models and only when those providers are selected.",
                 "Per-node provider choice and artifacts are captured in the run manifest so you can verify what really ran.",
                 "Some analytics remain heuristic by design in the prototype, especially claim scoring, quote attribution, and burst detection; check provenance and caveats per node.",
+                "Provider chips are import checks only; per-node provenance shows which provider actually executed.",
                 (
                     f"Recovered {self._startup_repaired_runs} interrupted run(s) from 'started' to 'failed' on startup."
                     if self._startup_repaired_runs

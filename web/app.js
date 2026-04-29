@@ -32,7 +32,6 @@ const llmSettingsNote = document.getElementById("llmSettingsNote");
 const runtimeSummary = document.getElementById("runtimeSummary");
 const retrievalHealth = document.getElementById("retrievalHealth");
 const providersInstalled = document.getElementById("providersInstalled");
-const providerOrder = document.getElementById("providerOrder");
 const runtimeNotes = document.getElementById("runtimeNotes");
 const statusBox = document.getElementById("statusBox");
 const detailText = document.getElementById("detailText");
@@ -41,6 +40,7 @@ const completedCount = document.getElementById("completedCount");
 const failedCount = document.getElementById("failedCount");
 const totalTimeCount = document.getElementById("totalTimeCount");
 const runIdText = document.getElementById("runIdText");
+const corpusNameText = document.getElementById("corpusNameText");
 const runSavedText = document.getElementById("runSavedText");
 const activeSteps = document.getElementById("activeSteps");
 const completedSteps = document.getElementById("completedSteps");
@@ -213,6 +213,14 @@ function canPrintReport() {
 function updateRunSaveDisplay() {
   runIdText.textContent = currentRunId || "not saved yet";
   runIdText.title = currentRunId || "";
+  const corpus = (latestManifest?.metadata?.runtime_info || latestRuntimeInfo || {}).corpus || {};
+  const corpusLabel = corpus.display_name || corpus.hf_dataset || corpus.name || "unknown";
+  corpusNameText.textContent = corpusLabel;
+  corpusNameText.title = [
+    corpus.hf_dataset ? `HF: ${corpus.hf_dataset}` : "",
+    corpus.local_source ? `Source: ${corpus.local_source}` : "",
+    corpus.pg_table ? `Table: ${corpus.pg_table}` : "",
+  ].filter(Boolean).join(" | ");
   const saved = Boolean(latestManifest || currentManifestSavedPath);
   runSavedText.textContent = saved ? "manifest saved" : currentRunId ? "running" : "no manifest yet";
   runSavedText.title = currentManifestSavedPath || "";
@@ -1225,6 +1233,7 @@ function renderRuntimeInfo(payload) {
       <div class="metric-row"><span>Dense strategy</span><strong>${escapeHtml(retrievalHealthPayload.dense_strategy || "unknown")}</strong></div>
       <div class="metric-row"><span>Re-rank</span><strong>${retrieval.rerank_enabled ? `on (top ${escapeHtml(retrieval.rerank_top_k ?? "")})` : "off"}</strong></div>
       <div class="metric-row"><span>Dense model</span><strong>${escapeHtml(retrieval.dense_model_id || "")}</strong></div>
+      <div class="metric-row"><span>Corpus</span><strong>${escapeHtml((payload.corpus || {}).display_name || (payload.corpus || {}).name || "unknown")}</strong></div>
     `;
 
   retrievalHealth.innerHTML = `
@@ -1245,20 +1254,13 @@ function renderRuntimeInfo(payload) {
   Object.entries(payload.providers_installed || {}).forEach(([name, installed]) => {
     const chip = document.createElement("span");
     chip.className = `chip ${installed ? "ok" : "off"}`;
-    chip.textContent = `${name}: ${installed ? "ready" : "missing"}`;
+    chip.textContent = `${name}: ${installed ? "import ok" : "missing"}`;
     providersInstalled.appendChild(chip);
-  });
-
-  providerOrder.innerHTML = "";
-  Object.entries(payload.provider_order || {}).forEach(([capability, providers]) => {
-    const chip = document.createElement("span");
-    chip.className = "chip";
-    chip.textContent = `${capability}: ${providers}`;
-    providerOrder.appendChild(chip);
   });
 
   renderList(runtimeNotes, [...(payload.analysis_notes || []), ...(llm.warnings || []), ...(device.warnings || [])], (row) => escapeHtml(row));
   updateControlState();
+  updateRunSaveDisplay();
   saveUiState();
 }
 

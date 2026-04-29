@@ -193,6 +193,8 @@ def test_create_working_set_can_materialize_doc_ids_from_search_results() -> Non
 
     assert result.payload["document_count"] == 2
     assert result.payload["working_set_doc_ids"] == ["doc-1", "doc-2"]
+    assert result.payload["working_set_ref"]
+    assert store.fetch_working_set_doc_ids("run", result.payload["working_set_ref"]) == ["doc-1", "doc-2"]
 
 
 def test_fetch_documents_can_read_working_set_doc_ids_from_dependency_payload() -> None:
@@ -290,6 +292,45 @@ def test_filter_working_set_narrows_existing_working_set_without_new_search() ->
     assert result.payload["results"][0]["doc_id"] == "doc-1"
     assert result.payload["source_working_set_ref"] == "broad"
     assert result.metadata["filtered_from_working_set"] is True
+
+
+def test_filter_working_set_can_limit_ranked_working_set_without_query() -> None:
+    store = InMemoryWorkingSetStore()
+    store.document_lookup.update(
+        {
+            "doc-1": {"doc_id": "doc-1", "title": "A", "text": "First", "published_at": "2018-01-01", "source": "a.com"},
+            "doc-2": {"doc_id": "doc-2", "title": "B", "text": "Second", "published_at": "2018-01-02", "source": "b.com"},
+            "doc-3": {"doc_id": "doc-3", "title": "C", "text": "Third", "published_at": "2018-01-03", "source": "c.com"},
+        }
+    )
+    store.record_working_set(
+        "run",
+        "broad",
+        [
+            {"doc_id": "doc-1", "rank": 1, "score": 0.2},
+            {"doc_id": "doc-2", "rank": 2, "score": 0.9},
+            {"doc_id": "doc-3", "rank": 3, "score": 0.7},
+        ],
+    )
+    context = AgentExecutionContext(
+        run_id="run",
+        artifacts_dir=Path("."),
+        search_backend=None,
+        working_store=store,
+        runtime=None,
+    )
+    deps = {"working_set": ToolExecutionResult(payload={"working_set_ref": "broad", "document_count": 3})}
+
+    result = _filter_working_set(
+        {"payload": {"working_set": "working_set", "limit": 2, "sort_by": [{"field": "_retrieval_score", "order": "desc"}]}},
+        deps,
+        context,
+    )
+
+    assert result.payload["document_count"] == 2
+    assert [row["doc_id"] for row in result.payload["results"]] == ["doc-2", "doc-3"]
+    assert store.fetch_working_set_doc_ids("run", result.payload["working_set_ref"]) == ["doc-2", "doc-3"]
+    assert result.metadata["full_match_count_before_limit"] == 3
 
 
 def test_filter_working_set_applies_nested_payload_filters() -> None:
@@ -1075,6 +1116,39 @@ def test_plot_artifact_prefers_nonzero_alias_candidate(tmp_path: Path) -> None:
     assert result.payload["resolved_y"] == "mention_share"
 
 
+def test_plot_artifact_resolves_generic_return_field_for_scatter(tmp_path: Path) -> None:
+    context = AgentExecutionContext(
+        run_id="run",
+        artifacts_dir=tmp_path,
+        search_backend=None,
+        working_store=InMemoryWorkingSetStore(),
+        runtime=None,
+    )
+    deps = {
+        "joined": ToolExecutionResult(
+            payload={
+                "rows": [
+                    {"time_bin": "2018-01-01", "avg_sentiment": 0.1, "market_return": 0.01},
+                    {"time_bin": "2018-01-02", "avg_sentiment": -0.2, "market_return": -0.03},
+                    {"time_bin": "2018-01-03", "avg_sentiment": 0.4, "market_return": 0.02},
+                ]
+            }
+        )
+    }
+
+    result = _plot_artifact(
+        {"plot_type": "scatter", "x": "avg_sentiment", "y": "sp500_daily_return", "title": "Sentiment vs market"},
+        deps,
+        context,
+    )
+
+    assert result.artifacts
+    assert result.payload["plot_kind"] == "scatter"
+    assert result.payload["resolved_y"] == "market_return"
+    assert result.payload["plotted_row_count"] == 3
+    assert any("Resolved plot y field 'sp500_daily_return'" in caveat for caveat in result.caveats)
+
+
 def test_build_evidence_table_uses_task_name_for_entity_frequency(tmp_path: Path) -> None:
     context = AgentExecutionContext(
         run_id="run",
@@ -1229,6 +1303,40 @@ def test_actor_prominence_merge_preserves_time_and_filters_junk_entities(tmp_pat
     assert "ICICI Bank today" not in actors
 
 
+def test_python_runner_handles_native_numeric_correlation_without_sandbox(tmp_path: Path) -> None:
+    context = AgentExecutionContext(
+        run_id="run",
+        artifacts_dir=tmp_path,
+        search_backend=None,
+        working_store=InMemoryWorkingSetStore(),
+        runtime=None,
+        python_runner=None,
+    )
+    deps = {
+        "joined": ToolExecutionResult(
+            payload={
+                "rows": [
+                    {"time_bin": "2018-01-01", "average_sentiment": 0.2, "market_return": 0.01},
+                    {"time_bin": "2018-01-02", "average_sentiment": -0.1, "market_return": -0.02},
+                    {"time_bin": "2018-01-03", "average_sentiment": 0.4, "market_return": 0.03},
+                ]
+            }
+        )
+    }
+
+    result = agent_capabilities._python_runner(
+        {"task": "compute correlation between sentiment and market returns"},
+        deps,
+        context,
+    )
+
+    row = result.payload["rows"][0]
+    assert row["x_field"] == "average_sentiment"
+    assert row["y_field"] == "market_return"
+    assert row["paired_observation_count"] == 3
+    assert result.metadata["analysis"] == "numeric_correlation"
+
+
 def test_entity_surface_filter_keeps_real_uppercase_entities() -> None:
     assert agent_capabilities._valid_entity_surface("US")
     assert agent_capabilities._valid_entity_surface("U.S.")
@@ -1361,6 +1469,45 @@ def test_targeted_claim_and_sentiment_infer_comparison_entities_from_question(tm
     assert {row["entity_label"] for row in sentiment.payload["rows"]} == {"Cristiano Ronaldo", "Lionel Messi"}
 
 
+def test_sentiment_falls_back_to_full_documents_when_target_windows_do_not_match(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("CORPUSAGENT2_PROVIDER_ORDER_SENTIMENT", "heuristic")
+    context = AgentExecutionContext(
+        run_id="run",
+        artifacts_dir=tmp_path,
+        search_backend=None,
+        working_store=InMemoryWorkingSetStore(),
+        runtime=None,
+    )
+    deps = {
+        "docs": ToolExecutionResult(
+            payload={
+                "documents": [
+                    {
+                        "doc_id": "d1",
+                        "published_at": "2018-01-01",
+                        "title": "Trump policy update",
+                        "text": "The article says the policy was good and successful.",
+                    }
+                ]
+            }
+        )
+    }
+
+    result = agent_capabilities._sentiment(
+        {
+            "window_strategy": "entity_local_context",
+            "target_entities": ["Nonexistent Entity"],
+            "query_focus": "sentiment toward Nonexistent Entity",
+        },
+        deps,
+        context,
+    )
+
+    assert len(result.payload["rows"]) == 1
+    assert result.payload["rows"][0]["doc_id"] == "d1"
+    assert any("fell back to full document text" in caveat for caveat in result.caveats)
+
+
 def test_time_series_aggregate_merges_metric_sources_by_series_definitions(tmp_path: Path) -> None:
     context = AgentExecutionContext(
         run_id="run",
@@ -1455,6 +1602,50 @@ def test_time_series_aggregate_uses_metrics_source_and_mean_alias_fields(tmp_pat
     assert rows[0]["claim_strength_score"] == 0.7
     assert rows[0]["mean_claim_strength_score"] == 0.7
     assert rows[0]["bucket"] == "2018-01"
+
+
+def test_time_series_aggregate_unwraps_payload_metric_specs_with_as_alias(tmp_path: Path) -> None:
+    context = AgentExecutionContext(
+        run_id="run",
+        artifacts_dir=tmp_path,
+        search_backend=None,
+        working_store=InMemoryWorkingSetStore(),
+        runtime=None,
+    )
+    deps = {
+        "sentiment": ToolExecutionResult(
+            payload={
+                "rows": [
+                    {"doc_id": "d1", "published_at": "2018-01-02", "sentiment_score": 0.5},
+                    {"doc_id": "d2", "published_at": "2018-01-02", "sentiment_score": -0.1},
+                    {"doc_id": "d3", "published_at": "2018-01-03", "sentiment_score": 0.8},
+                ]
+            }
+        )
+    }
+
+    result = _time_series_aggregate(
+        {
+            "payload": {
+                "from_node": "sentiment",
+                "date_field": "published_at",
+                "frequency": "day",
+                "metrics": [
+                    {"field": "sentiment_score", "agg": "mean", "as": "avg_sentiment"},
+                    {"field": "doc_id", "agg": "count", "as": "post_count"},
+                ],
+            },
+            "bucket_granularity": "month",
+            "metrics": ["average_sentiment", "document_count"],
+        },
+        deps,
+        context,
+    )
+
+    rows = {row["time_bin"]: row for row in result.payload["rows"]}
+    assert rows["2018-01-02"]["avg_sentiment"] == 0.2
+    assert rows["2018-01-02"]["post_count"] == 2
+    assert rows["2018-01-03"]["avg_sentiment"] == 0.8
 
 
 def test_time_series_aggregate_handles_document_series_and_string_metrics(tmp_path: Path) -> None:
@@ -2376,6 +2567,59 @@ def test_join_external_series_returns_standalone_market_rows_when_internal_rows_
     assert captured["start"] == "2018-01-15"
     assert captured["end"] == "2018-02-21"
     assert any("standalone" in caveat.lower() for caveat in result.caveats)
+
+
+def test_join_external_series_accepts_nested_external_series_spec(monkeypatch, tmp_path: Path) -> None:
+    captured: dict[str, str] = {}
+
+    def fake_fetch_yfinance_series_rows(*, ticker: str, start: str, end: str, interval: str = "1d") -> list[dict]:
+        captured.update({"ticker": ticker, "start": start, "end": end, "interval": interval})
+        return [
+            {"ticker": ticker, "date": "2018-01-01", "time_bin": "2018-01", "market_return": 0.01},
+            {"ticker": ticker, "date": "2018-02-01", "time_bin": "2018-02", "market_return": -0.02},
+        ]
+
+    monkeypatch.setattr(agent_capabilities, "_fetch_yfinance_series_rows", fake_fetch_yfinance_series_rows)
+    context = AgentExecutionContext(
+        run_id="run",
+        artifacts_dir=tmp_path,
+        search_backend=_EmptySearchBackend(),
+        working_store=InMemoryWorkingSetStore(),
+        runtime=None,
+        state=SimpleNamespace(question="", rewritten_question=""),
+    )
+    deps = {
+        "series": ToolExecutionResult(
+            payload={
+                "rows": [
+                    {"time_bin": "2018-01", "average_sentiment": 0.2},
+                    {"time_bin": "2018-02", "average_sentiment": -0.1},
+                ]
+            }
+        )
+    }
+
+    result = _join_external_series(
+        {
+            "payload": {
+                "left_from_node": "series",
+                "external_series": {
+                    "provider_hint": "yfinance",
+                    "ticker": "^GSPC",
+                    "frequency": "daily",
+                    "start_date": "2018-01-01",
+                    "end_date": "2018-03-01",
+                },
+                "join_type": "inner",
+            }
+        },
+        deps,
+        context,
+    )
+
+    assert captured == {"ticker": "^GSPC", "start": "2018-01-01", "end": "2018-03-01", "interval": "1d"}
+    assert len(result.payload["rows"]) == 2
+    assert result.payload["rows"][0]["market_return"] == 0.01
 
 
 def test_noun_distribution_streaming_filters_function_words(monkeypatch, tmp_path: Path) -> None:

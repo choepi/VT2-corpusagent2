@@ -117,6 +117,10 @@
               <strong id="runIdText">not saved yet</strong>
             </div>
             <div>
+              <span class="metric-label">Corpus</span>
+              <strong id="corpusNameText">unknown</strong>
+            </div>
+            <div>
               <span class="metric-label">Saved</span>
               <strong id="runSavedText">no manifest yet</strong>
             </div>
@@ -222,10 +226,9 @@
             <div id="runtimeSummary" class="metric-stack"></div>
             <h3>Retrieval Health</h3>
             <div id="retrievalHealth" class="metric-stack"></div>
-            <h3>Installed Providers</h3>
+            <h3>Provider Imports</h3>
             <div id="providersInstalled" class="chip-wrap"></div>
-            <h3>Provider Order</h3>
-            <div id="providerOrder" class="chip-wrap"></div>
+            <p class="muted">These chips show whether provider libraries import. The actual provider used is recorded per node in the execution transcript.</p>
             <h3>Execution Notes</h3>
             <ul id="runtimeNotes"></ul>
           </article>
