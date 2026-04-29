@@ -2520,6 +2520,8 @@ def _infer_market_ticker_from_text(text: str) -> str:
     ticker_match = re.search(r"(?<![A-Za-z0-9])\$([A-Z]{1,5}(?:\.[A-Z])?)\b", text)
     if ticker_match:
         return ticker_match.group(1)
+    if any(term in lowered for term in ("s&p 500", "s&p500", "sp500", "standard & poor", "standard and poor")):
+        return "^GSPC"
     if any(term in lowered for term in ("crude oil", "oil price", "oil prices", "wti", "brent")):
         return "CL=F"
     if any(term in lowered for term in ("gasoline price", "gas prices", "gas price")):
@@ -2842,15 +2844,12 @@ def _db_search(params: dict[str, Any], deps: dict[str, ToolExecutionResult], con
     if rows and not _rows_match_query_anchor_terms(rows, query):
         caveats.append("Retrieved documents did not match the main query entities closely enough, so no evidence rows were kept.")
         rows = []
-    return ToolExecutionResult(
-        payload={
-            "results": rows,
-            "query": query,
-            "retrieval_mode": retrieval_mode,
-            "retrieval_strategy": retrieval_strategy,
-            "result_count": len(rows),
-        },
-        evidence=list(rows),
+    return _search_result(
+        context=context,
+        query=query,
+        retrieval_mode=retrieval_mode,
+        retrieval_strategy=retrieval_strategy,
+        rows=rows,
         caveats=caveats,
     )
 
@@ -3127,8 +3126,9 @@ def _create_working_set(params: dict[str, Any], deps: dict[str, ToolExecutionRes
     if rows:
         context.working_store.record_documents(context.run_id, rows)
     doc_ids = _working_set_doc_ids(deps)
+    dependency_rows = _dependency_rows(deps)
     if not doc_ids:
-        filtered_rows = _dependency_rows(deps)
+        filtered_rows = dependency_rows
         if filters.get("language_in"):
             allowed = {str(item).strip().lower() for item in filters.get("language_in", []) if str(item).strip()}
             filtered_rows = [
@@ -3136,13 +3136,52 @@ def _create_working_set(params: dict[str, Any], deps: dict[str, ToolExecutionRes
             ]
         doc_ids = [str(row.get("doc_id", "")) for row in filtered_rows if str(row.get("doc_id", "")).strip()]
     doc_ids = _dedupe_doc_ids(doc_ids or [str(row.get("doc_id", "")) for row in rows if str(row.get("doc_id", "")).strip()])
+    materialization_rows_by_id: dict[str, dict[str, Any]] = {}
+    for rank, row in enumerate([*dependency_rows, *rows], start=1):
+        doc_id = str(row.get("doc_id", "")).strip()
+        if not doc_id or doc_id in materialization_rows_by_id:
+            continue
+        materialization_rows_by_id[doc_id] = {
+            **row,
+            "doc_id": doc_id,
+            "rank": int(row.get("rank", rank) or rank),
+            "score": _coerce_score(row.get("score", row.get("_retrieval_score", 0.0))),
+        }
+    materialization_rows = [
+        materialization_rows_by_id.get(doc_id, {"doc_id": doc_id, "rank": index, "score": 0.0})
+        for index, doc_id in enumerate(doc_ids, start=1)
+    ]
+    label = ""
+    materialized_count = 0
+    if materialization_rows:
+        label, materialized_count = _materialize_result_working_set(
+            context,
+            query=str(params.get("label") or params.get("name") or "working_set"),
+            retrieval_mode="working_set",
+            rows=materialization_rows,
+        )
     if context.state is not None:
         context.state.working_set_doc_ids = list(doc_ids)
+        if label:
+            context.state.working_set_ref = label
+            context.state.working_set_count = materialized_count or len(doc_ids)
+    preview_limit = _result_preview_limit()
+    preview_ids = list(doc_ids[:preview_limit])
+    caveats = []
+    if label and len(doc_ids) > len(preview_ids):
+        caveats.append(
+            f"Working set '{label}' contains {materialized_count or len(doc_ids)} documents; payload includes only preview IDs."
+        )
     return ToolExecutionResult(
         payload={
-            "working_set_doc_ids": list(doc_ids),
+            "working_set_ref": label,
+            "working_set_doc_ids": preview_ids,
+            "working_set_doc_ids_truncated": len(doc_ids) > len(preview_ids),
+            "working_set_doc_ids_count": len(doc_ids),
             "document_count": len(doc_ids),
-        }
+        },
+        metadata={"working_set_ref": label} if label else {},
+        caveats=caveats,
     )
 
 
@@ -3227,11 +3266,82 @@ def _structured_filter_matches(row: dict[str, Any], filters: dict[str, Any]) -> 
     return True, unsupported
 
 
+def _positive_int_param(value: Any) -> int | None:
+    if value in (None, ""):
+        return None
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
+
+
+def _working_set_sort_specs(params: dict[str, Any]) -> list[dict[str, str]]:
+    raw = params.get("sort_by", params.get("order_by", []))
+    if isinstance(raw, str):
+        raw = [{"field": raw}]
+    if isinstance(raw, dict):
+        raw = [raw]
+    specs: list[dict[str, str]] = []
+    if not isinstance(raw, list):
+        return specs
+    for item in raw:
+        if isinstance(item, str):
+            field = item
+            order = "desc" if field.startswith("-") else "asc"
+            field = field.lstrip("-")
+        elif isinstance(item, dict):
+            field = str(item.get("field") or item.get("key") or item.get("column") or "").strip()
+            order = str(item.get("order") or item.get("direction") or "asc").strip().lower()
+        else:
+            continue
+        if field:
+            specs.append({"field": field, "order": "desc" if order.startswith("desc") else "asc"})
+    return specs
+
+
+def _working_set_sort_value(row: dict[str, Any], field: str) -> Any:
+    normalized = field.strip().lower().lstrip("_").replace("-", "_")
+    aliases = {
+        "retrieval_score": ("score", "_retrieval_score", "retrieval_score"),
+        "score": ("score", "_retrieval_score", "retrieval_score"),
+        "rank": ("rank", "_rank", "retrieval_rank"),
+        "date": ("published_at", "date"),
+    }
+    for candidate in aliases.get(normalized, (field, normalized)):
+        if candidate not in row:
+            continue
+        value = row.get(candidate)
+        if value in (None, ""):
+            continue
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return str(value).lower()
+    return None
+
+
+def _apply_working_set_sort(rows: list[dict[str, Any]], specs: list[dict[str, str]]) -> list[dict[str, Any]]:
+    ordered = list(rows)
+    for spec in reversed(specs):
+        field = spec["field"]
+        reverse = spec["order"] == "desc"
+        present = [row for row in ordered if _working_set_sort_value(row, field) is not None]
+        missing = [row for row in ordered if _working_set_sort_value(row, field) is None]
+        present.sort(key=lambda row: _working_set_sort_value(row, field), reverse=reverse)
+        ordered = present + missing
+    return ordered
+
+
 def _filter_working_set(params: dict[str, Any], deps: dict[str, ToolExecutionResult], context: AgentExecutionContext) -> ToolExecutionResult:
     params = _merged_payload_params(params)
     query = str(params.get("query", "") or "").strip()
     filters = params.get("filters", params.get("filter", {}))
     filters = dict(filters) if isinstance(filters, dict) else {}
+    limit = _positive_int_param(params.get("limit", params.get("top_k", params.get("max_documents"))))
+    sort_specs = _working_set_sort_specs(params)
+    date_from = str(params.get("date_from", "") or "").strip()
+    date_to = str(params.get("date_to", "") or "").strip()
     upstream_ref = str(params.get("working_set_ref", "") or _resolve_working_set_ref(params, deps)).strip()
     if not upstream_ref:
         return ToolExecutionResult(
@@ -3239,7 +3349,7 @@ def _filter_working_set(params: dict[str, Any], deps: dict[str, ToolExecutionRes
             caveats=["No upstream working_set_ref was available for working-set filtering."],
             metadata={"no_data": True, "no_data_reason": "missing_working_set_ref"},
         )
-    if not query and not filters:
+    if not query and not filters and not date_from and not date_to and not limit and not sort_specs:
         count = _count_working_set(context, upstream_ref, 0)
         preview_ids = _fetch_working_set_ids(context, upstream_ref, limit=_result_preview_limit())
         return ToolExecutionResult(
@@ -3253,8 +3363,6 @@ def _filter_working_set(params: dict[str, Any], deps: dict[str, ToolExecutionRes
             metadata={"working_set_ref": upstream_ref, "full_result_count": count},
         )
 
-    date_from = str(params.get("date_from", "") or "").strip()
-    date_to = str(params.get("date_to", "") or "").strip()
     try:
         batch_size = max(1, int(params.get("batch_size") or os.getenv("CORPUSAGENT2_WORKING_SET_FILTER_BATCH_SIZE", "5000")))
     except ValueError:
@@ -3312,10 +3420,17 @@ def _filter_working_set(params: dict[str, Any], deps: dict[str, ToolExecutionRes
         seen_ids.add(doc_id)
         row["rank"] = len(deduped) + 1
         deduped.append(row)
+    matched_count_before_limit = len(deduped)
+    if sort_specs:
+        deduped = _apply_working_set_sort(deduped, sort_specs)
+    if limit is not None:
+        deduped = deduped[:limit]
+    for rank, row in enumerate(deduped, start=1):
+        row["rank"] = rank
 
     label, materialized_count = _materialize_result_working_set(
         context,
-        query=f"{upstream_ref}\n{query}",
+        query=f"{upstream_ref}\n{query}\nlimit={limit or ''}\nsort={json.dumps(sort_specs, sort_keys=True)}",
         retrieval_mode="working_set_filter",
         rows=deduped,
     )
@@ -3325,7 +3440,7 @@ def _filter_working_set(params: dict[str, Any], deps: dict[str, ToolExecutionRes
     caveats = [
         (
             f"Filtered upstream working_set_ref='{upstream_ref}' with the requested query/metadata filters instead of running "
-            f"another full-corpus retrieval; matched {result_count} of {total or offset} upstream documents."
+            f"another full-corpus retrieval; matched {matched_count_before_limit} of {total or offset} upstream documents."
         )
     ]
     if filters:
@@ -3334,6 +3449,10 @@ def _filter_working_set(params: dict[str, Any], deps: dict[str, ToolExecutionRes
             + json.dumps(filters, ensure_ascii=False, sort_keys=True)
             + "."
         )
+    if sort_specs:
+        caveats.append("Applied working-set ordering: " + json.dumps(sort_specs, ensure_ascii=False, sort_keys=True) + ".")
+    if limit is not None and matched_count_before_limit > len(deduped):
+        caveats.append(f"Limited filtered working set to top {limit} of {matched_count_before_limit} matched documents.")
     if unsupported_filter_keys:
         caveats.append(
             "Requested working-set filters could not be evaluated from available document metadata: "
@@ -3362,6 +3481,7 @@ def _filter_working_set(params: dict[str, Any], deps: dict[str, ToolExecutionRes
             "working_set_ref": label,
             "source_working_set_ref": upstream_ref,
             "full_result_count": result_count,
+            "full_match_count_before_limit": matched_count_before_limit,
             "filtered_from_working_set": True,
             "payload_truncated": result_count > len(preview_rows),
         },
@@ -4241,6 +4361,18 @@ def _targeted_text_units(
                     "matched_focus_terms": matched_focus,
                 }
             )
+    if not units:
+        return [
+            {
+                "doc": doc,
+                "text": _row_analysis_text(doc),
+                "target_entity": str(doc.get("target_entity", doc.get("entity_label", "")) or ""),
+                "matched_alias": str(doc.get("matched_alias", "") or ""),
+                "matched_focus_terms": [],
+                "target_context_fallback": True,
+            }
+            for doc in docs
+        ]
     return units
 
 
@@ -4252,6 +4384,10 @@ def _sentiment(params: dict[str, Any], deps: dict[str, ToolExecutionResult], con
         max_documents=_sentiment_analysis_max_documents(),
     )
     units = _targeted_text_units(docs, params, context)
+    if any(unit.get("target_context_fallback") for unit in units):
+        source_caveats.append(
+            "No target-local context windows matched the inferred aliases, so sentiment fell back to full document text."
+        )
     providers = _provider_order("sentiment", ["flair", "textblob", "heuristic"])
     used_provider = "heuristic"
     for provider in providers:
@@ -4810,10 +4946,14 @@ def _time_series_rows_from_named_metrics(
 
 
 def _time_series_aggregate(params: dict[str, Any], deps: dict[str, ToolExecutionResult], context: AgentExecutionContext) -> ToolExecutionResult:
+    params = _payload_or_params(params)
     granularity = str(
         params.get(
-            "bucket_granularity",
-            params.get("granularity", params.get("time_granularity", params.get("interval", _default_time_granularity()))),
+            "frequency",
+            params.get(
+                "bucket_granularity",
+                params.get("granularity", params.get("time_granularity", params.get("interval", _default_time_granularity()))),
+            ),
         )
     ).strip().lower() or "month"
     metric_series = _time_series_rows_from_metric_specs(params, deps, granularity=granularity)
@@ -5517,7 +5657,7 @@ def _metric_value(row: dict[str, Any], metric: dict[str, Any]) -> float | None:
     aggregation = str(metric.get("aggregation", metric.get("agg", "")) or "").strip().lower()
     if aggregation == "count":
         return 1.0
-    metric_name = str(metric.get("name", "") or "").strip()
+    metric_name = str(metric.get("name") or metric.get("as") or metric.get("output_field") or "").strip()
     field_candidates = [
         str(metric.get("field", "") or "").strip(),
         str(metric.get("value_field", "") or "").strip(),
@@ -5548,7 +5688,12 @@ def _time_series_rows_from_metric_specs(
     raw_metrics = params.get("metrics")
     if not isinstance(raw_metrics, list) or not raw_metrics:
         return None
-    metrics = [metric for metric in raw_metrics if isinstance(metric, dict) and str(metric.get("name", "")).strip()]
+    metrics = [
+        metric
+        for metric in raw_metrics
+        if isinstance(metric, dict)
+        and str(metric.get("name") or metric.get("as") or metric.get("output_field") or metric.get("field") or "").strip()
+    ]
     if not metrics:
         return None
     groups = _series_definitions(params)
@@ -5557,11 +5702,11 @@ def _time_series_rows_from_metric_specs(
     doc_sets: defaultdict[tuple[str, str], set[str]] = defaultdict(set)
     skipped = 0
     for metric in metrics:
-        metric_name = str(metric.get("name", "") or "").strip()
+        metric_name = str(metric.get("name") or metric.get("as") or metric.get("output_field") or metric.get("field") or "").strip()
         aggregations[metric_name] = str(metric.get("aggregation", metric.get("agg", "sum")) or "sum").strip().lower()
         source = str(metric.get("source", metric.get("source_node", metric.get("source_node_id", ""))) or "").strip()
         for row in _dependency_rows_for_source(deps, source):
-            series = _row_series_name(row, groups)
+            series = _row_series_name(row, groups) if groups else "__all__"
             if not series:
                 skipped += 1
                 continue
@@ -6048,6 +6193,8 @@ def _fetch_yfinance_series_rows(
     date_column = "Date" if "Date" in frame.columns else frame.columns[0]
     rows: list[dict[str, Any]] = []
     previous_close: float | None = None
+    normalized_interval = str(interval or "1d").strip().lower()
+    series_granularity = "day" if normalized_interval in {"1d", "1h", "60m", "30m", "15m", "5m", "2m", "1m"} else "month"
     for row in frame.itertuples(index=False):
         record = row._asdict()
         raw_date = record.get(date_column)
@@ -6063,7 +6210,7 @@ def _fetch_yfinance_series_rows(
             {
                 "ticker": normalized_ticker,
                 "date": date_text,
-                "time_bin": _time_bin(date_text),
+                "time_bin": _time_bin(date_text, series_granularity),
                 "market_open": open_value,
                 "market_high": high_value,
                 "market_low": low_value,
@@ -6124,13 +6271,35 @@ def _infer_external_series_bounds(left_rows: list[dict[str, Any]], key: str) -> 
 
 
 def _join_external_series(params: dict[str, Any], deps: dict[str, ToolExecutionResult], context: AgentExecutionContext) -> ToolExecutionResult:
-    external_rows = list(params.get("series_rows", []))
-    ticker = str(params.get("ticker", "")).strip() or _infer_market_ticker_from_text(
+    params = _merged_payload_params(params)
+    external_spec = params.get("external_series") if isinstance(params.get("external_series"), dict) else {}
+    external_rows = list(params.get("series_rows") or external_spec.get("series_rows") or external_spec.get("rows") or [])
+    ticker = str(
+        params.get("ticker")
+        or params.get("symbol")
+        or external_spec.get("ticker")
+        or external_spec.get("symbol")
+        or ""
+    ).strip() or _infer_market_ticker_from_text(
         str(getattr(context.state, "rewritten_question", "") or getattr(context.state, "question", ""))
     )
-    start = str(params.get("start", params.get("date_from", ""))).strip()
-    end = str(params.get("end", params.get("date_to", ""))).strip()
-    interval = str(params.get("interval", "1d")).strip() or "1d"
+    start = str(
+        params.get("start")
+        or params.get("date_from")
+        or external_spec.get("start")
+        or external_spec.get("start_date")
+        or ""
+    ).strip()
+    end = str(
+        params.get("end")
+        or params.get("date_to")
+        or external_spec.get("end")
+        or external_spec.get("end_date")
+        or ""
+    ).strip()
+    interval = str(params.get("interval") or external_spec.get("interval") or external_spec.get("frequency") or "1d").strip() or "1d"
+    interval_aliases = {"daily": "1d", "day": "1d", "weekly": "1wk", "week": "1wk", "monthly": "1mo", "month": "1mo"}
+    interval = interval_aliases.get(interval.lower(), interval)
     left_rows: list[dict[str, Any]] = []
     bound_rows: list[dict[str, Any]] = []
     for result in deps.values():
@@ -6239,7 +6408,7 @@ def _join_external_series(params: dict[str, Any], deps: dict[str, ToolExecutionR
 
     merged = left_df.merge(
         right_df,
-        how=str(params.get("how", "left")),
+        how=str(params.get("how") or params.get("join_type") or "left"),
         left_on=left_key,
         right_on=right_key,
         suffixes=("", "_external"),
@@ -6412,6 +6581,32 @@ def _plot_field_has_nonzero_numeric_values(rows: list[dict[str, Any]], field: st
     return any((number := _plot_float(row.get(field))) is not None and abs(number) > 1e-12 for row in rows)
 
 
+def _semantic_plot_field_candidates(keys: list[str], requested_normalized: str) -> list[str]:
+    if not requested_normalized:
+        return []
+    semantic_terms = (
+        ("return", ("return", "pctchange", "percentchange", "dailychange")),
+        ("sentiment", ("sentiment", "tone", "polarity")),
+        ("volatility", ("volatility", "drawdown", "variance", "risk")),
+        ("price", ("price", "close", "open", "high", "low")),
+        ("count", ("count", "frequency", "mentions", "documents")),
+        ("share", ("share", "ratio", "percent", "percentage")),
+    )
+    requested_terms = [
+        target
+        for target, synonyms in semantic_terms
+        if target in requested_normalized or any(synonym in requested_normalized for synonym in synonyms)
+    ]
+    if not requested_terms:
+        return []
+    candidates: list[str] = []
+    for key in keys:
+        normalized_key = _normalize_plot_field_name(key)
+        if any(term in normalized_key for term in requested_terms) and key not in candidates:
+            candidates.append(key)
+    return candidates
+
+
 def _plot_axis_label_is_usable(value: Any, *, time_axis_like: bool = False) -> bool:
     text = str(value if value is not None else "").strip()
     if text.lower() in PLOT_NULL_AXIS_LABELS:
@@ -6475,6 +6670,11 @@ def _resolve_existing_plot_field(
         for key in keys
         for alias in alias_candidates
         if _normalize_plot_field_name(key) == _normalize_plot_field_name(alias) and key not in candidates
+    )
+    candidates.extend(
+        candidate
+        for candidate in _semantic_plot_field_candidates(keys, normalized)
+        if candidate not in candidates
     )
     valid_candidates: list[str] = []
     for candidate in candidates:
@@ -6767,6 +6967,7 @@ def _plot_artifact(params: dict[str, Any], deps: dict[str, ToolExecutionResult],
             metadata={"no_data": True, "no_data_reason": "No numeric plot field available."},
         )
     requested_plot_type = str(params.get("plot_type", "") or "").strip().lower()
+    scatter_like = requested_plot_type in {"scatter", "scatterplot", "point", "points"}
     time_axis_like = (
         requested_plot_type in {"line", "time_series", "timeseries"}
         or _plot_field_looks_time_like(structured_rows, x_key)
@@ -6799,7 +7000,21 @@ def _plot_artifact(params: dict[str, Any], deps: dict[str, ToolExecutionResult],
     points: list[dict[str, Any]] = []
     skipped_points = 0
     time_series_data: tuple[list[dict[str, Any]], list[tuple[str, list[tuple[str, float, dict[str, Any]]]]], list[str], int] | None = None
-    if time_series_like:
+    if scatter_like:
+        first = []
+        for row in axis_filtered_rows:
+            x_value = _plot_float(row.get(x_key)) if x_key else None
+            y_value = _plot_float(row.get(y_key)) if y_key else None
+            if x_value is None or y_value is None:
+                skipped_points += 1
+                continue
+            plotted_row = dict(row)
+            plotted_row["_plot_x"] = x_value
+            plotted_row["_plot_y"] = y_value
+            first.append(plotted_row)
+            if len(first) >= limit:
+                break
+    elif time_series_like:
         series_limit = _int_param(params, "series_top_k", "max_series", default=5, maximum=12)
         time_series_data = _prepare_time_series_plot_data(
             axis_filtered_rows,
@@ -6827,7 +7042,9 @@ def _plot_artifact(params: dict[str, Any], deps: dict[str, ToolExecutionResult],
             plot_field_caveats.append(f"Skipped {skipped_points} row(s) without numeric values for '{y_key}'.")
     total_skipped_rows = skipped_axis_rows + skipped_points
     plot_kind = (
-        "topic_bar"
+        "scatter"
+        if scatter_like
+        else "topic_bar"
         if topic_like_source
         else "market_overlay"
         if market_overlay_like_source
@@ -6886,7 +7103,25 @@ def _plot_artifact(params: dict[str, Any], deps: dict[str, ToolExecutionResult],
     topic_like = bool(first and "topic_id" in first[0] and any(item.get("top_terms") for item in first))
     market_overlay_like = bool(first and "market_close" in first[0] and any("count" in item or "score" in item for item in first))
 
-    if topic_like:
+    if scatter_like:
+        x_values = [float(item["_plot_x"]) for item in first]
+        y_values = [float(item["_plot_y"]) for item in first]
+        axis.scatter(x_values, y_values, s=44, color="#0f766e", edgecolors="#17312d", linewidths=0.45, alpha=0.82)
+        if len(x_values) >= 2 and len(set(x_values)) > 1:
+            try:
+                import numpy as np
+
+                slope, intercept = np.polyfit(x_values, y_values, 1)
+                line_x = np.array([min(x_values), max(x_values)])
+                axis.plot(line_x, slope * line_x + intercept, color="#b45309", linewidth=2.0, alpha=0.85, label="Linear fit")
+                axis.legend(loc="best", fontsize=8, frameon=True)
+            except Exception:
+                pass
+        axis.axhline(0, color="#4b5563", linewidth=0.8, alpha=0.45)
+        axis.axvline(0, color="#4b5563", linewidth=0.8, alpha=0.35)
+        axis.set_xlabel(x_key.replace("_", " ").title() or "X")
+        axis.set_ylabel(y_key.replace("_", " ").title() or "Y")
+    elif topic_like:
         labels = []
         values = []
         for index, item in enumerate(first):
@@ -7041,6 +7276,101 @@ def _looks_like_python_code(code: str) -> bool:
     return True
 
 
+def _is_numeric_correlation_task(task: str, params: dict[str, Any]) -> bool:
+    combined = " ".join(
+        str(value)
+        for value in (
+            task,
+            params.get("task", ""),
+            params.get("description", ""),
+            params.get("question", ""),
+        )
+        if value
+    ).lower()
+    return any(term in combined for term in ("correlation", "correlat", "association", "co-movement", "relationship"))
+
+
+def _numeric_series_field(rows: list[dict[str, Any]], explicit: Any, preferred_terms: tuple[str, ...]) -> str:
+    if explicit:
+        field = str(explicit).strip()
+        if field and any(field in row for row in rows):
+            return field
+    columns = sorted({key for row in rows for key in row})
+    numeric_columns: list[str] = []
+    for column in columns:
+        values = [row.get(column) for row in rows if row.get(column) not in (None, "")]
+        if not values:
+            continue
+        numeric_count = 0
+        for value in values:
+            try:
+                float(value)
+                numeric_count += 1
+            except (TypeError, ValueError):
+                pass
+        if numeric_count >= max(2, min(len(values), 3)):
+            numeric_columns.append(column)
+    for term in preferred_terms:
+        for column in numeric_columns:
+            if term in column.lower():
+                return column
+    low_value_columns = {
+        "rank",
+        "document_count",
+        "doc_count",
+        "count",
+        "mention_count",
+        "document_frequency",
+        "market_volume",
+    }
+    for column in numeric_columns:
+        if column.lower() not in low_value_columns:
+            return column
+    return numeric_columns[0] if numeric_columns else ""
+
+
+def _native_numeric_correlation_rows(
+    params: dict[str, Any],
+    deps: dict[str, ToolExecutionResult],
+) -> tuple[list[dict[str, Any]], dict[str, Any], list[str]]:
+    rows = _payload_rows_from_all_dependencies(deps)
+    if not rows:
+        return [], {"analysis": "numeric_correlation"}, ["No rows were available for native numeric correlation."]
+    x_field = _numeric_series_field(
+        rows,
+        params.get("x_field") or params.get("left_value_field") or params.get("sentiment_field"),
+        ("sentiment", "tone", "score"),
+    )
+    y_field = _numeric_series_field(
+        rows,
+        params.get("y_field") or params.get("right_value_field") or params.get("market_field") or params.get("return_field"),
+        ("market_return", "return", "drawdown", "volatility", "market_close", "close"),
+    )
+    if not x_field or not y_field or x_field == y_field:
+        return [], {"analysis": "numeric_correlation"}, ["Could not infer two distinct numeric fields for correlation."]
+    frame = pd.DataFrame(rows)
+    if x_field not in frame.columns or y_field not in frame.columns:
+        return [], {"analysis": "numeric_correlation", "x_field": x_field, "y_field": y_field}, [
+            "Requested correlation fields were not present in the dependency rows."
+        ]
+    pair_frame = frame[[x_field, y_field]].apply(pd.to_numeric, errors="coerce").dropna()
+    if len(pair_frame) < 2:
+        return [], {"analysis": "numeric_correlation", "x_field": x_field, "y_field": y_field}, [
+            "Fewer than two aligned numeric observations were available for correlation."
+        ]
+    pearson = float(pair_frame[x_field].corr(pair_frame[y_field], method="pearson"))
+    spearman = float(pair_frame[x_field].corr(pair_frame[y_field], method="spearman"))
+    row = {
+        "analysis": "numeric_correlation",
+        "x_field": x_field,
+        "y_field": y_field,
+        "paired_observation_count": int(len(pair_frame)),
+        "pearson_correlation": round(pearson, 6) if math.isfinite(pearson) else None,
+        "spearman_correlation": round(spearman, 6) if math.isfinite(spearman) else None,
+    }
+    return [row], {"analysis": "numeric_correlation", "x_field": x_field, "y_field": y_field}, []
+
+
 def _python_runner(params: dict[str, Any], deps: dict[str, ToolExecutionResult], context: AgentExecutionContext) -> ToolExecutionResult:
     params = _analysis_params(params)
     task = _task_name(params)
@@ -7062,6 +7392,19 @@ def _python_runner(params: dict[str, Any], deps: dict[str, ToolExecutionResult],
         )
     code = str(params.get("code", "")).strip()
     if not _looks_like_python_code(code):
+        if _is_numeric_correlation_task(task, params):
+            correlation_rows, correlation_metadata, correlation_caveats = _native_numeric_correlation_rows(params, deps)
+            if correlation_rows:
+                return ToolExecutionResult(
+                    payload={"rows": correlation_rows, **correlation_metadata, "exit_code": 0, "stdout": "", "stderr": ""},
+                    caveats=correlation_caveats,
+                    metadata={"no_data": False, **correlation_metadata},
+                )
+            return ToolExecutionResult(
+                payload={"rows": [], **correlation_metadata, "exit_code": 0, "stdout": "", "stderr": ""},
+                caveats=correlation_caveats,
+                metadata={"no_data": True, "no_data_reason": "numeric_correlation_unavailable", **correlation_metadata},
+            )
         if any(
             str(row.get("doc_id", "")).strip()
             and any(name in row for name in ("entity", "canonical_entity", "linked_entity", "speaker", "attributed_actor"))

@@ -337,6 +337,12 @@ def _execute_smoke_suite(tmp_path: Path) -> tuple[dict[str, ToolExecutionResult]
         sql_result = execute("postgres_sql_search", "sql_query_search", params={"query": query, "top_k": 5})
         fetch_result = execute("postgres_fetch_documents", "fetch_documents", deps={"search": search_result})
         execute("working_set_store", "create_working_set", deps={"documents": fetch_result})
+        execute(
+            "working_set_filter",
+            "filter_working_set",
+            params={"limit": 2, "sort_by": [{"field": "_retrieval_score", "order": "desc"}]},
+            deps={"working_set": results["working_set_store"]},
+        )
 
         doc_tools = [
             ("lang_id", "lang_id", {}),
@@ -471,6 +477,7 @@ def test_smoke_suite_covers_all_registered_tools() -> None:
         "postgres_sql_search",
         "postgres_fetch_documents",
         "working_set_store",
+        "working_set_filter",
         "lang_id",
         "clean_normalize",
         "tokenize",
