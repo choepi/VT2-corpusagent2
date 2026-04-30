@@ -7,17 +7,22 @@ from typing import Any
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
-from pydantic import BaseModel, Field
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field
 
 from .agent_runtime import AgentRuntime, AgentRuntimeConfig
 
 
 class QueryRequest(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
     question: str = Field(min_length=1)
-    force_answer: bool = False
-    no_cache: bool = False
-    async_mode: bool = False
-    clarification_history: list[str] = Field(default_factory=list)
+    force_answer: bool = Field(default=False, validation_alias=AliasChoices("force_answer", "forceAnswer"))
+    no_cache: bool = Field(default=False, validation_alias=AliasChoices("no_cache", "noCache"))
+    async_mode: bool = Field(default=False, validation_alias=AliasChoices("async_mode", "asyncMode"))
+    clarification_history: list[str] = Field(
+        default_factory=list,
+        validation_alias=AliasChoices("clarification_history", "clarificationHistory"),
+    )
 
 
 class LLMSettingsRequest(BaseModel):
