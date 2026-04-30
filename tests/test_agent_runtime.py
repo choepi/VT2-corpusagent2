@@ -782,6 +782,62 @@ def test_api_async_submission_exposes_live_status(tmp_path: Path) -> None:
     assert any(call.get("call_signature") for call in status_payload["tool_calls"])
 
 
+def test_api_async_submission_accepts_camel_case_force_answer(tmp_path: Path) -> None:
+    docs = _sample_documents()
+    llm = StaticLLMClient(
+        [
+            {
+                "action": "ask_clarification",
+                "rewritten_question": "Please clarify which media sources you mean.",
+                "clarification_question": "Which sources?",
+                "assumptions": [],
+                "message": "",
+            },
+            {
+                "action": "ask_clarification",
+                "rewritten_question": "Still unclear.",
+                "clarification_question": "Clarify more.",
+                "assumptions": [],
+                "message": "",
+            },
+        ]
+    )
+    runtime = build_test_runtime(tmp_path=tmp_path, documents=docs, search_rows_by_query=_search_rows(docs))
+    runtime.llm_client = llm
+    runtime.orchestrator.llm_client = llm
+    app = build_app(runtime=runtime, project_root=tmp_path)
+
+    from fastapi.testclient import TestClient
+
+    client = TestClient(app)
+    submitted = client.post(
+        "/query/submit",
+        json={
+            "question": "Which media predicted the outbreak of the Ukraine war in 2022?",
+            "forceAnswer": True,
+            "noCache": True,
+        },
+    )
+    assert submitted.status_code == 200
+    assert submitted.json()["force_answer"] is True
+    run_id = submitted.json()["run_id"]
+
+    deadline = time.time() + 5
+    status_payload = {}
+    while time.time() < deadline:
+        status_payload = client.get(f"/runs/{run_id}/status").json()
+        if status_payload["status"] in {"completed", "partial", "failed", "rejected", "needs_clarification"}:
+            break
+        time.sleep(0.05)
+
+    assert status_payload["force_answer"] is True
+    assert status_payload["status"] in {"completed", "partial"}
+    manifest = client.get(f"/runs/{run_id}").json()
+    assert manifest["metadata"]["force_answer"] is True
+    assert manifest["status"] in {"completed", "partial"}
+    assert not manifest["clarification_questions"]
+
+
 def test_runtime_manifest_persists_tool_call_transcript(tmp_path: Path) -> None:
     docs = _sample_documents()
     runtime = build_test_runtime(tmp_path=tmp_path, documents=docs, search_rows_by_query=_search_rows(docs))

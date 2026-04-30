@@ -3385,6 +3385,8 @@ class AgentRuntime:
             artifacts_dir=str(artifacts_dir),
             failures=list(resolved_snapshot.failures),
             metadata={
+                "force_answer": bool(state.force_answer),
+                "no_cache": bool(state.no_cache),
                 "clarification_history": list(state.clarification_history),
                 "llm_traces": list(state.llm_traces),
                 "runtime_info": self.runtime_info(),
@@ -3530,6 +3532,8 @@ class AgentRuntime:
             ),
             artifacts_dir=str(artifacts_dir),
             metadata={
+                "force_answer": bool(state.force_answer),
+                "no_cache": bool(state.no_cache),
                 "clarification_question": clarification_question,
                 "clarification_history": list(state.clarification_history),
                 "llm_traces": list(state.llm_traces),
@@ -3580,6 +3584,8 @@ class AgentRuntime:
             artifacts_dir=str(artifacts_dir),
             failures=[failure],
             metadata={
+                "force_answer": bool(state.force_answer) if state is not None else False,
+                "no_cache": bool(state.no_cache) if state is not None else False,
                 "clarification_history": clarification_history,
                 "llm_traces": llm_traces,
                 "runtime_info": self.runtime_info(),
@@ -3599,6 +3605,8 @@ class AgentRuntime:
         no_cache: bool = False,
         clarification_history: list[str] | None = None,
     ) -> AgentRunManifest:
+        force_answer = bool(force_answer)
+        no_cache = bool(no_cache)
         artifacts_dir = (self.config.outputs_root / run_id).resolve()
         (artifacts_dir / "nodes").mkdir(parents=True, exist_ok=True)
         self._set_live_status(
@@ -3607,6 +3615,8 @@ class AgentRuntime:
             status="running",
             current_phase="initializing",
             detail="Preparing run state",
+            force_answer=force_answer,
+            no_cache=no_cache,
         )
 
         state = self._build_state(question=question, force_answer=force_answer, no_cache=no_cache)
@@ -3683,6 +3693,8 @@ class AgentRuntime:
                 ),
                 artifacts_dir=str(artifacts_dir),
                 metadata={
+                    "force_answer": bool(state.force_answer),
+                    "no_cache": bool(state.no_cache),
                     "llm_traces": list(state.llm_traces),
                     "runtime_info": self.runtime_info(),
                 },
@@ -3692,7 +3704,7 @@ class AgentRuntime:
 
         state.rewritten_question = rephrase_action.rewritten_question or question
 
-        if rephrase_action.action == "ask_clarification" and not force_answer:
+        if rephrase_action.action == "ask_clarification" and not state.force_answer:
             manifest = self._needs_clarification_manifest(
                 run_id=run_id,
                 question=question,
@@ -3738,7 +3750,34 @@ class AgentRuntime:
         )
         if maybe_aborted is not None:
             return maybe_aborted
-        if plan_action.action == "ask_clarification" and not force_answer:
+        if plan_action.action == "ask_clarification" and state.force_answer:
+            forced_plan = self.orchestrator._heuristic_plan(state)
+            if forced_plan.plan_dag is not None:
+                forced_plan.plan_dag = self.orchestrator._normalize_plan_dag(
+                    forced_plan.plan_dag,
+                    question_text=forced_plan.rewritten_question or state.rewritten_question or state.question,
+                )
+            forced_plan.assumptions = list(
+                dict.fromkeys(
+                    list(plan_action.assumptions)
+                    + list(forced_plan.assumptions)
+                    + ["force_answer=true: planner clarification skipped and best-effort heuristic plan was used."]
+                )
+            )
+            plan_action = forced_plan
+            state.planner_actions[-1] = forced_plan.to_dict()
+            if forced_plan.plan_dag is not None:
+                state.last_plan = forced_plan.plan_dag.to_dict()
+            if forced_plan.assumptions:
+                state.assumptions = list(dict.fromkeys(state.assumptions + forced_plan.assumptions))
+            self._set_live_status(
+                run_id,
+                planner_actions=list(state.planner_actions),
+                plan_dags=[state.last_plan] if state.last_plan else [],
+                assumptions=list(state.assumptions),
+                detail="Force answer skipped planner clarification",
+            )
+        if plan_action.action == "ask_clarification" and not state.force_answer:
             manifest = self._needs_clarification_manifest(
                 run_id=run_id,
                 question=question,
@@ -3853,6 +3892,8 @@ class AgentRuntime:
             artifacts_dir=str(artifacts_dir),
             failures=list(snapshot.failures),
             metadata={
+                "force_answer": bool(state.force_answer),
+                "no_cache": bool(state.no_cache),
                 "planner_calls_used": state.planner_calls_used,
                 "clarification_history": list(state.clarification_history),
                 "llm_traces": list(state.llm_traces),
@@ -3911,6 +3952,8 @@ class AgentRuntime:
             status="queued",
             current_phase="queued",
             detail="Queued for execution",
+            force_answer=bool(force_answer),
+            no_cache=bool(no_cache),
         )
         self._register_cancel_event(run_id)
 
@@ -3976,6 +4019,8 @@ class AgentRuntime:
             tool_calls=list(manifest.tool_calls),
             llm_traces=list(manifest.metadata.get("llm_traces", [])),
             clarification_questions=list(manifest.clarification_questions),
+            force_answer=bool(manifest.metadata.get("force_answer", False)),
+            no_cache=bool(manifest.metadata.get("no_cache", False)),
             final_manifest_path=str(manifest_path),
         )
 

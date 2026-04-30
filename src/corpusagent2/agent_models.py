@@ -322,6 +322,8 @@ class LiveRunStatus:
     run_id: str
     question: str
     status: str
+    force_answer: bool = False
+    no_cache: bool = False
     started_at_utc: str = field(default_factory=lambda: datetime.now(UTC).isoformat())
     current_phase: str = ""
     detail: str = ""
@@ -342,6 +344,8 @@ class LiveRunStatus:
             "run_id": self.run_id,
             "question": self.question,
             "status": self.status,
+            "force_answer": self.force_answer,
+            "no_cache": self.no_cache,
             "started_at_utc": self.started_at_utc,
             "current_phase": self.current_phase,
             "detail": self.detail,
