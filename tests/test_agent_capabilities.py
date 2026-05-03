@@ -4,6 +4,7 @@ import base64
 from concurrent.futures import ThreadPoolExecutor
 import json
 from pathlib import Path
+import sys
 from types import SimpleNamespace
 
 import corpusagent2.retrieval as retrieval
@@ -1692,6 +1693,8 @@ def test_time_series_aggregate_handles_document_series_and_string_metrics(tmp_pa
     rows = {(row["series_name"], row["time_bin"]): row for row in result.payload["rows"]}
     assert rows[("Cristiano Ronaldo", "2018-03")]["document_count"] == 1
     assert rows[("Lionel Messi", "2018-03")]["document_count"] == 1
+    assert rows[("Cristiano Ronaldo", "2018-03")]["share_of_documents"] == 0.5
+    assert rows[("Lionel Messi", "2018-03")]["period_document_count"] == 2
 
 
 def test_time_series_aggregate_handles_named_average_metrics(tmp_path: Path) -> None:
@@ -3212,6 +3215,47 @@ def test_join_external_series_aggregates_daily_rows_to_time_bin(monkeypatch, tmp
 
 def test_infer_market_ticker_maps_oil_price_to_crude_futures() -> None:
     assert agent_capabilities._infer_market_ticker_from_text("How did the oil price change in America?") == "CL=F"
+
+
+def test_infer_market_ticker_detects_symbol_next_to_stock_context() -> None:
+    assert agent_capabilities._infer_market_ticker_from_text("How did this correspond to FB stock drawdowns?") == "FB"
+
+
+def test_fetch_yfinance_series_recovers_replaced_equity_symbol(monkeypatch) -> None:
+    agent_capabilities._YFINANCE_SERIES_CACHE.clear()
+    calls: list[str] = []
+
+    def fake_download(ticker, **_kwargs):
+        calls.append(ticker)
+        if ticker == "OLDX":
+            return pd.DataFrame()
+        return pd.DataFrame(
+            {
+                "Date": pd.to_datetime(["2018-03-01", "2018-03-02"]),
+                "Open": [10.0, 11.0],
+                "High": [12.0, 12.5],
+                "Low": [9.5, 10.5],
+                "Close": [11.0, 10.0],
+                "Volume": [1000, 1100],
+            }
+        )
+
+    class FakeSearch:
+        def __init__(self, _query, max_results=8):
+            self.quotes = [
+                {"quoteType": "ETF", "symbol": "OLDX", "exchange": "BTS", "score": 1000},
+                {"quoteType": "EQUITY", "symbol": "NEWX", "exchange": "NMS", "score": 900, "prevName": "Old X Inc."},
+            ]
+
+    monkeypatch.setitem(sys.modules, "yfinance", SimpleNamespace(download=fake_download, Search=FakeSearch))
+    monkeypatch.setattr(agent_capabilities, "_module_available", lambda name: name == "yfinance")
+
+    rows = agent_capabilities._fetch_yfinance_series_rows(ticker="OLDX", start="2018-03-01", end="2018-03-04")
+
+    assert calls == ["OLDX", "NEWX"]
+    assert rows[0]["ticker"] == "NEWX"
+    assert rows[0]["requested_ticker"] == "OLDX"
+    assert rows[0]["ticker_resolution"] == "yfinance_search_fallback"
 
 
 def test_fetch_documents_strict_backend_disables_runtime_fallback(monkeypatch) -> None:
