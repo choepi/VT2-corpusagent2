@@ -1435,6 +1435,20 @@ def test_plan_stage_clarification_is_converted_to_heuristic_when_history_is_suff
 
 def test_invalid_llm_plan_falls_back_to_framing_shift_heuristic(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setenv("CORPUSAGENT2_PROVIDER_ORDER_SENTIMENT", "heuristic")
+    monkeypatch.setattr(
+        "corpusagent2.agent_capabilities._fetch_yfinance_series_rows",
+        lambda **kwargs: [
+            {
+                "ticker": kwargs["ticker"],
+                "requested_ticker": kwargs["ticker"],
+                "ticker_resolution": "exact",
+                "date": "2018-03-01",
+                "time_bin": "2018-03",
+                "market_close": 180.0,
+                "market_drawdown": -0.04,
+            }
+        ],
+    )
     docs = _sample_documents()
     llm = StaticLLMClient(
         [
@@ -1490,10 +1504,18 @@ def test_invalid_llm_plan_falls_back_to_framing_shift_heuristic(tmp_path: Path, 
     assert manifest.status in {"completed", "partial"}
     assert any(record.capability == "topic_model" for record in manifest.node_records)
     assert any(record.capability == "sentiment" for record in manifest.node_records)
+    planned_nodes = manifest.plan_dags[0]["nodes"]
+    assert any(node["node_id"] == "framing_series" and node["capability"] == "time_series_aggregate" for node in planned_nodes)
+    assert any(node["node_id"] == "plot_framing_shift" and node["inputs"].get("x") == "time_bin" for node in planned_nodes)
+    assert any(node["capability"] == "join_external_series" and node["inputs"].get("ticker") == "FB" for node in planned_nodes)
+    assert any(node["node_id"] == "plot_market_drawdown" and node["inputs"].get("y") == "market_drawdown" for node in planned_nodes)
+    assert not any(
+        node["capability"] == "plot_artifact" and node["inputs"].get("plot_name") in {"framing_topics", "portrayal_topics"}
+        for node in planned_nodes
+    )
     assert any(action.get("action") == "emit_plan_dag" for action in manifest.planner_actions)
     assert any(trace.get("stage") == "plan_repair" for trace in manifest.metadata.get("llm_traces", []))
     assert manifest.evidence_table
-    assert any("stock-price correspondence" in caveat for caveat in manifest.final_answer.caveats)
 
 
 def test_framing_shift_heuristic_query_is_entity_driven_not_hardcoded_to_facebook(tmp_path: Path, monkeypatch) -> None:
@@ -2150,6 +2172,50 @@ def test_finance_question_heuristic_plan_uses_market_series_when_ticker_is_expli
         any(node.get("capability") == "join_external_series" for node in dag.get("nodes", []))
         for dag in manifest.plan_dags
     )
+    assert any(
+        any(node.get("node_id") == "plot_market_drawdown" and node.get("inputs", {}).get("y") == "market_drawdown" for node in dag.get("nodes", []))
+        for dag in manifest.plan_dags
+    )
+
+
+def test_finance_question_heuristic_plan_uses_symbol_next_to_stock_word(tmp_path: Path, monkeypatch) -> None:
+    captured: dict[str, str] = {}
+
+    def _fake_series(**kwargs):
+        captured["ticker"] = kwargs["ticker"]
+        return [
+            {
+                "ticker": kwargs["ticker"],
+                "requested_ticker": kwargs["ticker"],
+                "ticker_resolution": "exact",
+                "date": "2018-03-01",
+                "time_bin": "2018-03",
+                "market_close": 180.0,
+                "market_drawdown": -0.03,
+            }
+        ]
+
+    monkeypatch.setattr(agent_capabilities, "_fetch_yfinance_series_rows", _fake_series)
+    monkeypatch.setenv("CORPUSAGENT2_PROVIDER_ORDER_SENTIMENT", "heuristic")
+    monkeypatch.setenv("CORPUSAGENT2_PROVIDER_ORDER_TOPIC_MODEL", "heuristic")
+    runtime = build_test_runtime(
+        tmp_path=tmp_path,
+        documents=_sample_documents(),
+        search_rows_by_query=_search_rows(_sample_documents()),
+    )
+    runtime.llm_client = None
+    runtime.orchestrator.llm_client = None
+
+    manifest = runtime.handle_query(
+        "How did Facebook coverage shift from innovation/growth framing to privacy/regulation framing from 2016 to 2019, and how did this correspond to FB stock drawdowns?",
+        force_answer=True,
+        no_cache=True,
+    )
+
+    planned_nodes = manifest.plan_dags[0]["nodes"]
+    assert captured["ticker"] == "FB"
+    assert any(node["capability"] == "join_external_series" and node["inputs"].get("ticker") == "FB" for node in planned_nodes)
+    assert any(node["node_id"] == "plot_framing_shift" for node in planned_nodes)
 
 
 def test_finance_question_does_not_infer_market_series_from_company_name(tmp_path: Path, monkeypatch) -> None:
@@ -2403,7 +2469,8 @@ def test_api_runtime_info_reports_provider_and_device(tmp_path: Path) -> None:
     assert "providers_installed" in payload
 
 
-def test_synthesis_guardrail_blocks_unverified_stock_claims(tmp_path: Path) -> None:
+def test_synthesis_guardrail_blocks_unverified_stock_claims(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(agent_capabilities, "_fetch_yfinance_series_rows", lambda **_kwargs: [])
     docs = _sample_documents()
     llm = StaticLLMClient(
         [
