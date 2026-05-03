@@ -2520,6 +2520,16 @@ def _infer_market_ticker_from_text(text: str) -> str:
     ticker_match = re.search(r"(?<![A-Za-z0-9])\$([A-Z]{1,5}(?:\.[A-Z])?)\b", text)
     if ticker_match:
         return ticker_match.group(1)
+    market_context_patterns = (
+        r"\b([A-Z]{1,5}(?:\.[A-Z])?)\s+(?:stock|stocks|share|shares|equity|price|drawdown|drawdowns|returns?)\b",
+        r"\b(?:stock|stocks|share|shares|equity|price|drawdown|drawdowns|returns?)\s+(?:of|for|in)?\s*([A-Z]{1,5}(?:\.[A-Z])?)\b",
+    )
+    for pattern in market_context_patterns:
+        contextual_match = re.search(pattern, text)
+        if contextual_match:
+            candidate = contextual_match.group(1)
+            if candidate.upper() not in {"A", "AN", "AND", "FOR", "IN", "OR", "THE", "US"}:
+                return candidate
     if any(term in lowered for term in ("s&p 500", "s&p500", "sp500", "standard & poor", "standard and poor")):
         return "^GSPC"
     if any(term in lowered for term in ("crude oil", "oil price", "oil prices", "wti", "brent")):
@@ -2527,6 +2537,48 @@ def _infer_market_ticker_from_text(text: str) -> str:
     if any(term in lowered for term in ("gasoline price", "gas prices", "gas price")):
         return "RB=F"
     return ""
+
+
+def _yfinance_download_history(yf: Any, ticker: str, *, start: str, end: str, interval: str) -> Any:
+    return yf.download(
+        ticker,
+        start=start or None,
+        end=end or None,
+        interval=interval or "1d",
+        auto_adjust=False,
+        progress=False,
+    )
+
+
+def _yfinance_equity_symbol_candidates(yf: Any, query: str) -> list[str]:
+    search_factory = getattr(yf, "Search", None)
+    if search_factory is None:
+        return []
+    try:
+        search_result = search_factory(query, max_results=8)
+    except Exception:
+        return []
+    quotes = getattr(search_result, "quotes", []) or []
+    candidates: list[str] = []
+    preferred_exchanges = {"NMS", "NYQ", "ASE", "PCX", "BTS", "NASDAQ", "NYSE"}
+    ranked_quotes = sorted(
+        (quote for quote in quotes if isinstance(quote, dict)),
+        key=lambda quote: (
+            str(quote.get("quoteType", "")).upper() == "EQUITY",
+            str(quote.get("exchange", "")).upper() in preferred_exchanges,
+            bool(str(quote.get("prevName", "")).strip()),
+            float(quote.get("score", 0.0) or 0.0),
+        ),
+        reverse=True,
+    )
+    for quote in ranked_quotes:
+        if str(quote.get("quoteType", "")).upper() != "EQUITY":
+            continue
+        symbol = str(quote.get("symbol", "") or "").strip().upper()
+        if not symbol:
+            continue
+        candidates.append(symbol)
+    return list(dict.fromkeys(candidates))
 
 
 def _load_stanza_pipeline(processors: str) -> Any | None:
@@ -4711,12 +4763,18 @@ def _time_series_rows_from_document_series(
         return [], 0
     values: Counter[tuple[str, str]] = Counter()
     doc_sets: defaultdict[tuple[str, str], set[str]] = defaultdict(set)
+    period_doc_sets: defaultdict[str, set[str]] = defaultdict(set)
+    period_doc_counts: Counter[str] = Counter()
     for doc in docs:
         text = _row_analysis_text(doc)
         haystack = text.lower()
         timestamp = str(_first_nonempty_field(doc, ["published_at", "date", "time_bin", "month", "period", "time_period"]))
         time_bin = _time_bin(timestamp, granularity)
         doc_id = str(doc.get("doc_id", "") or "").strip()
+        if doc_id:
+            period_doc_sets[time_bin].add(doc_id)
+        else:
+            period_doc_counts[time_bin] += 1
         for item in series_items:
             series_name = _series_display_name(item)
             aliases = _series_match_terms(item)
@@ -4737,6 +4795,8 @@ def _time_series_rows_from_document_series(
     rows = []
     for (series_name, time_bin), count in sorted(values.items()):
         document_count = len(doc_sets.get((series_name, time_bin), set())) or int(count)
+        period_document_count = len(period_doc_sets.get(time_bin, set())) + int(period_doc_counts.get(time_bin, 0))
+        document_share = document_count / max(period_document_count, 1)
         rows.append(
             {
                 "series_name": series_name,
@@ -4752,6 +4812,10 @@ def _time_series_rows_from_document_series(
                 "document_count": document_count,
                 "doc_count": document_count,
                 "count": document_count,
+                "period_document_count": period_document_count,
+                "share_of_documents": round(document_share, 6),
+                "document_share": round(document_share, 6),
+                "percent_of_documents": round(document_share * 100.0, 4),
             }
         )
     return rows, 0
@@ -6176,14 +6240,17 @@ def _fetch_yfinance_series_rows(
         raise RuntimeError("yfinance is not installed.")
     import yfinance as yf
 
-    history = yf.download(
-        normalized_ticker,
-        start=start or None,
-        end=end or None,
-        interval=interval or "1d",
-        auto_adjust=False,
-        progress=False,
-    )
+    requested_ticker = normalized_ticker
+    history = _yfinance_download_history(yf, normalized_ticker, start=start, end=end, interval=interval)
+    if history is None or history.empty:
+        for candidate in _yfinance_equity_symbol_candidates(yf, normalized_ticker):
+            if candidate == normalized_ticker:
+                continue
+            candidate_history = _yfinance_download_history(yf, candidate, start=start, end=end, interval=interval)
+            if candidate_history is not None and not candidate_history.empty:
+                normalized_ticker = candidate
+                history = candidate_history
+                break
     if history is None or history.empty:
         _YFINANCE_SERIES_CACHE[cache_key] = []
         return []
@@ -6209,6 +6276,8 @@ def _fetch_yfinance_series_rows(
         rows.append(
             {
                 "ticker": normalized_ticker,
+                "requested_ticker": requested_ticker,
+                "ticker_resolution": "yfinance_search_fallback" if normalized_ticker != requested_ticker else "exact",
                 "date": date_text,
                 "time_bin": _time_bin(date_text, series_granularity),
                 "market_open": open_value,
@@ -6336,6 +6405,13 @@ def _join_external_series(params: dict[str, Any], deps: dict[str, ToolExecutionR
                 interval=interval,
             )
             provider = "yfinance"
+            if external_rows:
+                resolved_ticker = str(external_rows[0].get("ticker", "") or "").strip()
+                requested_ticker = str(external_rows[0].get("requested_ticker", "") or ticker).strip()
+                if resolved_ticker and requested_ticker and resolved_ticker != requested_ticker:
+                    caveats.append(
+                        f"Resolved requested market ticker '{requested_ticker}' to yfinance symbol '{resolved_ticker}' after the requested symbol returned no rows."
+                    )
         except Exception as exc:
             caveats.append(f"External market series fetch failed for ticker '{ticker}': {exc}")
     if not left_rows:

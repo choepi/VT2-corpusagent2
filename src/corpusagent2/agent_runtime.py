@@ -23,7 +23,7 @@ from .agent_backends import (
     WorkingSetStore,
     save_agent_manifest,
 )
-from .agent_capabilities import AgentExecutionContext, build_agent_registry
+from .agent_capabilities import AgentExecutionContext, _infer_market_ticker_from_text, build_agent_registry
 from .agent_executor import AgentExecutionSnapshot, AsyncPlanExecutor
 from .agent_models import (
     AgentFailure,
@@ -673,6 +673,82 @@ class MagicBoxOrchestrator:
         comparison = bool(re.search(r"\b(vs\.?|versus|compared? to|comparison|relative to)\b", lowered))
         return temporal and (portrayal or comparison)
 
+    def _split_framing_terms(self, raw: str) -> list[str]:
+        cleaned = re.sub(r"\([^)]*\)", " ", str(raw or ""))
+        cleaned = re.sub(
+            r"\b(?:framing|frame|frames|coverage|reporting|narrative|narratives|portrayal|tone|topic|topics)\b",
+            " ",
+            cleaned,
+            flags=re.IGNORECASE,
+        )
+        cleaned = re.sub(r"\b(?:around|during|through|between|from|to|toward|towards|into|and how|correspond.*)$", " ", cleaned, flags=re.IGNORECASE)
+        parts = re.split(r"\s*(?:/|,|;|\band\b|\bor\b|&|\+)\s*", cleaned)
+        stop_terms = {
+            "a",
+            "an",
+            "and",
+            "as",
+            "correspond",
+            "corresponded",
+            "did",
+            "from",
+            "how",
+            "in",
+            "of",
+            "shift",
+            "shifted",
+            "the",
+            "to",
+            "with",
+        }
+        terms: list[str] = []
+        for part in parts:
+            normalized = re.sub(r"[^A-Za-z0-9'. -]+", " ", part).strip(" .'-")
+            normalized = re.sub(r"\s+", " ", normalized)
+            if not normalized:
+                continue
+            lowered = normalized.lower()
+            if lowered in stop_terms or re.fullmatch(r"(?:19|20)\d{2}(?:\s*-\s*(?:19|20)\d{2})?", lowered):
+                continue
+            if not re.search(r"[A-Za-z]", normalized):
+                continue
+            terms.append(lowered)
+        return list(dict.fromkeys(terms))
+
+    def _infer_framing_series_definitions(self, text: str) -> list[dict[str, Any]]:
+        question = str(text or "")
+        patterns = [
+            re.compile(
+                r"\bfrom\s+(?P<left>.+?)\s+framing\s+(?:to|toward|towards|into)\s+(?P<right>.+?)\s+framing\b",
+                flags=re.IGNORECASE | re.DOTALL,
+            ),
+            re.compile(
+                r"\bfrom\s+(?P<left>.+?)\s+(?:to|toward|towards|into)\s+(?P<right>.+?)(?:\s+(?:around|during|between|from\s+(?:19|20)\d{2}|and how)|[?.]|$)",
+                flags=re.IGNORECASE | re.DOTALL,
+            ),
+        ]
+        for pattern in patterns:
+            match = pattern.search(question)
+            if not match:
+                continue
+            definitions: list[dict[str, Any]] = []
+            for side in ("left", "right"):
+                terms = self._split_framing_terms(match.group(side))
+                if not terms:
+                    continue
+                label = "/".join(terms[:3])
+                definitions.append(
+                    {
+                        "series_name": label,
+                        "label": label,
+                        "aliases": terms,
+                        "keyword_terms": terms,
+                    }
+                )
+            if len(definitions) >= 2:
+                return definitions
+        return []
+
     def _needs_entity_trend_analysis(self, text: str) -> bool:
         lowered = str(text or "").lower()
         asks_entities = any(
@@ -937,6 +1013,20 @@ class MagicBoxOrchestrator:
         fetch_node_id = first_node_id("fetch_documents")
         if not fetch_node_id:
             return
+        framing_series_definitions = self._infer_framing_series_definitions(question_text)
+
+        def is_static_topic_plot(node: AgentPlanNode, topics_id: str) -> bool:
+            if node.capability != "plot_artifact":
+                return False
+            inputs = dict(node.inputs)
+            plot_name = str(inputs.get("plot_name", "") or "").strip().lower()
+            x_field = str(inputs.get("x", inputs.get("x_field", "")) or "").strip().lower()
+            has_temporal_axis = x_field in {"time", "time_bin", "date", "published_at", "month", "period", "time_period"}
+            return (
+                bool(topics_id and topics_id in node.depends_on)
+                and not has_temporal_axis
+                and plot_name in {"", "plot_topics", "portrayal_topics", "framing_topics"}
+            )
 
         def ensure_node(
             capability: str,
@@ -964,6 +1054,8 @@ class MagicBoxOrchestrator:
         ensure_node("ner", "entities", [fetch_node_id], optional=True)
         keyterms_node_id = ensure_node("extract_keyterms", "keyterms", [fetch_node_id], optional=True)
         topics_node_id = ensure_node("topic_model", "topics", [fetch_node_id], inputs={"num_topics": 6}, optional=True)
+        if framing_series_definitions:
+            normalized_nodes[:] = [node for node in normalized_nodes if not is_static_topic_plot(node, topics_node_id)]
         value_focus_terms = [
             "value", "valuation", "worth", "market value", "transfer fee", "transfer",
             "salary", "salaries", "wage", "wages", "earnings", "contract", "price",
@@ -1018,7 +1110,53 @@ class MagicBoxOrchestrator:
                     optional=True,
                 )
             )
-        if not any(node.capability == "plot_artifact" and topics_node_id in node.depends_on for node in normalized_nodes):
+        if framing_series_definitions:
+            framing_series_node_id = next(
+                (
+                    node.node_id
+                    for node in normalized_nodes
+                    if node.capability == "time_series_aggregate"
+                    and isinstance(node.inputs.get("series", node.inputs.get("series_definitions")), list)
+                ),
+                "",
+            )
+            if not framing_series_node_id:
+                framing_series_node_id = unique_node_id("framing_series")
+                normalized_nodes.append(
+                    AgentPlanNode(
+                        node_id=framing_series_node_id,
+                        capability="time_series_aggregate",
+                        inputs={
+                            "documents_node": fetch_node_id,
+                            "time_field": "published_at",
+                            "bucket_granularity": "month",
+                            "series": framing_series_definitions,
+                            "metrics": ["document_count"],
+                        },
+                        depends_on=[fetch_node_id],
+                        optional=True,
+                    )
+                )
+            if not any(node.capability == "plot_artifact" and framing_series_node_id in node.depends_on for node in normalized_nodes):
+                normalized_nodes.append(
+                    AgentPlanNode(
+                        node_id=unique_node_id("plot_framing_shift"),
+                        capability="plot_artifact",
+                        inputs={
+                            "plot_name": "framing_shift_over_time",
+                            "plot_type": "line",
+                            "x": "time_bin",
+                            "y": "share_of_documents",
+                            "series": "series_name",
+                            "title": "Framing shift over time",
+                            "x_label": "Month",
+                            "y_label": "Share of matched documents",
+                        },
+                        depends_on=[framing_series_node_id],
+                        optional=True,
+                    )
+                )
+        elif not any(node.capability == "plot_artifact" and topics_node_id in node.depends_on for node in normalized_nodes):
             normalized_nodes.append(
                 AgentPlanNode(
                     node_id=unique_node_id("plot_topics"),
@@ -1029,12 +1167,59 @@ class MagicBoxOrchestrator:
                 )
             )
 
+        market_ticker = self._infer_market_ticker(question_text)
+        if market_ticker and not any(node.capability == "join_external_series" for node in normalized_nodes):
+            date_window = self._extract_date_window(question_text)
+            market_node_id = unique_node_id("market_series")
+            normalized_nodes.append(
+                AgentPlanNode(
+                    node_id=market_node_id,
+                    capability="join_external_series",
+                    inputs={
+                        "ticker": market_ticker,
+                        "date_from": date_window.get("date_from", ""),
+                        "date_to": date_window.get("date_to", ""),
+                        "left_key": "time_bin",
+                        "right_key": "time_bin",
+                        "how": "left",
+                    },
+                    depends_on=[fetch_node_id],
+                    optional=True,
+                )
+            )
+            normalized_nodes.append(
+                AgentPlanNode(
+                    node_id=unique_node_id("plot_market_drawdown"),
+                    capability="plot_artifact",
+                    inputs={
+                        "plot_name": f"{market_ticker.lower()}_stock_drawdown",
+                        "plot_type": "line",
+                        "x": "time_bin",
+                        "y": "market_drawdown",
+                        "title": f"{market_ticker} stock drawdowns",
+                        "x_label": "Date",
+                        "y_label": "Drawdown",
+                    },
+                    depends_on=[market_node_id],
+                    optional=True,
+                )
+            )
+
     def _question_with_clarifications(self, state: AgentRunState) -> str:
         history = [str(item).strip() for item in state.clarification_history if str(item).strip()]
         if not history:
             return state.question
         suffix = "\n".join(f"- {item}" for item in history)
         return f"{state.question}\n\nUser clarification history:\n{suffix}"
+
+    def _planning_context_text(self, state: AgentRunState, primary: str = "") -> str:
+        parts = [
+            str(state.question or "").strip(),
+            str(primary or "").strip(),
+            str(state.rewritten_question or "").strip(),
+        ]
+        parts.extend(str(item).strip() for item in state.clarification_history if str(item).strip())
+        return " ".join(dict.fromkeys(part for part in parts if part))
 
     def _extract_date_window(self, text: str) -> dict[str, str]:
         year_values = sorted({int(item) for item in re.findall(r"\b(?:19|20)\d{2}\b", text)})
@@ -1644,21 +1829,7 @@ class MagicBoxOrchestrator:
         return anchors[:8]
 
     def _infer_market_ticker(self, text: str) -> str:
-        lowered = str(text or "").lower()
-        explicit_match = re.search(
-            r"\b(?:ticker|symbol)\s*[:=]?\s*\$?([A-Z]{1,5}(?:\.[A-Z])?)\b",
-            text,
-        )
-        if explicit_match:
-            return explicit_match.group(1)
-        cashtag_match = re.search(r"(?<![A-Za-z0-9])\$([A-Z]{1,5}(?:\.[A-Z])?)\b", text)
-        if cashtag_match:
-            return cashtag_match.group(1)
-        if any(term in lowered for term in ("crude oil", "oil price", "oil prices", "wti", "brent")):
-            return "CL=F"
-        if any(term in lowered for term in ("gasoline price", "gas prices", "gas price")):
-            return "RB=F"
-        return ""
+        return _infer_market_ticker_from_text(text)
 
     def _search_inputs_for_question(
         self,
@@ -2056,6 +2227,7 @@ class MagicBoxOrchestrator:
         if asks_media_shift:
             search_inputs = self._search_inputs_for_question(rewritten, query_text=query_text)
             market_ticker = self._infer_market_ticker(rewritten)
+            framing_series_definitions = self._infer_framing_series_definitions(rewritten)
             nodes = [
                 AgentPlanNode("search", "db_search", inputs=search_inputs),
                 AgentPlanNode("fetch", "fetch_documents", depends_on=["search"]),
@@ -2067,8 +2239,43 @@ class MagicBoxOrchestrator:
                 AgentPlanNode("series", "time_series_aggregate", depends_on=["sentiment"]),
                 AgentPlanNode("changes", "change_point_detect", depends_on=["series"], optional=True),
                 AgentPlanNode("plot_sentiment", "plot_artifact", inputs={"plot_name": "framing_sentiment_series"}, depends_on=["series"], optional=True),
-                AgentPlanNode("plot_topics", "plot_artifact", inputs={"plot_name": "framing_topics"}, depends_on=["topics"], optional=True),
             ]
+            if framing_series_definitions:
+                nodes.extend(
+                    [
+                        AgentPlanNode(
+                            "framing_series",
+                            "time_series_aggregate",
+                            inputs={
+                                "documents_node": "fetch",
+                                "time_field": "published_at",
+                                "bucket_granularity": "month",
+                                "series": framing_series_definitions,
+                                "metrics": ["document_count"],
+                            },
+                            depends_on=["fetch"],
+                            optional=True,
+                        ),
+                        AgentPlanNode(
+                            "plot_framing_shift",
+                            "plot_artifact",
+                            inputs={
+                                "plot_name": "framing_shift_over_time",
+                                "plot_type": "line",
+                                "x": "time_bin",
+                                "y": "share_of_documents",
+                                "series": "series_name",
+                                "title": "Framing shift over time",
+                                "x_label": "Month",
+                                "y_label": "Share of matched documents",
+                            },
+                            depends_on=["framing_series"],
+                            optional=True,
+                        ),
+                    ]
+                )
+            else:
+                nodes.append(AgentPlanNode("plot_topics", "plot_artifact", inputs={"plot_name": "framing_topics"}, depends_on=["topics"], optional=True))
             assumptions: list[str] = []
             needs_external_series = bool(market_ticker) or any(
                 term in text
@@ -2088,18 +2295,21 @@ class MagicBoxOrchestrator:
                                 "right_key": "time_bin",
                                 "how": "left",
                             },
-                            depends_on=["series", "fetch"],
+                            depends_on=["fetch"],
                         )
                     )
                     nodes.append(
                         AgentPlanNode(
-                            "plot_market",
+                            "plot_market_drawdown",
                             "plot_artifact",
                             inputs={
-                                "plot_name": f"{market_ticker.lower()}_market_overlay",
+                                "plot_name": f"{market_ticker.lower()}_stock_drawdown",
                                 "plot_type": "line",
                                 "x": "time_bin",
-                                "y": "market_close",
+                                "y": "market_drawdown",
+                                "title": f"{market_ticker} stock drawdowns",
+                                "x_label": "Date",
+                                "y_label": "Drawdown",
                             },
                             depends_on=["market_series"],
                             optional=True,
@@ -2152,7 +2362,7 @@ class MagicBoxOrchestrator:
             if heuristic.action == "emit_plan_dag" and heuristic.plan_dag is not None:
                 heuristic.plan_dag = self._normalize_plan_dag(
                     heuristic.plan_dag,
-                    question_text=heuristic.rewritten_question or state.rewritten_question or state.question,
+                    question_text=self._planning_context_text(state, heuristic.rewritten_question),
                 )
             return heuristic
         messages = [
@@ -2261,14 +2471,14 @@ class MagicBoxOrchestrator:
             if action.action == "emit_plan_dag" and action.plan_dag is not None:
                 action.plan_dag = self._normalize_plan_dag(
                     action.plan_dag,
-                    question_text=action.rewritten_question or state.rewritten_question or state.question,
+                    question_text=self._planning_context_text(state, action.rewritten_question),
                 )
             if action.action == "ask_clarification" and state.force_answer:
                 heuristic = self._heuristic_plan(state)
                 if heuristic.action == "emit_plan_dag" and heuristic.plan_dag is not None:
                     heuristic.plan_dag = self._normalize_plan_dag(
                         heuristic.plan_dag,
-                        question_text=heuristic.rewritten_question or state.rewritten_question or state.question,
+                        question_text=self._planning_context_text(state, heuristic.rewritten_question),
                     )
                 heuristic.assumptions = list(
                     dict.fromkeys(
@@ -2283,7 +2493,7 @@ class MagicBoxOrchestrator:
                 if heuristic.action == "emit_plan_dag" and heuristic.plan_dag is not None:
                     heuristic.plan_dag = self._normalize_plan_dag(
                         heuristic.plan_dag,
-                        question_text=heuristic.rewritten_question or state.rewritten_question or state.question,
+                        question_text=self._planning_context_text(state, heuristic.rewritten_question),
                     )
                 heuristic.rewritten_question = action.rewritten_question or heuristic.rewritten_question or state.rewritten_question
                 heuristic.assumptions = list(
@@ -2313,7 +2523,7 @@ class MagicBoxOrchestrator:
             if heuristic.action == "emit_plan_dag" and heuristic.plan_dag is not None:
                 heuristic.plan_dag = self._normalize_plan_dag(
                     heuristic.plan_dag,
-                    question_text=heuristic.rewritten_question or state.rewritten_question or state.question,
+                    question_text=self._planning_context_text(state, heuristic.rewritten_question),
                 )
             return heuristic
 
@@ -3755,7 +3965,7 @@ class AgentRuntime:
             if forced_plan.plan_dag is not None:
                 forced_plan.plan_dag = self.orchestrator._normalize_plan_dag(
                     forced_plan.plan_dag,
-                    question_text=forced_plan.rewritten_question or state.rewritten_question or state.question,
+                    question_text=self.orchestrator._planning_context_text(state, forced_plan.rewritten_question),
                 )
             forced_plan.assumptions = list(
                 dict.fromkeys(
