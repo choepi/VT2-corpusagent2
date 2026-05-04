@@ -39,6 +39,7 @@ const activeCount = document.getElementById("activeCount");
 const completedCount = document.getElementById("completedCount");
 const failedCount = document.getElementById("failedCount");
 const totalTimeCount = document.getElementById("totalTimeCount");
+const etaText = document.getElementById("etaText");
 const runIdText = document.getElementById("runIdText");
 const corpusNameText = document.getElementById("corpusNameText");
 const runSavedText = document.getElementById("runSavedText");
@@ -55,6 +56,10 @@ const planNodes = document.getElementById("planNodes");
 const llmTraces = document.getElementById("llmTraces");
 const toolCallSummary = document.getElementById("toolCallSummary");
 const toolCalls = document.getElementById("toolCalls");
+const toolNodeMap = document.getElementById("toolNodeMap");
+const toolNodeTable = document.getElementById("toolNodeTable");
+const toolCatalogSummary = document.getElementById("toolCatalogSummary");
+const toolCatalog = document.getElementById("toolCatalog");
 const evidenceTable = document.getElementById("evidenceTable");
 const selectedDocs = document.getElementById("selectedDocs");
 const artifactList = document.getElementById("artifactList");
@@ -74,6 +79,9 @@ let currentRunFinishedAtUtc = "";
 let currentManifestSavedPath = "";
 let latestManifest = null;
 let latestRuntimeInfo = null;
+let latestCapabilityCatalog = [];
+let latestToolCallRows = [];
+let latestPlanDags = [];
 let providerDefaults = {};
 let submissionInFlight = false;
 let activePollSessionId = 0;
@@ -85,16 +93,26 @@ const MANIFEST_FETCH_MAX_ATTEMPTS = 5;
 const UI_STATE_KEY = "corpusagent2-ui-state-v2";
 const ACCESS_GATE_SESSION_KEY = "corpusagent2-access-gate-ok";
 const TERMINAL_RUN_STATUSES = ["completed", "partial", "failed", "rejected", "needs_clarification", "aborted"];
+const DEFAULT_API_BASE = "https://api.dongtse.com";
+const LOCAL_API_BASE = "http://127.0.0.1:8001";
+const API_BASE_OPTIONS = [DEFAULT_API_BASE, LOCAL_API_BASE];
 
 const runtimeConfig = window.CORPUSAGENT2_CONFIG || {};
 const accessGateConfig = runtimeConfig.accessGate || {};
-if (runtimeConfig.apiBaseUrl) {
-  apiBaseInput.value = runtimeConfig.apiBaseUrl;
-}
 if (runtimeConfig.title) {
   document.title = runtimeConfig.title;
 }
 providerBadge.textContent = "LLM: loading...";
+
+function normalizeApiBase(value) {
+  const normalized = String(value || "").trim().replace(/\/$/, "");
+  if (normalized === "http://127.0.0.1:5500") {
+    return LOCAL_API_BASE;
+  }
+  return API_BASE_OPTIONS.includes(normalized) ? normalized : DEFAULT_API_BASE;
+}
+
+apiBaseInput.value = normalizeApiBase(runtimeConfig.apiBaseUrl || DEFAULT_API_BASE);
 
 function isAccessGateEnabled() {
   return Boolean(accessGateConfig.enabled && accessGateConfig.passwordSha256);
@@ -180,7 +198,7 @@ function restoreUiState() {
       return;
     }
     const payload = JSON.parse(raw);
-    apiBaseInput.value = payload.apiBase || apiBaseInput.value;
+    apiBaseInput.value = normalizeApiBase(payload.apiBase || runtimeConfig.apiBaseUrl || DEFAULT_API_BASE);
     questionInput.value = payload.question || questionInput.value;
     forceAnswerInput.checked = Boolean(payload.forceAnswer);
     noCacheInput.checked = Boolean(payload.noCache);
@@ -449,6 +467,43 @@ function totalNodeDurationMs(nodeRecords) {
   }, 0);
 }
 
+function plannedNodeCountFromStatus(payload) {
+  const dags = payload?.plan_dags || latestManifest?.plan_dags || [];
+  const firstDag = Array.isArray(dags) && dags.length ? dags[0] : {};
+  const nodes = firstDag?.nodes || [];
+  return Array.isArray(nodes) ? nodes.length : 0;
+}
+
+function estimateEtaLabel(payload) {
+  if (isTerminalStatus(currentStatus)) {
+    return "finished";
+  }
+  const startedAt = parseUtcTimestamp(currentRunStartedAtUtc);
+  if (startedAt === null) {
+    return "unknown";
+  }
+  const completed = (payload?.completed_steps || []).length;
+  const failed = (payload?.failed_steps || []).length;
+  const active = (payload?.active_steps || []).length;
+  const planned = plannedNodeCountFromStatus(payload);
+  if (!planned || completed < 2) {
+    return active ? "learning" : "unknown";
+  }
+  const elapsedMs = Date.now() - startedAt;
+  if (!Number.isFinite(elapsedMs) || elapsedMs <= 0) {
+    return "unknown";
+  }
+  const done = completed + failed;
+  const remaining = Math.max(planned - done - active, 0);
+  if (remaining <= 0) {
+    return active ? "finishing" : "almost done";
+  }
+  const averagePerCompletedStep = elapsedMs / Math.max(done, 1);
+  const activeCredit = active ? 0.5 : 0;
+  const roughMs = Math.max(0, (remaining + activeCredit) * averagePerCompletedStep);
+  return `~${formatDurationMs(roughMs)}`;
+}
+
 function updateRunTotalTimeDisplay() {
   const startedAt = parseUtcTimestamp(currentRunStartedAtUtc);
   if (startedAt === null) {
@@ -462,6 +517,11 @@ function updateRunTotalTimeDisplay() {
     return;
   }
   totalTimeCount.textContent = formatDurationMs(finishedAt - startedAt) || "n/a";
+}
+
+function updateEtaDisplay(payload = {}) {
+  etaText.textContent = estimateEtaLabel(payload);
+  etaText.title = "Rough estimate from completed/planned executor steps. It is not a robust wall-clock prediction for long GPU/API/database work.";
 }
 
 async function ensureNotificationPermission() {
@@ -523,6 +583,321 @@ function collectToolCallTotals(rows) {
     totals.outputItems += Number(summary.items_count || 0) || 0;
   });
   return totals;
+}
+
+function keyFor(value) {
+  return String(value || "").trim().toLowerCase();
+}
+
+function collectRunToolUsage() {
+  const byToolName = new Map();
+  const byCapability = new Map();
+
+  function touch(map, key, update) {
+    const normalized = keyFor(key);
+    if (!normalized) {
+      return;
+    }
+    const current = map.get(normalized) || {
+      statuses: new Set(),
+      nodeIds: new Set(),
+      providers: new Set(),
+      callCount: 0,
+    };
+    update(current);
+    map.set(normalized, current);
+  }
+
+  (latestPlanDags || []).forEach((dag) => {
+    (dag.nodes || []).forEach((node) => {
+      const update = (entry) => {
+        entry.statuses.add("planned");
+        if (node.node_id || node.id) {
+          entry.nodeIds.add(String(node.node_id || node.id));
+        }
+      };
+      touch(byToolName, node.tool_name, update);
+      touch(byCapability, node.capability, update);
+    });
+  });
+
+  (latestToolCallRows || []).forEach((row) => {
+    const update = (entry) => {
+      entry.statuses.add(String(row.status || "used"));
+      if (row.node_id) {
+        entry.nodeIds.add(String(row.node_id));
+      }
+      if (row.provider) {
+        entry.providers.add(String(row.provider));
+      }
+      entry.callCount += 1;
+    };
+    touch(byToolName, row.tool_name, update);
+    touch(byCapability, row.capability, update);
+  });
+
+  return { byToolName, byCapability };
+}
+
+function toolUsageForSpec(spec, usage) {
+  const merged = {
+    statuses: new Set(),
+    nodeIds: new Set(),
+    providers: new Set(),
+    callCount: 0,
+  };
+  const candidates = [
+    usage.byToolName.get(keyFor(spec.tool_name)),
+    ...(Array.isArray(spec.capabilities) ? spec.capabilities : []).map((capability) =>
+      usage.byCapability.get(keyFor(capability))
+    ),
+  ].filter(Boolean);
+  candidates.forEach((entry) => {
+    entry.statuses.forEach((item) => merged.statuses.add(item));
+    entry.nodeIds.forEach((item) => merged.nodeIds.add(item));
+    entry.providers.forEach((item) => merged.providers.add(item));
+    merged.callCount += entry.callCount;
+  });
+  return merged;
+}
+
+function dominantToolStatus(statuses) {
+  const values = Array.from(statuses || []);
+  if (values.includes("failed")) {
+    return "failed";
+  }
+  if (values.includes("running")) {
+    return "running";
+  }
+  if (values.includes("completed")) {
+    return "completed";
+  }
+  if (values.includes("skipped")) {
+    return "skipped";
+  }
+  if (values.includes("planned")) {
+    return "planned";
+  }
+  return "available";
+}
+
+function renderToolCatalog() {
+  if (!toolCatalog || !toolCatalogSummary) {
+    return;
+  }
+  const catalog = Array.isArray(latestCapabilityCatalog) ? latestCapabilityCatalog : [];
+  if (!catalog.length) {
+    toolCatalogSummary.textContent = "No catalog loaded";
+    toolCatalog.innerHTML = '<p class="muted">The backend tool catalog has not loaded yet.</p>';
+    return;
+  }
+  const usage = collectRunToolUsage();
+  const decorated = catalog.map((spec, index) => {
+    const entry = toolUsageForSpec(spec, usage);
+    const status = dominantToolStatus(entry.statuses);
+    return { spec, entry, status, index };
+  });
+  const capabilityBuckets = new Map();
+  catalog.forEach((spec) => {
+    (Array.isArray(spec.capabilities) ? spec.capabilities : ["uncategorized"]).forEach((capability) => {
+      const key = String(capability || "uncategorized");
+      const bucket = capabilityBuckets.get(key) || new Set();
+      bucket.add(String(spec.tool_name || "tool"));
+      capabilityBuckets.set(key, bucket);
+    });
+  });
+  const capabilityRows = Array.from(capabilityBuckets.entries()).sort((left, right) =>
+    left[0].localeCompare(right[0])
+  );
+  const usedCount = decorated.filter((item) => item.status !== "available").length;
+  toolCatalogSummary.textContent = `All ${formatCount(catalog.length)} registered functions; ${formatCount(usedCount)} used/planned in current run`;
+  decorated.sort((left, right) => {
+    const leftUsed = left.status === "available" ? 1 : 0;
+    const rightUsed = right.status === "available" ? 1 : 0;
+    if (leftUsed !== rightUsed) {
+      return leftUsed - rightUsed;
+    }
+    return String(left.spec.tool_name || "").localeCompare(String(right.spec.tool_name || ""));
+  });
+  toolCatalog.innerHTML = `
+    <div class="tool-overview-grid">
+      <div>
+        <strong>${formatCount(catalog.length)}</strong>
+        <span>registered tool functions</span>
+      </div>
+      <div>
+        <strong>${formatCount(capabilityRows.length)}</strong>
+        <span>capabilities</span>
+      </div>
+      <div>
+        <strong>${formatCount(usedCount)}</strong>
+        <span>used or planned in this run</span>
+      </div>
+    </div>
+    <div class="tool-capability-overview" aria-label="Capability overview">
+      ${capabilityRows
+        .map(
+          ([capability, tools]) => `
+            <span title="${escapeHtml(Array.from(tools).sort().join(", "))}">
+              ${escapeHtml(capability)}
+              <small>${formatCount(tools.size)} tool${tools.size === 1 ? "" : "s"}</small>
+            </span>
+          `
+        )
+        .join("")}
+    </div>
+    <table class="tool-catalog-table">
+      <colgroup>
+        <col style="width: 7%" />
+        <col style="width: 24%" />
+        <col style="width: 27%" />
+        <col style="width: 22%" />
+        <col style="width: 9%" />
+        <col style="width: 11%" />
+      </colgroup>
+      <thead>
+        <tr>
+          <th>#</th>
+          <th>Tool function</th>
+          <th>Capabilities</th>
+          <th>Tool properties</th>
+          <th>Status</th>
+          <th>Current run usage</th>
+        </tr>
+      </thead>
+      <tbody>
+        ${decorated
+          .map(({ spec, entry, status }, displayIndex) => {
+            const capabilities = (Array.isArray(spec.capabilities) ? spec.capabilities : []).join(", ");
+            const nodeIds = Array.from(entry.nodeIds).sort();
+            const safeStatusClass = status.replace(/[^a-z0-9_-]/g, "-");
+            const propertyParts = [
+              spec.cost_class ? `cost ${spec.cost_class}` : "",
+              Number.isFinite(Number(spec.priority)) ? `priority ${spec.priority}` : "",
+              spec.deterministic === false ? "non-deterministic" : "deterministic",
+              spec.fallback_of ? `fallback of ${spec.fallback_of}` : "",
+              spec.model_id ? `model ${spec.model_id}` : "",
+            ].filter(Boolean);
+            const usageParts = [
+              nodeIds.length ? `nodes ${nodeIds.join(", ")}` : "",
+              entry.callCount ? `${formatCount(entry.callCount)} call${entry.callCount === 1 ? "" : "s"}` : "",
+            ].filter(Boolean);
+            return `
+              <tr class="${status === "available" ? "" : `tool-row-${safeStatusClass}`}">
+                <td class="tool-index-cell">f${String(displayIndex + 1).padStart(2, "0")}</td>
+                <td><strong>${escapeHtml(spec.tool_name || "tool")}</strong><br><span class="muted">${escapeHtml(spec.tool_version ? `version ${spec.tool_version}` : "version unknown")}</span></td>
+                <td>${escapeHtml(capabilities || "none")}</td>
+                <td>${escapeHtml(propertyParts.join(" | ") || "none")}</td>
+                <td><span class="tool-state tool-state-${safeStatusClass}">${escapeHtml(status)}</span></td>
+                <td>${usageParts.length ? escapeHtml(usageParts.join(" | ")) : '<span class="muted">not used in current run</span>'}</td>
+              </tr>
+            `;
+          })
+          .join("")}
+      </tbody>
+    </table>
+  `;
+}
+
+function renderToolNodeMap() {
+  if (!toolNodeMap || !toolNodeTable) {
+    return;
+  }
+  const planNodesFlat = (latestPlanDags || []).flatMap((dag) => (Array.isArray(dag.nodes) ? dag.nodes : []));
+  const callByNode = new Map();
+  (latestToolCallRows || []).forEach((row) => {
+    const nodeId = keyFor(row.node_id);
+    if (!nodeId) {
+      return;
+    }
+    callByNode.set(nodeId, row);
+  });
+  const rows =
+    planNodesFlat.length > 0
+      ? planNodesFlat
+      : (latestToolCallRows || []).map((row) => ({
+          node_id: row.node_id,
+          capability: row.capability,
+          tool_name: row.tool_name,
+          depends_on: row.dependency_nodes || [],
+        }));
+  if (!rows.length) {
+    toolNodeMap.innerHTML = '<p class="muted">No plan nodes yet. They appear after the backend planner emits a DAG.</p>';
+    toolNodeTable.innerHTML = '<p class="muted">No planned node table yet.</p>';
+    return;
+  }
+  toolNodeMap.innerHTML = rows
+    .map((node) => {
+      const nodeId = String(node.node_id || node.id || "").trim();
+      const call = callByNode.get(keyFor(nodeId)) || {};
+      const status = String(call.status || "planned").trim().toLowerCase() || "planned";
+      const safeStatusClass = status.replace(/[^a-z0-9_-]/g, "-");
+      const dependsOn = Array.isArray(node.depends_on) ? node.depends_on : [];
+      return `
+        <article class="node-pill node-${escapeHtml(safeStatusClass)}">
+          <div class="node-pill-head">
+            <strong>${escapeHtml(nodeId || "node")}</strong>
+            <span>${escapeHtml(status)}</span>
+          </div>
+          <p>${escapeHtml(node.tool_name || node.capability || "tool")}</p>
+          ${
+            dependsOn.length
+              ? `<small>depends on ${escapeHtml(dependsOn.join(", "))}</small>`
+              : "<small>no dependencies</small>"
+          }
+        </article>
+      `;
+    })
+    .join("");
+  toolNodeTable.innerHTML = `
+    <table>
+      <colgroup>
+        <col style="width: 10%" />
+        <col style="width: 18%" />
+        <col style="width: 22%" />
+        <col style="width: 12%" />
+        <col style="width: 18%" />
+        <col style="width: 20%" />
+      </colgroup>
+      <thead>
+        <tr>
+          <th>Node</th>
+          <th>Capability</th>
+          <th>Resolved tool</th>
+          <th>Status</th>
+          <th>Depends on</th>
+          <th>Runtime evidence</th>
+        </tr>
+      </thead>
+      <tbody>
+        ${rows
+          .map((node) => {
+            const nodeId = String(node.node_id || node.id || "").trim();
+            const call = callByNode.get(keyFor(nodeId)) || {};
+            const status = String(call.status || "planned").trim().toLowerCase() || "planned";
+            const safeStatusClass = status.replace(/[^a-z0-9_-]/g, "-");
+            const dependsOn = Array.isArray(node.depends_on) ? node.depends_on : [];
+            const evidenceParts = [
+              call.provider ? `provider ${call.provider}` : "",
+              call.duration_ms ? `duration ${formatDurationMs(call.duration_ms)}` : "",
+              call.summary?.items_count ? `${formatCount(call.summary.items_count)} ${call.summary.items_key || "items"}` : "",
+              call.error ? `error ${call.error}` : "",
+            ].filter(Boolean);
+            return `
+              <tr>
+                <td><strong>${escapeHtml(nodeId || "node")}</strong></td>
+                <td>${escapeHtml(node.capability || "")}</td>
+                <td>${escapeHtml(call.tool_name || node.tool_name || "not resolved yet")}</td>
+                <td><span class="tool-state tool-state-${safeStatusClass}">${escapeHtml(status)}</span></td>
+                <td>${escapeHtml(dependsOn.join(", ") || "none")}</td>
+                <td>${evidenceParts.length ? escapeHtml(evidenceParts.join(" | ")) : '<span class="muted">not executed yet</span>'}</td>
+              </tr>
+            `;
+          })
+          .join("")}
+      </tbody>
+    </table>
+  `;
 }
 
 function artifactUrl(runId, artifactPath) {
@@ -1195,6 +1570,7 @@ function clearRestoredRunState() {
   saveUiState();
   renderClarificationState();
   updateRunTotalTimeDisplay();
+  updateEtaDisplay();
   updateControlState();
 }
 
@@ -1288,6 +1664,7 @@ function renderPlannerActions(actions) {
 }
 
 function renderPlanNodes(planDagList) {
+  latestPlanDags = Array.isArray(planDagList) ? planDagList : [];
   const blocks = (planDagList || []).flatMap((dag, dagIndex) =>
     (dag.nodes || []).map(
       (node) => `
@@ -1302,6 +1679,8 @@ function renderPlanNodes(planDagList) {
     )
   );
   renderStackPanel(planNodes, blocks, "Plan DAG nodes will appear once the planner emits a plan.");
+  renderToolNodeMap();
+  renderToolCatalog();
 }
 
 function renderLLMTraces(traces) {
@@ -1335,6 +1714,7 @@ function renderToolCalls(rows) {
     const rightTime = parseUtcTimestamp(right.finished_at_utc || right.started_at_utc || "") || 0;
     return rightTime - leftTime;
   });
+  latestToolCallRows = ordered;
   const totals = collectToolCallTotals(ordered);
   renderMetricStrip(toolCallSummary, [
     { label: "Calls", value: formatCount(totals.totalCalls) },
@@ -1397,6 +1777,8 @@ function renderToolCalls(rows) {
     `;
   });
   renderStackPanel(toolCalls, blocks, "Exact backend tool calls will appear here while the run executes.");
+  renderToolNodeMap();
+  renderToolCatalog();
 }
 
 function renderSelectedDocs(rows) {
@@ -1497,6 +1879,7 @@ function renderManifest(manifest) {
     }
   }
   updateRunTotalTimeDisplay();
+  updateEtaDisplay(manifest);
 }
 
 function setStatus(payload) {
@@ -1549,6 +1932,7 @@ function setStatus(payload) {
   renderToolCalls(payload.tool_calls || []);
   renderLLMTraces(payload.llm_traces || []);
   updateRunTotalTimeDisplay();
+  updateEtaDisplay(payload);
 
   const clarificationQuestions = payload.clarification_questions || [];
   if (status === "needs_clarification" && clarificationQuestions.length > 0) {
@@ -1567,7 +1951,23 @@ async function fetchJson(url, options = {}) {
     ...options,
   });
   if (!response.ok) {
-    throw new Error(`${response.status} ${response.statusText}`);
+    let detail = "";
+    try {
+      const payload = await response.json();
+      detail = payload.detail ? `: ${payload.detail}` : "";
+    } catch (_error) {
+      detail = "";
+    }
+    let hint = "";
+    try {
+      const parsedUrl = new URL(url);
+      if (parsedUrl.port === "5500") {
+        hint = " Selected API base points to the static frontend server; use the local backend API on http://127.0.0.1:8001.";
+      }
+    } catch (_error) {
+      hint = "";
+    }
+    throw new Error(`${response.status} ${response.statusText}${detail}${hint}`);
   }
   return response.json();
 }
@@ -1589,42 +1989,64 @@ async function fetchManifestWithRetry(base, runId, attempts = MANIFEST_FETCH_MAX
 }
 
 async function loadRuntimeInfo() {
+  const base = apiBaseInput.value.replace(/\/$/, "");
   try {
-    const base = apiBaseInput.value.replace(/\/$/, "");
     const payload = await fetchJson(`${base}/runtime-info`);
     renderRuntimeInfo(payload);
   } catch (error) {
     runtimeModeBadge.textContent = "Runtime info unavailable";
     renderList(runtimeNotes, [`Could not load runtime info: ${error.message}`], (row) => escapeHtml(row));
   }
+  try {
+    const payload = await fetchJson(`${base}/capabilities`);
+    latestCapabilityCatalog = Array.isArray(payload.capabilities) ? payload.capabilities : [];
+    renderToolCatalog();
+  } catch (error) {
+    latestCapabilityCatalog = [];
+    toolCatalogSummary.textContent = "Tool catalog unavailable";
+    toolCatalog.innerHTML = `<p class="muted">Could not load backend tool catalog: ${escapeHtml(error.message)}</p>`;
+  }
 }
 
 async function applyLlmSettings() {
   const base = apiBaseInput.value.replace(/\/$/, "");
+  const requestedProvider = llmProviderSelect.value;
   llmSettingsNote.textContent = "Updating backend LLM settings...";
+  applyLlmSettingsButton.disabled = true;
   const payload = await fetchJson(`${base}/settings/llm`, {
     method: "POST",
     body: JSON.stringify({
-      use_openai: llmProviderSelect.value === "openai",
+      use_openai: requestedProvider === "openai",
       planner_model: plannerModelInput.value.trim(),
       synthesis_model: synthesisModelInput.value.trim(),
     }),
   });
   renderRuntimeInfo(payload);
-  detailText.textContent = "Backend LLM settings updated. New runs will use the selected provider/models.";
+  const appliedProvider = payload?.llm?.use_openai ? "openai" : "uncloseai";
+  if (appliedProvider !== requestedProvider) {
+    detailText.textContent = `Backend returned ${appliedProvider}, not requested ${requestedProvider}. Check backend settings and environment.`;
+    llmSettingsNote.textContent = detailText.textContent;
+  } else {
+    detailText.textContent = `Backend LLM settings updated to ${requestedProvider}. New runs will use the selected provider/models.`;
+    llmSettingsNote.textContent = detailText.textContent;
+  }
   saveUiState();
+  updateControlState();
 }
 
 async function resetLlmSettings() {
   const base = apiBaseInput.value.replace(/\/$/, "");
   llmSettingsNote.textContent = "Resetting backend LLM settings to startup defaults...";
+  resetLlmSettingsButton.disabled = true;
   const payload = await fetchJson(`${base}/settings/llm/reset`, {
     method: "POST",
     body: JSON.stringify({ reset_to_startup: true }),
   });
   renderRuntimeInfo(payload);
   detailText.textContent = "Backend LLM settings reset to startup defaults from config/.env.";
+  llmSettingsNote.textContent = detailText.textContent;
   saveUiState();
+  updateControlState();
 }
 
 async function abortCurrentRun({ silent = false } = {}) {
@@ -1851,6 +2273,9 @@ applyLlmSettingsButton.addEventListener("click", async () => {
     await applyLlmSettings();
   } catch (error) {
     detailText.textContent = `LLM settings update failed: ${error.message}`;
+    llmSettingsNote.textContent = detailText.textContent;
+  } finally {
+    updateControlState();
   }
 });
 
@@ -1859,6 +2284,9 @@ resetLlmSettingsButton.addEventListener("click", async () => {
     await resetLlmSettings();
   } catch (error) {
     detailText.textContent = `LLM settings reset failed: ${error.message}`;
+    llmSettingsNote.textContent = detailText.textContent;
+  } finally {
+    updateControlState();
   }
 });
 
@@ -1866,6 +2294,11 @@ llmProviderSelect.addEventListener("change", () => {
   applyProviderDefaultsToInputs(llmProviderSelect.value);
   llmSettingsNote.textContent = `Loaded default models for ${llmProviderSelect.value === "openai" ? "OpenAI" : "UncloseAI"} into the planner and synthesis fields.`;
   saveUiState();
+});
+
+apiBaseInput.addEventListener("change", () => {
+  detailText.textContent = `API base set to ${apiBaseInput.value}. Loading runtime info...`;
+  void loadRuntimeInfo();
 });
 
 continueButton.addEventListener("click", async () => {
@@ -1927,6 +2360,7 @@ restoreUiState();
 closePlotModal();
 renderClarificationState();
 renderToolCalls([]);
+updateEtaDisplay();
 updateControlState();
 renderAccessGate();
 
