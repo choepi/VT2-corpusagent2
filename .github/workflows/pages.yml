@@ -8,6 +8,16 @@ on:
       - "config/**"
       - "scripts/13_write_frontend_config.py"
       - ".github/workflows/pages.yml"
+      - "src/corpusagent2/app_config.py"
+      - "src/corpusagent2/app_secrets.py"
+  pull_request:
+    paths:
+      - "web/**"
+      - "config/**"
+      - "scripts/13_write_frontend_config.py"
+      - ".github/workflows/pages.yml"
+      - "src/corpusagent2/app_config.py"
+      - "src/corpusagent2/app_secrets.py"
   workflow_dispatch:
 
 permissions:
@@ -20,7 +30,35 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  validate:
+    name: Validate static frontend
+    runs-on: ubuntu-latest
+    env:
+      CORPUSAGENT2_FRONTEND_API_BASE_URL: https://api.dongtse.com
+      CORPUSAGENT2_FRONTEND_ACCESS_GATE: "false"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Generate frontend runtime config
+        run: python scripts/13_write_frontend_config.py
+
+      - name: Check required static files
+        run: |
+          test -f web/index.html
+          test -f web/app.js
+          test -f web/styles.css
+          test -f web/config.js
+
   deploy:
+    name: Deploy static frontend
+    needs: validate
+    if: github.event_name != 'pull_request'
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}

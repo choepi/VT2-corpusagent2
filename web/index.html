@@ -45,11 +45,48 @@
         <div class="controls-grid">
           <div>
             <label for="apiBase">API Base URL</label>
-            <input id="apiBase" type="url" value="http://127.0.0.1:8001" />
+            <select id="apiBase" class="button-select">
+              <option value="https://api.dongtse.com">Remote API - https://api.dongtse.com</option>
+              <option value="http://127.0.0.1:8001">Local API - http://127.0.0.1:8001</option>
+            </select>
           </div>
           <div>
             <label for="question">Question</label>
             <textarea id="question" rows="5">Which media predicted the outbreak of the Ukraine war in 2022?</textarea>
+          </div>
+        </div>
+
+        <div class="llm-settings-panel main-llm-settings">
+          <div class="llm-settings-head">
+            <div>
+              <p class="eyebrow">Backend LLM</p>
+              <h3>Provider and Models</h3>
+            </div>
+            <span class="pill subtle">Applies to future runs</span>
+          </div>
+          <div class="llm-settings-grid">
+            <div>
+              <label for="llmProvider">Provider</label>
+              <select id="llmProvider" class="button-select">
+                <option value="uncloseai">UncloseAI / Hermes</option>
+                <option value="openai">OpenAI</option>
+              </select>
+            </div>
+            <div>
+              <label for="plannerModelInput">Planner model</label>
+              <input id="plannerModelInput" type="text" placeholder="gpt-4.1-mini" />
+            </div>
+            <div>
+              <label for="synthesisModelInput">Synthesis model</label>
+              <input id="synthesisModelInput" type="text" placeholder="gpt-4.1-mini" />
+            </div>
+          </div>
+          <div class="controls llm-settings-controls">
+            <button id="applyLlmSettingsButton" type="button">Apply LLM Settings</button>
+            <button id="resetLlmSettingsButton" type="button" class="ghost-button">Reset To Startup</button>
+            <span id="llmSettingsNote" class="muted inline-note">
+              Runtime overrides affect future runs only.
+            </span>
           </div>
         </div>
 
@@ -113,6 +150,10 @@
               <strong id="totalTimeCount">n/a</strong>
             </div>
             <div>
+              <span class="metric-label">ETA</span>
+              <strong id="etaText">unknown</strong>
+            </div>
+            <div>
               <span class="metric-label">Run ID</span>
               <strong id="runIdText">not saved yet</strong>
             </div>
@@ -134,6 +175,27 @@
           <h3>Assumptions</h3>
           <ul id="assumptionsList"></ul>
         </article>
+      </section>
+
+      <section class="card plan-tool-card">
+        <div class="section-head">
+          <h2>Plan Nodes And Tool Catalog</h2>
+          <span class="pill subtle">Full planner/tool list</span>
+        </div>
+        <p class="muted">
+          Plan nodes like n1, n2, and n18 are generated per run. The table below lists every planned node once the
+          planner emits a DAG; the backend function catalog lists all registered tool functions, not only the ones used.
+        </p>
+        <h3>Current Plan Node Table</h3>
+        <div id="toolNodeMap" class="node-map"></div>
+        <div id="toolNodeTable" class="table-scroll tool-node-table"></div>
+        <details class="tool-catalog-details" open>
+          <summary>
+            <span>All Registered Backend Tool Functions</span>
+            <small id="toolCatalogSummary">Loading tool catalog...</small>
+          </summary>
+          <div id="toolCatalog" class="tool-catalog"></div>
+        </details>
       </section>
 
       <section class="main-grid output-grid">
@@ -193,44 +255,23 @@
               <h2>Runtime Profile</h2>
               <span id="runtimeModeBadge" class="pill subtle">Loading</span>
             </div>
-            <div class="llm-settings-panel">
-              <div class="llm-settings-head">
-                <h3>Backend LLM Controls</h3>
-                <span class="pill subtle">Applies to future runs</span>
+            <div class="runtime-compact-grid">
+              <div>
+                <div id="runtimeSummary" class="metric-stack"></div>
               </div>
-              <div class="llm-settings-grid">
-                <div>
-                  <label for="llmProvider">Provider</label>
-                  <select id="llmProvider">
-                    <option value="uncloseai">UncloseAI / Hermes</option>
-                    <option value="openai">OpenAI</option>
-                  </select>
-                </div>
-                <div>
-                  <label for="plannerModelInput">Planner model</label>
-                  <input id="plannerModelInput" type="text" placeholder="gpt-4.1-mini" />
-                </div>
-                <div>
-                  <label for="synthesisModelInput">Synthesis model</label>
-                  <input id="synthesisModelInput" type="text" placeholder="gpt-4.1-mini" />
-                </div>
+              <div>
+                <h3>Retrieval Health</h3>
+                <div id="retrievalHealth" class="metric-stack"></div>
               </div>
-              <div class="controls llm-settings-controls">
-                <button id="applyLlmSettingsButton" type="button">Apply LLM Settings</button>
-                <button id="resetLlmSettingsButton" type="button" class="ghost-button">Reset To Startup</button>
-              </div>
-              <p id="llmSettingsNote" class="muted">
-                The UI controls update the backend process for future runs only. Restarting the backend returns to the startup `.env` defaults unless you also change them there.
-              </p>
             </div>
-            <div id="runtimeSummary" class="metric-stack"></div>
-            <h3>Retrieval Health</h3>
-            <div id="retrievalHealth" class="metric-stack"></div>
-            <h3>Provider Imports</h3>
-            <div id="providersInstalled" class="chip-wrap"></div>
-            <p class="muted">These chips show whether provider libraries import. The actual provider used is recorded per node in the execution transcript.</p>
-            <h3>Execution Notes</h3>
-            <ul id="runtimeNotes"></ul>
+            <details class="mini-details">
+              <summary>Provider imports and runtime notes</summary>
+              <h3>Provider Imports</h3>
+              <div id="providersInstalled" class="chip-wrap"></div>
+              <p class="muted">These chips show whether provider libraries import. Per-node provenance shows what actually executed.</p>
+              <h3>Execution Notes</h3>
+              <ul id="runtimeNotes"></ul>
+            </details>
           </article>
 
           <article class="card transcript-card">
