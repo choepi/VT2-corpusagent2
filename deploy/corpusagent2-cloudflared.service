@@ -1,7 +1,7 @@
 [Unit]
 Description=CorpusAgent2 Cloudflare Tunnel
-After=network-online.target corpusagent2-api.service
-Wants=network-online.target corpusagent2-api.service
+After=network-online.target corpusagent2-stack.service
+Wants=network-online.target corpusagent2-stack.service
 
 [Service]
 Type=simple
