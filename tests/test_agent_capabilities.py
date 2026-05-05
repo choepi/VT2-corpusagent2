@@ -295,6 +295,37 @@ def test_filter_working_set_narrows_existing_working_set_without_new_search() ->
     assert result.metadata["filtered_from_working_set"] is True
 
 
+def test_filter_working_set_stops_immediately_when_cancel_requested() -> None:
+    store = InMemoryWorkingSetStore()
+    store.document_lookup.update(
+        {
+            "doc-1": {
+                "doc_id": "doc-1",
+                "title": "Trump and market volatility",
+                "text": "Donald Trump coverage discussed stocks and markets.",
+                "published_at": "2018-02-01",
+                "source": "example.com",
+            },
+        }
+    )
+    store.record_working_set("run", "broad", [{"doc_id": "doc-1", "rank": 1, "score": 1.0}])
+    context = AgentExecutionContext(
+        run_id="run",
+        artifacts_dir=Path("."),
+        search_backend=None,
+        working_store=store,
+        runtime=None,
+        cancel_requested=lambda: True,
+    )
+    deps = {"search": ToolExecutionResult(payload={"working_set_ref": "broad", "document_count": 1})}
+
+    result = _filter_working_set({"query": "Trump"}, deps, context)
+
+    assert result.metadata["cancelled"] is True
+    assert result.metadata["no_data_reason"] == "cancelled"
+    assert result.payload["results"] == []
+
+
 def test_filter_working_set_can_limit_ranked_working_set_without_query() -> None:
     store = InMemoryWorkingSetStore()
     store.document_lookup.update(

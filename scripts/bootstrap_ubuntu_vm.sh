@@ -14,6 +14,6 @@ python3 ./scripts/22_prepare_vm_stack.py --install-system "$@"
 
 echo ""
 echo "Bootstrap complete."
-echo "Backend: ./.venv/bin/python ./scripts/12_run_agent_api.py"
+echo "Backend/API: docker compose -f deploy/docker-compose.yml up -d corpusagent2-api"
 echo "Tunnel:  ./.venv/bin/python ./scripts/23_start_cloudflared_tunnel.py"
 echo "Services: ./.venv/bin/python ./scripts/24_configure_vm_services.py"

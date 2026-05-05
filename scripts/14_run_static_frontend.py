@@ -14,6 +14,14 @@ if str(SRC_ROOT) not in sys.path:
 from corpusagent2.app_config import AppConfig, frontend_runtime_payload
 
 
+class NoCacheStaticHandler(SimpleHTTPRequestHandler):
+    def end_headers(self) -> None:
+        self.send_header("Cache-Control", "no-store, max-age=0")
+        self.send_header("Pragma", "no-cache")
+        self.send_header("Expires", "0")
+        super().end_headers()
+
+
 if __name__ == "__main__":
     config = AppConfig.from_project_root(REPO_ROOT)
     web_root = REPO_ROOT / "web"
@@ -23,7 +31,7 @@ if __name__ == "__main__":
     )
     host = "127.0.0.1"
     port = 5500
-    handler = partial(SimpleHTTPRequestHandler, directory=str(web_root))
+    handler = partial(NoCacheStaticHandler, directory=str(web_root))
     server = ThreadingHTTPServer((host, port), handler)
     print(f"Serving static frontend on http://{host}:{port}")
     print(f"Using web root {web_root}")

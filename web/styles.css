@@ -511,6 +511,64 @@ h3 {
   margin-top: 16px;
 }
 
+.claim-verdict-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 12px;
+  margin: 10px 0 18px;
+}
+
+.claim-card {
+  border: 1px solid var(--hairline);
+  border-radius: 20px;
+  padding: 13px;
+  background: rgba(255, 255, 255, 0.84);
+  box-shadow: 0 12px 28px rgba(17, 24, 39, 0.05);
+}
+
+.claim-verdict-pill {
+  display: inline-flex;
+  width: fit-content;
+  border-radius: 999px;
+  padding: 5px 9px;
+  margin-bottom: 8px;
+  background: rgba(0, 0, 0, 0.055);
+  color: var(--muted);
+  font-size: 0.78rem;
+  font-weight: 780;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.claim-card-supported .claim-verdict-pill {
+  background: rgba(52, 199, 89, 0.14);
+  color: #16773a;
+}
+
+.claim-card-partially_supported .claim-verdict-pill,
+.claim-card-partial .claim-verdict-pill {
+  background: rgba(255, 149, 0, 0.15);
+  color: #a45a00;
+}
+
+.claim-card-unsupported .claim-verdict-pill,
+.claim-card-refuted .claim-verdict-pill {
+  background: rgba(217, 45, 32, 0.12);
+  color: var(--danger);
+}
+
+.claim-text {
+  margin: 0;
+  font-weight: 700;
+  line-height: 1.35;
+}
+
+.claim-evidence {
+  margin: 8px 0 0;
+  color: var(--muted);
+  line-height: 1.35;
+}
+
 .stack-panel {
   display: grid;
   gap: 12px;
@@ -670,6 +728,95 @@ h3 {
 .tool-node-table {
   max-height: 360px;
   margin-bottom: 14px;
+}
+
+.tool-usage-summary {
+  margin-bottom: 12px;
+}
+
+.usage-stat-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 10px;
+  margin: 10px 0;
+}
+
+.usage-stat-grid > div {
+  border: 1px solid var(--hairline);
+  border-radius: 18px;
+  padding: 12px;
+  background: rgba(255, 255, 255, 0.76);
+}
+
+.usage-stat-grid strong {
+  display: block;
+  margin-top: 3px;
+  font-size: 1.2rem;
+}
+
+.tool-usage-plot {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 14px;
+  margin: 12px 0 14px;
+}
+
+.usage-panel {
+  border: 1px solid var(--hairline);
+  border-radius: 20px;
+  padding: 14px;
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.9), rgba(246, 247, 249, 0.78));
+}
+
+.usage-panel h4,
+.tool-usage-never h4 {
+  margin: 0 0 10px;
+}
+
+.usage-bar-row {
+  display: grid;
+  grid-template-columns: minmax(120px, 0.9fr) minmax(120px, 1.4fr) 56px minmax(150px, 1.1fr);
+  gap: 10px;
+  align-items: center;
+  padding: 6px 0;
+  font-size: 0.88rem;
+}
+
+.usage-bar-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: 650;
+}
+
+.usage-bar-track {
+  height: 12px;
+  border-radius: 999px;
+  background: rgba(0, 0, 0, 0.06);
+  overflow: hidden;
+}
+
+.usage-bar-fill {
+  height: 100%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, var(--accent), #30d158);
+}
+
+.usage-bar-value {
+  font-variant-numeric: tabular-nums;
+  font-weight: 750;
+}
+
+.usage-bar-detail {
+  color: var(--muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.compact-table {
+  max-height: 320px;
 }
 
 .tool-index-cell {
@@ -896,7 +1043,6 @@ th {
   white-space: nowrap;
 }
 
-.selected-doc-snippet,
 .evidence-excerpt {
   line-height: 1.35;
 }
@@ -971,6 +1117,7 @@ th {
   .controls-grid,
   .runtime-compact-grid,
   .llm-settings-grid,
+  .tool-usage-plot,
   .subgrid {
     grid-template-columns: 1fr;
   }
@@ -994,6 +1141,11 @@ th {
   }
 
   .metric-strip {
+    grid-template-columns: 1fr;
+  }
+
+  .usage-stat-grid,
+  .usage-bar-row {
     grid-template-columns: 1fr;
   }
 

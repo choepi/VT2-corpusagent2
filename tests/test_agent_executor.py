@@ -59,6 +59,68 @@ def test_async_executor_runs_independent_nodes_in_parallel(tmp_path: Path) -> No
     assert duration < 0.5
 
 
+def test_async_executor_marks_pending_nodes_skipped_when_cancelled_before_execution(tmp_path: Path) -> None:
+    plan = AgentPlanDAG(
+        nodes=[
+            AgentPlanNode("node_a", "a"),
+            AgentPlanNode("node_b", "b", depends_on=["node_a"]),
+        ]
+    )
+    context = AgentExecutionContext(
+        run_id="run_cancelled",
+        artifacts_dir=tmp_path,
+        search_backend=_SearchBackend(),
+        working_store=InMemoryWorkingSetStore(),
+        cancel_requested=lambda: True,
+    )
+
+    snapshot = asyncio.run(AsyncPlanExecutor(ToolRegistry()).execute(plan, context))
+
+    assert snapshot.status == "aborted"
+    assert {record.node_id for record in snapshot.node_records} == {"node_a", "node_b"}
+    assert all(record.status == "skipped" for record in snapshot.node_records)
+
+
+def test_async_executor_stops_scheduling_after_cancel_requested(tmp_path: Path) -> None:
+    registry = ToolRegistry()
+    cancel_requested = False
+    second_started = False
+
+    def first_node(_params, _deps, _context):
+        nonlocal cancel_requested
+        cancel_requested = True
+        return ToolExecutionResult(payload={"ok": True})
+
+    def second_node(_params, _deps, _context):
+        nonlocal second_started
+        second_started = True
+        return ToolExecutionResult(payload={"ok": True})
+
+    registry.register(StaticAdapter(tool_name="first_tool", capability="first", run_fn=first_node))
+    registry.register(StaticAdapter(tool_name="second_tool", capability="second", run_fn=second_node))
+    plan = AgentPlanDAG(
+        nodes=[
+            AgentPlanNode("first", "first"),
+            AgentPlanNode("second", "second", depends_on=["first"]),
+        ]
+    )
+    context = AgentExecutionContext(
+        run_id="run_cancel_after_first",
+        artifacts_dir=tmp_path,
+        search_backend=_SearchBackend(),
+        working_store=InMemoryWorkingSetStore(),
+        cancel_requested=lambda: cancel_requested,
+    )
+
+    snapshot = asyncio.run(AsyncPlanExecutor(registry).execute(plan, context))
+
+    records = {record.node_id: record for record in snapshot.node_records}
+    assert snapshot.status == "aborted"
+    assert records["first"].status == "completed"
+    assert records["second"].status == "skipped"
+    assert second_started is False
+
+
 def test_summarize_tool_result_distinguishes_input_docs_and_no_data() -> None:
     dependency_results = {
         "fetch": ToolExecutionResult(

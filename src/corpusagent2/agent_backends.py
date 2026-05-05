@@ -499,6 +499,9 @@ class WorkingSetStore(Protocol):
     def read_tool_calls(self, run_id: str) -> list[dict[str, Any]]:
         ...
 
+    def read_all_tool_calls(self) -> list[dict[str, Any]]:
+        ...
+
     def cleanup_interrupted_runs(self) -> int:
         ...
 
@@ -613,6 +616,13 @@ class InMemoryWorkingSetStore:
 
     def read_tool_calls(self, run_id: str) -> list[dict[str, Any]]:
         return [dict(item) for item in self.tool_calls_by_run.get(run_id, [])]
+
+    def read_all_tool_calls(self) -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
+        for run_id, calls in self.tool_calls_by_run.items():
+            for item in calls:
+                rows.append({"run_id": run_id, **dict(item)})
+        return rows
 
     def cleanup_interrupted_runs(self) -> int:
         repaired = 0
@@ -1060,6 +1070,30 @@ class PostgresWorkingSetStore:
                 "tool_name": str(row[2]),
                 "status": str(row[3]),
                 "payload": dict(row[4] or {}),
+            }
+            for row in rows
+        ]
+
+    def read_all_tool_calls(self) -> list[dict[str, Any]]:
+        self.ensure_schema()
+        with self._connect() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT run_id, node_id, capability, tool_name, status, payload
+                    FROM ca_agent_run_tool_calls
+                    ORDER BY run_id, node_id, tool_name, status
+                    """
+                )
+                rows = cursor.fetchall()
+        return [
+            {
+                "run_id": str(row[0]),
+                "node_id": str(row[1]),
+                "capability": str(row[2]),
+                "tool_name": str(row[3]),
+                "status": str(row[4]),
+                "payload": dict(row[5] or {}),
             }
             for row in rows
         ]

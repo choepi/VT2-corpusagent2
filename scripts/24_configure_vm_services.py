@@ -16,6 +16,7 @@ if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
 from corpusagent2.app_config import load_project_configuration
+from corpusagent2.deploy_resources import compute_docker_resource_plan, detect_host_hardware
 
 
 def _load_dotenv(path: Path) -> dict[str, str]:
@@ -55,6 +56,12 @@ def _service_user_home(service_user: str) -> Path:
 
 
 def _upsert_dotenv(path: Path, updates: dict[str, str]) -> None:
+    def render(key: str, value: str) -> str:
+        escaped = str(value).replace("\\", "\\\\").replace('"', '\\"')
+        if any(char.isspace() for char in escaped):
+            return f'{key}="{escaped}"'
+        return f"{key}={escaped}"
+
     existing_lines = path.read_text(encoding="utf-8").splitlines() if path.exists() else []
     seen: set[str] = set()
     output: list[str] = []
@@ -65,25 +72,38 @@ def _upsert_dotenv(path: Path, updates: dict[str, str]) -> None:
             continue
         key = line.split("=", 1)[0].strip()
         if key in updates:
-            output.append(f"{key}={updates[key]}")
+            output.append(render(key, updates[key]))
             seen.add(key)
         else:
             output.append(line)
     for key, value in updates.items():
         if key not in seen:
-            output.append(f"{key}={value}")
+            output.append(render(key, value))
     path.write_text("\n".join(output).rstrip() + "\n", encoding="utf-8")
+
+
+def _compose_exec_fragment(*, docker_bin: str, use_gpu: bool) -> str:
+    files = [
+        REPO_ROOT / "deploy" / "docker-compose.yml",
+        REPO_ROOT / "deploy" / "docker-compose.mcp.yml",
+    ]
+    if use_gpu:
+        files.append(REPO_ROOT / "deploy" / "docker-compose.mcp.gpu.yml")
+    rendered_files = " ".join(f"-f {path}" for path in files)
+    return f"{docker_bin} compose {rendered_files}"
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Install reboot-safe systemd services for the CorpusAgent2 API and a named Cloudflare tunnel."
+        description="Install reboot-safe systemd services for the Dockerized CorpusAgent2 stack and a named Cloudflare tunnel."
     )
     parser.add_argument("--service-user", default=_get_config_value("USER", os.getenv("USER", "")) or "root")
-    parser.add_argument("--api-service-name", default="corpusagent2-api")
+    parser.add_argument("--stack-service-name", default="corpusagent2-stack")
+    parser.add_argument("--api-service-name", default="", help=argparse.SUPPRESS)
     parser.add_argument("--tunnel-service-name", default="corpusagent2-cloudflared")
     parser.add_argument("--backend-url", default="http://127.0.0.1:8001")
-    parser.add_argument("--skip-tunnel", action="store_true", help="Install only the API service.")
+    parser.add_argument("--gpu", choices=["auto", "on", "off"], default="auto", help="GPU compose selection for the Docker stack service.")
+    parser.add_argument("--skip-tunnel", action="store_true", help="Install only the Docker stack service.")
     return parser.parse_args()
 
 
@@ -115,36 +135,43 @@ def main() -> None:
         "CORPUSAGENT2_FRONTEND_API_BASE_URL",
         f"https://{tunnel_hostname}" if tunnel_hostname else "",
     )
+    resource_plan = compute_docker_resource_plan(detect_host_hardware(), gpu_mode=args.gpu)
+    _upsert_dotenv(dotenv_path, resource_plan.env)
     if frontend_api_base_url:
         _upsert_dotenv(
             dotenv_path,
             {"CORPUSAGENT2_FRONTEND_API_BASE_URL": frontend_api_base_url},
         )
-        _run([str(REPO_ROOT / ".venv" / "bin" / "python"), str(REPO_ROOT / "scripts" / "13_write_frontend_config.py")])
+        _run([sys.executable, str(REPO_ROOT / "scripts" / "13_write_frontend_config.py")])
 
-    api_service = f"""[Unit]
-Description=CorpusAgent2 FastAPI backend
-After=network.target docker.service
-Wants=docker.service
+    stack_service_name = args.api_service_name or args.stack_service_name
+    docker_bin = shutil.which("docker") or "/usr/bin/docker"
+    compose_exec = _compose_exec_fragment(docker_bin=docker_bin, use_gpu=resource_plan.use_gpu)
+
+    stack_service = f"""[Unit]
+Description=CorpusAgent2 Docker stack
+After=network-online.target docker.service
+Wants=network-online.target docker.service
 
 [Service]
-Type=simple
-User={service_user}
-WorkingDirectory={REPO_ROOT}
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory={REPO_ROOT / 'deploy'}
 EnvironmentFile={dotenv_path}
-ExecStart={REPO_ROOT / '.venv' / 'bin' / 'python'} {REPO_ROOT / 'scripts' / '12_run_agent_api.py'}
-Restart=always
-RestartSec=5
+ExecStart={compose_exec} up -d
+ExecStop={compose_exec} down --remove-orphans
+TimeoutStartSec=0
+TimeoutStopSec=120
 
 [Install]
 WantedBy=multi-user.target
 """
     service_dir = Path("/etc/systemd/system")
     prefix = _sudo_prefix()
-    api_service_path = service_dir / f"{args.api_service_name}.service"
-    temp_api = REPO_ROOT / "deploy" / f"{args.api_service_name}.service"
-    temp_api.write_text(api_service, encoding="utf-8")
-    _run(prefix + ["install", "-m", "0644", str(temp_api), str(api_service_path)])
+    stack_service_path = service_dir / f"{stack_service_name}.service"
+    temp_stack = REPO_ROOT / "deploy" / f"{stack_service_name}.service"
+    temp_stack.write_text(stack_service, encoding="utf-8")
+    _run(prefix + ["install", "-m", "0644", str(temp_stack), str(stack_service_path)])
 
     if not args.skip_tunnel:
         cloudflared_config = f"""tunnel: {tunnel_id}
@@ -159,8 +186,8 @@ ingress:
 
         tunnel_service = f"""[Unit]
 Description=CorpusAgent2 Cloudflare Tunnel
-After=network-online.target {args.api_service_name}.service
-Wants=network-online.target {args.api_service_name}.service
+After=network-online.target {stack_service_name}.service
+Wants=network-online.target {stack_service_name}.service
 
 [Service]
 Type=simple
@@ -178,12 +205,12 @@ WantedBy=multi-user.target
         _run(prefix + ["install", "-m", "0644", str(temp_tunnel), str(tunnel_service_path)])
 
     _run(prefix + ["systemctl", "daemon-reload"])
-    _run(prefix + ["systemctl", "enable", "--now", f"{args.api_service_name}.service"])
+    _run(prefix + ["systemctl", "enable", "--now", f"{stack_service_name}.service"])
     if not args.skip_tunnel:
         _run(prefix + ["systemctl", "enable", "--now", f"{args.tunnel_service_name}.service"])
 
     print("")
-    print(f"API service installed: {args.api_service_name}.service")
+    print(f"Docker stack service installed: {stack_service_name}.service")
     if not args.skip_tunnel:
         print(f"Tunnel service installed: {args.tunnel_service_name}.service")
         print(f"Stable public API URL: {frontend_api_base_url}")

@@ -21,6 +21,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 DEPLOY_ROOT = REPO_ROOT / "deploy"
 COMPOSE_FILE = DEPLOY_ROOT / "docker-compose.yml"
 MCP_COMPOSE_FILE = DEPLOY_ROOT / "docker-compose.mcp.yml"
+GPU_COMPOSE_FILE = DEPLOY_ROOT / "docker-compose.mcp.gpu.yml"
 DEFAULT_DOCKER_DATA_DIR = DEPLOY_ROOT / "data"
 DEFAULT_PG_HOST = "127.0.0.1"
 DEFAULT_PG_PORT = 5432
@@ -30,6 +31,12 @@ DEFAULT_OPENSEARCH_USERNAME = "admin"
 DEFAULT_OPENSEARCH_PASSWORD = "VerySecurePassword123!"
 DEFAULT_OPENSEARCH_VERIFY_SSL = False
 DEFAULT_RETRIEVAL_PROFILE = "hybrid"
+
+SRC_ROOT = REPO_ROOT / "src"
+if str(SRC_ROOT) not in sys.path:
+    sys.path.insert(0, str(SRC_ROOT))
+
+from corpusagent2.deploy_resources import compute_docker_resource_plan, detect_host_hardware
 
 
 class BootstrapError(RuntimeError):
@@ -134,6 +141,15 @@ def _docker_compose_command() -> list[str]:
     )
 
 
+def _compose_file_args(*, with_mcp: bool = False, use_gpu: bool = False) -> list[str]:
+    args = ["-f", str(COMPOSE_FILE)]
+    if with_mcp:
+        args.extend(["-f", str(MCP_COMPOSE_FILE)])
+    if use_gpu:
+        args.extend(["-f", str(GPU_COMPOSE_FILE)])
+    return args
+
+
 def _docker_runtime_is_available() -> bool:
     docker = shutil.which("docker")
     if not docker:
@@ -201,6 +217,12 @@ def _project_env() -> dict[str, str]:
 
 
 def _upsert_dotenv(path: Path, updates: dict[str, str]) -> None:
+    def render(key: str, value: str) -> str:
+        escaped = str(value).replace("\\", "\\\\").replace('"', '\\"')
+        if any(char.isspace() for char in escaped):
+            return f'{key}="{escaped}"'
+        return f"{key}={escaped}"
+
     existing_lines = path.read_text(encoding="utf-8").splitlines() if path.exists() else []
     output: list[str] = []
     seen: set[str] = set()
@@ -211,13 +233,13 @@ def _upsert_dotenv(path: Path, updates: dict[str, str]) -> None:
             continue
         key = line.split("=", 1)[0].strip()
         if key in updates:
-            output.append(f"{key}={updates[key]}")
+            output.append(render(key, updates[key]))
             seen.add(key)
         else:
             output.append(line)
     for key, value in updates.items():
         if key not in seen:
-            output.append(f"{key}={value}")
+            output.append(render(key, value))
     path.write_text("\n".join(output).rstrip() + "\n", encoding="utf-8")
     DOTENV_VALUES.update(updates)
 
@@ -629,18 +651,11 @@ def _ensure_docker_services(*, with_dashboards: bool) -> None:
     _wait_for_opensearch(timeout_s=240.0)
 
 
-def _ensure_mcp_service(*, build: bool) -> None:
+def _ensure_mcp_service(*, build: bool, use_gpu: bool = False) -> None:
     compose_command = _docker_compose_command()
     _ensure_docker_engine_ready()
     env = _project_env()
-    command = compose_command + [
-        "-f",
-        str(COMPOSE_FILE),
-        "-f",
-        str(MCP_COMPOSE_FILE),
-        "up",
-        "-d",
-    ]
+    command = compose_command + _compose_file_args(with_mcp=True, use_gpu=use_gpu) + ["up", "-d"]
     if build:
         command.append("--build")
     command.append("corpusagent2-mcp")
@@ -649,6 +664,18 @@ def _ensure_mcp_service(*, build: bool) -> None:
         "[ready] MCP server requested at "
         f"http://127.0.0.1:{env.get('CORPUSAGENT2_MCP_PORT', '8765')}{env.get('CORPUSAGENT2_MCP_PATH', '/mcp')}"
     )
+
+
+def _ensure_api_service(*, build: bool, use_gpu: bool = False) -> None:
+    compose_command = _docker_compose_command()
+    _ensure_docker_engine_ready()
+    env = _project_env()
+    command = compose_command + _compose_file_args(use_gpu=use_gpu) + ["up", "-d"]
+    if build:
+        command.append("--build")
+    command.append("corpusagent2-api")
+    _run(command, cwd=REPO_ROOT, env=env)
+    print(f"[ready] API backend requested at http://127.0.0.1:{env.get('CORPUSAGENT2_SERVER_PORT', '8001')}")
 
 
 def _maybe_run_script(
@@ -689,7 +716,7 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--refresh-postgres", action="store_true", help="Re-run Postgres schema, ingest, and pgvector indexing.")
     parser.add_argument("--refresh-opensearch", action="store_true", help="Re-run full OpenSearch bulk indexing.")
     parser.add_argument("--with-dashboards", action="store_true", help="Start OpenSearch Dashboards as well.")
-    parser.add_argument("--start-api", action="store_true", help="Start the FastAPI backend after preparation completes.")
+    parser.add_argument("--start-api", action="store_true", help="Start the Dockerized FastAPI backend after preparation completes.")
     parser.add_argument(
         "--setup-mcp-only",
         action="store_true",
@@ -697,6 +724,7 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--start-mcp", action="store_true", help="Start the Docker-hosted MCP job server after stack preparation.")
     parser.add_argument("--no-mcp-build", action="store_true", help="Do not rebuild the MCP Docker image before starting it.")
+    parser.add_argument("--gpu", choices=["auto", "on", "off"], default="auto", help="GPU compose selection for Dockerized API/MCP services.")
     parser.add_argument(
         "--retrieval-profile",
         choices=["no-dense", "hybrid"],
@@ -714,14 +742,17 @@ def main(argv: Iterable[str] | None = None) -> None:
         _install_system_packages()
 
     profile_env = _retrieval_profile_env(args.retrieval_profile)
+    resource_plan = compute_docker_resource_plan(detect_host_hardware(), gpu_mode=args.gpu)
+    _upsert_dotenv(REPO_ROOT / ".env", resource_plan.env)
     command_env = _project_env()
     command_env.update(profile_env)
+    command_env.update(resource_plan.env)
     _upsert_dotenv(REPO_ROOT / ".env", profile_env)
     if args.setup_mcp_only:
         if args.skip_docker:
             raise BootstrapError("--setup-mcp-only requires Docker; remove --skip-docker.")
         _ensure_docker_services(with_dashboards=args.with_dashboards)
-        _ensure_mcp_service(build=not args.no_mcp_build)
+        _ensure_mcp_service(build=not args.no_mcp_build, use_gpu=resource_plan.use_gpu)
         elapsed_s = time.perf_counter() - started
         summary_path = _write_summary(
             {
@@ -734,6 +765,7 @@ def main(argv: Iterable[str] | None = None) -> None:
                 "docker_prepared": True,
                 "mcp_started": True,
                 "mcp_url": f"http://127.0.0.1:{command_env.get('CORPUSAGENT2_MCP_PORT', '8765')}{command_env.get('CORPUSAGENT2_MCP_PATH', '/mcp')}",
+                "resource_plan": resource_plan.env,
                 "total_elapsed_seconds": round(elapsed_s, 3),
             }
         )
@@ -866,7 +898,7 @@ def main(argv: Iterable[str] | None = None) -> None:
             should_skip=not opensearch_needs_refresh,
         )
         if args.start_mcp:
-            _ensure_mcp_service(build=not args.no_mcp_build)
+            _ensure_mcp_service(build=not args.no_mcp_build, use_gpu=resource_plan.use_gpu)
 
     elapsed_s = time.perf_counter() - started
     summary_path = _write_summary(
@@ -879,7 +911,9 @@ def main(argv: Iterable[str] | None = None) -> None:
             "docker_data_dir": str(_project_env()["CORPUSAGENT2_DOCKER_DATA_DIR"]),
             "data_prepared": not args.skip_data,
             "docker_prepared": not args.skip_docker,
+            "api_started": bool(args.start_api and not args.skip_docker),
             "mcp_started": bool(args.start_mcp and not args.skip_docker),
+            "resource_plan": resource_plan.env,
             "postgres_summary": str(postgres_ingest_summary) if postgres_ingest_summary.exists() else "",
             "pgvector_backfill_summary": str(pgvector_backfill_summary) if pgvector_backfill_summary.exists() else "",
             "pgvector_index_summary": str(pgvector_index_summary) if pgvector_index_summary.exists() else "",
@@ -891,15 +925,17 @@ def main(argv: Iterable[str] | None = None) -> None:
     print("VM stack preparation complete.")
     print(f"Total time: {_format_duration(elapsed_s)}")
     print(f"Summary: {summary_path}")
-    print(f"Backend start: {python_exe} {REPO_ROOT / 'scripts' / '12_run_agent_api.py'}")
+    print(f"Backend start: docker compose -f {COMPOSE_FILE} up -d corpusagent2-api")
     print(f"Frontend config: {REPO_ROOT / 'web' / 'config.js'}")
     print(
         f"Cloudflared helper: {python_exe} {REPO_ROOT / 'scripts' / '23_start_cloudflared_tunnel.py'}"
     )
-    if args.start_api:
+    if args.start_api and not args.skip_docker:
         print("")
-        print("[run] starting API backend")
-        _run([str(python_exe), str(REPO_ROOT / "scripts" / "12_run_agent_api.py")], env=command_env)
+        print("[run] starting Dockerized API backend")
+        _ensure_api_service(build=True, use_gpu=False)
+    elif args.start_api:
+        print("[skip] --start-api ignored because --skip-docker was set.")
 
 
 if __name__ == "__main__":

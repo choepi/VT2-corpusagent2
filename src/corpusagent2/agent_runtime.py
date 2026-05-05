@@ -48,6 +48,65 @@ from .tool_registry import ToolRegistry
 from .python_runner_service import DockerPythonRunnerService
 
 TERMINAL_RUN_STATUSES = {"completed", "partial", "failed", "rejected", "needs_clarification", "aborted"}
+
+TOOL_USAGE_CATEGORIES: tuple[tuple[str, set[str]], ...] = (
+    ("Retrieval and working sets", {"db_search", "sql_query_search", "fetch_documents", "create_working_set", "filter_working_set"}),
+    ("Temporal and structured series", {"time_series_aggregate", "change_point_detect", "burst_detect", "join_external_series"}),
+    ("Language preprocessing", {"lang_id", "clean_normalize", "sentence_split", "tokenize", "lemmatize", "pos_morph", "mwt_expand"}),
+    ("Entities and syntax", {"ner", "entity_link", "noun_chunks", "dependency_parse", "extract_svo_triples"}),
+    ("Lexical topics and readability", {"extract_keyterms", "extract_ngrams", "topic_model", "lexical_diversity", "readability_stats", "extract_acronyms"}),
+    ("Sentiment classification and claims", {"sentiment", "text_classify", "claim_span_extract", "claim_strength_score"}),
+    ("Embeddings and similarity", {"doc_embeddings", "word_embeddings", "similarity_index", "similarity_pairwise"}),
+    ("Evidence and quotes", {"build_evidence_table", "quote_extract", "quote_attribute"}),
+    ("Sandbox and plotting", {"python_runner", "plot_artifact"}),
+)
+
+FRAMEWORK_BACKBONE_CAPABILITIES = {
+    "db_search",
+    "fetch_documents",
+    "create_working_set",
+    "filter_working_set",
+    "plot_artifact",
+    "python_runner",
+    "time_series_aggregate",
+}
+
+
+def _tool_usage_category(capabilities: list[str]) -> str:
+    capability_set = {str(item) for item in capabilities if str(item).strip()}
+    for category, members in TOOL_USAGE_CATEGORIES:
+        if capability_set & members:
+            return category
+    return "Other"
+
+
+def _tool_usage_role(capabilities: list[str]) -> str:
+    capability_set = {str(item) for item in capabilities if str(item).strip()}
+    return "framework backbone" if capability_set & FRAMEWORK_BACKBONE_CAPABILITIES else "question-specific"
+
+
+def _tool_usage_reason(
+    *,
+    capabilities: list[str],
+    completed_node_count: int,
+    planned_node_count: int,
+    planned_unresolved_count: int,
+) -> str:
+    if completed_node_count > 0:
+        return "Used by at least one historical run."
+    if planned_node_count > 0:
+        if planned_unresolved_count > 0:
+            return (
+                "Planned but not completed in at least one saved run. Usually this means the run was still active, "
+                "was aborted, hit an upstream dependency failure, or came from an older manifest before pending nodes "
+                "were explicitly marked skipped."
+            )
+        return "Planned historically, but node records show it did not complete."
+    if _tool_usage_role(capabilities) == "framework backbone":
+        return "Framework/backbone tool; absence means historical runs did not reach that stage or used an alternate backend path."
+    return "Question-specific tool; selected only when the planner needs that analysis type."
+
+
 SOURCE_CANDIDATE_LEADING_NOISE = {
     "and",
     "between",
@@ -3750,6 +3809,250 @@ class AgentRuntime:
         )
         return [spec.to_dict() for spec in specs]
 
+    def _saved_run_manifests(self) -> list[dict[str, Any]]:
+        root = self.config.outputs_root
+        if not root.exists():
+            return []
+        manifests: list[tuple[float, dict[str, Any]]] = []
+        for path in root.glob("agent_*/run_manifest.json"):
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            if isinstance(payload, dict):
+                payload.setdefault("run_id", path.parent.name)
+                try:
+                    modified = path.stat().st_mtime
+                except OSError:
+                    modified = 0.0
+                manifests.append((modified, payload))
+        return [payload for _, payload in sorted(manifests, key=lambda item: item[0], reverse=True)]
+
+    def tool_usage_summary(self) -> dict[str, Any]:
+        catalog = self.capability_catalog()
+        by_tool = {str(item.get("tool_name", "")): item for item in catalog if str(item.get("tool_name", "")).strip()}
+        capability_to_tool: dict[str, str] = {}
+        for item in catalog:
+            tool_name = str(item.get("tool_name", "")).strip()
+            capabilities = item.get("capabilities", [])
+            if not isinstance(capabilities, list):
+                capabilities = []
+            for capability in capabilities:
+                capability_to_tool.setdefault(str(capability), tool_name)
+
+        def new_entry(tool_name: str, spec: dict[str, Any] | None = None) -> dict[str, Any]:
+            spec_capabilities = (spec or {}).get("capabilities", [])
+            if not isinstance(spec_capabilities, list):
+                spec_capabilities = []
+            capabilities = [
+                str(item)
+                for item in spec_capabilities
+                if str(item).strip()
+            ]
+            return {
+                "tool_name": tool_name,
+                "capabilities": capabilities,
+                "category": _tool_usage_category(capabilities or [tool_name]),
+                "role": _tool_usage_role(capabilities or [tool_name]),
+                "registered": bool(spec),
+                "event_count": 0,
+                "completed_event_count": 0,
+                "completed_node_count": 0,
+                "planned_node_count": 0,
+                "planned_unresolved_count": 0,
+                "run_count": 0,
+                "planned_run_count": 0,
+                "status_counts": {},
+                "node_status_counts": {},
+                "last_run_id": "",
+                "last_question": "",
+                "_run_ids": set(),
+                "_planned_run_ids": set(),
+                "_event_keys": set(),
+                "_call_node_keys": set(),
+                "_completed_node_keys": set(),
+                "_planned_node_keys": set(),
+                "_recorded_node_keys": set(),
+            }
+
+        entries = {
+            tool_name: new_entry(tool_name, spec)
+            for tool_name, spec in by_tool.items()
+        }
+
+        def entry_for(tool_name: str = "", capability: str = "") -> dict[str, Any]:
+            resolved_tool = tool_name.strip() or capability_to_tool.get(capability.strip(), "") or capability.strip() or "unknown_tool"
+            if resolved_tool not in entries:
+                entries[resolved_tool] = new_entry(resolved_tool)
+                if capability and capability not in entries[resolved_tool]["capabilities"]:
+                    entries[resolved_tool]["capabilities"].append(capability)
+                    entries[resolved_tool]["category"] = _tool_usage_category(entries[resolved_tool]["capabilities"])
+                    entries[resolved_tool]["role"] = _tool_usage_role(entries[resolved_tool]["capabilities"])
+            return entries[resolved_tool]
+
+        manifests = self._saved_run_manifests()
+        questions_by_run = {
+            str(manifest.get("run_id", "")): str(manifest.get("question", ""))
+            for manifest in manifests
+            if str(manifest.get("run_id", "")).strip()
+        }
+
+        db_rows: list[dict[str, Any]] = []
+        try:
+            reader = getattr(self.working_store, "read_all_tool_calls", None)
+            if callable(reader):
+                db_rows = [dict(row) for row in reader()]
+        except Exception:
+            db_rows = []
+        db_run_ids = {str(row.get("run_id", "")) for row in db_rows if str(row.get("run_id", "")).strip()}
+
+        def ingest_call(row: dict[str, Any], *, source: str) -> None:
+            payload = row.get("payload", {}) if isinstance(row.get("payload"), dict) else {}
+            run_id = str(row.get("run_id", "")).strip()
+            node_id = str(row.get("node_id", "")).strip()
+            capability = str(row.get("capability", "")).strip()
+            tool_name = str(row.get("tool_name", "")).strip()
+            status = str(row.get("status", "") or "unknown").strip().lower()
+            entry = entry_for(tool_name, capability)
+            event_key = (
+                source,
+                run_id,
+                node_id,
+                capability,
+                tool_name,
+                status,
+                json.dumps(payload, sort_keys=True, default=str)[:500],
+            )
+            if event_key in entry["_event_keys"]:
+                return
+            entry["_event_keys"].add(event_key)
+            entry["event_count"] += 1
+            entry["status_counts"][status] = int(entry["status_counts"].get(status, 0)) + 1
+            if status == "completed":
+                entry["completed_event_count"] += 1
+            if run_id:
+                entry["_run_ids"].add(run_id)
+                entry["last_run_id"] = run_id
+                entry["last_question"] = questions_by_run.get(run_id, entry["last_question"])
+            if run_id and node_id:
+                node_key = f"{run_id}:{node_id}"
+                entry["_call_node_keys"].add(node_key)
+                if status == "completed":
+                    entry["_completed_node_keys"].add(node_key)
+
+        for row in db_rows:
+            ingest_call(row, source="db")
+
+        for manifest in manifests:
+            run_id = str(manifest.get("run_id", "")).strip()
+            if not run_id:
+                continue
+            plan_dags = manifest.get("plan_dags", [])
+            if not isinstance(plan_dags, list):
+                plan_dags = []
+            for dag in plan_dags:
+                dag_nodes = dag.get("nodes", []) if isinstance(dag, dict) else []
+                if not isinstance(dag_nodes, list):
+                    dag_nodes = []
+                for node in dag_nodes:
+                    if not isinstance(node, dict):
+                        continue
+                    node_id = str(node.get("node_id", node.get("id", ""))).strip()
+                    capability = str(node.get("capability", "")).strip()
+                    tool_name = str(node.get("tool_name", "")).strip()
+                    entry = entry_for(tool_name, capability)
+                    if run_id and node_id:
+                        node_key = f"{run_id}:{node_id}"
+                        entry["_planned_node_keys"].add(node_key)
+                        entry["_planned_run_ids"].add(run_id)
+            node_records = manifest.get("node_records", [])
+            if not isinstance(node_records, list):
+                node_records = []
+            for record in node_records:
+                if not isinstance(record, dict):
+                    continue
+                node_id = str(record.get("node_id", "")).strip()
+                capability = str(record.get("capability", "")).strip()
+                tool_name = str(record.get("tool_name", "")).strip()
+                status = str(record.get("status", "") or "unknown").strip().lower()
+                entry = entry_for(tool_name, capability)
+                entry["node_status_counts"][status] = int(entry["node_status_counts"].get(status, 0)) + 1
+                if run_id and node_id:
+                    node_key = f"{run_id}:{node_id}"
+                    entry["_recorded_node_keys"].add(node_key)
+                    if status == "completed":
+                        entry["_completed_node_keys"].add(node_key)
+            if run_id not in db_run_ids:
+                tool_calls = manifest.get("tool_calls", [])
+                if not isinstance(tool_calls, list):
+                    tool_calls = []
+                for row in tool_calls:
+                    if isinstance(row, dict):
+                        ingest_call({"run_id": run_id, **row}, source="manifest")
+
+        tool_rows: list[dict[str, Any]] = []
+        for entry in entries.values():
+            planned_node_count = len(entry["_planned_node_keys"])
+            completed_node_count = len(entry["_completed_node_keys"])
+            unresolved = entry["_planned_node_keys"] - entry["_recorded_node_keys"] - entry["_call_node_keys"]
+            entry["planned_node_count"] = planned_node_count
+            entry["completed_node_count"] = completed_node_count
+            entry["planned_unresolved_count"] = len(unresolved)
+            entry["run_count"] = len(entry["_run_ids"])
+            entry["planned_run_count"] = len(entry["_planned_run_ids"])
+            entry["never_used"] = completed_node_count == 0 and entry["completed_event_count"] == 0
+            entry["reason"] = _tool_usage_reason(
+                capabilities=list(entry["capabilities"]),
+                completed_node_count=completed_node_count,
+                planned_node_count=planned_node_count,
+                planned_unresolved_count=len(unresolved),
+            )
+            tool_rows.append(
+                {
+                    key: value
+                    for key, value in entry.items()
+                    if not key.startswith("_")
+                }
+            )
+
+        tool_rows.sort(
+            key=lambda row: (
+                -int(row.get("completed_node_count", 0)),
+                -int(row.get("completed_event_count", 0)),
+                str(row.get("tool_name", "")),
+            )
+        )
+        category_rows: list[dict[str, Any]] = []
+        for category, _members in TOOL_USAGE_CATEGORIES + (("Other", set()),):
+            tools = [row for row in tool_rows if row.get("category") == category]
+            if not tools:
+                continue
+            category_rows.append(
+                {
+                    "category": category,
+                    "registered_tool_count": len(tools),
+                    "used_tool_count": sum(1 for row in tools if not row.get("never_used")),
+                    "completed_node_count": sum(int(row.get("completed_node_count", 0)) for row in tools),
+                    "planned_node_count": sum(int(row.get("planned_node_count", 0)) for row in tools),
+                }
+            )
+
+        return {
+            "run_count": len({str(manifest.get("run_id", "")) for manifest in manifests if str(manifest.get("run_id", "")).strip()} | db_run_ids),
+            "manifest_run_count": len(manifests),
+            "db_run_count": len(db_run_ids),
+            "registered_tool_count": len(catalog),
+            "used_tool_count": sum(1 for row in tool_rows if not row.get("never_used")),
+            "never_used_tool_count": sum(1 for row in tool_rows if row.get("registered") and row.get("never_used")),
+            "tools": tool_rows,
+            "categories": category_rows,
+            "notes": [
+                "Counts distinguish planned nodes, recorded tool-call events, and completed node executions.",
+                "Tool-call events can include running and completed rows for one node; completed_node_count is the cleaner usage metric.",
+                "Manifest files are used to recover planned nodes and local runs; database tool-call rows are preferred when present for a run.",
+            ],
+        }
+
     def _active_run_ids(self) -> list[str]:
         with self._run_lock:
             return [
@@ -3947,6 +4250,27 @@ class AgentRuntime:
             status.updated_at_utc = datetime.now(UTC).isoformat()
             return status
 
+    def _mark_abort_requested_live_status(self, run_id: str, *, detail: str) -> dict[str, Any]:
+        with self._run_lock:
+            status = self._live_runs.get(run_id)
+            if status is None:
+                raise FileNotFoundError(f"Run not found for run_id={run_id}")
+            now = datetime.now(UTC).isoformat()
+            status.status = "aborting"
+            status.current_phase = "aborting"
+            status.detail = detail
+            status.active_steps = [
+                {
+                    **dict(item),
+                    "status": "aborting",
+                    "abort_requested": True,
+                    "abort_requested_at_utc": now,
+                }
+                for item in status.active_steps
+            ]
+            status.updated_at_utc = now
+            return status.to_dict()
+
     def _current_tool_calls(self, run_id: str) -> list[dict[str, Any]]:
         with self._run_lock:
             live = self._live_runs.get(run_id)
@@ -4040,6 +4364,7 @@ class AgentRuntime:
             status="aborted",
             current_phase="aborted",
             detail="Run aborted by user",
+            active_steps=[],
             assumptions=list(state.assumptions),
             planner_actions=list(state.planner_actions),
             llm_traces=list(state.llm_traces),
@@ -4640,6 +4965,7 @@ class AgentRuntime:
             status=manifest.status,
             current_phase="completed" if manifest.status in {"completed", "partial"} else manifest.status,
             detail="Run finished",
+            active_steps=[],
             assumptions=list(manifest.assumptions),
             planner_actions=list(manifest.planner_actions),
             plan_dags=list(manifest.plan_dags),
@@ -4671,12 +4997,10 @@ class AgentRuntime:
                 event = threading.Event()
                 self._run_cancel_events[run_id] = event
             event.set()
-        return self._set_live_status(
+        return self._mark_abort_requested_live_status(
             run_id,
-            status="aborting",
-            current_phase="aborting",
             detail="Abort requested; waiting for current step to stop",
-        ).to_dict()
+        )
 
     def abort_all_runs(self) -> dict[str, Any]:
         aborted_run_ids: list[str] = []
@@ -4686,7 +5010,7 @@ class AgentRuntime:
             with self._run_lock:
                 status = self._live_runs.get(run_id)
                 current_status = str(status.status) if status is not None else ""
-            if current_status and current_status not in TERMINAL_RUN_STATUSES and current_status != "aborting":
+            if current_status and current_status not in TERMINAL_RUN_STATUSES:
                 self.abort_run(run_id)
                 aborted_run_ids.append(run_id)
         return {"aborted_run_ids": aborted_run_ids, "count": len(aborted_run_ids)}

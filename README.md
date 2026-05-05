@@ -136,10 +136,11 @@ Print the config the backend is actually using:
 python scripts/16_print_effective_config.py
 ```
 
-Run the backend only:
+Run the Dockerized backend stack:
 
 ```bash
-python scripts/12_run_agent_api.py
+cd deploy
+docker compose -f docker-compose.yml -f docker-compose.mcp.yml up -d --build
 ```
 
 Run the frontend only:
@@ -154,7 +155,7 @@ Run tests:
 python -m pytest -q
 ```
 
-Run the MCP server:
+Run the MCP server locally for development:
 
 ```bash
 python scripts/07_mcp_server.py
@@ -220,4 +221,3 @@ web/                   static frontend
 - Large corpus setup needs disk space and patience.
 - Full hybrid retrieval expects Postgres/pgvector and OpenSearch to be healthy.
 - The frontend is a debugging UI, not a finished app.
-

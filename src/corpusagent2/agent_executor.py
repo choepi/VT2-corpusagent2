@@ -322,6 +322,35 @@ class AsyncPlanExecutor:
         attempts = 0
         last_error = ""
 
+        def cancelled_response(
+            reason: str,
+            *,
+            tool_name: str | None = None,
+            provider: str | None = None,
+        ) -> tuple[AgentNodeExecutionRecord, None, None, None]:
+            finished_at = _utc_now()
+            duration_ms = (time.perf_counter() - started_perf) * 1000.0
+            return (
+                AgentNodeExecutionRecord(
+                    node_id=node.node_id,
+                    capability=node.capability,
+                    status="skipped",
+                    tool_name=tool_name or node.tool_name,
+                    provider=provider or "",
+                    started_at_utc=started_at,
+                    finished_at_utc=finished_at,
+                    duration_ms=duration_ms,
+                    attempts=attempts,
+                    error=reason,
+                ),
+                None,
+                None,
+                None,
+            )
+
+        if self._is_cancelled(context):
+            return cancelled_response("Skipped because run abort was requested before this node started.")
+
         if node.capability == "plot_artifact" and not _dependency_results_have_plot_rows(dependency_results):
             finished_at = _utc_now()
             duration_ms = (time.perf_counter() - started_perf) * 1000.0
@@ -428,6 +457,13 @@ class AsyncPlanExecutor:
                 None,
             )
 
+        if self._is_cancelled(context):
+            return cancelled_response(
+                "Skipped because run abort was requested after tool resolution.",
+                tool_name=resolution.spec.tool_name,
+                provider=resolution.spec.provider,
+            )
+
         schema_errors = _validate_tool_input_schema(dict(node.inputs), dict(resolution.spec.input_schema.fields))
         if schema_errors:
             finished_at = _utc_now()
@@ -486,6 +522,13 @@ class AsyncPlanExecutor:
                     retriable=True,
                 ),
                 None,
+            )
+
+        if self._is_cancelled(context):
+            return cancelled_response(
+                "Skipped because run abort was requested before this tool started.",
+                tool_name=resolution.spec.tool_name,
+                provider=resolution.spec.provider,
             )
 
         cache_key = self._cache_key(node, resolution.spec.tool_name, dependency_results, context)
@@ -617,6 +660,12 @@ class AsyncPlanExecutor:
             )
 
         while attempts < 2:
+            if self._is_cancelled(context):
+                return cancelled_response(
+                    "Skipped because run abort was requested before this tool attempt started.",
+                    tool_name=resolution.spec.tool_name,
+                    provider=resolution.spec.provider,
+                )
             attempts += 1
             try:
                 context.working_store.record_tool_call(
@@ -830,6 +879,7 @@ class AsyncPlanExecutor:
 
         while pending:
             if self._is_cancelled(context):
+                mark_pending_skipped("Skipped because run abort was requested.")
                 return AgentExecutionSnapshot(
                     node_records=node_records,
                     node_results=completed,
@@ -955,6 +1005,7 @@ class AsyncPlanExecutor:
                     status="failed",
                 )
             if self._is_cancelled(context):
+                mark_pending_skipped("Skipped because run abort was requested.")
                 return AgentExecutionSnapshot(
                     node_records=node_records,
                     node_results=completed,

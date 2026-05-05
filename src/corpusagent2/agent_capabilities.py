@@ -915,12 +915,15 @@ def _analysis_document_rows_from_deps(
         _with_cleaned_document_text(row)
         for row in _iter_working_set_documents(context, working_set_ref, max_documents=max_documents)
     ]
+    cancelled = _cancel_requested(context)
     working_set_count = _count_working_set(context, working_set_ref, len(rows))
     caveats = [
         "Upstream fetched documents were only a preview, so documents were streamed from working_set_ref for analysis."
         if documents_truncated
         else "No fetched document rows were available, so documents were streamed from working_set_ref for analysis."
     ]
+    if cancelled:
+        caveats.append("Run abort was requested; analysis document streaming stopped early.")
     if max_documents is not None and working_set_count > max_documents:
         caveats.append(
             f"Working-set analysis was capped at {max_documents} documents from a working set of {working_set_count}; "
@@ -932,6 +935,7 @@ def _analysis_document_rows_from_deps(
         "working_set_ref": working_set_ref,
         "documents_from": "working_set_ref",
         "analysis_document_limit": max_documents,
+        "cancelled": cancelled,
     }, caveats
 
 
@@ -1084,7 +1088,7 @@ def _iter_working_set_documents(
     offset = 0
     yielded = 0
     while True:
-        if context.cancel_requested and context.cancel_requested():
+        if _cancel_requested(context):
             break
         if max_documents is not None and yielded >= max_documents:
             break
@@ -1097,14 +1101,22 @@ def _iter_working_set_documents(
         if not rows:
             break
         for row in rows:
+            if _cancel_requested(context):
+                break
             if isinstance(row, dict):
                 yield dict(row)
                 yielded += 1
                 if max_documents is not None and yielded >= max_documents:
                     break
+        if _cancel_requested(context):
+            break
         if len(rows) < resolved_batch_size:
             break
         offset += len(rows)
+
+
+def _cancel_requested(context: "AgentExecutionContext") -> bool:
+    return bool(context.cancel_requested is not None and context.cancel_requested())
 
 
 def _sql_noun_frequency_rows_from_working_set(
@@ -3401,6 +3413,12 @@ def _filter_working_set(params: dict[str, Any], deps: dict[str, ToolExecutionRes
             caveats=["No upstream working_set_ref was available for working-set filtering."],
             metadata={"no_data": True, "no_data_reason": "missing_working_set_ref"},
         )
+    if _cancel_requested(context):
+        return ToolExecutionResult(
+            payload={"results": [], "document_count": 0, "source_working_set_ref": upstream_ref, "cancelled": True},
+            caveats=["Run abort was requested before working-set filtering started."],
+            metadata={"cancelled": True, "no_data": True, "no_data_reason": "cancelled"},
+        )
     if not query and not filters and not date_from and not date_to and not limit and not sort_specs:
         count = _count_working_set(context, upstream_ref, 0)
         preview_ids = _fetch_working_set_ids(context, upstream_ref, limit=_result_preview_limit())
@@ -3431,11 +3449,18 @@ def _filter_working_set(params: dict[str, Any], deps: dict[str, ToolExecutionRes
     filtered_rows: list[dict[str, Any]] = []
     unsupported_filter_keys: set[str] = set()
     offset = 0
+    cancelled = False
     while True:
+        if _cancel_requested(context):
+            cancelled = True
+            break
         batch = fetcher(context.run_id, upstream_ref, limit=batch_size, offset=offset)
         if not batch:
             break
         for raw_row in batch:
+            if _cancel_requested(context):
+                cancelled = True
+                break
             row = _with_cleaned_document_text(dict(raw_row))
             published_at = str(row.get("published_at", row.get("date", "")) or "")
             if date_from and published_at and published_at < date_from:
@@ -3459,9 +3484,40 @@ def _filter_working_set(params: dict[str, Any], deps: dict[str, ToolExecutionRes
                         "score": _coerce_score(row.get("score", 0.0)),
                     }
                 )
+        if cancelled:
+            break
         offset += len(batch)
         if total and offset >= total:
             break
+
+    if cancelled:
+        preview_limit = _result_preview_limit()
+        preview_rows = filtered_rows[:preview_limit]
+        return ToolExecutionResult(
+            payload={
+                "results": preview_rows,
+                "query": query,
+                "source_working_set_ref": upstream_ref,
+                "retrieval_mode": "working_set_filter",
+                "retrieval_strategy": "working_set_filter",
+                "result_count": len(filtered_rows),
+                "document_count": len(filtered_rows),
+                "preview_count": len(preview_rows),
+                "results_truncated": len(filtered_rows) > len(preview_rows),
+                "cancelled": True,
+            },
+            evidence=preview_rows,
+            caveats=["Run abort was requested; working-set filtering stopped early."],
+            metadata={
+                "source_working_set_ref": upstream_ref,
+                "full_result_count": len(filtered_rows),
+                "filtered_from_working_set": True,
+                "payload_truncated": len(filtered_rows) > len(preview_rows),
+                "cancelled": True,
+                "no_data": not filtered_rows,
+                "no_data_reason": "cancelled" if not filtered_rows else "",
+            },
+        )
 
     deduped: list[dict[str, Any]] = []
     seen_ids: set[str] = set()
@@ -3914,6 +3970,7 @@ def _ner(params: dict[str, Any], deps: dict[str, ToolExecutionResult], context: 
         max_documents=_entity_analysis_max_documents(),
     )
     entities: list[dict[str, Any]] = []
+    cancelled = _cancel_requested(context)
     providers = _provider_order("ner", ["spacy", "stanza", "flair", "regex"])
     provider_limit = _entity_provider_max_documents()
     provider_order_explicit = os.getenv("CORPUSAGENT2_PROVIDER_ORDER_NER") is not None
@@ -3926,6 +3983,28 @@ def _ner(params: dict[str, Any], deps: dict[str, ToolExecutionResult], context: 
             "Set CORPUSAGENT2_ENTITY_PROVIDER_MAX_DOCS=-1 or CORPUSAGENT2_PROVIDER_ORDER_NER to force provider NER."
         )
     used_provider = "regex"
+
+    def finish() -> ToolExecutionResult:
+        caveats = list(source_caveats)
+        metadata = {**_metadata(used_provider, f"{used_provider}_ner"), **source_metadata}
+        if cancelled:
+            caveats.append("Run abort was requested; NER stopped before all documents were processed.")
+            metadata.update(
+                {
+                    "cancelled": True,
+                    "no_data": not entities,
+                    "no_data_reason": "cancelled" if not entities else "",
+                }
+            )
+        return ToolExecutionResult(
+            payload={"rows": entities},
+            caveats=caveats,
+            metadata=metadata,
+        )
+
+    if cancelled:
+        return finish()
+
     for provider in providers:
         try:
             if provider == "spacy":
@@ -3934,6 +4013,9 @@ def _ner(params: dict[str, Any], deps: dict[str, ToolExecutionResult], context: 
                     continue
                 docs = nlp.pipe([_row_analysis_text(row) for row in rows], batch_size=16)
                 for row, doc in zip(rows, docs, strict=False):
+                    if _cancel_requested(context):
+                        cancelled = True
+                        return finish()
                     for ent in doc.ents:
                         entities.append(
                             {
@@ -3953,6 +4035,9 @@ def _ner(params: dict[str, Any], deps: dict[str, ToolExecutionResult], context: 
                 if pipeline is None:
                     continue
                 for row in rows:
+                    if _cancel_requested(context):
+                        cancelled = True
+                        return finish()
                     doc = pipeline(_row_analysis_text(row))
                     for ent in getattr(doc, "ents", []):
                         entities.append(
@@ -3975,6 +4060,9 @@ def _ner(params: dict[str, Any], deps: dict[str, ToolExecutionResult], context: 
                 from flair.data import Sentence
 
                 for row in rows:
+                    if _cancel_requested(context):
+                        cancelled = True
+                        return finish()
                     sentence = Sentence(_row_analysis_text(row))
                     tagger.predict(sentence)
                     for entity in sentence.get_spans("ner"):
@@ -3997,6 +4085,9 @@ def _ner(params: dict[str, Any], deps: dict[str, ToolExecutionResult], context: 
 
     if not entities:
         for row in rows:
+            if _cancel_requested(context):
+                cancelled = True
+                return finish()
             for match in ENTITY_PATTERN.finditer(_row_analysis_text(row)):
                 entities.append(
                     {
@@ -4009,11 +4100,7 @@ def _ner(params: dict[str, Any], deps: dict[str, ToolExecutionResult], context: 
                         "published_at": _row_timestamp(row),
                     }
                 )
-    return ToolExecutionResult(
-        payload={"rows": entities},
-        caveats=source_caveats,
-        metadata={**_metadata(used_provider, f"{used_provider}_ner"), **source_metadata},
-    )
+    return finish()
 
 
 def _entity_link(params: dict[str, Any], deps: dict[str, ToolExecutionResult], context: AgentExecutionContext) -> ToolExecutionResult:
@@ -4442,6 +4529,29 @@ def _sentiment(params: dict[str, Any], deps: dict[str, ToolExecutionResult], con
         )
     providers = _provider_order("sentiment", ["flair", "textblob", "heuristic"])
     used_provider = "heuristic"
+    cancelled = _cancel_requested(context)
+
+    def finish() -> ToolExecutionResult:
+        caveats = list(source_caveats)
+        metadata = {**_metadata(used_provider, f"{used_provider}_sentiment"), "no_data": not rows, **source_metadata}
+        if cancelled:
+            caveats.append("Run abort was requested; sentiment analysis stopped before all documents were processed.")
+            metadata.update(
+                {
+                    "cancelled": True,
+                    "no_data": not rows,
+                    "no_data_reason": "cancelled" if not rows else "",
+                }
+            )
+        return ToolExecutionResult(
+            payload={"rows": rows, **source_metadata},
+            caveats=caveats,
+            metadata=metadata,
+        )
+
+    if cancelled:
+        return finish()
+
     for provider in providers:
         try:
             if provider == "flair":
@@ -4452,6 +4562,9 @@ def _sentiment(params: dict[str, Any], deps: dict[str, ToolExecutionResult], con
 
                 rows = []
                 for unit in units:
+                    if _cancel_requested(context):
+                        cancelled = True
+                        return finish()
                     doc = unit["doc"]
                     sentence = Sentence(str(unit.get("text", ""))[:1500])
                     classifier.predict(sentence)
@@ -4481,6 +4594,9 @@ def _sentiment(params: dict[str, Any], deps: dict[str, ToolExecutionResult], con
 
                 rows = []
                 for unit in units:
+                    if _cancel_requested(context):
+                        cancelled = True
+                        return finish()
                     doc = unit["doc"]
                     polarity = float(TextBlob(str(unit.get("text", ""))).sentiment.polarity)
                     label = "positive" if polarity > 0.05 else "negative" if polarity < -0.05 else "neutral"
@@ -4508,6 +4624,9 @@ def _sentiment(params: dict[str, Any], deps: dict[str, ToolExecutionResult], con
 
     if not rows:
         for unit in units:
+            if _cancel_requested(context):
+                cancelled = True
+                return finish()
             doc = unit["doc"]
             tokens = [token.lower() for token in _tokenize(str(unit.get("text", "")))]
             score = sum(1 for token in tokens if token in POSITIVE_WORDS) - sum(
@@ -4529,11 +4648,7 @@ def _sentiment(params: dict[str, Any], deps: dict[str, ToolExecutionResult], con
                     **_series_identity_fields(doc),
                 }
             )
-    return ToolExecutionResult(
-        payload={"rows": rows, **source_metadata},
-        caveats=source_caveats,
-        metadata={**_metadata(used_provider, f"{used_provider}_sentiment"), "no_data": not rows, **source_metadata},
-    )
+    return finish()
 
 
 def _text_classify(params: dict[str, Any], deps: dict[str, ToolExecutionResult], context: AgentExecutionContext) -> ToolExecutionResult:

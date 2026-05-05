@@ -65,6 +65,10 @@ def build_app(runtime: AgentRuntime | None = None, project_root: Path | None = N
     def runtime_info() -> dict[str, Any]:
         return resolved_runtime.runtime_info()
 
+    @app.get("/tool-usage")
+    def tool_usage() -> dict[str, Any]:
+        return resolved_runtime.tool_usage_summary()
+
     @app.get("/settings/llm")
     def get_llm_settings() -> dict[str, Any]:
         return resolved_runtime.runtime_info()["llm"]

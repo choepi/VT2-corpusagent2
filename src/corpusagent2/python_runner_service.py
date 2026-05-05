@@ -3,8 +3,8 @@
 from dataclasses import asdict, dataclass
 import base64
 import json
+import os
 from pathlib import Path
-import shutil
 import subprocess
 import tempfile
 from typing import Any
@@ -39,24 +39,31 @@ class PythonRunnerResult:
 class DockerPythonRunnerService:
     def __init__(
         self,
-        image: str = "python:3.11-slim",
+        image: str | None = None,
         *,
-        timeout_s: int = 60,
-        cpus: str = "1",
-        memory: str = "512m",
+        timeout_s: int | None = None,
+        cpus: str | None = None,
+        memory: str | None = None,
+        shared_tmp_dir: str | Path | None = None,
     ) -> None:
-        self.image = image
-        self.timeout_s = timeout_s
-        self.cpus = cpus
-        self.memory = memory
+        self.image = image or os.getenv("CORPUSAGENT2_PYTHON_RUNNER_IMAGE", "python:3.11-slim")
+        self.timeout_s = int(timeout_s or os.getenv("CORPUSAGENT2_PYTHON_RUNNER_TIMEOUT_S", "60"))
+        self.cpus = cpus or os.getenv("CORPUSAGENT2_PYTHON_RUNNER_CPUS", "1")
+        self.memory = memory or os.getenv("CORPUSAGENT2_PYTHON_RUNNER_MEMORY", "512m")
+        raw_shared_tmp = shared_tmp_dir or os.getenv("CORPUSAGENT2_PYTHON_RUNNER_SHARED_TMP", "")
+        self.shared_tmp_dir = Path(raw_shared_tmp).resolve() if raw_shared_tmp else None
 
     def run(self, code: str, inputs_json: dict[str, Any]) -> PythonRunnerResult:
-        with tempfile.TemporaryDirectory(prefix="ca2_py_runner_") as temp_dir:
+        if self.shared_tmp_dir is not None:
+            self.shared_tmp_dir.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="ca2_py_runner_", dir=str(self.shared_tmp_dir) if self.shared_tmp_dir else None) as temp_dir:
             temp_root = Path(temp_dir)
             workspace = temp_root / "workspace"
             outputs = temp_root / "outputs"
             workspace.mkdir(parents=True, exist_ok=True)
             outputs.mkdir(parents=True, exist_ok=True)
+            workspace.chmod(0o755)
+            outputs.chmod(0o777)
 
             code_path = workspace / "code.py"
             inputs_path = workspace / "inputs.json"

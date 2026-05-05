@@ -1344,6 +1344,29 @@ def test_api_abort_run_marks_async_query_aborted(tmp_path: Path) -> None:
         time.sleep(0.05)
 
     assert status_payload["status"] == "aborted"
+    assert status_payload["active_steps"] == []
+
+
+def test_abort_run_marks_active_steps_aborting_and_abort_all_reports_existing_request(tmp_path: Path) -> None:
+    runtime = build_test_runtime(tmp_path=tmp_path, documents=_sample_documents(), search_rows_by_query={})
+    run_id = "agent_abort_status"
+    runtime._set_live_status(
+        run_id,
+        question="test",
+        status="running",
+        current_phase="executing",
+        detail="Running slow tool",
+        active_steps=[{"node_id": "slow", "capability": "sentiment", "status": "running"}],
+    )
+    runtime._register_cancel_event(run_id)
+
+    payload = runtime.abort_run(run_id)
+    assert payload["status"] == "aborting"
+    assert payload["active_steps"][0]["status"] == "aborting"
+    assert payload["active_steps"][0]["abort_requested"] is True
+
+    abort_all_payload = runtime.abort_all_runs()
+    assert run_id in abort_all_payload["aborted_run_ids"]
 
 
 def test_api_llm_settings_endpoint_rejects_updates_while_run_is_active(monkeypatch, tmp_path: Path) -> None:
@@ -2881,6 +2904,84 @@ def test_api_runtime_info_reports_provider_and_device(tmp_path: Path) -> None:
     assert "llm" in payload
     assert "device" in payload
     assert "providers_installed" in payload
+
+
+def test_tool_usage_summary_counts_completed_and_unresolved_planned_nodes(tmp_path: Path) -> None:
+    docs = _sample_documents()
+    runtime = build_test_runtime(tmp_path=tmp_path, documents=docs, search_rows_by_query=_search_rows(docs))
+    run_dir = runtime.config.outputs_root / "agent_usage"
+    run_dir.mkdir(parents=True)
+    (run_dir / "run_manifest.json").write_text(
+        json.dumps(
+            {
+                "run_id": "agent_usage",
+                "status": "completed",
+                "question": "How does one outlet cover football differently?",
+                "plan_dags": [
+                    {
+                        "nodes": [
+                            {
+                                "node_id": "search",
+                                "capability": "db_search",
+                                "tool_name": "opensearch_db_search",
+                            },
+                            {
+                                "node_id": "keyterms",
+                                "capability": "extract_keyterms",
+                                "tool_name": "extract_keyterms",
+                            },
+                        ]
+                    }
+                ],
+                "node_records": [
+                    {
+                        "node_id": "search",
+                        "capability": "db_search",
+                        "tool_name": "opensearch_db_search",
+                        "status": "completed",
+                    }
+                ],
+                "tool_calls": [
+                    {
+                        "node_id": "search",
+                        "capability": "db_search",
+                        "tool_name": "opensearch_db_search",
+                        "status": "completed",
+                        "payload": {},
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    summary = runtime.tool_usage_summary()
+    by_tool = {row["tool_name"]: row for row in summary["tools"]}
+
+    assert summary["run_count"] == 1
+    assert by_tool["opensearch_db_search"]["completed_node_count"] == 1
+    assert by_tool["opensearch_db_search"]["never_used"] is False
+    assert by_tool["extract_keyterms"]["planned_node_count"] == 1
+    assert by_tool["extract_keyterms"]["planned_unresolved_count"] == 1
+    assert by_tool["extract_keyterms"]["never_used"] is True
+    assert "Planned but not completed" in by_tool["extract_keyterms"]["reason"]
+
+
+def test_tool_usage_endpoint_returns_historical_summary(tmp_path: Path) -> None:
+    docs = _sample_documents()
+    runtime = build_test_runtime(tmp_path=tmp_path, documents=docs, search_rows_by_query=_search_rows(docs))
+    app = build_app(runtime=runtime, project_root=tmp_path)
+
+    from fastapi.testclient import TestClient
+
+    client = TestClient(app)
+    response = client.get("/tool-usage")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert "tools" in payload
+    assert "categories" in payload
+    assert payload["registered_tool_count"] >= 1
 
 
 def test_runtime_info_caches_retrieval_health_probe(tmp_path: Path) -> None:
