@@ -1,3 +1,6 @@
+## Overlay for deploy/docker-compose.yml. Use this together with the base file:
+## docker compose -f docker-compose.yml -f docker-compose.mcp.yml up -d corpusagent2-mcp
+## Add docker-compose.mcp.gpu.yml only on hosts with a working NVIDIA/CDI GPU runtime.
 services:
   corpusagent2-mcp:
     build:
@@ -33,9 +36,9 @@ services:
       CORPUSAGENT2_MCP_WORKER_POLL_SECONDS: ${CORPUSAGENT2_MCP_WORKER_POLL_SECONDS:-2}
       CORPUSAGENT2_MCP_HEARTBEAT_SECONDS: ${CORPUSAGENT2_MCP_HEARTBEAT_SECONDS:-5}
       CORPUSAGENT2_MCP_STALE_RUNNING_SECONDS: ${CORPUSAGENT2_MCP_STALE_RUNNING_SECONDS:-900}
+      CORPUSAGENT2_DEVICE: ${CORPUSAGENT2_DEVICE:-cpu}
     ports:
       - "127.0.0.1:${CORPUSAGENT2_MCP_PORT:-8765}:8765"
     volumes:
       - ../data:/app/data:ro
       - ../outputs:/app/outputs
-    gpus: all
