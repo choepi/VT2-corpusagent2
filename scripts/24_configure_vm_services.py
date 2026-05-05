@@ -147,6 +147,10 @@ def main() -> None:
     stack_service_name = args.api_service_name or args.stack_service_name
     docker_bin = shutil.which("docker") or "/usr/bin/docker"
     compose_exec = _compose_exec_fragment(docker_bin=docker_bin, use_gpu=resource_plan.use_gpu)
+    stack_start = shlex.quote(
+        f"{compose_exec} up -d --no-recreate postgres opensearch && "
+        f"{compose_exec} up -d --build --no-deps corpusagent2-api corpusagent2-mcp"
+    )
 
     stack_service = f"""[Unit]
 Description=CorpusAgent2 Docker stack
@@ -158,8 +162,8 @@ Type=oneshot
 RemainAfterExit=yes
 WorkingDirectory={REPO_ROOT / 'deploy'}
 EnvironmentFile={dotenv_path}
-ExecStart={compose_exec} up -d
-ExecStop={compose_exec} down --remove-orphans
+ExecStart=/bin/sh -lc {stack_start}
+ExecStop={compose_exec} stop corpusagent2-api corpusagent2-mcp
 TimeoutStartSec=0
 TimeoutStopSec=120
 

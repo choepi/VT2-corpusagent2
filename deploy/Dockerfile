@@ -17,9 +17,14 @@ COPY --from=docker:27-cli /usr/local/bin/docker /usr/local/bin/docker
 COPY pyproject.toml uv.lock README.md ./
 COPY scripts/17_download_provider_assets.py ./scripts/17_download_provider_assets.py
 
-RUN uv sync --frozen --extra nlp-providers --no-install-project
+ARG CORPUSAGENT2_DOCKER_INSTALL_NLP_PROVIDERS=false
+RUN if [ "$CORPUSAGENT2_DOCKER_INSTALL_NLP_PROVIDERS" = "true" ]; then \
+      uv sync --frozen --extra nlp-providers --no-install-project; \
+    else \
+      uv sync --frozen --no-install-project; \
+    fi
 
-ARG CORPUSAGENT2_DOCKER_DOWNLOAD_PROVIDER_ASSETS=true
+ARG CORPUSAGENT2_DOCKER_DOWNLOAD_PROVIDER_ASSETS=false
 RUN if [ "$CORPUSAGENT2_DOCKER_DOWNLOAD_PROVIDER_ASSETS" = "true" ]; then \
       .venv/bin/python scripts/17_download_provider_assets.py; \
     fi
@@ -28,7 +33,11 @@ COPY config ./config
 COPY scripts ./scripts
 COPY src ./src
 
-RUN uv sync --frozen --extra nlp-providers --inexact
+RUN if [ "$CORPUSAGENT2_DOCKER_INSTALL_NLP_PROVIDERS" = "true" ]; then \
+      uv sync --frozen --extra nlp-providers --inexact; \
+    else \
+      uv sync --frozen --inexact; \
+    fi
 
 ENV PATH="/app/.venv/bin:${PATH}"
 

@@ -8,8 +8,8 @@ Type=oneshot
 RemainAfterExit=yes
 WorkingDirectory=/home/dongtten/corpusagent2/deploy
 EnvironmentFile=/home/dongtten/corpusagent2/.env
-ExecStart=/usr/bin/docker compose -f docker-compose.yml -f docker-compose.mcp.yml up -d
-ExecStop=/usr/bin/docker compose -f docker-compose.yml -f docker-compose.mcp.yml down --remove-orphans
+ExecStart=/bin/sh -lc '/usr/bin/docker compose -f docker-compose.yml -f docker-compose.mcp.yml up -d --no-recreate postgres opensearch && /usr/bin/docker compose -f docker-compose.yml -f docker-compose.mcp.yml up -d --build --no-deps corpusagent2-api corpusagent2-mcp'
+ExecStop=/usr/bin/docker compose -f docker-compose.yml -f docker-compose.mcp.yml stop corpusagent2-api corpusagent2-mcp
 TimeoutStartSec=0
 TimeoutStopSec=120
 

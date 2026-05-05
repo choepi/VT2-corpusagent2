@@ -7,7 +7,8 @@ services:
       context: ..
       dockerfile: deploy/Dockerfile
       args:
-        CORPUSAGENT2_DOCKER_DOWNLOAD_PROVIDER_ASSETS: ${CORPUSAGENT2_DOCKER_DOWNLOAD_PROVIDER_ASSETS:-true}
+        CORPUSAGENT2_DOCKER_INSTALL_NLP_PROVIDERS: ${CORPUSAGENT2_DOCKER_INSTALL_NLP_PROVIDERS:-false}
+        CORPUSAGENT2_DOCKER_DOWNLOAD_PROVIDER_ASSETS: ${CORPUSAGENT2_DOCKER_DOWNLOAD_PROVIDER_ASSETS:-false}
     image: corpusagent2-runtime:latest
     container_name: corpusagent2_mcp
     restart: unless-stopped
