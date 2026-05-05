@@ -184,10 +184,11 @@
         </div>
         <p class="muted">
           Plan nodes like n1, n2, and n18 are generated per run. The table below lists every planned node once the
-          planner emits a DAG; the backend function catalog lists all registered tool functions, not only the ones used.
+          planner emits a DAG. A tool function is a concrete backend implementation; a capability is the abstract task
+          the planner requests. In this build most capabilities map one-to-one to functions, so the table is the source
+          of truth.
         </p>
         <h3>Current Plan Node Table</h3>
-        <div id="toolNodeMap" class="node-map"></div>
         <div id="toolNodeTable" class="table-scroll tool-node-table"></div>
         <details class="tool-catalog-details" open>
           <summary>

@@ -12,6 +12,7 @@ import httpx
 from .io_utils import write_json
 from .retrieval import (
     dense_retrieval_enabled,
+    pg_connect_kwargs,
     RetrievalResult,
     reciprocal_rank_fusion,
     rerank_cross_encoder,
@@ -632,7 +633,7 @@ class PostgresWorkingSetStore:
     def _connect(self):
         from psycopg import connect
 
-        return connect(self.dsn)
+        return connect(self.dsn, **pg_connect_kwargs())
 
     def ensure_schema(self) -> None:
         if self._schema_ready:

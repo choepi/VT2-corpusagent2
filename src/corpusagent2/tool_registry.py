@@ -189,7 +189,7 @@ class ToolRegistry:
             reason = (
                 f"Selected {adapter.spec.tool_name} for capability '{capability}' "
                 f"because it is {'deterministic' if adapter.spec.deterministic else 'non-deterministic'}, "
-                f"cost_class={adapter.spec.cost_class}, priority={adapter.spec.priority}. "
+                f"cost_class={adapter.spec.cost_class}. "
                 f"Availability notes: {detail_text}.{fallback_text}"
             )
         if alternatives:

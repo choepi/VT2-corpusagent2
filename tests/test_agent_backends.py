@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import sys
+import types
+
 import pandas as pd
 
 import corpusagent2.agent_backends as agent_backends
-from corpusagent2.agent_backends import LocalSearchBackend, OpenSearchBackend, OpenSearchConfig
-from corpusagent2.retrieval import RetrievalResult, build_lexical_assets
+from corpusagent2.agent_backends import LocalSearchBackend, OpenSearchBackend, OpenSearchConfig, PostgresWorkingSetStore
+from corpusagent2.retrieval import RetrievalResult, build_lexical_assets, pg_connect_kwargs
 
 
 class _RuntimeWithBrokenDenseAssets:
@@ -159,3 +162,26 @@ def test_opensearch_backend_uses_multi_match_for_plain_queries(monkeypatch) -> N
     assert requests
     clause = requests[0]["query"]["bool"]["must"][0]
     assert "multi_match" in clause
+
+
+def test_pg_connect_kwargs_uses_short_default_timeout(monkeypatch) -> None:
+    monkeypatch.delenv("CORPUSAGENT2_PG_CONNECT_TIMEOUT_S", raising=False)
+
+    assert pg_connect_kwargs() == {"connect_timeout": 2}
+
+
+def test_postgres_working_store_passes_connect_timeout(monkeypatch) -> None:
+    calls: list[dict] = []
+
+    def fake_connect(dsn, **kwargs):
+        calls.append({"dsn": dsn, **kwargs})
+        return object()
+
+    monkeypatch.setitem(sys.modules, "psycopg", types.SimpleNamespace(connect=fake_connect))
+    monkeypatch.setenv("CORPUSAGENT2_PG_CONNECT_TIMEOUT_S", "2")
+
+    store = PostgresWorkingSetStore(dsn="postgresql://example/db")
+    result = store._connect()
+
+    assert result is not None
+    assert calls == [{"dsn": "postgresql://example/db", "connect_timeout": 2}]

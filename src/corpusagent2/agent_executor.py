@@ -161,6 +161,85 @@ def _summarize_tool_result(result: ToolExecutionResult, *, dependency_results: d
     return summary
 
 
+_CORE_NO_DATA_FAILURE_CAPABILITIES = {
+    "join_external_series",
+    "plot_artifact",
+    "python_runner",
+    "time_series_aggregate",
+}
+
+
+def _result_no_data_reason(result: ToolExecutionResult) -> str:
+    if result.metadata.get("no_data_reason") not in (None, ""):
+        return str(result.metadata.get("no_data_reason", "")).strip()
+    if result.caveats:
+        return str(result.caveats[0]).strip()
+    payload = result.payload
+    if isinstance(payload, dict):
+        items_key, items = _result_items(payload)
+        if items_key in {"documents", "results", "rows"} and not items:
+            return f"empty {items_key}"
+    return "no data returned"
+
+
+def _result_has_no_data(result: ToolExecutionResult) -> bool:
+    if bool(result.metadata.get("no_data")):
+        return True
+    payload = result.payload
+    if not isinstance(payload, dict):
+        return False
+    items_key, items = _result_items(payload)
+    return items_key in {"documents", "results", "rows"} and len(items) == 0
+
+
+def _dependency_results_have_plot_rows(dependency_results: dict[str, ToolExecutionResult]) -> bool:
+    if not dependency_results:
+        return True
+    for result in dependency_results.values():
+        items_key, items = _result_items(result.payload)
+        if items_key in {"rows", "results", "documents"} and items:
+            return True
+    return False
+
+
+def _matches_schema_type(value: Any, schema_type: str) -> bool:
+    normalized = str(schema_type or "").strip().lower()
+    if normalized in {"", "any", "object"}:
+        return True
+    if normalized in {"dict", "mapping", "object"}:
+        return isinstance(value, dict)
+    if normalized in {"list", "array"}:
+        return isinstance(value, list)
+    if normalized in {"str", "string"}:
+        return isinstance(value, str)
+    if normalized in {"int", "integer"}:
+        return isinstance(value, int) and not isinstance(value, bool)
+    if normalized in {"float", "number"}:
+        return isinstance(value, (int, float)) and not isinstance(value, bool)
+    if normalized in {"bool", "boolean"}:
+        return isinstance(value, bool)
+    return True
+
+
+def _validate_tool_input_schema(params: dict[str, Any], schema_fields: dict[str, str]) -> list[str]:
+    errors: list[str] = []
+    for field_name, schema_type in schema_fields.items():
+        normalized_type = str(schema_type or "").strip()
+        required = normalized_type.endswith("!") or normalized_type.lower().startswith("required ")
+        expected_type = normalized_type.rstrip("!")
+        if expected_type.lower().startswith("required "):
+            expected_type = expected_type[len("required "):]
+        expected_type = expected_type.strip()
+        if field_name not in params:
+            if required:
+                errors.append(f"missing required field '{field_name}'")
+            continue
+        value = params[field_name]
+        if not _matches_schema_type(value, expected_type):
+            errors.append(f"field '{field_name}' expected {expected_type or 'Any'}, got {type(value).__name__}")
+    return errors
+
+
 @dataclass(slots=True)
 class AgentExecutionSnapshot:
     node_records: list[AgentNodeExecutionRecord]
@@ -243,6 +322,65 @@ class AsyncPlanExecutor:
         attempts = 0
         last_error = ""
 
+        if node.capability == "plot_artifact" and not _dependency_results_have_plot_rows(dependency_results):
+            finished_at = _utc_now()
+            duration_ms = (time.perf_counter() - started_perf) * 1000.0
+            message = "Plot input dependencies did not produce rows; plot was not executed."
+            status = "skipped" if node.optional else "failed"
+            context.working_store.record_tool_call(
+                context.run_id,
+                node.node_id,
+                node.capability,
+                node.tool_name or "plot_artifact",
+                status,
+                {
+                    "error": message,
+                    "started_at_utc": started_at,
+                    "finished_at_utc": finished_at,
+                    "inputs": _safe_json(node.inputs),
+                    "dependency_nodes": sorted(dependency_results.keys()),
+                },
+            )
+            self._emit_event(
+                context,
+                {
+                    "event": "node_failed",
+                    "node_id": node.node_id,
+                    "capability": node.capability,
+                    "status": status,
+                    "error": message,
+                    "inputs": _safe_json(node.inputs),
+                    "dependency_nodes": sorted(dependency_results.keys()),
+                    "started_at_utc": started_at,
+                    "finished_at_utc": finished_at,
+                    "duration_ms": duration_ms,
+                },
+            )
+            return (
+                AgentNodeExecutionRecord(
+                    node_id=node.node_id,
+                    capability=node.capability,
+                    status=status,
+                    tool_name=node.tool_name or "plot_artifact",
+                    started_at_utc=started_at,
+                    finished_at_utc=finished_at,
+                    duration_ms=duration_ms,
+                    attempts=0,
+                    error=message,
+                ),
+                None,
+                None
+                if node.optional
+                else AgentFailure(
+                    node_id=node.node_id,
+                    capability=node.capability,
+                    error_type="plot_input_no_data",
+                    message=message,
+                    retriable=False,
+                ),
+                None,
+            )
+
         try:
             resolution = self.registry.resolve(
                 capability=node.capability,
@@ -287,6 +425,66 @@ class AsyncPlanExecutor:
                 ),
                 None,
                 failure,
+                None,
+            )
+
+        schema_errors = _validate_tool_input_schema(dict(node.inputs), dict(resolution.spec.input_schema.fields))
+        if schema_errors:
+            finished_at = _utc_now()
+            duration_ms = (time.perf_counter() - started_perf) * 1000.0
+            message = "; ".join(schema_errors)
+            status = "skipped" if node.optional else "failed"
+            context.working_store.record_tool_call(
+                context.run_id,
+                node.node_id,
+                node.capability,
+                resolution.spec.tool_name,
+                status,
+                {
+                    "error": message,
+                    "started_at_utc": started_at,
+                    "finished_at_utc": finished_at,
+                    "inputs": _safe_json(node.inputs),
+                    "input_schema": _safe_json(resolution.spec.input_schema.to_dict()),
+                },
+            )
+            self._emit_event(
+                context,
+                {
+                    "event": "node_failed",
+                    "node_id": node.node_id,
+                    "capability": node.capability,
+                    "status": status,
+                    "error": message,
+                    "tool_name": resolution.spec.tool_name,
+                    "provider": resolution.spec.provider,
+                    "inputs": _safe_json(node.inputs),
+                    "started_at_utc": started_at,
+                    "finished_at_utc": finished_at,
+                    "duration_ms": duration_ms,
+                },
+            )
+            return (
+                AgentNodeExecutionRecord(
+                    node_id=node.node_id,
+                    capability=node.capability,
+                    status=status,
+                    tool_name=node.tool_name or resolution.spec.tool_name,
+                    provider=resolution.spec.provider,
+                    started_at_utc=started_at,
+                    finished_at_utc=finished_at,
+                    duration_ms=duration_ms,
+                    attempts=0,
+                    error=message,
+                ),
+                None,
+                AgentFailure(
+                    node_id=node.node_id,
+                    capability=node.capability,
+                    error_type="input_schema_validation_failed",
+                    message=message,
+                    retriable=True,
+                ),
                 None,
             )
 
@@ -611,6 +809,25 @@ class AsyncPlanExecutor:
         provenance_rows: list[dict[str, Any]] = []
         selected_docs: list[dict[str, Any]] = []
 
+        def mark_pending_skipped(reason: str) -> None:
+            now = _utc_now()
+            for pending_id in sorted(pending):
+                pending_node = node_map[pending_id]
+                node_records.append(
+                    AgentNodeExecutionRecord(
+                        node_id=pending_node.node_id,
+                        capability=pending_node.capability,
+                        status="skipped",
+                        tool_name=pending_node.tool_name,
+                        started_at_utc=now,
+                        finished_at_utc=now,
+                        duration_ms=0.0,
+                        attempts=0,
+                        error=reason,
+                    )
+                )
+            pending.clear()
+
         while pending:
             if self._is_cancelled(context):
                 return AgentExecutionSnapshot(
@@ -621,13 +838,71 @@ class AsyncPlanExecutor:
                     selected_docs=selected_docs,
                     status="aborted",
                 )
+            skipped_ids = {item.node_id for item in node_records if item.status == "skipped"}
+            for node_id in list(pending):
+                node = node_map[node_id]
+                skipped_dependencies = [dep for dep in node.depends_on if dep in skipped_ids]
+                if not skipped_dependencies:
+                    continue
+                pending.discard(node_id)
+                message = f"Skipped because dependencies did not produce executable data: {', '.join(skipped_dependencies)}"
+                now = _utc_now()
+                if node.optional:
+                    node_records.append(
+                        AgentNodeExecutionRecord(
+                            node_id=node.node_id,
+                            capability=node.capability,
+                            status="skipped",
+                            tool_name=node.tool_name,
+                            started_at_utc=now,
+                            finished_at_utc=now,
+                            duration_ms=0.0,
+                            attempts=0,
+                            error=message,
+                        )
+                    )
+                    continue
+                failure = AgentFailure(
+                    node_id=node.node_id,
+                    capability=node.capability,
+                    error_type="dependency_no_data",
+                    message=message,
+                    retriable=True,
+                )
+                failures.append(failure)
+                node_records.append(
+                    AgentNodeExecutionRecord(
+                        node_id=node.node_id,
+                        capability=node.capability,
+                        status="failed",
+                        tool_name=node.tool_name,
+                        started_at_utc=now,
+                        finished_at_utc=now,
+                        duration_ms=0.0,
+                        attempts=0,
+                        error=message,
+                    )
+                )
+                mark_pending_skipped("Skipped because the run stopped after an unmet required dependency.")
+                return AgentExecutionSnapshot(
+                    node_records=node_records,
+                    node_results=completed,
+                    failures=failures,
+                    provenance_records=provenance_rows,
+                    selected_docs=selected_docs,
+                    status="failed",
+                )
+
             ready_ids = []
             for node_id in list(pending):
                 node = node_map[node_id]
-                if all(dep in completed or any(item.node_id == dep and item.status == "skipped" for item in node_records) for dep in node.depends_on):
+                if all(dep in completed for dep in node.depends_on):
                     ready_ids.append(node_id)
             if not ready_ids:
                 break
+            required_ready_ids = [node_id for node_id in ready_ids if not node_map[node_id].optional]
+            if required_ready_ids:
+                ready_ids = required_ready_ids
 
             ready_nodes = [node_map[node_id] for node_id in ready_ids]
             tasks = []
@@ -638,25 +913,47 @@ class AsyncPlanExecutor:
 
             for node, (record, result, failure, provenance_row) in zip(ready_nodes, results, strict=False):
                 pending.discard(node.node_id)
+                effective_result = result
+                effective_failure = failure
+                if result is not None and _result_has_no_data(result):
+                    reason = _result_no_data_reason(result)
+                    if node.optional:
+                        record.status = "skipped"
+                        record.error = reason
+                        effective_result = None
+                        effective_failure = None
+                        provenance_row = None
+                    elif node.capability in _CORE_NO_DATA_FAILURE_CAPABILITIES:
+                        record.status = "failed"
+                        record.error = reason
+                        effective_result = None
+                        effective_failure = AgentFailure(
+                            node_id=node.node_id,
+                            capability=node.capability,
+                            error_type="core_no_data",
+                            message=reason,
+                            retriable=True,
+                        )
                 node_records.append(record)
                 if provenance_row is not None:
                     provenance_rows.append(provenance_row)
-                if result is not None:
-                    completed[node.node_id] = result
+                if effective_result is not None:
+                    completed[node.node_id] = effective_result
                     if node.capability == "fetch_documents":
-                        payload = result.payload if isinstance(result.payload, dict) else {}
+                        payload = effective_result.payload if isinstance(effective_result.payload, dict) else {}
                         selected_docs = list(payload.get("documents", []))
-                if failure is not None:
-                    failures.append(failure)
-                    if not node.optional:
-                        return AgentExecutionSnapshot(
-                            node_records=node_records,
-                            node_results=completed,
-                            failures=failures,
-                            provenance_records=provenance_rows,
-                            selected_docs=selected_docs,
-                            status="failed",
-                        )
+                if effective_failure is not None:
+                    failures.append(effective_failure)
+            if any(item.status == "failed" and not node_map[item.node_id].optional for item in node_records if item.node_id in ready_ids):
+                mark_pending_skipped("Skipped because the run stopped after a required node failed.")
+                return AgentExecutionSnapshot(
+                    node_records=node_records,
+                    node_results=completed,
+                    failures=failures,
+                    provenance_records=provenance_rows,
+                    selected_docs=selected_docs,
+                    status="failed",
+                )
             if self._is_cancelled(context):
                 return AgentExecutionSnapshot(
                     node_records=node_records,

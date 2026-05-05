@@ -1150,6 +1150,36 @@ def test_plot_artifact_resolves_generic_return_field_for_scatter(tmp_path: Path)
     assert any("Resolved plot y field 'sp500_daily_return'" in caveat for caveat in result.caveats)
 
 
+def test_plot_artifact_resolves_drawdown_alias_to_market_drawdown(tmp_path: Path) -> None:
+    context = AgentExecutionContext(
+        run_id="run",
+        artifacts_dir=tmp_path,
+        search_backend=None,
+        working_store=InMemoryWorkingSetStore(),
+        runtime=None,
+    )
+    deps = {
+        "joined": ToolExecutionResult(
+            payload={
+                "rows": [
+                    {"time_bin": "2018-01", "series_name": "privacy/regulation", "share_of_documents": 0.2, "market_drawdown": -0.01},
+                    {"time_bin": "2018-02", "series_name": "privacy/regulation", "share_of_documents": 0.4, "market_drawdown": -0.08},
+                ]
+            }
+        )
+    }
+
+    result = _plot_artifact(
+        {"plot_type": "line", "x": "time_bin", "y": "drawdown", "title": "Drawdown"},
+        deps,
+        context,
+    )
+
+    assert result.artifacts
+    assert result.payload["resolved_y"] == "market_drawdown"
+    assert result.payload["plotted_row_count"] == 2
+
+
 def test_build_evidence_table_uses_task_name_for_entity_frequency(tmp_path: Path) -> None:
     context = AgentExecutionContext(
         run_id="run",

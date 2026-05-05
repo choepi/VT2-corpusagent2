@@ -13,7 +13,7 @@ import uuid
 from typing import Any, Callable, Protocol
 
 from .agent_runtime import AgentRuntime, AgentRuntimeConfig, TERMINAL_RUN_STATUSES
-from .retrieval import pg_dsn_from_env
+from .retrieval import pg_connect_kwargs, pg_dsn_from_env
 
 
 MCP_JOB_TERMINAL_STATUSES = TERMINAL_RUN_STATUSES | {"cancelled"}
@@ -418,7 +418,7 @@ class PostgresMCPJobStore:
     def _connect(self):
         from psycopg import connect
 
-        return connect(self.dsn)
+        return connect(self.dsn, **pg_connect_kwargs())
 
     def ensure_schema(self) -> None:
         if self._schema_ready:
@@ -960,7 +960,6 @@ class MCPJobManager:
         if is_local_active:
             try:
                 live_status = self._runtime().get_run_status(current.run_id)
-                self.store.update_progress(current.job_id, live_status)
             except Exception:
                 live_status = dict(current.result_summary.get("live_status", {}))
         else:

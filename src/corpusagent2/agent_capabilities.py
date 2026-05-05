@@ -6565,6 +6565,10 @@ PLOT_FIELD_ALIASES = {
     "share_of_monthly_entity_mentions": ("mention_share", "share_of_mentions", "normalized_value", "mention_count_normalized", "count"),
     "monthly_mention_share": ("mention_share", "share_of_mentions", "normalized_value", "mention_count_normalized", "count"),
     "monthly_entity_mention_share": ("mention_share", "share_of_mentions", "normalized_value", "mention_count_normalized", "count"),
+    "drawdown": ("drawdown", "market_drawdown", "max_drawdown", "minimum_drawdown"),
+    "market_drawdown": ("market_drawdown", "drawdown", "max_drawdown", "minimum_drawdown"),
+    "market_return": ("market_return", "return", "daily_return", "monthly_return"),
+    "market_close": ("market_close", "close", "price", "value"),
     "quote_share": ("quote_share", "quote_count", "count"),
     "mention_count_normalized": ("mention_count_normalized", "share_of_docs", "mention_share", "count"),
     "normalized_value": ("normalized_value", "mention_count_normalized", "share_of_docs", "mention_share", "doc_share", "count", "value"),
@@ -6599,6 +6603,9 @@ PLOT_Y_FIELD_PRIORITY = (
     "mention_count_normalized",
     "doc_share",
     "mention_share",
+    "market_drawdown",
+    "market_return",
+    "market_close",
     "frequency",
 )
 PLOT_NUMERIC_FIELD_EXCLUDES = {"rank", "id", "doc_id", "topic_id", "year", "month", "day"}
