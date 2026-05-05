@@ -86,13 +86,18 @@ def test_dockerized_api_and_mcp_share_runtime_image_and_sandbox_mounts() -> None
 
     assert runtime_dockerfile.exists()
     assert not (project_root / "deploy" / "Dockerfile.mcp").exists()
+    assert "ARG CORPUSAGENT2_DOCKER_TORCH_PROFILE=cpu" in dockerfile_text
     assert "ARG CORPUSAGENT2_DOCKER_INSTALL_NLP_PROVIDERS=false" in dockerfile_text
     assert "ARG CORPUSAGENT2_DOCKER_DOWNLOAD_PROVIDER_ASSETS=false" in dockerfile_text
-    assert "uv sync --frozen --no-install-project" in dockerfile_text
-    assert "uv sync --frozen --extra nlp-providers --no-install-project" in dockerfile_text
+    assert "deploy/requirements.docker-cpu.txt" in dockerfile_text
+    assert "deploy/requirements.docker-nlp-providers.txt" in dockerfile_text
+    assert "https://download.pytorch.org/whl/cpu" in dockerfile_text
+    assert "PYTHONPATH=/app/src" in dockerfile_text
     assert "CMD [\"python\", \"/app/scripts/12_run_agent_api.py\"]" in dockerfile_text
     assert "image: corpusagent2-runtime:latest" in base_compose
     assert "image: corpusagent2-runtime:latest" in mcp_compose
+    assert "CORPUSAGENT2_DOCKER_TORCH_PROFILE: ${CORPUSAGENT2_DOCKER_TORCH_PROFILE:-cpu}" in base_compose
+    assert "CORPUSAGENT2_DOCKER_TORCH_PROFILE: ${CORPUSAGENT2_DOCKER_TORCH_PROFILE:-cpu}" in mcp_compose
     assert "CORPUSAGENT2_DOCKER_INSTALL_NLP_PROVIDERS: ${CORPUSAGENT2_DOCKER_INSTALL_NLP_PROVIDERS:-false}" in base_compose
     assert "CORPUSAGENT2_DOCKER_INSTALL_NLP_PROVIDERS: ${CORPUSAGENT2_DOCKER_INSTALL_NLP_PROVIDERS:-false}" in mcp_compose
     assert "CORPUSAGENT2_API_CPUS" in base_compose
@@ -103,6 +108,25 @@ def test_dockerized_api_and_mcp_share_runtime_image_and_sandbox_mounts() -> None
     assert "/var/run/docker.sock:/var/run/docker.sock" in mcp_compose
     assert "CORPUSAGENT2_PYTHON_RUNNER_SHARED_TMP" in base_compose
     assert "CORPUSAGENT2_PYTHON_RUNNER_SHARED_TMP" in mcp_compose
+
+
+def test_docker_cpu_requirements_use_cpu_torch_and_real_provider_stack() -> None:
+    project_root = Path(__file__).resolve().parents[1]
+    cpu_requirements = (project_root / "deploy" / "requirements.docker-cpu.txt").read_text(encoding="utf-8")
+    provider_requirements = (project_root / "deploy" / "requirements.docker-nlp-providers.txt").read_text(encoding="utf-8")
+    gpu_compose = (project_root / "deploy" / "docker-compose.mcp.gpu.yml").read_text(encoding="utf-8")
+
+    assert "torch==2.3.1+cpu" in cpu_requirements
+    assert "torchvision==0.18.1+cpu" in cpu_requirements
+    assert "torchaudio==2.3.1+cpu" in cpu_requirements
+    assert "cu118" not in cpu_requirements
+    assert "sentence-transformers" in cpu_requirements
+    assert "bertopic" in cpu_requirements
+    assert "flair" in provider_requirements
+    assert "stanza" in provider_requirements
+    assert "textacy" in provider_requirements
+    assert "CORPUSAGENT2_DOCKER_TORCH_PROFILE: ${CORPUSAGENT2_DOCKER_TORCH_PROFILE:-cuda}" in gpu_compose
+    assert "CORPUSAGENT2_DOCKER_INSTALL_NLP_PROVIDERS: ${CORPUSAGENT2_DOCKER_INSTALL_NLP_PROVIDERS:-true}" in gpu_compose
 
 
 def test_vm_services_are_docker_stack_first() -> None:
