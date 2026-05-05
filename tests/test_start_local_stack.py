@@ -58,3 +58,58 @@ def test_wait_for_backend_ready_polls_runtime_info(monkeypatch) -> None:
     module.wait_for_backend_ready("http://127.0.0.1:8001", FakeProcess(), timeout_s=1)
 
     assert requested_urls == ["http://127.0.0.1:8001/runtime-info"]
+
+
+def test_mcp_compose_defaults_to_cpu_and_keeps_gpu_override_separate() -> None:
+    project_root = Path(__file__).resolve().parents[1]
+    base_compose = (project_root / "deploy" / "docker-compose.yml").read_text(encoding="utf-8")
+    mcp_compose = (project_root / "deploy" / "docker-compose.mcp.yml").read_text(encoding="utf-8")
+    gpu_compose = (project_root / "deploy" / "docker-compose.mcp.gpu.yml").read_text(encoding="utf-8")
+
+    assert "corpusagent2-api:" in base_compose
+    assert "dockerfile: deploy/Dockerfile" in base_compose
+    assert "dockerfile: deploy/Dockerfile" in mcp_compose
+    assert "Dockerfile.mcp" not in mcp_compose
+    assert "CORPUSAGENT2_DEVICE: ${CORPUSAGENT2_DEVICE:-cpu}" in mcp_compose
+    assert "gpus: all" not in mcp_compose
+    assert "corpusagent2-api:" in gpu_compose
+    assert "CORPUSAGENT2_DEVICE: ${CORPUSAGENT2_DEVICE:-cuda}" in gpu_compose
+    assert "gpus: all" in gpu_compose
+
+
+def test_dockerized_api_and_mcp_share_runtime_image_and_sandbox_mounts() -> None:
+    project_root = Path(__file__).resolve().parents[1]
+    runtime_dockerfile = project_root / "deploy" / "Dockerfile"
+    base_compose = (project_root / "deploy" / "docker-compose.yml").read_text(encoding="utf-8")
+    mcp_compose = (project_root / "deploy" / "docker-compose.mcp.yml").read_text(encoding="utf-8")
+
+    assert runtime_dockerfile.exists()
+    assert not (project_root / "deploy" / "Dockerfile.mcp").exists()
+    assert "CMD [\"python\", \"/app/scripts/12_run_agent_api.py\"]" in runtime_dockerfile.read_text(encoding="utf-8")
+    assert "image: corpusagent2-runtime:latest" in base_compose
+    assert "image: corpusagent2-runtime:latest" in mcp_compose
+    assert "CORPUSAGENT2_API_CPUS" in base_compose
+    assert "CORPUSAGENT2_MCP_CPUS" in mcp_compose
+    assert "CORPUSAGENT2_OPENSEARCH_JAVA_OPTS" in base_compose
+    assert "CORPUSAGENT2_POSTGRES_MEM_LIMIT" in base_compose
+    assert "/var/run/docker.sock:/var/run/docker.sock" in base_compose
+    assert "/var/run/docker.sock:/var/run/docker.sock" in mcp_compose
+    assert "CORPUSAGENT2_PYTHON_RUNNER_SHARED_TMP" in base_compose
+    assert "CORPUSAGENT2_PYTHON_RUNNER_SHARED_TMP" in mcp_compose
+
+
+def test_vm_services_are_docker_stack_first() -> None:
+    project_root = Path(__file__).resolve().parents[1]
+    configure_script = (project_root / "scripts" / "24_configure_vm_services.py").read_text(encoding="utf-8")
+    stack_service = (project_root / "deploy" / "corpusagent2-stack.service").read_text(encoding="utf-8")
+    tunnel_service = (project_root / "deploy" / "corpusagent2-cloudflared.service").read_text(encoding="utf-8")
+
+    assert not (project_root / "deploy" / "corpusagent2-api.service").exists()
+    assert "docker compose -f docker-compose.yml -f docker-compose.mcp.yml up -d" in stack_service
+    assert "EnvironmentFile=/home/dongtten/corpusagent2/.env" in stack_service
+    assert "corpusagent2-stack.service" in tunnel_service
+    assert "scripts/12_run_agent_api.py" not in stack_service
+    assert "compute_docker_resource_plan(detect_host_hardware(), gpu_mode=args.gpu)" in configure_script
+    assert "--gpu" in configure_script
+    assert "ExecStart={compose_exec} up -d" in configure_script
+    assert "scripts' / '12_run_agent_api.py" not in configure_script
