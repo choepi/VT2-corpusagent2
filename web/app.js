@@ -697,20 +697,8 @@ function renderToolCatalog() {
     const status = dominantToolStatus(entry.statuses);
     return { spec, entry, status, index };
   });
-  const capabilityBuckets = new Map();
-  catalog.forEach((spec) => {
-    (Array.isArray(spec.capabilities) ? spec.capabilities : ["uncategorized"]).forEach((capability) => {
-      const key = String(capability || "uncategorized");
-      const bucket = capabilityBuckets.get(key) || new Set();
-      bucket.add(String(spec.tool_name || "tool"));
-      capabilityBuckets.set(key, bucket);
-    });
-  });
-  const capabilityRows = Array.from(capabilityBuckets.entries()).sort((left, right) =>
-    left[0].localeCompare(right[0])
-  );
   const usedCount = decorated.filter((item) => item.status !== "available").length;
-  toolCatalogSummary.textContent = `All ${formatCount(catalog.length)} registered functions; ${formatCount(usedCount)} used/planned in current run`;
+  toolCatalogSummary.textContent = `${formatCount(catalog.length)} registered function${catalog.length === 1 ? "" : "s"}; ${formatCount(usedCount)} used/planned in current run`;
   decorated.sort((left, right) => {
     const leftUsed = left.status === "available" ? 1 : 0;
     const rightUsed = right.status === "available" ? 1 : 0;
@@ -720,47 +708,19 @@ function renderToolCatalog() {
     return String(left.spec.tool_name || "").localeCompare(String(right.spec.tool_name || ""));
   });
   toolCatalog.innerHTML = `
-    <div class="tool-overview-grid">
-      <div>
-        <strong>${formatCount(catalog.length)}</strong>
-        <span>registered tool functions</span>
-      </div>
-      <div>
-        <strong>${formatCount(capabilityRows.length)}</strong>
-        <span>capabilities</span>
-      </div>
-      <div>
-        <strong>${formatCount(usedCount)}</strong>
-        <span>used or planned in this run</span>
-      </div>
-    </div>
-    <div class="tool-capability-overview" aria-label="Capability overview">
-      ${capabilityRows
-        .map(
-          ([capability, tools]) => `
-            <span title="${escapeHtml(Array.from(tools).sort().join(", "))}">
-              ${escapeHtml(capability)}
-              <small>${formatCount(tools.size)} tool${tools.size === 1 ? "" : "s"}</small>
-            </span>
-          `
-        )
-        .join("")}
-    </div>
     <table class="tool-catalog-table">
       <colgroup>
         <col style="width: 7%" />
-        <col style="width: 24%" />
-        <col style="width: 27%" />
-        <col style="width: 22%" />
-        <col style="width: 9%" />
-        <col style="width: 11%" />
+        <col style="width: 28%" />
+        <col style="width: 32%" />
+        <col style="width: 12%" />
+        <col style="width: 21%" />
       </colgroup>
       <thead>
         <tr>
           <th>#</th>
           <th>Tool function</th>
           <th>Capabilities</th>
-          <th>Tool properties</th>
           <th>Status</th>
           <th>Current run usage</th>
         </tr>
@@ -771,13 +731,6 @@ function renderToolCatalog() {
             const capabilities = (Array.isArray(spec.capabilities) ? spec.capabilities : []).join(", ");
             const nodeIds = Array.from(entry.nodeIds).sort();
             const safeStatusClass = status.replace(/[^a-z0-9_-]/g, "-");
-            const propertyParts = [
-              spec.cost_class ? `cost ${spec.cost_class}` : "",
-              Number.isFinite(Number(spec.priority)) ? `priority ${spec.priority}` : "",
-              spec.deterministic === false ? "non-deterministic" : "deterministic",
-              spec.fallback_of ? `fallback of ${spec.fallback_of}` : "",
-              spec.model_id ? `model ${spec.model_id}` : "",
-            ].filter(Boolean);
             const usageParts = [
               nodeIds.length ? `nodes ${nodeIds.join(", ")}` : "",
               entry.callCount ? `${formatCount(entry.callCount)} call${entry.callCount === 1 ? "" : "s"}` : "",
@@ -787,7 +740,6 @@ function renderToolCatalog() {
                 <td class="tool-index-cell">f${String(displayIndex + 1).padStart(2, "0")}</td>
                 <td><strong>${escapeHtml(spec.tool_name || "tool")}</strong><br><span class="muted">${escapeHtml(spec.tool_version ? `version ${spec.tool_version}` : "version unknown")}</span></td>
                 <td>${escapeHtml(capabilities || "none")}</td>
-                <td>${escapeHtml(propertyParts.join(" | ") || "none")}</td>
                 <td><span class="tool-state tool-state-${safeStatusClass}">${escapeHtml(status)}</span></td>
                 <td>${usageParts.length ? escapeHtml(usageParts.join(" | ")) : '<span class="muted">not used in current run</span>'}</td>
               </tr>
@@ -800,8 +752,11 @@ function renderToolCatalog() {
 }
 
 function renderToolNodeMap() {
-  if (!toolNodeMap || !toolNodeTable) {
+  if (!toolNodeTable) {
     return;
+  }
+  if (toolNodeMap) {
+    toolNodeMap.innerHTML = "";
   }
   const planNodesFlat = (latestPlanDags || []).flatMap((dag) => (Array.isArray(dag.nodes) ? dag.nodes : []));
   const callByNode = new Map();
@@ -812,6 +767,30 @@ function renderToolNodeMap() {
     }
     callByNode.set(nodeId, row);
   });
+  const recordByNode = new Map();
+  (latestManifest?.node_records || []).forEach((record) => {
+    const nodeId = keyFor(record.node_id);
+    if (!nodeId) {
+      return;
+    }
+    recordByNode.set(nodeId, record);
+  });
+  const terminalRun = isTerminalStatus(latestManifest?.status || currentStatus);
+  const nodeRuntimeView = (nodeId) => {
+    const call = callByNode.get(keyFor(nodeId)) || {};
+    const record = recordByNode.get(keyFor(nodeId)) || {};
+    const status = String(call.status || record.status || (terminalRun ? "not executed" : "planned")).trim().toLowerCase() || "planned";
+    return {
+      ...record,
+      ...call,
+      status,
+      tool_name: call.tool_name || record.tool_name || "",
+      provider: call.provider || record.provider || "",
+      duration_ms: call.duration_ms || record.duration_ms || 0,
+      error: call.error || record.error || "",
+      summary: call.summary || {},
+    };
+  };
   const rows =
     planNodesFlat.length > 0
       ? planNodesFlat
@@ -822,33 +801,9 @@ function renderToolNodeMap() {
           depends_on: row.dependency_nodes || [],
         }));
   if (!rows.length) {
-    toolNodeMap.innerHTML = '<p class="muted">No plan nodes yet. They appear after the backend planner emits a DAG.</p>';
     toolNodeTable.innerHTML = '<p class="muted">No planned node table yet.</p>';
     return;
   }
-  toolNodeMap.innerHTML = rows
-    .map((node) => {
-      const nodeId = String(node.node_id || node.id || "").trim();
-      const call = callByNode.get(keyFor(nodeId)) || {};
-      const status = String(call.status || "planned").trim().toLowerCase() || "planned";
-      const safeStatusClass = status.replace(/[^a-z0-9_-]/g, "-");
-      const dependsOn = Array.isArray(node.depends_on) ? node.depends_on : [];
-      return `
-        <article class="node-pill node-${escapeHtml(safeStatusClass)}">
-          <div class="node-pill-head">
-            <strong>${escapeHtml(nodeId || "node")}</strong>
-            <span>${escapeHtml(status)}</span>
-          </div>
-          <p>${escapeHtml(node.tool_name || node.capability || "tool")}</p>
-          ${
-            dependsOn.length
-              ? `<small>depends on ${escapeHtml(dependsOn.join(", "))}</small>`
-              : "<small>no dependencies</small>"
-          }
-        </article>
-      `;
-    })
-    .join("");
   toolNodeTable.innerHTML = `
     <table>
       <colgroup>
@@ -873,8 +828,8 @@ function renderToolNodeMap() {
         ${rows
           .map((node) => {
             const nodeId = String(node.node_id || node.id || "").trim();
-            const call = callByNode.get(keyFor(nodeId)) || {};
-            const status = String(call.status || "planned").trim().toLowerCase() || "planned";
+            const call = nodeRuntimeView(nodeId);
+            const status = call.status;
             const safeStatusClass = status.replace(/[^a-z0-9_-]/g, "-");
             const dependsOn = Array.isArray(node.depends_on) ? node.depends_on : [];
             const evidenceParts = [
@@ -887,10 +842,10 @@ function renderToolNodeMap() {
               <tr>
                 <td><strong>${escapeHtml(nodeId || "node")}</strong></td>
                 <td>${escapeHtml(node.capability || "")}</td>
-                <td>${escapeHtml(call.tool_name || node.tool_name || "not resolved yet")}</td>
+                <td>${escapeHtml(call.tool_name || node.tool_name || (terminalRun ? "not executed" : "not resolved yet"))}</td>
                 <td><span class="tool-state tool-state-${safeStatusClass}">${escapeHtml(status)}</span></td>
                 <td>${escapeHtml(dependsOn.join(", ") || "none")}</td>
-                <td>${evidenceParts.length ? escapeHtml(evidenceParts.join(" | ")) : '<span class="muted">not executed yet</span>'}</td>
+                <td>${evidenceParts.length ? escapeHtml(evidenceParts.join(" | ")) : `<span class="muted">${terminalRun ? "not executed before run ended" : "not executed yet"}</span>`}</td>
               </tr>
             `;
           })

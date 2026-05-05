@@ -13,6 +13,7 @@ from .retrieval import (
     dense_asset_health,
     load_dense_assets,
     load_lexical_assets,
+    pg_connect_kwargs,
     pg_dsn_from_env,
     pg_table_from_env,
     resolve_retrieval_backend,
@@ -181,7 +182,7 @@ class CorpusRuntime:
             try:
                 from psycopg import connect
 
-                with connect(self.pg_dsn) as conn:
+                with connect(self.pg_dsn, **pg_connect_kwargs()) as conn:
                     with conn.cursor() as cursor:
                         cursor.execute(f"SELECT COUNT(*), COUNT(*) FILTER (WHERE dense_embedding IS NOT NULL) FROM {self.pg_table}")
                         total_rows, dense_rows = cursor.fetchone()

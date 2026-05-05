@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from dataclasses import dataclass
+import math
 import os
 from pathlib import Path
 from typing import Any
@@ -19,6 +20,17 @@ _ALLOWED_RETRIEVAL_BACKENDS = {"local", "pgvector"}
 _SENTENCE_TRANSFORMER_CACHE: dict[tuple[str, str], Any] = {}
 _CROSS_ENCODER_CACHE: dict[tuple[str, str], Any] = {}
 _TORCH_DENSE_CACHE: dict[tuple[int, str], Any] = {}
+
+
+def pg_connect_kwargs() -> dict[str, Any]:
+    raw = os.getenv("CORPUSAGENT2_PG_CONNECT_TIMEOUT_S", "2").strip()
+    try:
+        timeout_s = float(raw or "2")
+    except ValueError:
+        timeout_s = 2.0
+    if timeout_s <= 0:
+        return {}
+    return {"connect_timeout": max(1, int(math.ceil(timeout_s)))}
 
 
 @dataclass(slots=True)
@@ -480,7 +492,7 @@ def retrieve_dense_pgvector(
     )
 
     rows: list[tuple] = []
-    with connect(dsn) as conn:
+    with connect(dsn, **pg_connect_kwargs()) as conn:
         with conn.cursor(row_factory=tuple_row) as cursor:
             cursor.execute(sql, (query_vector_literal, query_vector_literal, int(top_k)))
             rows = cursor.fetchall()
