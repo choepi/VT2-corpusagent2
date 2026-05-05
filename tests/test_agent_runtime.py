@@ -1,15 +1,17 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 from pathlib import Path
 import time
 
 from corpusagent2 import agent_capabilities
+from corpusagent2.agent_capabilities import AgentExecutionContext
 from corpusagent2.agent_backends import InMemoryWorkingSetStore
 from corpusagent2.agent_models import AgentPlanDAG, AgentPlanNode, AgentRunState
 from corpusagent2.api import build_app
-from corpusagent2.agent_executor import AgentExecutionSnapshot
+from corpusagent2.agent_executor import AgentExecutionSnapshot, AsyncPlanExecutor
 from corpusagent2.python_runner_service import PythonRunnerResult, SandboxArtifact
 from corpusagent2.retrieval_budgeting import infer_retrieval_budget
 from corpusagent2.tool_registry import ToolExecutionResult, ToolRegistry
@@ -122,6 +124,413 @@ def _search_rows(documents: list[dict]) -> dict[str, list[dict]]:
                 )
         mapping[key] = rows
     return mapping
+
+
+def test_plan_compiler_removes_invalid_natural_language_python_runner(tmp_path: Path) -> None:
+    runtime = build_test_runtime(
+        tmp_path=tmp_path,
+        documents=_sample_documents(),
+        search_rows_by_query=_search_rows(_sample_documents()),
+    )
+    dag = AgentPlanDAG(
+        nodes=[
+            AgentPlanNode(node_id="search", capability="db_search", inputs={"query": "Facebook"}),
+            AgentPlanNode(
+                node_id="monthly",
+                capability="time_series_aggregate",
+                inputs={"documents_node": "search", "time_field": "published_at"},
+                depends_on=["search"],
+            ),
+            AgentPlanNode(
+                node_id="join",
+                capability="python_runner",
+                inputs={"payload": {"sources": ["monthly"], "task": "Join monthly framing rows to drawdown rows."}},
+                depends_on=["monthly"],
+            ),
+            AgentPlanNode(
+                node_id="plot",
+                capability="plot_artifact",
+                inputs={"payload": {"table_source": "join", "x": "month", "y": ["privacy_share", "drawdown"]}},
+                depends_on=["join"],
+            ),
+        ]
+    )
+
+    compiled = runtime.orchestrator._normalize_plan_dag(
+        dag,
+        "How did Facebook coverage shift from innovation framing to privacy framing and stock drawdowns?",
+    )
+
+    node_ids = {node.node_id for node in compiled.nodes}
+    notes = " | ".join(compiled.metadata.get("compiler_notes", []))
+    assert "join" not in node_ids
+    assert "plot" not in node_ids
+    assert "invalid natural-language python_runner" in notes
+
+
+def test_plan_compiler_rejects_comment_only_python_runner_code(tmp_path: Path) -> None:
+    runtime = build_test_runtime(
+        tmp_path=tmp_path,
+        documents=_sample_documents(),
+        search_rows_by_query=_search_rows(_sample_documents()),
+    )
+    dag = AgentPlanDAG(
+        nodes=[
+            AgentPlanNode(node_id="source", capability="time_series_aggregate", inputs={"rows": []}),
+            AgentPlanNode(
+                node_id="comment_only",
+                capability="python_runner",
+                inputs={"payload": {"code": "# compute lead lag comparison here\n# output rows"}},
+                depends_on=["source"],
+            ),
+            AgentPlanNode(
+                node_id="plot",
+                capability="plot_artifact",
+                inputs={"payload": {"table_source": "comment_only", "x": "month", "y": "drawdown"}},
+                depends_on=["comment_only"],
+            ),
+        ]
+    )
+
+    compiled = runtime.orchestrator._normalize_plan_dag(
+        dag,
+        "How did framing correspond to stock drawdowns?",
+    )
+
+    node_ids = {node.node_id for node in compiled.nodes}
+    assert "comment_only" not in node_ids
+    assert "plot" not in node_ids
+
+
+def test_plan_compiler_drops_unrequested_expensive_leaf_analysis(tmp_path: Path) -> None:
+    runtime = build_test_runtime(
+        tmp_path=tmp_path,
+        documents=_sample_documents(),
+        search_rows_by_query=_search_rows(_sample_documents()),
+    )
+    dag = AgentPlanDAG(
+        nodes=[
+            AgentPlanNode(node_id="search", capability="db_search", inputs={"query": "Facebook"}),
+            AgentPlanNode(node_id="fetch", capability="fetch_documents", depends_on=["search"]),
+            AgentPlanNode(node_id="entities", capability="ner", depends_on=["fetch"]),
+            AgentPlanNode(
+                node_id="framing_series",
+                capability="time_series_aggregate",
+                inputs={"documents_node": "fetch", "time_field": "published_at", "bucket_granularity": "month"},
+                depends_on=["fetch"],
+            ),
+        ]
+    )
+
+    compiled = runtime.orchestrator._normalize_plan_dag(
+        dag,
+        "How did Facebook coverage shift from innovation framing to privacy framing over time?",
+    )
+
+    node_ids = {node.node_id for node in compiled.nodes}
+    notes = " | ".join(compiled.metadata.get("compiler_notes", []))
+    assert "entities" not in node_ids
+    assert "removed unrequested expensive leaf analysis (ner)" in notes
+
+
+def test_plan_compiler_requires_noun_distribution_deliverables(tmp_path: Path) -> None:
+    runtime = build_test_runtime(
+        tmp_path=tmp_path,
+        documents=_sample_documents(),
+        search_rows_by_query=_search_rows(_sample_documents()),
+    )
+    dag = AgentPlanDAG(
+        nodes=[
+            AgentPlanNode(node_id="search", capability="db_search", inputs={"query": "football"}),
+            AgentPlanNode(node_id="fetch", capability="fetch_documents", depends_on=["search"]),
+        ]
+    )
+
+    compiled = runtime.orchestrator._normalize_plan_dag(
+        dag,
+        "What is the distribution of nouns in football reports?",
+    )
+
+    node_map = compiled.node_map()
+    assert node_map["noun_distribution"].capability == "build_evidence_table"
+    assert node_map["noun_distribution"].inputs["task_name"] == "noun_frequency_distribution"
+    assert node_map["plot_noun_distribution"].capability == "plot_artifact"
+    assert node_map["plot_noun_distribution"].depends_on == ["noun_distribution"]
+
+
+def test_temporal_market_plan_joins_market_to_framing_aggregate(tmp_path: Path) -> None:
+    runtime = build_test_runtime(
+        tmp_path=tmp_path,
+        documents=_sample_documents(),
+        search_rows_by_query=_search_rows(_sample_documents()),
+    )
+    dag = AgentPlanDAG(
+        nodes=[
+            AgentPlanNode(node_id="search", capability="db_search", inputs={"query": "Facebook"}),
+            AgentPlanNode(node_id="fetch", capability="fetch_documents", depends_on=["search"]),
+        ]
+    )
+
+    compiled = runtime.orchestrator._normalize_plan_dag(
+        dag,
+        "How did Facebook coverage shift from innovation/growth framing to privacy/regulation framing around Cambridge Analytica from 2016 to 2019, and how did this correspond to FB stock drawdowns?",
+    )
+
+    node_map = compiled.node_map()
+    framing_node = node_map["framing_series"]
+    market_node = node_map["market_series"]
+    plot_node = node_map["plot_market_drawdown"]
+    assert framing_node.optional is False
+    assert market_node.optional is False
+    assert plot_node.optional is False
+    assert market_node.depends_on == ["framing_series"]
+    assert market_node.inputs["interval"] == "1mo"
+    assert plot_node.inputs["y"] == ["share_of_documents", "market_drawdown"]
+
+
+def test_plan_compiler_rebuilds_market_join_after_invalid_branch_removal(tmp_path: Path) -> None:
+    runtime = build_test_runtime(
+        tmp_path=tmp_path,
+        documents=_sample_documents(),
+        search_rows_by_query=_search_rows(_sample_documents()),
+    )
+    dag = AgentPlanDAG(
+        nodes=[
+            AgentPlanNode(node_id="search", capability="db_search", inputs={"query": "Facebook"}),
+            AgentPlanNode(node_id="fetch", capability="fetch_documents", depends_on=["search"]),
+            AgentPlanNode(
+                node_id="bad_join",
+                capability="python_runner",
+                inputs={"payload": {"sources": ["fetch"], "task": "Join framing rows to stock drawdowns."}},
+                depends_on=["fetch"],
+            ),
+            AgentPlanNode(
+                node_id="bad_market",
+                capability="join_external_series",
+                inputs={"payload": {"series_source": "bad_join", "ticker": "FB"}},
+                depends_on=["bad_join"],
+            ),
+            AgentPlanNode(
+                node_id="bad_plot",
+                capability="plot_artifact",
+                inputs={"payload": {"table_source": "bad_market", "x": "month", "y": ["privacy_share", "drawdown"]}},
+                depends_on=["bad_market"],
+            ),
+        ]
+    )
+
+    compiled = runtime.orchestrator._normalize_plan_dag(
+        dag,
+        "How did Facebook coverage shift from innovation/growth framing to privacy/regulation framing around Cambridge Analytica from 2016 to 2019, and how did this correspond to FB stock drawdowns?",
+    )
+
+    node_map = compiled.node_map()
+    assert "bad_join" not in node_map
+    assert "bad_market" not in node_map
+    assert "bad_plot" not in node_map
+    assert node_map["market_series"].depends_on == ["framing_series"]
+    assert node_map["plot_market_drawdown"].depends_on == ["market_series"]
+
+
+def test_executor_schedules_required_path_before_ready_optional_branch(tmp_path: Path) -> None:
+    execution_order: list[str] = []
+    registry = ToolRegistry()
+
+    def adapter(tool_name: str, capability: str) -> StaticAdapter:
+        def run_fn(params: dict, deps: dict, context: object) -> ToolExecutionResult:
+            execution_order.append(tool_name)
+            return ToolExecutionResult(payload={"rows": [{"tool": tool_name}]})
+
+        return StaticAdapter(tool_name=tool_name, capability=capability, run_fn=run_fn)
+
+    registry.register(adapter("core_seed_tool", "core_seed"))
+    registry.register(adapter("core_after_tool", "core_after"))
+    registry.register(adapter("optional_tool", "optional_support"))
+    executor = AsyncPlanExecutor(registry)
+    context = AgentExecutionContext(
+        run_id="test_optional_order",
+        artifacts_dir=tmp_path,
+        search_backend=None,
+        working_store=InMemoryWorkingSetStore(),
+        state=AgentRunState(question="test", no_cache=True),
+    )
+    dag = AgentPlanDAG(
+        nodes=[
+            AgentPlanNode(node_id="core_seed", capability="core_seed"),
+            AgentPlanNode(node_id="optional", capability="optional_support", optional=True),
+            AgentPlanNode(node_id="core_after", capability="core_after", depends_on=["core_seed"]),
+        ]
+    )
+
+    snapshot = asyncio.run(executor.execute(dag, context))
+
+    assert snapshot.status == "completed"
+    assert execution_order == ["core_seed_tool", "core_after_tool", "optional_tool"]
+
+
+def test_executor_preflights_empty_plot_dependencies(tmp_path: Path) -> None:
+    execution_order: list[str] = []
+    registry = ToolRegistry()
+
+    def empty_rows(params: dict, deps: dict, context: object) -> ToolExecutionResult:
+        execution_order.append("aggregate")
+        return ToolExecutionResult(payload={"rows": []}, metadata={"no_data": True, "no_data_reason": "empty rows"})
+
+    def plot_should_not_run(params: dict, deps: dict, context: object) -> ToolExecutionResult:
+        execution_order.append("plot")
+        raise AssertionError("plot should not execute when upstream rows are empty")
+
+    registry.register(StaticAdapter(tool_name="aggregate_tool", capability="table_source", run_fn=empty_rows))
+    registry.register(StaticAdapter(tool_name="plot_tool", capability="plot_artifact", run_fn=plot_should_not_run))
+    executor = AsyncPlanExecutor(registry)
+    context = AgentExecutionContext(
+        run_id="test_plot_preflight",
+        artifacts_dir=tmp_path,
+        search_backend=None,
+        working_store=InMemoryWorkingSetStore(),
+        state=AgentRunState(question="test", no_cache=True),
+    )
+    dag = AgentPlanDAG(
+        nodes=[
+            AgentPlanNode(node_id="aggregate", capability="table_source"),
+            AgentPlanNode(node_id="plot", capability="plot_artifact", depends_on=["aggregate"], optional=True),
+        ]
+    )
+
+    snapshot = asyncio.run(executor.execute(dag, context))
+
+    assert snapshot.status == "completed"
+    assert execution_order == ["aggregate"]
+    assert [record.status for record in snapshot.node_records] == ["completed", "skipped"]
+
+
+def test_executor_records_successful_ready_siblings_and_skips_pending_after_core_failure(tmp_path: Path) -> None:
+    registry = ToolRegistry()
+
+    registry.register(
+        StaticAdapter(
+            tool_name="seed_tool",
+            capability="seed",
+            run_fn=lambda params, deps, context: ToolExecutionResult(payload={"rows": [{"x": 1}]}),
+        )
+    )
+    registry.register(
+        StaticAdapter(
+            tool_name="failing_tool",
+            capability="time_series_aggregate",
+            run_fn=lambda params, deps, context: ToolExecutionResult(
+                payload={"rows": []},
+                metadata={"no_data": True, "no_data_reason": "missing y field"},
+            ),
+        )
+    )
+    registry.register(
+        StaticAdapter(
+            tool_name="sibling_tool",
+            capability="sibling_analysis",
+            run_fn=lambda params, deps, context: ToolExecutionResult(payload={"rows": [{"ok": True}]}),
+        )
+    )
+    registry.register(
+        StaticAdapter(
+            tool_name="pending_tool",
+            capability="later_analysis",
+            run_fn=lambda params, deps, context: ToolExecutionResult(payload={"rows": [{"late": True}]}),
+        )
+    )
+    executor = AsyncPlanExecutor(registry)
+    context = AgentExecutionContext(
+        run_id="test_ready_sibling_failure",
+        artifacts_dir=tmp_path,
+        search_backend=None,
+        working_store=InMemoryWorkingSetStore(),
+        state=AgentRunState(question="test", no_cache=True),
+    )
+    dag = AgentPlanDAG(
+        nodes=[
+            AgentPlanNode(node_id="seed", capability="seed"),
+            AgentPlanNode(node_id="failing", capability="time_series_aggregate", depends_on=["seed"]),
+            AgentPlanNode(node_id="sibling", capability="sibling_analysis", depends_on=["seed"]),
+            AgentPlanNode(node_id="pending", capability="later_analysis", depends_on=["sibling"]),
+        ]
+    )
+
+    snapshot = asyncio.run(executor.execute(dag, context))
+    statuses = {record.node_id: record.status for record in snapshot.node_records}
+
+    assert snapshot.status == "failed"
+    assert statuses["seed"] == "completed"
+    assert statuses["failing"] == "failed"
+    assert statuses["sibling"] == "completed"
+    assert statuses["pending"] == "skipped"
+
+
+def test_executor_rejects_malformed_declared_tool_input(tmp_path: Path) -> None:
+    registry = ToolRegistry()
+
+    def run_fn(params: dict, deps: dict, context: object) -> ToolExecutionResult:
+        raise AssertionError("tool should not execute after schema validation failure")
+
+    adapter = StaticAdapter(tool_name="payload_tool", capability="payload_capability", run_fn=run_fn)
+    adapter.spec.input_schema.fields = {"payload": "dict"}
+    registry.register(adapter)
+    executor = AsyncPlanExecutor(registry)
+    context = AgentExecutionContext(
+        run_id="test_schema_validation",
+        artifacts_dir=tmp_path,
+        search_backend=None,
+        working_store=InMemoryWorkingSetStore(),
+        state=AgentRunState(question="test", no_cache=True),
+    )
+    dag = AgentPlanDAG(
+        nodes=[
+            AgentPlanNode(
+                node_id="bad_payload",
+                capability="payload_capability",
+                inputs={"payload": "this should have been a dict"},
+            )
+        ]
+    )
+
+    snapshot = asyncio.run(executor.execute(dag, context))
+
+    assert snapshot.status == "failed"
+    assert snapshot.failures[0].error_type == "input_schema_validation_failed"
+    assert "expected dict" in snapshot.failures[0].message
+
+
+def test_snapshot_caveats_summarize_internal_tool_noise(tmp_path: Path) -> None:
+    runtime = build_test_runtime(
+        tmp_path=tmp_path,
+        documents=_sample_documents(),
+        search_rows_by_query=_search_rows(_sample_documents()),
+    )
+    snapshot = AgentExecutionSnapshot(
+        node_records=[],
+        node_results={
+            "plot": ToolExecutionResult(
+                payload={"rows": [], "no_data_reason": "Missing plot x field: month"},
+                caveats=["No rows available for plotting."],
+                metadata={"no_data": True, "no_data_reason": "python_runner_non_python_code"},
+            ),
+            "market": ToolExecutionResult(
+                payload={"rows": [{"time_bin": "2018-03", "market_drawdown": -0.05}]},
+                caveats=["Resolved requested market ticker 'FB' to yfinance symbol 'META' after the requested symbol returned no rows."],
+            ),
+        },
+        failures=[],
+        provenance_records=[],
+        selected_docs=[],
+        status="completed",
+    )
+
+    caveats = runtime.orchestrator._snapshot_caveats(snapshot)
+
+    assert not any("python_runner" in caveat for caveat in caveats)
+    assert not any("Missing plot x field" in caveat for caveat in caveats)
+    assert not any("No rows available for plotting" in caveat for caveat in caveats)
+    assert any("supporting tool outputs were empty" in caveat for caveat in caveats)
+    assert any("Resolved requested market ticker" in caveat for caveat in caveats)
 
 
 def test_runtime_rejects_hidden_motive_question(tmp_path: Path) -> None:
@@ -1508,7 +1917,11 @@ def test_invalid_llm_plan_falls_back_to_framing_shift_heuristic(tmp_path: Path, 
     assert any(node["node_id"] == "framing_series" and node["capability"] == "time_series_aggregate" for node in planned_nodes)
     assert any(node["node_id"] == "plot_framing_shift" and node["inputs"].get("x") == "time_bin" for node in planned_nodes)
     assert any(node["capability"] == "join_external_series" and node["inputs"].get("ticker") == "FB" for node in planned_nodes)
-    assert any(node["node_id"] == "plot_market_drawdown" and node["inputs"].get("y") == "market_drawdown" for node in planned_nodes)
+    assert any(
+        node["node_id"] == "plot_market_drawdown"
+        and node["inputs"].get("y") == ["share_of_documents", "market_drawdown"]
+        for node in planned_nodes
+    )
     assert not any(
         node["capability"] == "plot_artifact" and node["inputs"].get("plot_name") in {"framing_topics", "portrayal_topics"}
         for node in planned_nodes
@@ -1966,7 +2379,8 @@ def test_fallback_synthesis_surfaces_no_data_tool_caveats(tmp_path: Path) -> Non
     assert "could not produce a supported answer" in answer.answer_text
     assert caveat in answer.answer_text
     assert caveat in answer.caveats
-    assert "No rows available for plotting." in answer.caveats
+    assert "No rows available for plotting." not in answer.caveats
+    assert any("supporting tool outputs were empty" in item for item in answer.caveats)
     assert any("no evidence rows" in item for item in answer.unsupported_parts)
 
 
@@ -2467,6 +2881,26 @@ def test_api_runtime_info_reports_provider_and_device(tmp_path: Path) -> None:
     assert "llm" in payload
     assert "device" in payload
     assert "providers_installed" in payload
+
+
+def test_runtime_info_caches_retrieval_health_probe(tmp_path: Path) -> None:
+    docs = _sample_documents()
+    runtime = build_test_runtime(tmp_path=tmp_path, documents=docs, search_rows_by_query=_search_rows(docs))
+    original_retrieval_health = runtime.runtime.retrieval_health
+    calls = 0
+
+    def counted_retrieval_health():
+        nonlocal calls
+        calls += 1
+        return original_retrieval_health()
+
+    runtime.runtime.retrieval_health = counted_retrieval_health
+    runtime._runtime_info_health_ttl_s = 30.0
+
+    runtime.runtime_info()
+    runtime.runtime_info()
+
+    assert calls == 1
 
 
 def test_synthesis_guardrail_blocks_unverified_stock_claims(tmp_path: Path, monkeypatch) -> None:

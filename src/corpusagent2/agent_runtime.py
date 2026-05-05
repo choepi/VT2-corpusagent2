@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import asyncio
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -10,6 +11,7 @@ import os
 from pathlib import Path
 import re
 import threading
+import time
 import uuid
 from typing import Any, Callable
 
@@ -501,6 +503,294 @@ class MagicBoxOrchestrator:
             rewritten.append(node)
         return rewritten
 
+    _SOURCE_REFERENCE_INPUT_KEYS = {
+        "source",
+        "source_node",
+        "source_node_id",
+        "table_source",
+        "table_from",
+        "documents_node",
+        "document_source",
+        "series_source",
+        "working_set_id",
+        "working_set_source",
+        "working_set_source_node_id",
+    }
+    _EXPENSIVE_LEAF_CAPABILITIES = {
+        "build_evidence_table",
+        "claim_span_extract",
+        "claim_strength_score",
+        "dependency_parse",
+        "doc_embeddings",
+        "entity_link",
+        "extract_ngrams",
+        "extract_svo_triples",
+        "ner",
+        "noun_chunks",
+        "pos_morph",
+        "quote_attribute",
+        "quote_extract",
+        "similarity_index",
+        "similarity_pairwise",
+        "word_embeddings",
+    }
+    _EXPENSIVE_OPTIONAL_CAPABILITIES = _EXPENSIVE_LEAF_CAPABILITIES | {
+        "extract_keyterms",
+        "sentiment",
+        "topic_model",
+    }
+    _PYTHON_RUNNER_NATIVE_TASK_HINTS = {
+        "actor prominence",
+        "actor_prominence",
+        "correlation",
+        "entity frequency",
+        "entity_frequency",
+        "numeric correlation",
+        "numeric_correlation",
+    }
+
+    @classmethod
+    def _effective_node_inputs(cls, node: AgentPlanNode) -> dict[str, Any]:
+        inputs = dict(node.inputs or {})
+        payload = inputs.get("payload")
+        if isinstance(payload, dict):
+            return {**payload, **{key: value for key, value in inputs.items() if key != "payload"}}
+        return inputs
+
+    @classmethod
+    def _input_source_references(cls, inputs: dict[str, Any], node_ids: set[str]) -> list[str]:
+        references: list[str] = []
+        for key, value in inputs.items():
+            if key in cls._SOURCE_REFERENCE_INPUT_KEYS and isinstance(value, str) and value in node_ids:
+                references.append(value)
+            if isinstance(value, dict):
+                references.extend(cls._input_source_references(value, node_ids))
+            elif isinstance(value, list):
+                for item in value:
+                    if isinstance(item, dict):
+                        references.extend(cls._input_source_references(item, node_ids))
+        return list(dict.fromkeys(references))
+
+    @staticmethod
+    def _has_executable_python_code(value: Any) -> bool:
+        code = str(value or "").strip()
+        if not code:
+            return False
+        try:
+            parsed = ast.parse(code, filename="<planned_python_runner>", mode="exec")
+        except SyntaxError:
+            return False
+        for statement in parsed.body:
+            if isinstance(statement, ast.Expr) and isinstance(statement.value, ast.Constant):
+                if isinstance(statement.value.value, str):
+                    continue
+            return True
+        return False
+
+    @classmethod
+    def _python_runner_is_routable(cls, node: AgentPlanNode) -> bool:
+        inputs = cls._effective_node_inputs(node)
+        if cls._has_executable_python_code(inputs.get("code")):
+            return True
+        task_text = " ".join(
+            str(inputs.get(key, ""))
+            for key in ("task", "task_name", "analysis", "analysis_type")
+            if inputs.get(key) is not None
+        ).lower()
+        return any(hint in task_text for hint in cls._PYTHON_RUNNER_NATIVE_TASK_HINTS)
+
+    @staticmethod
+    def _question_requires_capability(question_text: str, capability: str) -> bool:
+        lowered = str(question_text or "").lower()
+        capability_terms = {
+            "build_evidence_table": ("evidence table", "noun distribution", "noun frequency", "distribution of nouns"),
+            "claim_span_extract": ("claim", "claims", "span"),
+            "claim_strength_score": ("claim", "claims", "verdict", "strength"),
+            "extract_ngrams": ("ngram", "n-gram", "phrase distribution", "bigram", "trigram"),
+            "extract_keyterms": ("keyterm", "key term", "keywords", "dominant terms"),
+            "join_external_series": ("stock", "drawdown", "market", "price", "oil", "equity", "ticker"),
+            "ner": ("named entities", "named entity", "actors", "actor", "entities"),
+            "noun_chunks": ("noun chunk", "noun phrase"),
+            "pos_morph": ("part of speech", "pos", "noun distribution", "nouns"),
+            "quote_attribute": ("quote", "quoted", "attribution"),
+            "quote_extract": ("quote", "quoted", "quotation"),
+            "sentiment": ("sentiment", "tone", "portrayal", "positive", "negative"),
+            "topic_model": ("topic", "topics", "framing", "frame", "frames"),
+        }
+        return any(term in lowered for term in capability_terms.get(capability, (capability.replace("_", " "),)))
+
+    @staticmethod
+    def _downstream_map(nodes: list[AgentPlanNode]) -> dict[str, set[str]]:
+        downstream: dict[str, set[str]] = {node.node_id: set() for node in nodes}
+        for node in nodes:
+            for dep in node.depends_on:
+                downstream.setdefault(dep, set()).add(node.node_id)
+        return downstream
+
+    def _compile_plan_dag(self, dag: AgentPlanDAG, question_text: str) -> AgentPlanDAG:
+        node_ids = {node.node_id for node in dag.nodes}
+        compiler_notes: list[str] = []
+        nodes_with_inferred_deps: list[AgentPlanNode] = []
+        for node in dag.nodes:
+            inferred_deps = self._input_source_references(self._effective_node_inputs(node), node_ids)
+            depends_on = list(dict.fromkeys([*node.depends_on, *[dep for dep in inferred_deps if dep != node.node_id]]))
+            if len(depends_on) != len(node.depends_on):
+                compiler_notes.append(
+                    f"node {node.node_id}: inferred dependencies {sorted(set(depends_on) - set(node.depends_on))}"
+                )
+            nodes_with_inferred_deps.append(
+                AgentPlanNode(
+                    node_id=node.node_id,
+                    capability=node.capability,
+                    tool_name=node.tool_name,
+                    inputs=dict(node.inputs),
+                    depends_on=depends_on,
+                    optional=node.optional,
+                    cacheable=node.cacheable,
+                    description=node.description,
+                )
+            )
+
+        invalid_nodes = {
+            node.node_id
+            for node in nodes_with_inferred_deps
+            if node.capability == "python_runner" and not self._python_runner_is_routable(node)
+        }
+        for node_id in sorted(invalid_nodes):
+            compiler_notes.append(f"node {node_id}: removed invalid natural-language python_runner payload")
+        changed = True
+        while changed:
+            changed = False
+            for node in nodes_with_inferred_deps:
+                if node.node_id in invalid_nodes:
+                    continue
+                if any(dep in invalid_nodes for dep in node.depends_on):
+                    invalid_nodes.add(node.node_id)
+                    compiler_notes.append(f"node {node.node_id}: removed because it depended on invalid node")
+                    changed = True
+
+        retained_nodes = [node for node in nodes_with_inferred_deps if node.node_id not in invalid_nodes]
+        if not retained_nodes:
+            metadata = dict(dag.metadata)
+            metadata["compiler_notes"] = [*metadata.get("compiler_notes", []), *compiler_notes]
+            return AgentPlanDAG(nodes=nodes_with_inferred_deps, metadata=metadata)
+
+        downstream = self._downstream_map(retained_nodes)
+        removed_leaf_ids: set[str] = set()
+        for node in retained_nodes:
+            if node.capability not in self._EXPENSIVE_LEAF_CAPABILITIES:
+                continue
+            if downstream.get(node.node_id):
+                continue
+            if self._question_requires_capability(question_text, node.capability):
+                continue
+            removed_leaf_ids.add(node.node_id)
+            compiler_notes.append(f"node {node.node_id}: removed unrequested expensive leaf analysis ({node.capability})")
+
+        retained_nodes = [node for node in retained_nodes if node.node_id not in removed_leaf_ids]
+        retained_ids = {node.node_id for node in retained_nodes}
+
+        def unique_retained_node_id(preferred: str) -> str:
+            if preferred not in retained_ids:
+                retained_ids.add(preferred)
+                return preferred
+            index = 2
+            while f"{preferred}_{index}" in retained_ids:
+                index += 1
+            node_id = f"{preferred}_{index}"
+            retained_ids.add(node_id)
+            return node_id
+
+        market_ticker = self._infer_market_ticker(question_text)
+        if (
+            market_ticker
+            and self._question_requires_capability(question_text, "join_external_series")
+            and not any(node.capability == "join_external_series" for node in retained_nodes)
+        ):
+            aggregate_node = next(
+                (
+                    node
+                    for node in retained_nodes
+                    if node.capability == "time_series_aggregate"
+                    and isinstance(node.inputs.get("series", node.inputs.get("series_definitions")), list)
+                ),
+                next((node for node in retained_nodes if node.capability == "time_series_aggregate"), None),
+            )
+            if aggregate_node is not None:
+                date_window = self._extract_date_window(question_text)
+                market_node_id = unique_retained_node_id("market_series")
+                retained_nodes.append(
+                    AgentPlanNode(
+                        node_id=market_node_id,
+                        capability="join_external_series",
+                        inputs={
+                            "ticker": market_ticker,
+                            "date_from": date_window.get("date_from", ""),
+                            "date_to": date_window.get("date_to", ""),
+                            "interval": "1mo",
+                            "left_key": "time_bin",
+                            "right_key": "time_bin",
+                            "how": "left",
+                        },
+                        depends_on=[aggregate_node.node_id],
+                    )
+                )
+                retained_nodes.append(
+                    AgentPlanNode(
+                        node_id=unique_retained_node_id("plot_market_drawdown"),
+                        capability="plot_artifact",
+                        inputs={
+                            "plot_name": f"{market_ticker.lower()}_framing_vs_drawdown",
+                            "plot_type": "line",
+                            "x": "time_bin",
+                            "y": ["share_of_documents", "market_drawdown"],
+                            "series": "series_name",
+                            "title": f"{market_ticker} framing share and stock drawdowns",
+                            "x_label": "Date",
+                            "y_label": "Share / drawdown",
+                        },
+                        depends_on=[market_node_id],
+                    )
+                )
+                compiler_notes.append(
+                    f"node {market_node_id}: added aggregate-based external series join after invalid market branch repair"
+                )
+
+        retained_node_map = {node.node_id: node for node in retained_nodes}
+        downstream = self._downstream_map(retained_nodes)
+        compiled_nodes: list[AgentPlanNode] = []
+        for node in retained_nodes:
+            optional = node.optional
+            description = node.description
+            downstream_nodes = [retained_node_map[item] for item in downstream.get(node.node_id, set()) if item in retained_node_map]
+            has_required_downstream = any(not item.optional for item in downstream_nodes)
+            if (
+                node.capability in self._EXPENSIVE_OPTIONAL_CAPABILITIES
+                and not self._question_requires_capability(question_text, node.capability)
+                and not has_required_downstream
+            ):
+                optional = True
+                if not description:
+                    description = "Supporting analysis; not required for the core answer."
+                compiler_notes.append(f"node {node.node_id}: marked optional supporting analysis ({node.capability})")
+            compiled_nodes.append(
+                AgentPlanNode(
+                    node_id=node.node_id,
+                    capability=node.capability,
+                    tool_name=node.tool_name,
+                    inputs=dict(node.inputs),
+                    depends_on=list(node.depends_on),
+                    optional=optional,
+                    cacheable=node.cacheable,
+                    description=description,
+                )
+            )
+
+        metadata = dict(dag.metadata)
+        if compiler_notes:
+            metadata["compiler_notes"] = [*metadata.get("compiler_notes", []), *compiler_notes]
+        return AgentPlanDAG(nodes=compiled_nodes or retained_nodes, metadata=metadata)
+
     def _normalize_plan_dag(self, dag: AgentPlanDAG, question_text: str = "") -> AgentPlanDAG:
         existing_ids = {node.node_id for node in dag.nodes}
 
@@ -638,8 +928,61 @@ class MagicBoxOrchestrator:
             self._ensure_source_comparison_nodes(normalized_nodes, unique_node_id)
             if metadata.get("question_family", "") in {"", "generic"}:
                 metadata["question_family"] = "source_comparison"
+        elif self._needs_noun_distribution_analysis(dag_text):
+            self._ensure_noun_distribution_nodes(normalized_nodes, unique_node_id, dag_text)
+            if metadata.get("question_family", "") in {"", "generic"}:
+                metadata["question_family"] = "noun_distribution"
         normalized_nodes = self._reuse_subsumed_search_branches(normalized_nodes)
-        return AgentPlanDAG(nodes=normalized_nodes, metadata=metadata)
+        return self._compile_plan_dag(AgentPlanDAG(nodes=normalized_nodes, metadata=metadata), dag_text)
+
+    @staticmethod
+    def _needs_noun_distribution_analysis(text: str) -> bool:
+        lowered = str(text or "").lower()
+        return "noun" in lowered and any(term in lowered for term in ("distribution", "frequency", "frequencies", "top"))
+
+    def _ensure_noun_distribution_nodes(
+        self,
+        normalized_nodes: list[AgentPlanNode],
+        unique_node_id: Callable[[str], str],
+        question_text: str,
+    ) -> None:
+        fetch_node_id = next((node.node_id for node in normalized_nodes if node.capability == "fetch_documents"), "")
+        if not fetch_node_id:
+            return
+        if not any(node.capability == "build_evidence_table" for node in normalized_nodes):
+            top_n = infer_requested_output_limit(question_text, default=100, minimum=20, maximum=500)
+            normalized_nodes.append(
+                AgentPlanNode(
+                    node_id=unique_node_id("noun_distribution"),
+                    capability="build_evidence_table",
+                    inputs={
+                        "task": "noun_frequency_distribution",
+                        "task_name": "noun_frequency_distribution",
+                        "text_fields": ["title", "text"],
+                        "filters": {"upos": ["NOUN", "PROPN"]},
+                        "top_n": top_n,
+                    },
+                    depends_on=[fetch_node_id],
+                )
+            )
+        noun_node_id = next((node.node_id for node in normalized_nodes if node.capability == "build_evidence_table"), "")
+        if noun_node_id and not any(node.capability == "plot_artifact" and noun_node_id in node.depends_on for node in normalized_nodes):
+            plot_top_k = min(infer_requested_output_limit(question_text, default=30, minimum=10, maximum=120), 120)
+            normalized_nodes.append(
+                AgentPlanNode(
+                    node_id=unique_node_id("plot_noun_distribution"),
+                    capability="plot_artifact",
+                    inputs={
+                        "plot_name": "noun_distribution",
+                        "plot_type": "bar",
+                        "x": "lemma",
+                        "y": "count",
+                        "top_k": plot_top_k,
+                        "title": "Noun distribution",
+                    },
+                    depends_on=[noun_node_id],
+                )
+            )
 
     def _needs_temporal_portrayal_analysis(self, text: str) -> bool:
         lowered = str(text or "").lower()
@@ -1134,7 +1477,6 @@ class MagicBoxOrchestrator:
                             "metrics": ["document_count"],
                         },
                         depends_on=[fetch_node_id],
-                        optional=True,
                     )
                 )
             if not any(node.capability == "plot_artifact" and framing_series_node_id in node.depends_on for node in normalized_nodes):
@@ -1153,7 +1495,6 @@ class MagicBoxOrchestrator:
                             "y_label": "Share of matched documents",
                         },
                         depends_on=[framing_series_node_id],
-                        optional=True,
                     )
                 )
         elif not any(node.capability == "plot_artifact" and topics_node_id in node.depends_on for node in normalized_nodes):
@@ -1170,6 +1511,15 @@ class MagicBoxOrchestrator:
         market_ticker = self._infer_market_ticker(question_text)
         if market_ticker and not any(node.capability == "join_external_series" for node in normalized_nodes):
             date_window = self._extract_date_window(question_text)
+            aggregate_source_node_id = next(
+                (
+                    node.node_id
+                    for node in normalized_nodes
+                    if node.capability == "time_series_aggregate"
+                    and isinstance(node.inputs.get("series", node.inputs.get("series_definitions")), list)
+                ),
+                series_node_id,
+            )
             market_node_id = unique_node_id("market_series")
             normalized_nodes.append(
                 AgentPlanNode(
@@ -1179,12 +1529,12 @@ class MagicBoxOrchestrator:
                         "ticker": market_ticker,
                         "date_from": date_window.get("date_from", ""),
                         "date_to": date_window.get("date_to", ""),
+                        "interval": "1mo",
                         "left_key": "time_bin",
                         "right_key": "time_bin",
                         "how": "left",
                     },
-                    depends_on=[fetch_node_id],
-                    optional=True,
+                    depends_on=[aggregate_source_node_id],
                 )
             )
             normalized_nodes.append(
@@ -1192,16 +1542,16 @@ class MagicBoxOrchestrator:
                     node_id=unique_node_id("plot_market_drawdown"),
                     capability="plot_artifact",
                     inputs={
-                        "plot_name": f"{market_ticker.lower()}_stock_drawdown",
+                        "plot_name": f"{market_ticker.lower()}_framing_vs_drawdown",
                         "plot_type": "line",
                         "x": "time_bin",
-                        "y": "market_drawdown",
-                        "title": f"{market_ticker} stock drawdowns",
+                        "y": ["share_of_documents", "market_drawdown"],
+                        "series": "series_name",
+                        "title": f"{market_ticker} framing share and stock drawdowns",
                         "x_label": "Date",
-                        "y_label": "Drawdown",
+                        "y_label": "Share / drawdown",
                     },
                     depends_on=[market_node_id],
-                    optional=True,
                 )
             )
 
@@ -2775,25 +3125,61 @@ class MagicBoxOrchestrator:
             )
         return fallback_rows
 
+    @staticmethod
+    def _is_internal_tool_caveat(text: str) -> bool:
+        lowered = str(text or "").strip().lower()
+        if not lowered:
+            return True
+        internal_markers = (
+            "dependency nodes",
+            "fetched preview",
+            "fetched 250 preview",
+            "fetched 1000 preview",
+            "input docs",
+            "missing plot",
+            "no rows available for plotting",
+            "plot requested",
+            "preview/batch",
+            "python_runner",
+            "streamed from working_set_ref",
+            "upstream fetched documents were only a preview",
+            "working_set_ref",
+        )
+        return any(marker in lowered for marker in internal_markers)
+
     def _snapshot_caveats(self, snapshot: AgentExecutionSnapshot) -> list[str]:
         caveats: list[str] = []
+        empty_supporting_outputs = 0
         for result in snapshot.node_results.values():
+            metadata = result.metadata if isinstance(result.metadata, dict) else {}
+            if metadata.get("no_data"):
+                empty_supporting_outputs += 1
+
             for caveat in result.caveats:
                 caveat_text = str(caveat).strip()
+                if self._is_internal_tool_caveat(caveat_text):
+                    continue
                 if caveat_text:
                     caveats.append(caveat_text)
 
-            metadata = result.metadata if isinstance(result.metadata, dict) else {}
             for key in ("no_data_reason", "reason", "warning"):
                 reason_text = str(metadata.get(key, "")).strip()
+                if self._is_internal_tool_caveat(reason_text):
+                    continue
                 if reason_text:
                     caveats.append(reason_text)
 
             payload = result.payload if isinstance(result.payload, dict) else {}
             for key in ("no_data_reason", "reason", "warning"):
                 reason_text = str(payload.get(key, "")).strip()
+                if self._is_internal_tool_caveat(reason_text):
+                    continue
                 if reason_text:
                     caveats.append(reason_text)
+        if empty_supporting_outputs:
+            caveats.append(
+                "Some supporting tool outputs were empty; affected plots or comparisons were omitted or marked unsupported."
+            )
         return list(dict.fromkeys(caveats))
 
     @staticmethod
@@ -3316,6 +3702,16 @@ class AgentRuntime:
         self._run_threads: dict[str, threading.Thread] = {}
         self._run_lock = threading.Lock()
         self._llm_override_active = False
+        self._provider_modules_cache: dict[str, bool] | None = None
+        self._device_report_cache: dict[str, Any] | None = None
+        self._retrieval_health_cache: tuple[float, dict[str, Any]] | None = None
+        try:
+            self._runtime_info_health_ttl_s = max(
+                0.0,
+                float(os.getenv("CORPUSAGENT2_RUNTIME_INFO_HEALTH_TTL_S", "30").strip() or "30"),
+            )
+        except ValueError:
+            self._runtime_info_health_ttl_s = 30.0
         try:
             self._startup_repaired_runs = int(self.working_store.cleanup_interrupted_runs())
         except Exception:
@@ -3362,6 +3758,29 @@ class AgentRuntime:
                 if status.status not in TERMINAL_RUN_STATUSES
             ]
 
+    def _provider_modules_installed(self) -> dict[str, bool]:
+        if self._provider_modules_cache is None:
+            self._provider_modules_cache = {
+                module_name: importlib.util.find_spec(module_name) is not None
+                for module_name in ["spacy", "textacy", "stanza", "nltk", "gensim", "flair", "textblob", "torch", "yfinance"]
+            }
+        return dict(self._provider_modules_cache)
+
+    def _cached_device_report(self) -> dict[str, Any]:
+        if self._device_report_cache is None:
+            self._device_report_cache = dict(runtime_device_report())
+        return dict(self._device_report_cache)
+
+    def _cached_retrieval_health(self) -> dict[str, Any]:
+        now = time.monotonic()
+        if self._retrieval_health_cache is not None and self._runtime_info_health_ttl_s > 0:
+            cached_at, cached_payload = self._retrieval_health_cache
+            if now - cached_at <= self._runtime_info_health_ttl_s:
+                return dict(cached_payload)
+        payload = dict(self.runtime.retrieval_health())
+        self._retrieval_health_cache = (now, payload)
+        return dict(payload)
+
     def update_llm_runtime_settings(
         self,
         *,
@@ -3404,10 +3823,8 @@ class AgentRuntime:
         return self.runtime_info()
 
     def runtime_info(self) -> dict[str, Any]:
-        provider_modules = {}
-        for module_name in ["spacy", "textacy", "stanza", "nltk", "gensim", "flair", "textblob", "torch", "yfinance"]:
-            provider_modules[module_name] = importlib.util.find_spec(module_name) is not None
-        device_report = runtime_device_report()
+        provider_modules = self._provider_modules_installed()
+        device_report = self._cached_device_report()
         openai_defaults = self._startup_llm_config.with_runtime_overrides(use_openai=True)
         unclose_defaults = self._startup_llm_config.with_runtime_overrides(use_openai=False)
         llm_warnings: list[str] = []
@@ -3426,7 +3843,7 @@ class AgentRuntime:
             for capability, value in os.environ.items()
             if capability.startswith("CORPUSAGENT2_PROVIDER_ORDER_")
         }
-        retrieval_health = self.runtime.retrieval_health()
+        retrieval_health = self._cached_retrieval_health()
         corpus_info = _runtime_corpus_info(self.config.project_root, retrieval_health)
         configured_default_mode = os.getenv("CORPUSAGENT2_DEFAULT_RETRIEVAL_MODE", "").strip().lower()
         if not configured_default_mode:
