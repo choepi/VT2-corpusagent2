@@ -1,0 +1,6 @@
+flair>=0.15.1
+gensim>=4.3.3
+nltk>=3.9.1
+stanza>=1.11.0
+textacy>=0.13.0
+textblob>=0.19.0

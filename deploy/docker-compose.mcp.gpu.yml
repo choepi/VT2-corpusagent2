@@ -2,11 +2,19 @@
 ## Use only on hosts where Docker can discover an NVIDIA/CDI GPU runtime.
 services:
   corpusagent2-api:
+    build:
+      args:
+        CORPUSAGENT2_DOCKER_TORCH_PROFILE: ${CORPUSAGENT2_DOCKER_TORCH_PROFILE:-cuda}
+        CORPUSAGENT2_DOCKER_INSTALL_NLP_PROVIDERS: ${CORPUSAGENT2_DOCKER_INSTALL_NLP_PROVIDERS:-true}
     environment:
       CORPUSAGENT2_DEVICE: ${CORPUSAGENT2_DEVICE:-cuda}
     gpus: all
 
   corpusagent2-mcp:
+    build:
+      args:
+        CORPUSAGENT2_DOCKER_TORCH_PROFILE: ${CORPUSAGENT2_DOCKER_TORCH_PROFILE:-cuda}
+        CORPUSAGENT2_DOCKER_INSTALL_NLP_PROVIDERS: ${CORPUSAGENT2_DOCKER_INSTALL_NLP_PROVIDERS:-true}
     environment:
       CORPUSAGENT2_DEVICE: ${CORPUSAGENT2_DEVICE:-cuda}
     gpus: all

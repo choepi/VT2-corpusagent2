@@ -28,6 +28,11 @@ def _download_stanza_models() -> None:
 
 
 def _download_nltk_assets(python_exe: str) -> None:
+    try:
+        import nltk  # noqa: F401
+    except Exception as exc:
+        print(f"[skip] nltk unavailable: {exc}")
+        return
     packages = [
         "punkt",
         "punkt_tab",

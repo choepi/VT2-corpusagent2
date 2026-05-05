@@ -144,6 +144,23 @@ docker compose -f docker-compose.yml -f docker-compose.mcp.yml up -d --no-recrea
 docker compose -f docker-compose.yml -f docker-compose.mcp.yml up -d --build --no-deps corpusagent2-api corpusagent2-mcp
 ```
 
+Build the real CPU NLP/embedding stack on a CPU-only VM:
+
+```bash
+cd deploy
+CORPUSAGENT2_DOCKER_TORCH_PROFILE=cpu \
+CORPUSAGENT2_DOCKER_INSTALL_NLP_PROVIDERS=true \
+CORPUSAGENT2_DOCKER_DOWNLOAD_PROVIDER_ASSETS=true \
+docker compose -f docker-compose.yml -f docker-compose.mcp.yml build corpusagent2-api corpusagent2-mcp
+```
+
+Use the GPU override only on a host where Docker can discover an NVIDIA/CDI GPU runtime:
+
+```bash
+cd deploy
+docker compose -f docker-compose.yml -f docker-compose.mcp.yml -f docker-compose.mcp.gpu.yml up -d --build --no-deps corpusagent2-api corpusagent2-mcp
+```
+
 Run the frontend only:
 
 ```bash
