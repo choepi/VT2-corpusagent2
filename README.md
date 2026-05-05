@@ -140,7 +140,8 @@ Run the Dockerized backend stack:
 
 ```bash
 cd deploy
-docker compose -f docker-compose.yml -f docker-compose.mcp.yml up -d --build
+docker compose -f docker-compose.yml -f docker-compose.mcp.yml up -d --no-recreate postgres opensearch
+docker compose -f docker-compose.yml -f docker-compose.mcp.yml up -d --build --no-deps corpusagent2-api corpusagent2-mcp
 ```
 
 Run the frontend only:

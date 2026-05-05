@@ -212,7 +212,7 @@ def compute_docker_resource_plan(
         "CORPUSAGENT2_MCP_MEM_LIMIT": _format_memory_limit(memory_allocations["MCP"]),
         "CORPUSAGENT2_OPENSEARCH_MEM_LIMIT": _format_memory_limit(opensearch_mem),
         "CORPUSAGENT2_POSTGRES_MEM_LIMIT": _format_memory_limit(memory_allocations["POSTGRES"]),
-        "CORPUSAGENT2_OPENSEARCH_JAVA_OPTS": (
+        "CORPUSAGENT2_OPENSEARCH_RECOMMENDED_JAVA_OPTS": (
             f"-Xms{_format_memory_limit(heap_bytes)} -Xmx{_format_memory_limit(heap_bytes)}"
         ),
         "CORPUSAGENT2_PYTHON_RUNNER_CPUS": _format_cpu(python_runner_cpus),
@@ -234,3 +234,16 @@ def compose_files_for_stack(*, use_gpu: bool) -> list[str]:
     if use_gpu:
         files.append("docker-compose.mcp.gpu.yml")
     return files
+
+
+def data_service_resource_updates(plan: DockerResourcePlan) -> dict[str, dict[str, str]]:
+    return {
+        "corpus_postgres": {
+            "cpus": plan.env["CORPUSAGENT2_POSTGRES_CPUS"],
+            "memory": plan.env["CORPUSAGENT2_POSTGRES_MEM_LIMIT"],
+        },
+        "os_news": {
+            "cpus": plan.env["CORPUSAGENT2_OPENSEARCH_CPUS"],
+            "memory": plan.env["CORPUSAGENT2_OPENSEARCH_MEM_LIMIT"],
+        },
+    }
