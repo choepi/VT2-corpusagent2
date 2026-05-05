@@ -1,13 +1,14 @@
 ## Overlay for deploy/docker-compose.yml. Use this together with the base file:
-## docker compose -f docker-compose.yml -f docker-compose.mcp.yml up -d corpusagent2-mcp
+## docker compose -f docker-compose.yml -f docker-compose.mcp.yml up -d
 ## Add docker-compose.mcp.gpu.yml only on hosts with a working NVIDIA/CDI GPU runtime.
 services:
   corpusagent2-mcp:
     build:
       context: ..
-      dockerfile: deploy/Dockerfile.mcp
+      dockerfile: deploy/Dockerfile
       args:
         CORPUSAGENT2_DOCKER_DOWNLOAD_PROVIDER_ASSETS: ${CORPUSAGENT2_DOCKER_DOWNLOAD_PROVIDER_ASSETS:-true}
+    image: corpusagent2-runtime:latest
     container_name: corpusagent2_mcp
     restart: unless-stopped
     depends_on:
@@ -37,8 +38,14 @@ services:
       CORPUSAGENT2_MCP_HEARTBEAT_SECONDS: ${CORPUSAGENT2_MCP_HEARTBEAT_SECONDS:-5}
       CORPUSAGENT2_MCP_STALE_RUNNING_SECONDS: ${CORPUSAGENT2_MCP_STALE_RUNNING_SECONDS:-900}
       CORPUSAGENT2_DEVICE: ${CORPUSAGENT2_DEVICE:-cpu}
+      CORPUSAGENT2_PYTHON_RUNNER_SHARED_TMP: ${CORPUSAGENT2_PYTHON_RUNNER_SHARED_TMP:-/tmp/corpusagent2_python_runner}
+    command: ["python", "-m", "corpusagent2.mcp_server"]
     ports:
       - "127.0.0.1:${CORPUSAGENT2_MCP_PORT:-8765}:8765"
     volumes:
       - ../data:/app/data:ro
       - ../outputs:/app/outputs
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ${CORPUSAGENT2_PYTHON_RUNNER_SHARED_TMP:-/tmp/corpusagent2_python_runner}:${CORPUSAGENT2_PYTHON_RUNNER_SHARED_TMP:-/tmp/corpusagent2_python_runner}
+    cpus: "${CORPUSAGENT2_MCP_CPUS:-6}"
+    mem_limit: "${CORPUSAGENT2_MCP_MEM_LIMIT:-7g}"

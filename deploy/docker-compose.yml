@@ -1,4 +1,49 @@
 services:
+  corpusagent2-api:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+      args:
+        CORPUSAGENT2_DOCKER_DOWNLOAD_PROVIDER_ASSETS: ${CORPUSAGENT2_DOCKER_DOWNLOAD_PROVIDER_ASSETS:-true}
+    image: corpusagent2-runtime:latest
+    container_name: corpusagent2_api
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      opensearch:
+        condition: service_healthy
+    env_file:
+      - ../.env
+    environment:
+      CORPUSAGENT2_PROJECT_ROOT: /app
+      CORPUSAGENT2_SERVER_HOST: 0.0.0.0
+      CORPUSAGENT2_SERVER_PORT: ${CORPUSAGENT2_SERVER_PORT:-8001}
+      CORPUSAGENT2_PG_DSN: ${CORPUSAGENT2_DOCKER_PG_DSN:-postgresql://corpus:corpus@postgres:5432/corpus_db}
+      CORPUSAGENT2_OPENSEARCH_URL: ${CORPUSAGENT2_DOCKER_OPENSEARCH_URL:-https://opensearch:9200}
+      CORPUSAGENT2_OPENSEARCH_USERNAME: ${CORPUSAGENT2_OPENSEARCH_USERNAME:-admin}
+      CORPUSAGENT2_OPENSEARCH_PASSWORD: ${CORPUSAGENT2_OPENSEARCH_PASSWORD:-VerySecurePassword123!}
+      CORPUSAGENT2_OPENSEARCH_VERIFY_SSL: "false"
+      CORPUSAGENT2_REQUIRE_BACKEND_SERVICES: "true"
+      CORPUSAGENT2_ALLOW_LOCAL_FALLBACK: "false"
+      CORPUSAGENT2_DEVICE: ${CORPUSAGENT2_DEVICE:-cpu}
+      CORPUSAGENT2_PYTHON_RUNNER_SHARED_TMP: ${CORPUSAGENT2_PYTHON_RUNNER_SHARED_TMP:-/tmp/corpusagent2_python_runner}
+    command: ["python", "/app/scripts/12_run_agent_api.py"]
+    ports:
+      - "127.0.0.1:${CORPUSAGENT2_SERVER_PORT:-8001}:8001"
+    volumes:
+      - ../data:/app/data:ro
+      - ../outputs:/app/outputs
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ${CORPUSAGENT2_PYTHON_RUNNER_SHARED_TMP:-/tmp/corpusagent2_python_runner}:${CORPUSAGENT2_PYTHON_RUNNER_SHARED_TMP:-/tmp/corpusagent2_python_runner}
+    cpus: "${CORPUSAGENT2_API_CPUS:-4}"
+    mem_limit: "${CORPUSAGENT2_API_MEM_LIMIT:-6g}"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8001/health >/dev/null"]
+      interval: 15s
+      timeout: 10s
+      retries: 20
+
   postgres:
     image: pgvector/pgvector:pg16
     container_name: corpus_postgres
@@ -12,6 +57,8 @@ services:
       - "127.0.0.1:5432:5432"
     volumes:
       - ${CORPUSAGENT2_DOCKER_DATA_DIR:-./data}/pgdata:/var/lib/postgresql/data
+    cpus: "${CORPUSAGENT2_POSTGRES_CPUS:-1}"
+    mem_limit: "${CORPUSAGENT2_POSTGRES_MEM_LIMIT:-2g}"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U corpus -d corpus_db"]
       interval: 10s
@@ -24,13 +71,15 @@ services:
     restart: unless-stopped
     environment:
       discovery.type: single-node
-      OPENSEARCH_JAVA_OPTS: -Xms1g -Xmx1g
+      OPENSEARCH_JAVA_OPTS: ${CORPUSAGENT2_OPENSEARCH_JAVA_OPTS:--Xms1g -Xmx1g}
       OPENSEARCH_INITIAL_ADMIN_PASSWORD: ${CORPUSAGENT2_OPENSEARCH_PASSWORD:-VerySecurePassword123!}
     ports:
       - "127.0.0.1:9200:9200"
       - "127.0.0.1:9600:9600"
     volumes:
       - ${CORPUSAGENT2_DOCKER_DATA_DIR:-./data}/osdata:/usr/share/opensearch/data
+    cpus: "${CORPUSAGENT2_OPENSEARCH_CPUS:-1}"
+    mem_limit: "${CORPUSAGENT2_OPENSEARCH_MEM_LIMIT:-3g}"
     ulimits:
       memlock:
         soft: -1

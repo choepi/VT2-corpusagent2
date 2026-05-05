@@ -3,10 +3,7 @@ FROM python:3.11-slim-bookworm
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     UV_LINK_MODE=copy \
-    CORPUSAGENT2_PROJECT_ROOT=/app \
-    CORPUSAGENT2_MCP_TRANSPORT=streamable-http \
-    CORPUSAGENT2_MCP_HOST=0.0.0.0 \
-    CORPUSAGENT2_MCP_PORT=8765
+    CORPUSAGENT2_PROJECT_ROOT=/app
 
 WORKDIR /app
 
@@ -15,6 +12,8 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=ghcr.io/astral-sh/uv:0.11.7 /uv /usr/local/bin/uv
+COPY --from=docker:27-cli /usr/local/bin/docker /usr/local/bin/docker
+
 COPY pyproject.toml uv.lock README.md ./
 COPY scripts/17_download_provider_assets.py ./scripts/17_download_provider_assets.py
 
@@ -33,6 +32,6 @@ RUN uv sync --frozen --extra nlp-providers --inexact
 
 ENV PATH="/app/.venv/bin:${PATH}"
 
-EXPOSE 8765
+EXPOSE 8001 8765
 
-CMD ["python", "-m", "corpusagent2.mcp_server"]
+CMD ["python", "/app/scripts/12_run_agent_api.py"]

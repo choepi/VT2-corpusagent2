@@ -1,6 +1,11 @@
-## Optional GPU override for deploy/docker-compose.mcp.yml.
+## Optional GPU override for deploy/docker-compose.yml + deploy/docker-compose.mcp.yml.
 ## Use only on hosts where Docker can discover an NVIDIA/CDI GPU runtime.
 services:
+  corpusagent2-api:
+    environment:
+      CORPUSAGENT2_DEVICE: ${CORPUSAGENT2_DEVICE:-cuda}
+    gpus: all
+
   corpusagent2-mcp:
     environment:
       CORPUSAGENT2_DEVICE: ${CORPUSAGENT2_DEVICE:-cuda}

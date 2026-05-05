@@ -1,0 +1,17 @@
+[Unit]
+Description=CorpusAgent2 Docker stack
+After=network-online.target docker.service
+Wants=network-online.target docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=/home/dongtten/corpusagent2/deploy
+EnvironmentFile=/home/dongtten/corpusagent2/.env
+ExecStart=/usr/bin/docker compose -f docker-compose.yml -f docker-compose.mcp.yml up -d
+ExecStop=/usr/bin/docker compose -f docker-compose.yml -f docker-compose.mcp.yml down --remove-orphans
+TimeoutStartSec=0
+TimeoutStopSec=120
+
+[Install]
+WantedBy=multi-user.target
