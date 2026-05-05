@@ -60,8 +60,10 @@ const toolNodeMap = document.getElementById("toolNodeMap");
 const toolNodeTable = document.getElementById("toolNodeTable");
 const toolCatalogSummary = document.getElementById("toolCatalogSummary");
 const toolCatalog = document.getElementById("toolCatalog");
+const toolUsageSummary = document.getElementById("toolUsageSummary");
+const toolUsagePlot = document.getElementById("toolUsagePlot");
+const toolUsageNeverUsed = document.getElementById("toolUsageNeverUsed");
 const evidenceTable = document.getElementById("evidenceTable");
-const selectedDocs = document.getElementById("selectedDocs");
 const artifactList = document.getElementById("artifactList");
 const plotGallery = document.getElementById("plotGallery");
 const plotModal = document.getElementById("plotModal");
@@ -82,6 +84,7 @@ let latestRuntimeInfo = null;
 let latestCapabilityCatalog = [];
 let latestToolCallRows = [];
 let latestPlanDags = [];
+let latestToolUsageSummary = null;
 let providerDefaults = {};
 let submissionInFlight = false;
 let activePollSessionId = 0;
@@ -96,6 +99,7 @@ const TERMINAL_RUN_STATUSES = ["completed", "partial", "failed", "rejected", "ne
 const DEFAULT_API_BASE = "https://api.dongtse.com";
 const LOCAL_API_BASE = "http://127.0.0.1:8001";
 const API_BASE_OPTIONS = [DEFAULT_API_BASE, LOCAL_API_BASE];
+let clarificationBaseQuestion = "";
 
 const runtimeConfig = window.CORPUSAGENT2_CONFIG || {};
 const accessGateConfig = runtimeConfig.accessGate || {};
@@ -110,6 +114,15 @@ function normalizeApiBase(value) {
     return LOCAL_API_BASE;
   }
   return API_BASE_OPTIONS.includes(normalized) ? normalized : DEFAULT_API_BASE;
+}
+
+function questionStateKey(value) {
+  return String(value || "").replace(/\s+/g, " ").trim().toLowerCase();
+}
+
+function clarificationMatchesCurrentQuestion() {
+  const currentQuestion = questionStateKey(questionInput.value);
+  return Boolean(currentQuestion && questionStateKey(clarificationBaseQuestion) === currentQuestion);
 }
 
 apiBaseInput.value = normalizeApiBase(runtimeConfig.apiBaseUrl || DEFAULT_API_BASE);
@@ -183,6 +196,7 @@ function saveUiState() {
     plannerModel: plannerModelInput.value,
     synthesisModel: synthesisModelInput.value,
     clarificationHistory,
+    clarificationBaseQuestion,
     pendingClarificationQuestion,
     currentRunId,
     currentStatus,
@@ -206,8 +220,15 @@ function restoreUiState() {
     llmProviderSelect.value = payload.llmProvider || llmProviderSelect.value;
     plannerModelInput.value = payload.plannerModel || plannerModelInput.value;
     synthesisModelInput.value = payload.synthesisModel || synthesisModelInput.value;
-    clarificationHistory = Array.isArray(payload.clarificationHistory) ? payload.clarificationHistory : [];
-    pendingClarificationQuestion = payload.pendingClarificationQuestion || "";
+    clarificationBaseQuestion = payload.clarificationBaseQuestion || "";
+    if (clarificationMatchesCurrentQuestion()) {
+      clarificationHistory = Array.isArray(payload.clarificationHistory) ? payload.clarificationHistory : [];
+      pendingClarificationQuestion = payload.pendingClarificationQuestion || "";
+    } else {
+      clarificationBaseQuestion = "";
+      clarificationHistory = [];
+      pendingClarificationQuestion = "";
+    }
     currentRunId = payload.currentRunId || "";
     currentStatus = payload.currentStatus || "idle";
     currentRunStartedAtUtc = payload.currentRunStartedAtUtc || "";
@@ -592,6 +613,8 @@ function keyFor(value) {
 function collectRunToolUsage() {
   const byToolName = new Map();
   const byCapability = new Map();
+  const terminalRun = isTerminalStatus(latestManifest?.status || currentStatus);
+  const planNodeById = new Map();
 
   function touch(map, key, update) {
     const normalized = keyFor(key);
@@ -610,10 +633,14 @@ function collectRunToolUsage() {
 
   (latestPlanDags || []).forEach((dag) => {
     (dag.nodes || []).forEach((node) => {
+      const nodeId = String(node.node_id || node.id || "").trim();
+      if (nodeId) {
+        planNodeById.set(keyFor(nodeId), node);
+      }
       const update = (entry) => {
-        entry.statuses.add("planned");
-        if (node.node_id || node.id) {
-          entry.nodeIds.add(String(node.node_id || node.id));
+        entry.statuses.add(terminalRun ? "not executed" : "planned");
+        if (nodeId) {
+          entry.nodeIds.add(nodeId);
         }
       };
       touch(byToolName, node.tool_name, update);
@@ -634,6 +661,23 @@ function collectRunToolUsage() {
     };
     touch(byToolName, row.tool_name, update);
     touch(byCapability, row.capability, update);
+  });
+
+  (latestManifest?.node_records || []).forEach((record) => {
+    const node = planNodeById.get(keyFor(record.node_id)) || {};
+    const toolName = record.tool_name || node.tool_name;
+    const capability = record.capability || node.capability;
+    const update = (entry) => {
+      entry.statuses.add(String(record.status || (terminalRun ? "not executed" : "planned")).trim().toLowerCase());
+      if (record.node_id) {
+        entry.nodeIds.add(String(record.node_id));
+      }
+      if (record.provider) {
+        entry.providers.add(String(record.provider));
+      }
+    };
+    touch(byToolName, toolName, update);
+    touch(byCapability, capability, update);
   });
 
   return { byToolName, byCapability };
@@ -674,6 +718,9 @@ function dominantToolStatus(statuses) {
   }
   if (values.includes("skipped")) {
     return "skipped";
+  }
+  if (values.includes("not executed")) {
+    return "not executed";
   }
   if (values.includes("planned")) {
     return "planned";
@@ -748,6 +795,131 @@ function renderToolCatalog() {
           .join("")}
       </tbody>
     </table>
+  `;
+}
+
+function renderToolUsageBar(label, value, maxValue, detail) {
+  const numericValue = Number(value) || 0;
+  const width = maxValue > 0 ? Math.max(2, Math.round((numericValue / maxValue) * 100)) : 0;
+  return `
+    <div class="usage-bar-row">
+      <div class="usage-bar-label" title="${escapeHtml(label)}">${escapeHtml(label)}</div>
+      <div class="usage-bar-track" aria-label="${escapeHtml(`${label}: ${numericValue}`)}">
+        <div class="usage-bar-fill" style="width: ${width}%"></div>
+      </div>
+      <div class="usage-bar-value">${formatCount(numericValue)}</div>
+      <div class="usage-bar-detail">${escapeHtml(detail || "")}</div>
+    </div>
+  `;
+}
+
+function renderToolUsageSummary(payload) {
+  if (!toolUsageSummary || !toolUsagePlot || !toolUsageNeverUsed) {
+    return;
+  }
+  latestToolUsageSummary = payload || null;
+  if (!payload) {
+    toolUsageSummary.innerHTML = '<p class="muted">Historical tool usage is not loaded yet.</p>';
+    toolUsagePlot.innerHTML = "";
+    toolUsageNeverUsed.innerHTML = "";
+    return;
+  }
+
+  const categories = Array.isArray(payload.categories) ? payload.categories : [];
+  const tools = Array.isArray(payload.tools) ? payload.tools : [];
+  const usedTools = tools.filter((row) => !row.never_used);
+  const topTools = usedTools
+    .slice()
+    .sort((left, right) => {
+      const leftScore = Number(left.completed_node_count || left.completed_event_count || 0);
+      const rightScore = Number(right.completed_node_count || right.completed_event_count || 0);
+      if (leftScore !== rightScore) {
+        return rightScore - leftScore;
+      }
+      return String(left.tool_name || "").localeCompare(String(right.tool_name || ""));
+    })
+    .slice(0, 14);
+  const neverUsed = tools
+    .filter((row) => row.registered && row.never_used)
+    .sort((left, right) => String(left.category || "").localeCompare(String(right.category || "")) || String(left.tool_name || "").localeCompare(String(right.tool_name || "")));
+
+  toolUsageSummary.innerHTML = `
+    <div class="usage-stat-grid">
+      <div><span class="metric-label">Runs scanned</span><strong>${formatCount(payload.run_count || 0)}</strong></div>
+      <div><span class="metric-label">Registered tools</span><strong>${formatCount(payload.registered_tool_count || tools.length)}</strong></div>
+      <div><span class="metric-label">Used historically</span><strong>${formatCount(payload.used_tool_count || usedTools.length)}</strong></div>
+      <div><span class="metric-label">Never completed</span><strong>${formatCount(payload.never_used_tool_count || neverUsed.length)}</strong></div>
+    </div>
+    <p class="muted">${escapeHtml((payload.notes || [])[0] || "Counts are derived from saved run manifests and backend tool-call history.")}</p>
+  `;
+
+  const categoryMax = Math.max(1, ...categories.map((row) => Number(row.completed_node_count || 0)));
+  const toolMax = Math.max(1, ...topTools.map((row) => Number(row.completed_node_count || row.completed_event_count || 0)));
+  toolUsagePlot.innerHTML = `
+    <div class="usage-panel">
+      <h4>Usage By Tool Category</h4>
+      ${categories.length
+        ? categories
+            .map((row) =>
+              renderToolUsageBar(
+                row.category || "Other",
+                row.completed_node_count || 0,
+                categoryMax,
+                `${formatCount(row.used_tool_count || 0)}/${formatCount(row.registered_tool_count || 0)} tools used`
+              )
+            )
+            .join("")
+        : '<p class="muted">No historical category usage found yet.</p>'}
+    </div>
+    <div class="usage-panel">
+      <h4>Top Tools By Completed Nodes</h4>
+      ${topTools.length
+        ? topTools
+            .map((row) =>
+              renderToolUsageBar(
+                row.tool_name || "tool",
+                row.completed_node_count || row.completed_event_count || 0,
+                toolMax,
+                `${row.role || "unknown role"} | ${formatCount(row.run_count || 0)} run${Number(row.run_count || 0) === 1 ? "" : "s"}`
+              )
+            )
+            .join("")
+        : '<p class="muted">No completed tool nodes found yet.</p>'}
+    </div>
+  `;
+
+  const preview = neverUsed.slice(0, 14);
+  toolUsageNeverUsed.innerHTML = `
+    <h4>Never Completed Tools</h4>
+    ${preview.length
+      ? `<div class="table-scroll compact-table">
+          <table>
+            <thead>
+              <tr>
+                <th>Tool</th>
+                <th>Category</th>
+                <th>Role</th>
+                <th>Why likely unused</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${preview
+                .map(
+                  (row) => `
+                    <tr>
+                      <td><strong>${escapeHtml(row.tool_name || "tool")}</strong></td>
+                      <td>${escapeHtml(row.category || "Other")}</td>
+                      <td>${escapeHtml(row.role || "question-specific")}</td>
+                      <td>${escapeHtml(row.reason || "No historical completed node found.")}</td>
+                    </tr>
+                  `
+                )
+                .join("")}
+            </tbody>
+          </table>
+        </div>
+        ${neverUsed.length > preview.length ? `<p class="muted">Showing ${formatCount(preview.length)} of ${formatCount(neverUsed.length)} never-completed registered tools.</p>` : ""}`
+      : '<p class="muted">Every registered tool has at least one completed historical node.</p>'}
   `;
 }
 
@@ -1325,22 +1497,6 @@ function buildPrintableReportHtml(manifest) {
       </section>
 
       <section>
-        <h2>Selected Documents</h2>
-        ${reportTable(
-          ["Doc", "Outlet", "Date", "Score", "Snippet"],
-          manifest.selected_docs || [],
-          (row) => [
-            row.doc_id || "",
-            row.outlet || row.source || row.source_domain || "",
-            row.published_at || row.date || row.year || "",
-            formatScore(row.score_display ?? row.score ?? ""),
-            row.snippet || row.text || row.body || row.title || "",
-          ],
-          "No selected documents"
-        )}
-      </section>
-
-      <section>
         <h2>Raw LLM Outputs</h2>
         ${llmTraceBlocks || '<p class="muted">No LLM traces recorded.</p>'}
       </section>
@@ -1436,7 +1592,7 @@ function closePlotModal() {
 
 function renderEvidence(rows) {
   if (!rows || rows.length === 0) {
-    evidenceTable.innerHTML = '<p class="muted">No evidence rows returned yet. Retrieved support documents will still appear below.</p>';
+    evidenceTable.innerHTML = '<p class="muted">No evidence rows returned yet.</p>';
     return;
   }
   evidenceTable.innerHTML = `
@@ -1483,7 +1639,6 @@ function resetManifestPanels(answerMessage = "Waiting for result...") {
     claim_verdicts: [],
   });
   renderEvidence([]);
-  renderSelectedDocs([]);
   renderArtifacts({ run_id: "", node_records: [], final_answer: { artifacts_used: [] } });
   renderPlannerActions([]);
   renderPlanNodes([]);
@@ -1510,6 +1665,7 @@ function clarificationHistoryEntry(question, response) {
 function resetClarificationState() {
   pendingClarificationQuestion = "";
   clarificationHistory = [];
+  clarificationBaseQuestion = "";
   clarificationInput.value = "";
   renderClarificationState();
 }
@@ -1522,6 +1678,8 @@ function clearRestoredRunState() {
   currentManifestSavedPath = "";
   latestManifest = null;
   pendingClarificationQuestion = "";
+  clarificationBaseQuestion = "";
+  clarificationHistory = [];
   saveUiState();
   renderClarificationState();
   updateRunTotalTimeDisplay();
@@ -1736,28 +1894,6 @@ function renderToolCalls(rows) {
   renderToolCatalog();
 }
 
-function renderSelectedDocs(rows) {
-  const blocks = (rows || []).map((row) => {
-    const previewSource = row.snippet || row.text || row.body || row.title || "";
-    const preview = String(previewSource).slice(0, 260);
-      return `
-        <div class="trace-head">
-          <span class="pill subtle">${escapeHtml(row.doc_id || "doc")}</span>
-          <strong>${escapeHtml(row.outlet || row.source || row.source_domain || "")}</strong>
-        </div>
-        <p><strong>Date:</strong> ${escapeHtml(row.published_at || row.date || row.year || "")}</p>
-        <p><strong>Score:</strong> ${escapeHtml(formatScore(row.score_display ?? row.score ?? ""))}</p>
-        ${
-          row.score_components
-            ? `<details><summary>Score components</summary><pre>${formatJson(row.score_components)}</pre></details>`
-            : ""
-        }
-        <p class="selected-doc-snippet">${escapeHtml(preview)}</p>
-      `;
-    });
-  renderStackPanel(selectedDocs, blocks, "Retrieved support documents will appear here.");
-}
-
 function renderArtifacts(manifest) {
   const artifacts = collectArtifacts(manifest);
   const runId = manifest.run_id;
@@ -1795,19 +1931,26 @@ function renderArtifacts(manifest) {
 
 function renderAnswerPayload(finalAnswer) {
   answerText.textContent = finalAnswer?.answer_text || "No answer text returned.";
+  const verdicts = finalAnswer?.claim_verdicts || [];
+  if (!verdicts.length) {
+    claimVerdicts.innerHTML = '<p class="muted">Claim verdicts will appear when verification outputs are available.</p>';
+  } else {
+    claimVerdicts.innerHTML = verdicts
+      .map((row) => {
+        const verdict = String(row.verdict || row.label || "claim").trim() || "claim";
+        const safeClass = verdict.toLowerCase().replace(/[^a-z0-9_-]/g, "-");
+        return `
+          <article class="claim-card claim-card-${safeClass}">
+            <span class="claim-verdict-pill">${escapeHtml(verdict)}</span>
+            <p class="claim-text">${escapeHtml(row.claim || "")}</p>
+            ${row.evidence ? `<p class="claim-evidence">${escapeHtml(row.evidence)}</p>` : ""}
+          </article>
+        `;
+      })
+      .join("");
+  }
   renderList(caveatsList, finalAnswer?.caveats || [], (row) => escapeHtml(row));
   renderList(unsupportedList, finalAnswer?.unsupported_parts || [], (row) => escapeHtml(row));
-
-  const verdictBlocks = (finalAnswer?.claim_verdicts || []).map(
-    (row) => `
-      <div class="trace-head">
-        <span class="pill subtle">${escapeHtml(row.verdict || row.label || "claim")}</span>
-        <strong>${escapeHtml(row.claim || "")}</strong>
-      </div>
-      ${row.evidence ? `<p>${escapeHtml(row.evidence)}</p>` : ""}
-    `
-  );
-  renderStackPanel(claimVerdicts, verdictBlocks, "Claim verdicts will appear when verification outputs are available.");
 }
 
 function renderManifest(manifest) {
@@ -1816,7 +1959,6 @@ function renderManifest(manifest) {
   updateRunSaveDisplay();
   renderAnswerPayload(manifest.final_answer || {});
   renderEvidence(manifest.evidence_table || manifest.final_answer?.evidence_items || []);
-  renderSelectedDocs(manifest.selected_docs || []);
   renderArtifacts(manifest);
   renderPlannerActions(manifest.planner_actions || []);
   renderPlanNodes(manifest.plan_dags || []);
@@ -1869,7 +2011,11 @@ function setStatus(payload) {
         : [];
   statusBox.textContent = status;
   statusBox.className = `status ${status}`;
-  detailText.textContent = payload.detail || payload.current_phase || "No detail available.";
+  detailText.textContent = isTerminalStatus(status)
+    ? payload.detail || "Run finished."
+    : payload.run_id
+      ? "Run is in progress. Current work is listed under Active Steps."
+      : payload.detail || payload.current_phase || "No detail available.";
   activeCount.textContent = String(derivedActiveSteps.length);
   completedCount.textContent = String((payload.completed_steps || []).length);
   failedCount.textContent = String((payload.failed_steps || []).length);
@@ -1892,8 +2038,12 @@ function setStatus(payload) {
   const clarificationQuestions = payload.clarification_questions || [];
   if (status === "needs_clarification" && clarificationQuestions.length > 0) {
     pendingClarificationQuestion = clarificationQuestions[0];
+    clarificationBaseQuestion = questionInput.value;
   } else if (status !== "needs_clarification") {
     pendingClarificationQuestion = "";
+    if (!clarificationHistory.length) {
+      clarificationBaseQuestion = "";
+    }
   }
   renderClarificationState();
   updateControlState();
@@ -1943,6 +2093,28 @@ async function fetchManifestWithRetry(base, runId, attempts = MANIFEST_FETCH_MAX
   throw lastError || new Error("Manifest fetch failed.");
 }
 
+async function loadToolUsageSummary() {
+  const base = apiBaseInput.value.replace(/\/$/, "");
+  if (toolUsageSummary) {
+    toolUsageSummary.innerHTML = '<p class="muted">Loading historical tool usage...</p>';
+  }
+  try {
+    const payload = await fetchJson(`${base}/tool-usage`);
+    renderToolUsageSummary(payload);
+  } catch (error) {
+    latestToolUsageSummary = null;
+    if (toolUsageSummary) {
+      toolUsageSummary.innerHTML = `<p class="muted">Could not load historical tool usage: ${escapeHtml(error.message)}</p>`;
+    }
+    if (toolUsagePlot) {
+      toolUsagePlot.innerHTML = "";
+    }
+    if (toolUsageNeverUsed) {
+      toolUsageNeverUsed.innerHTML = "";
+    }
+  }
+}
+
 async function loadRuntimeInfo() {
   const base = apiBaseInput.value.replace(/\/$/, "");
   try {
@@ -1961,6 +2133,7 @@ async function loadRuntimeInfo() {
     toolCatalogSummary.textContent = "Tool catalog unavailable";
     toolCatalog.innerHTML = `<p class="muted">Could not load backend tool catalog: ${escapeHtml(error.message)}</p>`;
   }
+  await loadToolUsageSummary();
 }
 
 async function applyLlmSettings() {
@@ -2066,6 +2239,10 @@ async function submitQuery({ preserveClarificationHistory = false } = {}) {
   if (!preserveClarificationHistory) {
     resetClarificationState();
   } else {
+    if (!clarificationMatchesCurrentQuestion()) {
+      resetClarificationState();
+      preserveClarificationHistory = false;
+    }
     pendingClarificationQuestion = "";
     renderClarificationState();
     saveUiState();
@@ -2095,7 +2272,7 @@ async function submitQuery({ preserveClarificationHistory = false } = {}) {
         question: questionInput.value,
         force_answer: forceAnswerInput.checked,
         no_cache: noCacheInput.checked,
-        clarification_history: clarificationHistory,
+        clarification_history: preserveClarificationHistory ? clarificationHistory : [],
       }),
     });
     if (pollSessionId !== activePollSessionId) {
@@ -2168,6 +2345,7 @@ async function pollRun(runId, pollSessionId = activePollSessionId) {
           detailText.textContent = `${detailText.textContent} Total executor step time: ${totalDuration}.`;
         }
       }
+      void loadToolUsageSummary();
     }
   } catch (error) {
     if (pollSessionId !== activePollSessionId) {
@@ -2293,6 +2471,12 @@ plotModal.addEventListener("click", (event) => {
 window.addEventListener("keydown", (event) => {
   if (event.key === "Escape" && !plotModal.classList.contains("hidden")) {
     closePlotModal();
+  }
+});
+
+questionInput.addEventListener("input", () => {
+  if (clarificationBaseQuestion && !clarificationMatchesCurrentQuestion()) {
+    resetClarificationState();
   }
 });
 
