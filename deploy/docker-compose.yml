@@ -4,7 +4,8 @@ services:
       context: ..
       dockerfile: deploy/Dockerfile
       args:
-        CORPUSAGENT2_DOCKER_DOWNLOAD_PROVIDER_ASSETS: ${CORPUSAGENT2_DOCKER_DOWNLOAD_PROVIDER_ASSETS:-true}
+        CORPUSAGENT2_DOCKER_INSTALL_NLP_PROVIDERS: ${CORPUSAGENT2_DOCKER_INSTALL_NLP_PROVIDERS:-false}
+        CORPUSAGENT2_DOCKER_DOWNLOAD_PROVIDER_ASSETS: ${CORPUSAGENT2_DOCKER_DOWNLOAD_PROVIDER_ASSETS:-false}
     image: corpusagent2-runtime:latest
     container_name: corpusagent2_api
     restart: unless-stopped
@@ -57,8 +58,6 @@ services:
       - "127.0.0.1:5432:5432"
     volumes:
       - ${CORPUSAGENT2_DOCKER_DATA_DIR:-./data}/pgdata:/var/lib/postgresql/data
-    cpus: "${CORPUSAGENT2_POSTGRES_CPUS:-1}"
-    mem_limit: "${CORPUSAGENT2_POSTGRES_MEM_LIMIT:-2g}"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U corpus -d corpus_db"]
       interval: 10s
@@ -71,15 +70,13 @@ services:
     restart: unless-stopped
     environment:
       discovery.type: single-node
-      OPENSEARCH_JAVA_OPTS: ${CORPUSAGENT2_OPENSEARCH_JAVA_OPTS:--Xms1g -Xmx1g}
+      OPENSEARCH_JAVA_OPTS: -Xms1g -Xmx1g
       OPENSEARCH_INITIAL_ADMIN_PASSWORD: ${CORPUSAGENT2_OPENSEARCH_PASSWORD:-VerySecurePassword123!}
     ports:
       - "127.0.0.1:9200:9200"
       - "127.0.0.1:9600:9600"
     volumes:
       - ${CORPUSAGENT2_DOCKER_DATA_DIR:-./data}/osdata:/usr/share/opensearch/data
-    cpus: "${CORPUSAGENT2_OPENSEARCH_CPUS:-1}"
-    mem_limit: "${CORPUSAGENT2_OPENSEARCH_MEM_LIMIT:-3g}"
     ulimits:
       memlock:
         soft: -1

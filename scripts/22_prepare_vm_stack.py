@@ -642,7 +642,7 @@ def _ensure_docker_services(*, with_dashboards: bool) -> None:
     services = ["postgres", "opensearch"]
     if with_dashboards:
         services.append("opensearch-dashboards")
-    command = compose_command + ["-f", str(COMPOSE_FILE), "up", "-d", *services]
+    command = compose_command + ["-f", str(COMPOSE_FILE), "up", "-d", "--no-recreate", *services]
     _run(command, cwd=REPO_ROOT, env=env)
     pg_host, pg_port = _pg_host_port()
     os_host, os_port = _opensearch_host_port()
