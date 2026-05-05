@@ -3,7 +3,8 @@ FROM python:3.11-slim-bookworm
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     UV_LINK_MODE=copy \
-    CORPUSAGENT2_PROJECT_ROOT=/app
+    CORPUSAGENT2_PROJECT_ROOT=/app \
+    PYTHONPATH=/app/src
 
 WORKDIR /app
 
@@ -15,13 +16,30 @@ COPY --from=ghcr.io/astral-sh/uv:0.11.7 /uv /usr/local/bin/uv
 COPY --from=docker:27-cli /usr/local/bin/docker /usr/local/bin/docker
 
 COPY pyproject.toml uv.lock README.md ./
+COPY deploy/requirements.docker-cpu.txt ./deploy/requirements.docker-cpu.txt
+COPY deploy/requirements.docker-nlp-providers.txt ./deploy/requirements.docker-nlp-providers.txt
 COPY scripts/17_download_provider_assets.py ./scripts/17_download_provider_assets.py
 
+ARG CORPUSAGENT2_DOCKER_TORCH_PROFILE=cpu
 ARG CORPUSAGENT2_DOCKER_INSTALL_NLP_PROVIDERS=false
-RUN if [ "$CORPUSAGENT2_DOCKER_INSTALL_NLP_PROVIDERS" = "true" ]; then \
-      uv sync --frozen --extra nlp-providers --no-install-project; \
+RUN if [ "$CORPUSAGENT2_DOCKER_TORCH_PROFILE" = "cuda" ]; then \
+      if [ "$CORPUSAGENT2_DOCKER_INSTALL_NLP_PROVIDERS" = "true" ]; then \
+        uv sync --frozen --extra nlp-providers --no-install-project; \
+      else \
+        uv sync --frozen --no-install-project; \
+      fi; \
     else \
-      uv sync --frozen --no-install-project; \
+      uv venv; \
+      uv pip install \
+        --index-url https://pypi.org/simple \
+        --extra-index-url https://download.pytorch.org/whl/cpu \
+        -r deploy/requirements.docker-cpu.txt; \
+      if [ "$CORPUSAGENT2_DOCKER_INSTALL_NLP_PROVIDERS" = "true" ]; then \
+        uv pip install \
+          --index-url https://pypi.org/simple \
+          --extra-index-url https://download.pytorch.org/whl/cpu \
+          -r deploy/requirements.docker-nlp-providers.txt; \
+      fi; \
     fi
 
 ARG CORPUSAGENT2_DOCKER_DOWNLOAD_PROVIDER_ASSETS=false
@@ -33,10 +51,12 @@ COPY config ./config
 COPY scripts ./scripts
 COPY src ./src
 
-RUN if [ "$CORPUSAGENT2_DOCKER_INSTALL_NLP_PROVIDERS" = "true" ]; then \
-      uv sync --frozen --extra nlp-providers --inexact; \
-    else \
-      uv sync --frozen --inexact; \
+RUN if [ "$CORPUSAGENT2_DOCKER_TORCH_PROFILE" = "cuda" ]; then \
+      if [ "$CORPUSAGENT2_DOCKER_INSTALL_NLP_PROVIDERS" = "true" ]; then \
+        uv sync --frozen --extra nlp-providers --inexact; \
+      else \
+        uv sync --frozen --inexact; \
+      fi; \
     fi
 
 ENV PATH="/app/.venv/bin:${PATH}"
