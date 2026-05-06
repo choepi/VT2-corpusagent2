@@ -143,7 +143,7 @@ def _docker_compose_command() -> list[str]:
 
 def _compose_file_args(*, with_mcp: bool = False, use_gpu: bool = False) -> list[str]:
     args = ["-f", str(COMPOSE_FILE)]
-    if with_mcp:
+    if with_mcp or use_gpu:
         args.extend(["-f", str(MCP_COMPOSE_FILE)])
     if use_gpu:
         args.extend(["-f", str(GPU_COMPOSE_FILE)])
@@ -925,7 +925,9 @@ def main(argv: Iterable[str] | None = None) -> None:
     print("VM stack preparation complete.")
     print(f"Total time: {_format_duration(elapsed_s)}")
     print(f"Summary: {summary_path}")
-    print(f"Backend start: docker compose -f {COMPOSE_FILE} up -d corpusagent2-api")
+    print(f"Backend start: cd {DEPLOY_ROOT}")
+    print("  docker compose -f docker-compose.yml -f docker-compose.mcp.yml up -d --no-recreate postgres opensearch")
+    print("  docker compose -f docker-compose.yml -f docker-compose.mcp.yml up -d --build --no-deps corpusagent2-api corpusagent2-mcp")
     print(f"Frontend config: {REPO_ROOT / 'web' / 'config.js'}")
     print(
         f"Cloudflared helper: {python_exe} {REPO_ROOT / 'scripts' / '23_start_cloudflared_tunnel.py'}"
@@ -933,7 +935,7 @@ def main(argv: Iterable[str] | None = None) -> None:
     if args.start_api and not args.skip_docker:
         print("")
         print("[run] starting Dockerized API backend")
-        _ensure_api_service(build=True, use_gpu=False)
+        _ensure_api_service(build=True, use_gpu=resource_plan.use_gpu)
     elif args.start_api:
         print("[skip] --start-api ignored because --skip-docker was set.")
 

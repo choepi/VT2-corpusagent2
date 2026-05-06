@@ -713,6 +713,31 @@ def test_planner_query_repair_compacts_overconstrained_comparative_entity_query(
     assert repaired == "Ronaldo Messi value"
 
 
+def test_planner_query_repair_recovers_company_coverage_from_malformed_source_filter(tmp_path: Path) -> None:
+    runtime = build_test_runtime(
+        tmp_path=tmp_path,
+        documents=_sample_documents(),
+        search_rows_by_query=_search_rows(_sample_documents()),
+    )
+    orchestrator = runtime.orchestrator
+    question = (
+        "How did news coverage of Tesla change between 2016 and 2021, "
+        "and how did major coverage peaks compare with Tesla's stock performance?"
+    )
+    fallback = orchestrator._compact_query_terms(question, orchestrator._query_anchor_terms(question))
+    repaired = orchestrator._apply_source_scope_to_query(
+        orchestrator._repair_search_query(
+            '(\" \" OR \" Inc\" OR \" Motors\") AND source:(\"with Tesla s stock performance How did\")',
+            fallback,
+        ),
+        question,
+    )
+
+    assert fallback == "Tesla"
+    assert repaired == "Tesla"
+    assert "source:" not in repaired
+
+
 def test_search_inputs_do_not_invent_swiss_newspaper_source_aliases(tmp_path: Path) -> None:
     runtime = build_test_runtime(
         tmp_path=tmp_path,

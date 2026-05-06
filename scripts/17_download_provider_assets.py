@@ -12,6 +12,17 @@ def _run(command: list[str]) -> None:
 
 
 def _download_spacy_model(python_exe: str) -> None:
+    try:
+        import spacy
+    except Exception as exc:
+        print(f"[skip] spacy unavailable: {exc}")
+        return
+    try:
+        spacy.load("en_core_web_sm")
+        print("[ready] spacy model en_core_web_sm already available.")
+        return
+    except OSError:
+        pass
     _run([python_exe, "-m", "spacy", "download", "en_core_web_sm"])
 
 

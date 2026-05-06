@@ -91,7 +91,11 @@ def test_dockerized_api_and_mcp_share_runtime_image_and_sandbox_mounts() -> None
     assert "ARG CORPUSAGENT2_DOCKER_DOWNLOAD_PROVIDER_ASSETS=false" in dockerfile_text
     assert "deploy/requirements.docker-cpu.txt" in dockerfile_text
     assert "deploy/requirements.docker-nlp-providers.txt" in dockerfile_text
+    assert "RUN set -eu;" in dockerfile_text
+    assert "--torch-backend cpu" in dockerfile_text
+    assert "--index-strategy unsafe-best-match" in dockerfile_text
     assert "https://download.pytorch.org/whl/cpu" in dockerfile_text
+    assert "Unsupported CORPUSAGENT2_DOCKER_TORCH_PROFILE" in dockerfile_text
     assert "PYTHONPATH=/app/src" in dockerfile_text
     assert "CMD [\"python\", \"/app/scripts/12_run_agent_api.py\"]" in dockerfile_text
     assert "image: corpusagent2-runtime:latest" in base_compose
@@ -120,6 +124,7 @@ def test_docker_cpu_requirements_use_cpu_torch_and_real_provider_stack() -> None
     assert "torchvision==0.18.1+cpu" in cpu_requirements
     assert "torchaudio==2.3.1+cpu" in cpu_requirements
     assert "cu118" not in cpu_requirements
+    assert "cu118" not in provider_requirements
     assert "sentence-transformers" in cpu_requirements
     assert "bertopic" in cpu_requirements
     assert "flair" in provider_requirements
@@ -149,3 +154,17 @@ def test_vm_services_are_docker_stack_first() -> None:
     assert "up -d --build --no-deps corpusagent2-api corpusagent2-mcp" in configure_script
     assert "down --remove-orphans" not in configure_script
     assert "scripts' / '12_run_agent_api.py" not in configure_script
+
+
+def test_vm_bootstrap_guidance_does_not_recreate_data_services() -> None:
+    project_root = Path(__file__).resolve().parents[1]
+    bootstrap_script = (project_root / "scripts" / "bootstrap_ubuntu_vm.sh").read_text(encoding="utf-8")
+    prepare_script = (project_root / "scripts" / "22_prepare_vm_stack.py").read_text(encoding="utf-8")
+
+    assert "up -d --no-recreate postgres opensearch" in bootstrap_script
+    assert "up -d --build --no-deps corpusagent2-api corpusagent2-mcp" in bootstrap_script
+    assert "up -d corpusagent2-api" not in bootstrap_script
+    assert "up -d --no-recreate postgres opensearch" in prepare_script
+    assert "up -d --build --no-deps corpusagent2-api corpusagent2-mcp" in prepare_script
+    assert "_ensure_api_service(build=True, use_gpu=resource_plan.use_gpu)" in prepare_script
+    assert "docker compose -f {COMPOSE_FILE} up -d corpusagent2-api" not in prepare_script
