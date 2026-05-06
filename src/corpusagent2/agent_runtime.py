@@ -1667,6 +1667,9 @@ class MagicBoxOrchestrator:
             "relation", "relations", "pattern", "patterns", "trend", "trends",
             "toward", "towards",
         } | temporal_scope_terms
+        coverage_entity = self._coverage_entity_query(text)
+        if coverage_entity:
+            return coverage_entity
         for term in preferred_terms:
             if term.lower() in blocked_source_tokens or term.lower() in preferred_stopwords:
                 continue
@@ -1696,6 +1699,55 @@ class MagicBoxOrchestrator:
         filtered = [token for token in tokens if token.lower() not in stopwords and token.lower() not in blocked_source_tokens]
         compact = " ".join(filtered[:8]).strip()
         return self._expand_topic_query(compact, text) or compact
+
+    def _coverage_entity_query(self, text: str) -> str:
+        value = str(text or "").strip()
+        if not value:
+            return ""
+        patterns = (
+            r"\bcoverage\s+of\s+(?P<entity>[A-Z][A-Za-z0-9&.'-]*(?:\s+[A-Z][A-Za-z0-9&.'-]*){0,3})\b",
+            r"\b(?P<entity>[A-Z][A-Za-z0-9&.'-]*(?:\s+[A-Z][A-Za-z0-9&.'-]*){0,3})\s+coverage\b",
+        )
+        trailing_stop = re.compile(
+            r"\b(?:change|changed|changes|changing|shift|shifted|evolve|evolved|between|from|with|and|compare|compared|peaks?|stock|performance)\b",
+            flags=re.IGNORECASE,
+        )
+        blocked = {
+            "How",
+            "What",
+            "Which",
+            "When",
+            "Where",
+            "Why",
+            "News",
+            "Media",
+            "Major",
+        }
+        for pattern in patterns:
+            match = re.search(pattern, value)
+            if not match:
+                continue
+            raw_entity = str(match.group("entity") or "").strip(" ,.;:!?()[]{}")
+            if not raw_entity:
+                continue
+            stop_match = trailing_stop.search(raw_entity)
+            if stop_match:
+                raw_entity = raw_entity[: stop_match.start()].strip()
+            tokens = [
+                token.strip(" ,.;:!?()[]{}")
+                for token in raw_entity.split()
+                if token.strip(" ,.;:!?()[]{}")
+            ]
+            while tokens and tokens[0] in blocked:
+                tokens = tokens[1:]
+            while tokens and tokens[-1] in blocked:
+                tokens = tokens[:-1]
+            if not tokens:
+                continue
+            entity = " ".join(tokens).strip()
+            if entity and any(char.isalpha() for char in entity):
+                return entity
+        return ""
 
     def _expand_topic_query(self, query_text: str, question_text: str) -> str:
         combined = f"{query_text} {question_text}".lower()
@@ -1792,6 +1844,46 @@ class MagicBoxOrchestrator:
                 return True
         return False
 
+    def _query_is_hollow_after_filter_removal(self, planned_query: str, fallback_query: str) -> bool:
+        planned_tokens = [
+            token.lower()
+            for token in re.findall(r"[A-Za-z][A-Za-z0-9]+", planned_query)
+        ]
+        fallback_tokens = [
+            token.lower()
+            for token in re.findall(r"[A-Za-z][A-Za-z0-9]+", fallback_query)
+        ]
+        if not fallback_tokens:
+            return False
+        hollow_tokens = {
+            "and",
+            "co",
+            "company",
+            "corp",
+            "corporation",
+            "gmbh",
+            "inc",
+            "limited",
+            "llc",
+            "ltd",
+            "motors",
+            "or",
+            "plc",
+            "sa",
+            "se",
+            "source",
+            "the",
+        }
+        meaningful_tokens = [
+            token for token in planned_tokens
+            if token not in hollow_tokens and len(token) > 1
+        ]
+        if not meaningful_tokens:
+            return bool(planned_tokens)
+        if len(meaningful_tokens) <= 1 and len(fallback_tokens) >= 2:
+            return not bool(set(meaningful_tokens) & set(fallback_tokens))
+        return False
+
     def _compact_comparison_entity_query(self, query_text: str) -> str:
         text = str(query_text or "").strip()
         lowered = text.lower()
@@ -1836,12 +1928,16 @@ class MagicBoxOrchestrator:
         fallback = str(fallback_query or "").strip()
         if not planned:
             return fallback
-        compacted_comparison = self._compact_comparison_entity_query(planned)
+        planned_without_source_filters = self._remove_source_field_filters(planned)
+        repair_candidate = planned_without_source_filters or planned
+        compacted_comparison = self._compact_comparison_entity_query(repair_candidate)
         if compacted_comparison:
             return compacted_comparison
-        if fallback and self._query_needs_topical_repair(planned, fallback):
+        if fallback and self._query_needs_topical_repair(repair_candidate, fallback):
             return fallback
-        return planned
+        if fallback and self._query_is_hollow_after_filter_removal(repair_candidate, fallback):
+            return fallback
+        return repair_candidate
 
     def _source_candidate_tokens(self, text: str) -> list[str]:
         return re.findall(r"[A-Za-z0-9]+(?:[._'-][A-Za-z0-9]+)*", str(text or ""))
