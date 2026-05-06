@@ -4363,14 +4363,33 @@ def _lexical_diversity(params: dict[str, Any], deps: dict[str, ToolExecutionResu
 
 
 def _extract_ngrams(params: dict[str, Any], deps: dict[str, ToolExecutionResult], context: AgentExecutionContext) -> ToolExecutionResult:
-    n = int(params.get("n", 2))
+    params = _payload_or_params(params)
+    raw_n = params.get("n", 2)
+    raw_values = raw_n if isinstance(raw_n, list) else [raw_n]
+    n_values: list[int] = []
+    for value in raw_values:
+        try:
+            n_value = int(value)
+        except (TypeError, ValueError):
+            continue
+        if n_value >= 1:
+            n_values.append(n_value)
+    if not n_values:
+        n_values = [2]
+    n_values = list(dict.fromkeys(n_values))[:4]
     counts: Counter = Counter()
     for doc in _doc_rows(deps):
         tokens = [token.lower() for token in _tokenize(_row_analysis_text(doc)) if token.lower() not in STOPWORDS]
-        for idx in range(len(tokens) - n + 1):
-            counts[" ".join(tokens[idx : idx + n])] += 1
+        for n in n_values:
+            for idx in range(len(tokens) - n + 1):
+                counts[(n, " ".join(tokens[idx : idx + n]))] += 1
     return ToolExecutionResult(
-        payload={"rows": [{"ngram": ngram, "count": int(count)} for ngram, count in counts.most_common(25)]}
+        payload={
+            "rows": [
+                {"n": int(n), "ngram": ngram, "count": int(count)}
+                for (n, ngram), count in counts.most_common(25)
+            ]
+        }
     )
 
 
@@ -5008,6 +5027,12 @@ def _time_series_rows_from_named_metrics(
         "type",
     ]
     date_field = str(params.get("date_field", params.get("time_field", params.get("datetime_field", ""))) or "")
+    fallback_timestamp = str(
+        params.get("fallback_time_bin")
+        or params.get("default_time_bin")
+        or params.get("fallback_date")
+        or ""
+    ).strip()
     values: defaultdict[tuple[str, str, str], list[float]] = defaultdict(list)
     doc_sets: defaultdict[tuple[str, str], set[str]] = defaultdict(set)
     period_doc_sets: defaultdict[str, set[str]] = defaultdict(set)
@@ -5030,6 +5055,8 @@ def _time_series_rows_from_named_metrics(
             skipped += 1
             continue
         timestamp = str(_first_nonempty_field(row, [date_field, "month", "period", "time_period", "date", "published_at", "time_bin"]))
+        if not timestamp.strip() and fallback_timestamp:
+            timestamp = fallback_timestamp
         time_bin = _time_bin(timestamp, granularity)
         key = (entity, time_bin)
         row_counts[key] += 1
@@ -5171,6 +5198,12 @@ def _time_series_aggregate(params: dict[str, Any], deps: dict[str, ToolExecution
     fallback_group = str(params.get("fallback_group_by", params.get("fallback_series_key", "")) or "")
     group_candidates.extend([fallback_group, "series_name", "target_entity", "entity_label", "canonical_entity", "linked_entity", "actor", "attributed_actor", "entity_text", "entity", "label", "term"])
     date_field = str(params.get("date_field", params.get("time_field", params.get("datetime_field", ""))) or "")
+    fallback_timestamp = str(
+        params.get("fallback_time_bin")
+        or params.get("default_time_bin")
+        or params.get("fallback_date")
+        or ""
+    ).strip()
     value_field = str(params.get("value_field", params.get("metric", "")) or "")
     metric_rows = params.get("metrics")
     if isinstance(metric_rows, list) and metric_rows:
@@ -5209,6 +5242,8 @@ def _time_series_aggregate(params: dict[str, Any], deps: dict[str, ToolExecution
             skipped_rows += 1
             continue
         timestamp = str(_first_nonempty_field(row, [date_field, "month", "period", "time_period", "date", "published_at", "time_bin"]))
+        if not timestamp.strip() and fallback_timestamp:
+            timestamp = fallback_timestamp
         time_bin = _time_bin(timestamp, granularity)
         value = row.get(value_field) if value_field else None
         if value in (None, ""):
@@ -6524,6 +6559,7 @@ def _align_external_series_join_key(
 def _join_external_series(params: dict[str, Any], deps: dict[str, ToolExecutionResult], context: AgentExecutionContext) -> ToolExecutionResult:
     params = _merged_payload_params(params)
     external_spec = params.get("external_series") if isinstance(params.get("external_series"), dict) else {}
+    date_range = params.get("date_range") if isinstance(params.get("date_range"), dict) else {}
     external_rows = list(params.get("series_rows") or external_spec.get("series_rows") or external_spec.get("rows") or [])
     ticker = str(
         params.get("ticker")
@@ -6537,6 +6573,8 @@ def _join_external_series(params: dict[str, Any], deps: dict[str, ToolExecutionR
     start = str(
         params.get("start")
         or params.get("date_from")
+        or date_range.get("start")
+        or date_range.get("date_from")
         or external_spec.get("start")
         or external_spec.get("start_date")
         or ""
@@ -6544,6 +6582,8 @@ def _join_external_series(params: dict[str, Any], deps: dict[str, ToolExecutionR
     end = str(
         params.get("end")
         or params.get("date_to")
+        or date_range.get("end")
+        or date_range.get("date_to")
         or external_spec.get("end")
         or external_spec.get("end_date")
         or ""

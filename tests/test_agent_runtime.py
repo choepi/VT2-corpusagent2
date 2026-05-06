@@ -895,6 +895,125 @@ def test_source_comparison_heuristic_groups_keyterms_by_outlet(tmp_path: Path) -
     assert plot_node.inputs["series"] == "outlet"
 
 
+def test_semantic_wording_question_forces_embeddings_similarity_and_acronyms(tmp_path: Path) -> None:
+    docs = _sample_documents()
+    runtime = build_test_runtime(tmp_path=tmp_path, documents=docs, search_rows_by_query=_search_rows(docs))
+    question = (
+        "How did English-language media describe US monetary policy problems between 2016 and 2021 "
+        "when they did not use the same exact wording, and which recurring terms or abbreviations "
+        "connected those descriptions over time?"
+    )
+    boring_dag = AgentPlanDAG(
+        nodes=[
+            AgentPlanNode("search", "db_search", inputs={"query": "monetary policy", "top_k": 10}),
+            AgentPlanNode("fetch", "fetch_documents", depends_on=["search"]),
+            AgentPlanNode("topics", "topic_model", depends_on=["fetch"]),
+            AgentPlanNode("sentiment", "sentiment", depends_on=["fetch"]),
+        ],
+        metadata={"question_family": "generic"},
+    )
+
+    normalized = runtime.orchestrator._normalize_plan_dag(boring_dag, question_text=question)
+    capabilities = {node.capability for node in normalized.nodes}
+
+    assert {
+        "doc_embeddings",
+        "similarity_index",
+        "similarity_pairwise",
+        "word_embeddings",
+        "extract_acronyms",
+        "extract_keyterms",
+        "entity_link",
+        "time_series_aggregate",
+        "change_point_detect",
+        "plot_artifact",
+        "build_evidence_table",
+    }.issubset(capabilities)
+    search_node = next(node for node in normalized.nodes if node.capability == "db_search")
+    assert search_node.inputs["retrieval_strategy"] == "semantic_exploratory"
+    assert search_node.inputs["retrieval_mode"] == "dense"
+    assert normalized.metadata["question_family"] == "semantic_similarity_terms"
+
+
+def test_syntax_role_question_forces_dependency_svo_preprocessing_and_quotes(tmp_path: Path) -> None:
+    docs = _sample_documents()
+    runtime = build_test_runtime(tmp_path=tmp_path, documents=docs, search_rows_by_query=_search_rows(docs))
+    question = (
+        "In 2020 US protest coverage, who was most often described as acting, who was acted upon, "
+        "and how did those subject-verb-object patterns differ between police, protesters, politicians, and institutions?"
+    )
+    boring_dag = AgentPlanDAG(
+        nodes=[
+            AgentPlanNode("search", "db_search", inputs={"query": "US protest coverage", "top_k": 10}),
+            AgentPlanNode("fetch", "fetch_documents", depends_on=["search"]),
+            AgentPlanNode("topics", "topic_model", depends_on=["fetch"]),
+            AgentPlanNode("sentiment", "sentiment", depends_on=["fetch"]),
+        ],
+        metadata={"question_family": "generic"},
+    )
+
+    normalized = runtime.orchestrator._normalize_plan_dag(boring_dag, question_text=question)
+    capabilities = {node.capability for node in normalized.nodes}
+
+    assert {
+        "sentence_split",
+        "tokenize",
+        "pos_morph",
+        "lemmatize",
+        "dependency_parse",
+        "extract_svo_triples",
+        "noun_chunks",
+        "ner",
+        "entity_link",
+        "quote_extract",
+        "quote_attribute",
+        "build_evidence_table",
+        "plot_artifact",
+    }.issubset(capabilities)
+    assert normalized.metadata["question_family"] == "syntax_role_patterns"
+
+
+def test_attributed_price_explanation_question_forces_quotes_claims_and_external_series(tmp_path: Path) -> None:
+    docs = _sample_documents()
+    runtime = build_test_runtime(tmp_path=tmp_path, documents=docs, search_rows_by_query=_search_rows(docs))
+    question = (
+        "During the 2020 oil price crash and recovery, what explanations did US media give for the largest price movements, "
+        "and which explanations were directly attributed to named people or institutions?"
+    )
+    boring_dag = AgentPlanDAG(
+        nodes=[
+            AgentPlanNode("search", "db_search", inputs={"query": "oil price crash", "top_k": 10}),
+            AgentPlanNode("fetch", "fetch_documents", depends_on=["search"]),
+            AgentPlanNode("topics", "topic_model", depends_on=["fetch"]),
+            AgentPlanNode("sentiment", "sentiment", depends_on=["fetch"]),
+        ],
+        metadata={"question_family": "generic"},
+    )
+
+    normalized = runtime.orchestrator._normalize_plan_dag(boring_dag, question_text=question)
+    capabilities = {node.capability for node in normalized.nodes}
+
+    assert {
+        "join_external_series",
+        "time_series_aggregate",
+        "change_point_detect",
+        "burst_detect",
+        "extract_keyterms",
+        "quote_extract",
+        "quote_attribute",
+        "claim_span_extract",
+        "claim_strength_score",
+        "ner",
+        "entity_link",
+        "build_evidence_table",
+        "plot_artifact",
+    }.issubset(capabilities)
+    market_node = next(node for node in normalized.nodes if node.capability == "join_external_series")
+    assert market_node.inputs["ticker"] == "CL=F"
+    assert market_node.inputs["join_granularity"] == "month"
+    assert normalized.metadata["question_family"] == "attributed_explanation_series"
+
+
 def test_entity_trend_normalization_removes_unrequested_quote_branch(tmp_path: Path) -> None:
     runtime = build_test_runtime(
         tmp_path=tmp_path,
