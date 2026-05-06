@@ -532,6 +532,58 @@ def test_registered_tools_have_guaranteed_non_empty_smoke_cases(tmp_path: Path) 
     assert not failures, "\n".join(failures)
 
 
+def test_smoke_suite_verifies_weak_tool_families_with_structured_outputs(tmp_path: Path) -> None:
+    _, records, failures = _execute_smoke_suite(tmp_path)
+    assert not failures, "\n".join(failures)
+    by_tool = {record.tool_name: record for record in records}
+
+    semantic_tools = {
+        "doc_embeddings",
+        "similarity_index",
+        "similarity_pairwise",
+        "word_embeddings",
+        "extract_acronyms",
+    }
+    syntax_tools = {
+        "tokenize",
+        "sentence_split",
+        "lemmatize",
+        "pos_morph",
+        "dependency_parse",
+        "extract_svo_triples",
+        "noun_chunks",
+    }
+    attribution_tools = {
+        "quote_extract",
+        "quote_attribute",
+        "claim_span_extract",
+        "claim_strength_score",
+    }
+    for tool_name in sorted(semantic_tools | syntax_tools | attribution_tools):
+        record = by_tool[tool_name]
+        assert record.passed, record.failure_reason
+        assert record.items_count > 0
+
+    assert any(row.get("vector_preview") for row in by_tool["doc_embeddings"].output_payload["rows"])
+    assert any(row.get("vector_preview") for row in by_tool["word_embeddings"].output_payload["rows"])
+    assert any(float(row.get("score", 0.0)) for row in by_tool["similarity_index"].output_payload["rows"])
+    assert any(float(row.get("score", 0.0)) for row in by_tool["similarity_pairwise"].output_payload["rows"])
+    assert {row.get("acronym") for row in by_tool["extract_acronyms"].output_payload["rows"]} & {"NATO", "NASA", "WHO"}
+
+    assert any(row.get("tokens") for row in by_tool["tokenize"].output_payload["rows"])
+    assert any(row.get("sentences") for row in by_tool["sentence_split"].output_payload["rows"])
+    assert any(row.get("lemmas") for row in by_tool["lemmatize"].output_payload["rows"])
+    assert any(row.get("pos") and row.get("lemma") for row in by_tool["pos_morph"].output_payload["rows"])
+    assert any(row.get("dependencies") for row in by_tool["dependency_parse"].output_payload["rows"])
+    assert any(row.get("subject") and row.get("verb") and row.get("object") for row in by_tool["extract_svo_triples"].output_payload["rows"])
+    assert any(row.get("noun_chunks") for row in by_tool["noun_chunks"].output_payload["rows"])
+
+    assert any(row.get("quote") for row in by_tool["quote_extract"].output_payload["rows"])
+    assert any(row.get("speaker") for row in by_tool["quote_attribute"].output_payload["rows"])
+    assert any(row.get("claim_span") for row in by_tool["claim_span_extract"].output_payload["rows"])
+    assert any(row.get("claim_strength_score") for row in by_tool["claim_strength_score"].output_payload["rows"])
+
+
 if __name__ == "__main__":
     with TemporaryDirectory(prefix="ca2_smoke_report_") as temp_dir:
         _, records, failures = _execute_smoke_suite(Path(temp_dir))

@@ -380,14 +380,22 @@ class MagicBoxOrchestrator:
         "text_classify",
         "sentiment",
         "ner",
+        "tokenize",
+        "sentence_split",
         "pos_morph",
         "lemmatize",
+        "dependency_parse",
+        "extract_svo_triples",
+        "noun_chunks",
+        "extract_acronyms",
         "quote_extract",
         "quote_attribute",
         "claim_span_extract",
         "claim_strength_score",
         "build_evidence_table",
         "doc_embeddings",
+        "word_embeddings",
+        "similarity_index",
         "similarity_pairwise",
     }
 
@@ -662,19 +670,42 @@ class MagicBoxOrchestrator:
     def _question_requires_capability(question_text: str, capability: str) -> bool:
         lowered = str(question_text or "").lower()
         capability_terms = {
-            "build_evidence_table": ("evidence table", "noun distribution", "noun frequency", "distribution of nouns"),
-            "claim_span_extract": ("claim", "claims", "span"),
-            "claim_strength_score": ("claim", "claims", "verdict", "strength"),
+            "build_evidence_table": (
+                "evidence table",
+                "evidence",
+                "noun distribution",
+                "noun frequency",
+                "distribution of nouns",
+                "acted upon",
+                "who did what",
+                "directly attributed",
+                "attributed to",
+                "explanation",
+                "explanations",
+                "recurring terms",
+                "abbreviations",
+                "connected descriptions",
+            ),
+            "claim_span_extract": ("claim", "claims", "span", "explanation", "explanations", "reason", "reasons", "why"),
+            "claim_strength_score": ("claim", "claims", "verdict", "strength", "explanation", "explanations"),
+            "dependency_parse": ("dependency", "syntax", "grammatical", "subject", "verb", "object", "acted upon"),
+            "doc_embeddings": ("semantic", "semantically", "similar", "similarity", "related", "same exact wording", "different wording"),
+            "entity_link": ("entity link", "entity linking", "actor", "actors", "who", "named people", "institutions", "abbreviations"),
+            "extract_acronyms": ("acronym", "acronyms", "abbreviation", "abbreviations"),
             "extract_ngrams": ("ngram", "n-gram", "phrase distribution", "bigram", "trigram"),
-            "extract_keyterms": ("keyterm", "key term", "keywords", "dominant terms"),
+            "extract_keyterms": ("keyterm", "key term", "keywords", "dominant terms", "recurring terms", "explanation", "explanations"),
+            "extract_svo_triples": ("svo", "subject", "verb", "object", "who did what", "acted upon", "acting"),
             "join_external_series": ("stock", "drawdown", "market", "price", "oil", "equity", "ticker"),
-            "ner": ("named entities", "named entity", "actors", "actor", "entities"),
-            "noun_chunks": ("noun chunk", "noun phrase"),
-            "pos_morph": ("part of speech", "pos", "noun distribution", "nouns"),
-            "quote_attribute": ("quote", "quoted", "attribution"),
-            "quote_extract": ("quote", "quoted", "quotation"),
+            "ner": ("named entities", "named entity", "actors", "actor", "entities", "named people", "institutions"),
+            "noun_chunks": ("noun chunk", "noun phrase", "noun phrases", "syntax", "grammatical", "subject", "verb", "object", "acted upon"),
+            "pos_morph": ("part of speech", "pos", "noun distribution", "nouns", "syntax", "grammatical", "subject", "verb", "object", "acted upon"),
+            "quote_attribute": ("quote", "quoted", "attribution", "attributed", "directly attributed", "named people", "named institutions", "described as acting"),
+            "quote_extract": ("quote", "quoted", "quotation", "said", "according to", "directly attributed", "described as acting"),
             "sentiment": ("sentiment", "tone", "portrayal", "positive", "negative"),
+            "similarity_index": ("semantic", "semantically", "similar", "similarity", "related", "same exact wording", "different wording"),
+            "similarity_pairwise": ("semantic", "semantically", "similar", "similarity", "related", "same exact wording", "different wording"),
             "topic_model": ("topic", "topics", "framing", "frame", "frames"),
+            "word_embeddings": ("semantic", "semantically", "similar", "similarity", "related", "wording", "recurring terms", "terms"),
         }
         return any(term in lowered for term in capability_terms.get(capability, (capability.replace("_", " "),)))
 
@@ -864,22 +895,26 @@ class MagicBoxOrchestrator:
             existing_ids.add(node_id)
             return node_id
 
-        search_node_id = next((node.node_id for node in dag.nodes if node.capability in self._SEARCH_BACKBONE_CAPABILITIES), "")
-        fetch_node_id = next((node.node_id for node in dag.nodes if node.capability == "fetch_documents"), "")
-        requires_retrieval_backbone = any(
-            node.capability in self._DOC_RETRIEVAL_BACKBONE_CAPABILITIES
-            for node in dag.nodes
-        )
-        if requires_retrieval_backbone and not search_node_id:
-            search_node_id = unique_node_id("search")
-        if requires_retrieval_backbone and not fetch_node_id:
-            fetch_node_id = unique_node_id("fetch")
-
         dag_text = " ".join(
             part
             for part in [question_text, dag.metadata.get("question_family", "")]
             if part
         ).strip()
+        needs_semantic_similarity = self._needs_semantic_similarity_analysis(dag_text)
+        needs_syntax_roles = self._needs_syntax_role_analysis(dag_text)
+        needs_attributed_explanations = self._needs_attributed_explanation_analysis(dag_text)
+        needs_specialized_intent = needs_semantic_similarity or needs_syntax_roles or needs_attributed_explanations
+        search_node_id = next((node.node_id for node in dag.nodes if node.capability in self._SEARCH_BACKBONE_CAPABILITIES), "")
+        fetch_node_id = next((node.node_id for node in dag.nodes if node.capability == "fetch_documents"), "")
+        requires_retrieval_backbone = any(
+            node.capability in self._DOC_RETRIEVAL_BACKBONE_CAPABILITIES
+            for node in dag.nodes
+        ) or needs_semantic_similarity or needs_syntax_roles or needs_attributed_explanations
+        if requires_retrieval_backbone and not search_node_id:
+            search_node_id = unique_node_id("search")
+        if requires_retrieval_backbone and not fetch_node_id:
+            fetch_node_id = unique_node_id("fetch")
+
         query_text = ""
         if dag_text:
             query_text = self._compact_query_terms(dag_text, self._query_anchor_terms(dag_text)) or dag_text
@@ -887,12 +922,22 @@ class MagicBoxOrchestrator:
             dag_text,
             configured_mode=os.getenv("CORPUSAGENT2_DEFAULT_RETRIEVAL_MODE", "hybrid"),
         ).to_inputs()
+        if needs_semantic_similarity:
+            search_inputs["retrieval_strategy"] = "semantic_exploratory"
+            search_inputs["retrieval_mode"] = "dense"
+        if needs_syntax_roles or needs_attributed_explanations:
+            precision_search_inputs = infer_retrieval_budget(
+                dag_text,
+                inputs={"retrieval_strategy": "precision_ranked"},
+                configured_mode=os.getenv("CORPUSAGENT2_DEFAULT_RETRIEVAL_MODE", "hybrid"),
+            ).to_inputs()
+            search_inputs.update(precision_search_inputs)
         if query_text:
             repaired_query = self._repair_search_query(str(search_inputs.get("query", "")), query_text)
             search_inputs["query"] = self._apply_source_scope_to_query(repaired_query, dag_text)
         if requires_retrieval_backbone:
             search_inputs.update(self._extract_date_window(dag_text))
-        if self._needs_source_comparison_analysis(dag_text):
+        if self._needs_source_comparison_analysis(dag_text) and not needs_specialized_intent:
             search_inputs["retrieval_strategy"] = "exhaustive_analytic"
             search_inputs["retrieve_all"] = True
             search_inputs["top_k"] = 0
@@ -941,15 +986,40 @@ class MagicBoxOrchestrator:
                     if planned_date_to.startswith(inferred_year):
                         normalized_search_inputs.pop("date_to", None)
                 if query_text:
-                    repaired_query = self._repair_search_query(
-                        str(normalized_search_inputs.get("query", "")),
-                        query_text,
-                    )
-                    normalized_search_inputs["query"] = self._apply_source_scope_to_query(repaired_query, dag_text)
-                if self._needs_source_comparison_analysis(dag_text):
+                    if needs_specialized_intent:
+                        normalized_search_inputs["query"] = self._apply_source_scope_to_query(query_text, dag_text)
+                    else:
+                        repaired_query = self._repair_search_query(
+                            str(normalized_search_inputs.get("query", "")),
+                            query_text,
+                        )
+                        normalized_search_inputs["query"] = self._apply_source_scope_to_query(repaired_query, dag_text)
+                if self._needs_source_comparison_analysis(dag_text) and not needs_specialized_intent:
                     normalized_search_inputs["retrieval_strategy"] = "exhaustive_analytic"
                     normalized_search_inputs["retrieve_all"] = True
                     normalized_search_inputs["top_k"] = 0
+                if needs_semantic_similarity:
+                    normalized_search_inputs["retrieval_strategy"] = "semantic_exploratory"
+                    normalized_search_inputs["retrieval_mode"] = "dense"
+                if needs_specialized_intent:
+                    for key in (
+                        "top_k",
+                        "retrieval_strategy",
+                        "retrieval_mode",
+                        "lexical_top_k",
+                        "dense_top_k",
+                        "use_rerank",
+                        "fusion_k",
+                        "fallback_top_k",
+                        "rerank_top_k",
+                        "retrieve_all",
+                    ):
+                        if key in search_inputs:
+                            normalized_search_inputs[key] = search_inputs[key]
+                    if "retrieve_all" not in search_inputs:
+                        normalized_search_inputs["retrieve_all"] = False
+                    if needs_semantic_similarity:
+                        normalized_search_inputs["retrieval_strategy"] = "semantic_exploratory"
                 node_inputs = normalized_search_inputs
             if node.capability == "fetch_documents" and search_node_id and not depends_on:
                 depends_on = [search_node_id]
@@ -974,7 +1044,19 @@ class MagicBoxOrchestrator:
                 )
             )
         metadata = dict(dag.metadata)
-        if self._needs_temporal_portrayal_analysis(dag_text):
+        if needs_semantic_similarity:
+            self._ensure_semantic_similarity_nodes(normalized_nodes, unique_node_id, dag_text)
+            if metadata.get("question_family", "") in {"", "generic"}:
+                metadata["question_family"] = "semantic_similarity_terms"
+        elif needs_syntax_roles:
+            self._ensure_syntax_role_nodes(normalized_nodes, unique_node_id, dag_text)
+            if metadata.get("question_family", "") in {"", "generic"}:
+                metadata["question_family"] = "syntax_role_patterns"
+        elif needs_attributed_explanations:
+            self._ensure_attributed_explanation_nodes(normalized_nodes, unique_node_id, dag_text)
+            if metadata.get("question_family", "") in {"", "generic"}:
+                metadata["question_family"] = "attributed_explanation_series"
+        elif self._needs_temporal_portrayal_analysis(dag_text):
             self._ensure_temporal_portrayal_nodes(normalized_nodes, unique_node_id, dag_text)
             if metadata.get("question_family", "") in {"", "generic"}:
                 metadata["question_family"] = "temporal_portrayal_shift"
@@ -993,6 +1075,460 @@ class MagicBoxOrchestrator:
                 metadata["question_family"] = "noun_distribution"
         normalized_nodes = self._reuse_subsumed_search_branches(normalized_nodes)
         return self._compile_plan_dag(AgentPlanDAG(nodes=normalized_nodes, metadata=metadata), dag_text)
+
+    @staticmethod
+    def _needs_semantic_similarity_analysis(text: str) -> bool:
+        lowered = str(text or "").lower()
+        if "semantic_similarity_terms" in lowered or "similarity_analysis" in lowered:
+            return True
+        wording_signal = bool(
+            re.search(
+                r"\b(?:semantic(?:ally)?|similar(?:ity)?|related|paraphras(?:e|es|ed)|same exact wording|exact wording|different wording|same wording|wording mismatch|lexical(?:ly)?)\b",
+                lowered,
+            )
+            or re.search(r"\bnot\s+use\s+(?:the\s+)?same\b.{0,40}\bwording\b", lowered)
+        )
+        term_bridge_signal = bool(
+            re.search(
+                r"\b(?:recurring terms?|abbreviations?|acronyms?|connected descriptions?|describe(?:d|s)?|descriptions?|word choices?)\b",
+                lowered,
+            )
+        )
+        return wording_signal and term_bridge_signal
+
+    @staticmethod
+    def _needs_syntax_role_analysis(text: str) -> bool:
+        lowered = str(text or "").lower()
+        if "syntax_role_patterns" in lowered:
+            return True
+        return bool(
+            re.search(r"\bwho\s+(?:did|does)\s+what\s+to\s+whom\b", lowered)
+            or re.search(r"\b(?:subject[- ]verb[- ]object|svo|subject|verb|object|dependency|grammatical role|grammatical roles)\b", lowered)
+            or re.search(r"\b(?:acting|acted)\b.{0,80}\b(?:acted upon|upon|against|by)\b", lowered)
+            or re.search(r"\bwho\b.{0,80}\b(?:acting|acted upon|acted on|action patterns?|patterns differ)\b", lowered)
+        )
+
+    @staticmethod
+    def _needs_attributed_explanation_analysis(text: str) -> bool:
+        lowered = str(text or "").lower()
+        if "attributed_explanation_series" in lowered:
+            return True
+        explanation_signal = bool(
+            re.search(r"\b(?:explanation|explanations|explained|explain|reason|reasons|why|gave for)\b", lowered)
+        )
+        movement_signal = bool(
+            re.search(
+                r"\b(?:price movements?|market movements?|largest movements?|crash|recovery|drawdown|rally|selloff|spike|plunge|price shock)\b",
+                lowered,
+            )
+        )
+        attribution_signal = bool(
+            re.search(
+                r"\b(?:directly attributed|attributed to|quote|quoted|said|according to|named people|named institutions|speaker|spokes(?:man|woman|person|people))\b",
+                lowered,
+            )
+        )
+        external_signal = bool(
+            re.search(r"\b(?:stock|share price|market|price|prices|oil|crude|gas|commodity|equity|ticker)\b", lowered)
+        )
+        return explanation_signal and movement_signal and (attribution_signal or external_signal)
+
+    def _ensure_semantic_similarity_nodes(
+        self,
+        normalized_nodes: list[AgentPlanNode],
+        unique_node_id: Callable[[str], str],
+        question_text: str,
+    ) -> None:
+        def first_node_id(capability: str) -> str:
+            return next((node.node_id for node in normalized_nodes if node.capability == capability), "")
+
+        def ensure_node(
+            capability: str,
+            preferred_id: str,
+            depends_on: list[str],
+            *,
+            inputs: dict[str, Any] | None = None,
+            optional: bool = False,
+        ) -> str:
+            existing = first_node_id(capability)
+            if existing:
+                for node in normalized_nodes:
+                    if node.node_id == existing:
+                        if inputs:
+                            updated_inputs = dict(node.inputs)
+                            payload_inputs = dict(updated_inputs.get("payload", {})) if isinstance(updated_inputs.get("payload"), dict) else {}
+                            for key, value in inputs.items():
+                                updated_inputs[key] = value
+                                if payload_inputs:
+                                    payload_inputs[key] = value
+                            if payload_inputs:
+                                updated_inputs["payload"] = payload_inputs
+                            node.inputs = updated_inputs
+                        if not node.depends_on:
+                            node.depends_on = list(dict.fromkeys(depends_on))
+                        break
+                return existing
+            node_id = unique_node_id(preferred_id)
+            normalized_nodes.append(
+                AgentPlanNode(
+                    node_id=node_id,
+                    capability=capability,
+                    inputs=inputs or {},
+                    depends_on=list(dict.fromkeys(depends_on)),
+                    optional=optional,
+                )
+            )
+            return node_id
+
+        fetch_node_id = first_node_id("fetch_documents")
+        if not fetch_node_id:
+            return
+        search_node_id = first_node_id("db_search") or first_node_id("sql_query_search")
+        ensure_node("create_working_set", "working_set", [fetch_node_id], optional=True)
+        doc_embeddings_id = ensure_node("doc_embeddings", "doc_embeddings", [fetch_node_id])
+        similarity_index_id = ensure_node("similarity_index", "similarity_index", [fetch_node_id])
+        similarity_pairwise_id = ensure_node(
+            "similarity_pairwise",
+            "similarity_pairwise",
+            [fetch_node_id],
+            inputs={"query": question_text},
+        )
+        ensure_node("word_embeddings", "word_embeddings", [fetch_node_id])
+        ensure_node("extract_acronyms", "acronyms", [fetch_node_id])
+        keyterms_id = ensure_node("extract_keyterms", "keyterms", [fetch_node_id], inputs={"top_k": 40})
+        ner_id = ensure_node("ner", "entities", [fetch_node_id], optional=True)
+        entity_link_id = ensure_node("entity_link", "entity_link", [ner_id], optional=True)
+        series_id = ensure_node(
+            "time_series_aggregate",
+            "series",
+            [fetch_node_id],
+            inputs={
+                "documents_node": fetch_node_id,
+                "time_field": "published_at",
+                "bucket_granularity": "month",
+                "metrics": ["document_count"],
+            },
+        )
+        ensure_node("change_point_detect", "changes", [series_id], optional=True)
+        if not any(node.capability == "plot_artifact" and series_id in node.depends_on for node in normalized_nodes):
+            normalized_nodes.append(
+                AgentPlanNode(
+                    node_id=unique_node_id("plot_semantic_terms"),
+                    capability="plot_artifact",
+                    inputs={
+                        "plot_name": "semantic_term_coverage_over_time",
+                        "plot_type": "line",
+                        "x": "time_bin",
+                        "y": "document_count",
+                        "series": "series_name",
+                        "title": "Semantic coverage over time",
+                    },
+                    depends_on=[series_id],
+                    optional=True,
+                )
+            )
+        evidence_deps = [
+            dep
+            for dep in [
+                keyterms_id,
+                doc_embeddings_id,
+                similarity_index_id,
+                similarity_pairwise_id,
+                search_node_id,
+                entity_link_id,
+            ]
+            if dep
+        ]
+        has_semantic_evidence = any(
+            node.capability == "build_evidence_table" and entity_link_id and entity_link_id in node.depends_on
+            for node in normalized_nodes
+        )
+        if not has_semantic_evidence:
+            normalized_nodes.append(
+                AgentPlanNode(
+                    node_id=unique_node_id("semantic_evidence"),
+                    capability="build_evidence_table",
+                    inputs={"task": "semantic_similarity_evidence"},
+                    depends_on=list(dict.fromkeys(evidence_deps)),
+                )
+            )
+
+    def _ensure_syntax_role_nodes(
+        self,
+        normalized_nodes: list[AgentPlanNode],
+        unique_node_id: Callable[[str], str],
+        question_text: str,
+    ) -> None:
+        def first_node_id(capability: str) -> str:
+            return next((node.node_id for node in normalized_nodes if node.capability == capability), "")
+
+        def ensure_node(
+            capability: str,
+            preferred_id: str,
+            depends_on: list[str],
+            *,
+            inputs: dict[str, Any] | None = None,
+            optional: bool = False,
+        ) -> str:
+            existing = first_node_id(capability)
+            if existing:
+                for node in normalized_nodes:
+                    if node.node_id == existing:
+                        if inputs:
+                            updated_inputs = dict(node.inputs)
+                            payload_inputs = dict(updated_inputs.get("payload", {})) if isinstance(updated_inputs.get("payload"), dict) else {}
+                            for key, value in inputs.items():
+                                updated_inputs[key] = value
+                                if payload_inputs:
+                                    payload_inputs[key] = value
+                            if payload_inputs:
+                                updated_inputs["payload"] = payload_inputs
+                            node.inputs = updated_inputs
+                        if not node.depends_on:
+                            node.depends_on = list(dict.fromkeys(depends_on))
+                        break
+                return existing
+            node_id = unique_node_id(preferred_id)
+            normalized_nodes.append(
+                AgentPlanNode(
+                    node_id=node_id,
+                    capability=capability,
+                    inputs=inputs or {},
+                    depends_on=list(dict.fromkeys(depends_on)),
+                    optional=optional,
+                )
+            )
+            return node_id
+
+        fetch_node_id = first_node_id("fetch_documents")
+        if not fetch_node_id:
+            return
+        ensure_node("create_working_set", "working_set", [fetch_node_id], optional=True)
+        sentence_id = ensure_node("sentence_split", "sentences", [fetch_node_id])
+        token_id = ensure_node("tokenize", "tokens", [fetch_node_id])
+        pos_id = ensure_node("pos_morph", "pos", [fetch_node_id])
+        lemma_id = ensure_node("lemmatize", "lemmas", [fetch_node_id])
+        dependency_id = ensure_node("dependency_parse", "dependencies", [fetch_node_id])
+        svo_id = ensure_node("extract_svo_triples", "svo_triples", [fetch_node_id])
+        noun_chunks_id = ensure_node("noun_chunks", "noun_chunks", [pos_id])
+        ner_id = ensure_node("ner", "entities", [fetch_node_id], optional=True)
+        entity_link_id = ensure_node("entity_link", "entity_link", [ner_id], optional=True)
+        quotes_id = ensure_node("quote_extract", "quotes", [fetch_node_id])
+        attributed_quotes_id = ensure_node("quote_attribute", "quote_attribution", [quotes_id])
+        date_window = self._extract_date_window(question_text)
+        forced_dependencies = {
+            sentence_id: [fetch_node_id],
+            token_id: [fetch_node_id],
+            pos_id: [fetch_node_id],
+            lemma_id: [fetch_node_id],
+            dependency_id: [fetch_node_id],
+            svo_id: [fetch_node_id],
+            noun_chunks_id: [pos_id],
+            quotes_id: [fetch_node_id],
+            attributed_quotes_id: [quotes_id],
+        }
+        for node in normalized_nodes:
+            if node.node_id in forced_dependencies:
+                node.depends_on = forced_dependencies[node.node_id]
+        role_counts_id = ensure_node(
+            "time_series_aggregate",
+            "syntax_role_counts",
+            [svo_id],
+            inputs={
+                "group_by": "subject",
+                "metrics": ["mention_count"],
+                "bucket_granularity": "year",
+                "fallback_time_bin": date_window.get("date_from", ""),
+                "top_k": 30,
+            },
+            optional=True,
+        )
+        if not any(node.capability == "plot_artifact" and role_counts_id in node.depends_on for node in normalized_nodes):
+            normalized_nodes.append(
+                AgentPlanNode(
+                    node_id=unique_node_id("plot_svo_roles"),
+                    capability="plot_artifact",
+                    inputs={
+                        "plot_name": "svo_role_patterns",
+                        "plot_type": "bar",
+                        "x": "entity",
+                        "y": "mention_count",
+                        "series": "series_name",
+                        "top_k": 30,
+                        "title": "Subject-verb-object role patterns",
+                    },
+                    depends_on=[role_counts_id],
+                    optional=True,
+                )
+            )
+        role_evidence_deps = [
+            sentence_id,
+            token_id,
+            pos_id,
+            lemma_id,
+            dependency_id,
+            noun_chunks_id,
+            entity_link_id,
+            attributed_quotes_id,
+            svo_id,
+        ]
+        has_role_evidence = any(
+            node.capability == "build_evidence_table" and any(dep in node.depends_on for dep in role_evidence_deps)
+            for node in normalized_nodes
+        )
+        if not has_role_evidence:
+            normalized_nodes.append(
+                AgentPlanNode(
+                    node_id=unique_node_id("role_evidence"),
+                    capability="build_evidence_table",
+                    inputs={"task": "syntax_role_evidence"},
+                    depends_on=role_evidence_deps,
+                )
+            )
+
+    def _ensure_attributed_explanation_nodes(
+        self,
+        normalized_nodes: list[AgentPlanNode],
+        unique_node_id: Callable[[str], str],
+        question_text: str,
+    ) -> None:
+        def first_node_id(capability: str) -> str:
+            return next((node.node_id for node in normalized_nodes if node.capability == capability), "")
+
+        def ensure_node(
+            capability: str,
+            preferred_id: str,
+            depends_on: list[str],
+            *,
+            inputs: dict[str, Any] | None = None,
+            optional: bool = False,
+        ) -> str:
+            existing = first_node_id(capability)
+            if existing:
+                for node in normalized_nodes:
+                    if node.node_id == existing:
+                        if inputs:
+                            updated_inputs = dict(node.inputs)
+                            payload_inputs = dict(updated_inputs.get("payload", {})) if isinstance(updated_inputs.get("payload"), dict) else {}
+                            for key, value in inputs.items():
+                                updated_inputs[key] = value
+                                if payload_inputs:
+                                    payload_inputs[key] = value
+                            if payload_inputs:
+                                updated_inputs["payload"] = payload_inputs
+                            node.inputs = updated_inputs
+                        if not node.depends_on:
+                            node.depends_on = list(dict.fromkeys(depends_on))
+                        break
+                return existing
+            node_id = unique_node_id(preferred_id)
+            normalized_nodes.append(
+                AgentPlanNode(
+                    node_id=node_id,
+                    capability=capability,
+                    inputs=inputs or {},
+                    depends_on=list(dict.fromkeys(depends_on)),
+                    optional=optional,
+                )
+            )
+            return node_id
+
+        fetch_node_id = first_node_id("fetch_documents")
+        if not fetch_node_id:
+            return
+        ensure_node("create_working_set", "working_set", [fetch_node_id], optional=True)
+        keyterms_id = ensure_node("extract_keyterms", "keyterms", [fetch_node_id], inputs={"top_k": 40})
+        quotes_id = ensure_node("quote_extract", "quotes", [fetch_node_id])
+        quote_attribute_id = ensure_node("quote_attribute", "quote_attribution", [quotes_id])
+        claim_spans_id = ensure_node("claim_span_extract", "claim_spans", [fetch_node_id], inputs={"query_focus": question_text})
+        claim_scores_id = ensure_node("claim_strength_score", "claim_scores", [claim_spans_id])
+        ner_id = ensure_node("ner", "entities", [fetch_node_id], optional=True)
+        entity_link_id = ensure_node("entity_link", "entity_link", [ner_id], optional=True)
+        series_id = ensure_node(
+            "time_series_aggregate",
+            "series",
+            [fetch_node_id],
+            inputs={
+                "documents_node": fetch_node_id,
+                "time_field": "published_at",
+                "bucket_granularity": "month",
+                "metrics": ["document_count"],
+                "fallback_time_bin": self._extract_date_window(question_text).get("date_from", ""),
+            },
+        )
+        ensure_node("change_point_detect", "changes", [series_id], optional=True)
+        ensure_node("burst_detect", "bursts", [series_id], optional=True)
+
+        ticker = self._infer_market_ticker(question_text)
+        market_node_id = first_node_id("join_external_series")
+        date_window = self._extract_date_window(question_text)
+        market_inputs = {
+            "ticker": ticker,
+            "date_from": date_window.get("date_from", ""),
+            "date_to": date_window.get("date_to", ""),
+            "interval": "1d",
+            "join_granularity": "month",
+            "left_key": "time_bin",
+            "right_key": "time_bin",
+            "how": "left",
+        }
+        if ticker and market_node_id:
+            for node in normalized_nodes:
+                if node.node_id != market_node_id:
+                    continue
+                updated_inputs = dict(node.inputs)
+                payload_inputs = dict(updated_inputs.get("payload", {})) if isinstance(updated_inputs.get("payload"), dict) else {}
+                for key, value in market_inputs.items():
+                    updated_inputs[key] = value
+                    if payload_inputs:
+                        payload_inputs[key] = value
+                if payload_inputs:
+                    payload_inputs.setdefault("date_range", {})
+                    if isinstance(payload_inputs["date_range"], dict):
+                        payload_inputs["date_range"]["start"] = market_inputs["date_from"]
+                        payload_inputs["date_range"]["end"] = market_inputs["date_to"]
+                    updated_inputs["payload"] = payload_inputs
+                node.inputs = updated_inputs
+                node.depends_on = [series_id]
+                break
+        if ticker and not market_node_id:
+            market_node_id = unique_node_id("market_series")
+            normalized_nodes.append(
+                AgentPlanNode(
+                    node_id=market_node_id,
+                    capability="join_external_series",
+                    inputs=market_inputs,
+                    depends_on=[series_id],
+                )
+            )
+
+        plot_dep = market_node_id or series_id
+        if not any(node.capability == "plot_artifact" and plot_dep in node.depends_on for node in normalized_nodes):
+            normalized_nodes.append(
+                AgentPlanNode(
+                    node_id=unique_node_id("plot_explanations"),
+                    capability="plot_artifact",
+                    inputs={
+                        "plot_name": "coverage_vs_external_price_movements",
+                        "plot_type": "line",
+                        "x": "time_bin",
+                        "y": ["document_count", "market_drawdown"] if market_node_id else "document_count",
+                        "series": "series_name",
+                        "title": "Coverage and price movement timeline",
+                    },
+                    depends_on=[plot_dep],
+                    optional=True,
+                )
+            )
+        if not any(node.capability == "build_evidence_table" for node in normalized_nodes):
+            normalized_nodes.append(
+                AgentPlanNode(
+                    node_id=unique_node_id("explanation_evidence"),
+                    capability="build_evidence_table",
+                    inputs={"task": "attributed_explanation_evidence"},
+                    depends_on=[keyterms_id, quote_attribute_id, entity_link_id, claim_scores_id],
+                )
+            )
 
     @staticmethod
     def _needs_noun_distribution_analysis(text: str) -> bool:
@@ -1096,9 +1632,11 @@ class MagicBoxOrchestrator:
             "from",
             "how",
             "in",
+            "not",
             "of",
             "shift",
             "shifted",
+            "they",
             "the",
             "to",
             "with",
@@ -1636,6 +2174,8 @@ class MagicBoxOrchestrator:
             return {}
         if len(year_values) == 1:
             year = year_values[0]
+            if re.search(r"\bduring\b", text, flags=re.IGNORECASE):
+                return {"date_from": f"{year}-01-01", "date_to": f"{year}-12-31"}
             if re.search(
                 r"\b(?:from|since|starting|started|beginning|began|after|through|until|to)\b",
                 text,
@@ -1666,6 +2206,9 @@ class MagicBoxOrchestrator:
             "term", "terms", "period", "periods", "relationship", "relationships",
             "relation", "relations", "pattern", "patterns", "trend", "trends",
             "toward", "towards",
+            "abbreviation", "abbreviations", "acronym", "acronyms", "connected",
+            "description", "descriptions", "describe", "described", "describes",
+            "exact", "not", "recurring", "same", "they", "wording",
         } | temporal_scope_terms
         coverage_entity = self._coverage_entity_query(text)
         if coverage_entity:
@@ -1681,6 +2224,7 @@ class MagicBoxOrchestrator:
         tokens = [token for token in re.findall(r"[A-Za-z][A-Za-z0-9\-]+", text) if len(token) > 2]
         stopwords = {
             "how", "did", "from", "into", "with", "what", "when", "which", "that", "this", "those",
+            "they", "not",
             "coverage", "framing", "frame", "around", "during", "between", "across", "their", "there",
             "correspond", "corresponded", "media", "shift", "shifted",
             "does",
@@ -1695,6 +2239,9 @@ class MagicBoxOrchestrator:
             "relationship", "relationships", "relation", "relations", "pattern", "patterns",
             "trend", "trends", "heightened", "elevated", "specific", "subperiod", "subperiods",
             "his", "her", "its", "our", "your", "toward", "towards",
+            "abbreviation", "abbreviations", "acronym", "acronyms", "connected",
+            "description", "descriptions", "describe", "described", "describes",
+            "exact", "recurring", "same", "wording",
         } | temporal_scope_terms
         filtered = [token for token in tokens if token.lower() not in stopwords and token.lower() not in blocked_source_tokens]
         compact = " ".join(filtered[:8]).strip()
@@ -2033,6 +2580,12 @@ class MagicBoxOrchestrator:
         return bool(matches)
 
     def _source_scope_filters_for_question(self, text: str) -> list[str]:
+        if (
+            self._needs_semantic_similarity_analysis(text)
+            or self._needs_syntax_role_analysis(text)
+            or self._needs_attributed_explanation_analysis(text)
+        ):
+            return []
         filters: list[str] = []
         explicit_matches = self._explicit_source_scope_matches(text)
         if self._explicit_source_scope_is_active(text, explicit_matches):
@@ -2041,6 +2594,12 @@ class MagicBoxOrchestrator:
         return list(dict.fromkeys(item for item in filters if item))
 
     def _source_scope_query_tokens_for_question(self, text: str) -> set[str]:
+        if (
+            self._needs_semantic_similarity_analysis(text)
+            or self._needs_syntax_role_analysis(text)
+            or self._needs_attributed_explanation_analysis(text)
+        ):
+            return set()
         explicit_matches = self._explicit_source_scope_matches(text)
         if not self._explicit_source_scope_is_active(text, explicit_matches):
             return set()
@@ -2556,6 +3115,228 @@ class MagicBoxOrchestrator:
             heuristic_assumptions.append(
                 "Heuristic fallback increased retrieval budget to improve recall for this broad analytical question."
             )
+        if self._needs_semantic_similarity_analysis(rewritten):
+            search_inputs = self._search_inputs_for_question(
+                rewritten,
+                query_text=query_text,
+                overrides={"retrieval_strategy": "semantic_exploratory"},
+            )
+            dag = AgentPlanDAG(
+                nodes=[
+                    AgentPlanNode("search", "db_search", inputs=search_inputs),
+                    AgentPlanNode("fetch", "fetch_documents", depends_on=["search"]),
+                    AgentPlanNode("working_set", "create_working_set", depends_on=["fetch"]),
+                    AgentPlanNode("doc_embeddings", "doc_embeddings", depends_on=["fetch"]),
+                    AgentPlanNode("similarity_index", "similarity_index", depends_on=["fetch"]),
+                    AgentPlanNode("similarity_pairwise", "similarity_pairwise", inputs={"query": rewritten}, depends_on=["fetch"]),
+                    AgentPlanNode("word_embeddings", "word_embeddings", depends_on=["fetch"]),
+                    AgentPlanNode("acronyms", "extract_acronyms", depends_on=["fetch"]),
+                    AgentPlanNode("keyterms", "extract_keyterms", inputs={"top_k": 40}, depends_on=["fetch"]),
+                    AgentPlanNode("entities", "ner", depends_on=["fetch"], optional=True),
+                    AgentPlanNode("entity_link", "entity_link", depends_on=["entities"], optional=True),
+                    AgentPlanNode(
+                        "series",
+                        "time_series_aggregate",
+                        inputs={
+                            "documents_node": "fetch",
+                            "time_field": "published_at",
+                            "bucket_granularity": "month",
+                            "metrics": ["document_count"],
+                        },
+                        depends_on=["fetch"],
+                    ),
+                    AgentPlanNode("changes", "change_point_detect", depends_on=["series"], optional=True),
+                    AgentPlanNode(
+                        "plot",
+                        "plot_artifact",
+                        inputs={
+                            "plot_name": "semantic_term_coverage_over_time",
+                            "plot_type": "line",
+                            "x": "time_bin",
+                            "y": "document_count",
+                            "series": "series_name",
+                        },
+                        depends_on=["series"],
+                        optional=True,
+                    ),
+                    AgentPlanNode(
+                        "evidence",
+                        "build_evidence_table",
+                        inputs={"task": "semantic_similarity_evidence"},
+                        depends_on=["keyterms", "doc_embeddings", "similarity_index", "similarity_pairwise", "entity_link"],
+                    ),
+                ],
+                metadata={"question_family": "semantic_similarity_terms"},
+            )
+            return PlannerAction(
+                action="emit_plan_dag",
+                rewritten_question=state.rewritten_question or rewritten,
+                assumptions=list(heuristic_assumptions),
+                plan_dag=dag,
+            )
+        if self._needs_syntax_role_analysis(rewritten):
+            search_inputs = self._search_inputs_for_question(
+                rewritten,
+                query_text=query_text,
+                overrides={"retrieval_strategy": "precision_ranked"},
+            )
+            date_window = self._extract_date_window(rewritten)
+            dag = AgentPlanDAG(
+                nodes=[
+                    AgentPlanNode("search", "db_search", inputs=search_inputs),
+                    AgentPlanNode("fetch", "fetch_documents", depends_on=["search"]),
+                    AgentPlanNode("working_set", "create_working_set", depends_on=["fetch"]),
+                    AgentPlanNode("sentences", "sentence_split", depends_on=["fetch"]),
+                    AgentPlanNode("tokens", "tokenize", depends_on=["fetch"]),
+                    AgentPlanNode("pos", "pos_morph", depends_on=["fetch"]),
+                    AgentPlanNode("lemmas", "lemmatize", depends_on=["fetch"]),
+                    AgentPlanNode("dependencies", "dependency_parse", depends_on=["fetch"]),
+                    AgentPlanNode("svo_triples", "extract_svo_triples", depends_on=["fetch"]),
+                    AgentPlanNode("noun_chunks", "noun_chunks", depends_on=["pos"]),
+                    AgentPlanNode("entities", "ner", depends_on=["fetch"], optional=True),
+                    AgentPlanNode("entity_link", "entity_link", depends_on=["entities"], optional=True),
+                    AgentPlanNode("quotes", "quote_extract", depends_on=["fetch"]),
+                    AgentPlanNode("quote_attribution", "quote_attribute", depends_on=["quotes"]),
+                    AgentPlanNode(
+                        "syntax_role_counts",
+                        "time_series_aggregate",
+                        inputs={
+                            "group_by": "subject",
+                            "metrics": ["mention_count"],
+                            "bucket_granularity": "year",
+                            "fallback_time_bin": date_window.get("date_from", ""),
+                            "top_k": 30,
+                        },
+                        depends_on=["svo_triples"],
+                        optional=True,
+                    ),
+                    AgentPlanNode(
+                        "plot",
+                        "plot_artifact",
+                        inputs={
+                            "plot_name": "svo_role_patterns",
+                            "plot_type": "bar",
+                            "x": "entity",
+                            "y": "mention_count",
+                            "series": "series_name",
+                            "top_k": 30,
+                        },
+                        depends_on=["syntax_role_counts"],
+                        optional=True,
+                    ),
+                    AgentPlanNode(
+                        "evidence",
+                        "build_evidence_table",
+                        inputs={"task": "syntax_role_evidence"},
+                        depends_on=[
+                            "sentences",
+                            "tokens",
+                            "pos",
+                            "lemmas",
+                            "dependencies",
+                            "noun_chunks",
+                            "entity_link",
+                            "quote_attribution",
+                            "svo_triples",
+                        ],
+                    ),
+                ],
+                metadata={"question_family": "syntax_role_patterns"},
+            )
+            return PlannerAction(
+                action="emit_plan_dag",
+                rewritten_question=state.rewritten_question or rewritten,
+                assumptions=list(heuristic_assumptions),
+                plan_dag=dag,
+            )
+        if self._needs_attributed_explanation_analysis(rewritten):
+            search_inputs = self._search_inputs_for_question(rewritten, query_text=query_text)
+            market_ticker = self._infer_market_ticker(rewritten)
+            nodes = [
+                AgentPlanNode("search", "db_search", inputs=search_inputs),
+                AgentPlanNode("fetch", "fetch_documents", depends_on=["search"]),
+                AgentPlanNode("working_set", "create_working_set", depends_on=["fetch"]),
+                AgentPlanNode("keyterms", "extract_keyterms", inputs={"top_k": 40}, depends_on=["fetch"]),
+                AgentPlanNode("quotes", "quote_extract", depends_on=["fetch"]),
+                AgentPlanNode("quote_attribution", "quote_attribute", depends_on=["quotes"]),
+                AgentPlanNode("claim_spans", "claim_span_extract", inputs={"query_focus": rewritten}, depends_on=["fetch"]),
+                AgentPlanNode("claim_scores", "claim_strength_score", depends_on=["claim_spans"]),
+                AgentPlanNode("entities", "ner", depends_on=["fetch"], optional=True),
+                AgentPlanNode("entity_link", "entity_link", depends_on=["entities"], optional=True),
+                AgentPlanNode(
+                    "series",
+                    "time_series_aggregate",
+                    inputs={
+                        "documents_node": "fetch",
+                        "time_field": "published_at",
+                        "bucket_granularity": "month",
+                        "metrics": ["document_count"],
+                        "fallback_time_bin": self._extract_date_window(rewritten).get("date_from", ""),
+                    },
+                    depends_on=["fetch"],
+                ),
+                AgentPlanNode("changes", "change_point_detect", depends_on=["series"], optional=True),
+                AgentPlanNode("bursts", "burst_detect", depends_on=["series"], optional=True),
+            ]
+            assumptions: list[str] = []
+            plot_dep = "series"
+            if market_ticker:
+                date_window = self._extract_date_window(rewritten)
+                nodes.append(
+                    AgentPlanNode(
+                        "market_series",
+                        "join_external_series",
+                        inputs={
+                            "ticker": market_ticker,
+                            "date_from": date_window.get("date_from", ""),
+                            "date_to": date_window.get("date_to", ""),
+                            "interval": "1d",
+                            "join_granularity": "month",
+                            "left_key": "time_bin",
+                            "right_key": "time_bin",
+                            "how": "left",
+                        },
+                        depends_on=["series"],
+                    )
+                )
+                plot_dep = "market_series"
+            else:
+                assumptions.append(
+                    "The runtime could not infer a ticker for the external price series; the explanation analysis will still run over coverage and evidence."
+                )
+            nodes.extend(
+                [
+                    AgentPlanNode(
+                        "plot",
+                        "plot_artifact",
+                        inputs={
+                            "plot_name": "coverage_vs_external_price_movements",
+                            "plot_type": "line",
+                            "x": "time_bin",
+                            "y": ["document_count", "market_drawdown"] if plot_dep == "market_series" else "document_count",
+                            "series": "series_name",
+                        },
+                        depends_on=[plot_dep],
+                        optional=True,
+                    ),
+                    AgentPlanNode(
+                        "evidence",
+                        "build_evidence_table",
+                        inputs={"task": "attributed_explanation_evidence"},
+                        depends_on=["keyterms", "quote_attribution", "entity_link", "claim_scores"],
+                    ),
+                ]
+            )
+            dag = AgentPlanDAG(
+                nodes=nodes,
+                metadata={"question_family": "attributed_explanation_series", "market_ticker": market_ticker},
+            )
+            return PlannerAction(
+                action="emit_plan_dag",
+                rewritten_question=state.rewritten_question or rewritten,
+                assumptions=list(dict.fromkeys(heuristic_assumptions + assumptions)),
+                plan_dag=dag,
+            )
         if "distribution" in text and "noun" in text:
             noun_top_k = infer_requested_output_limit(rewritten, default=100, minimum=20, maximum=500)
             plot_top_k = min(noun_top_k, infer_requested_output_limit(rewritten, default=30, minimum=10, maximum=120))
@@ -2889,6 +3670,9 @@ class MagicBoxOrchestrator:
                     "Use retrieval_strategy='exhaustive_analytic' for corpus-wide aggregates, distributions, trends, comparisons, and questions that ask for all relevant records; in that mode the goal is to materialize the full candidate working set before analysis rather than relying on a tiny ranked slice. "
                     "Use retrieval_strategy='precision_ranked' for targeted evidence lookups where the best supporting documents matter more than full-population coverage. "
                     "Use retrieval_strategy='semantic_exploratory' for similarity, thematic, or concept-discovery questions where semantic closeness matters more than exact lexical overlap. "
+                    "For questions about descriptions that use different wording, semantic relatedness, recurring terms, or abbreviations, include embeddings/similarity tools: doc_embeddings, similarity_index, similarity_pairwise, word_embeddings, extract_acronyms, plus keyterms/entities and temporal summaries when the question asks over time. "
+                    "For questions asking who acted, who was acted upon, subject-verb-object patterns, or grammatical roles, include sentence_split, tokenize, pos_morph, lemmatize, dependency_parse, extract_svo_triples, noun_chunks, named entities/entity linking, and quote tools when political statements or attributed speech matter. "
+                    "For questions asking what explanations media gave for price movements/crashes/recoveries and who those explanations were attributed to, combine the external price series with time_series_aggregate, burst/change detection, keyterms, quote_extract, quote_attribute, claim_span_extract, claim_strength_score, NER/entity_link, and an evidence table. "
                     "Size retrieval budgets to the question, and never use tiny default retrieval budgets for broad analytical questions. "
                     "When using db_search for ranked retrieval, set top_k and, when helpful, lexical_top_k, dense_top_k, rerank_top_k, and use_rerank based on the scope needed to answer the question faithfully. "
                     "When retrieve_all is true, top_k is only a fallback budget and must not be treated as the analyzed population size. "
@@ -2927,6 +3711,7 @@ class MagicBoxOrchestrator:
             "Allowed actions: ask_clarification, emit_plan_dag, grounded_rejection. "
             "If action is emit_plan_dag, plan_dag.nodes must contain at least one executable node with node_id, capability, optional tool_name, inputs, and depends_on. "
             "Choose retrieval budgets and retrieval_strategy values that match question scope instead of relying on tiny generic defaults. "
+            "Preserve specialized intent: semantic wording/abbreviation questions need embeddings and similarity; who-did-what questions need syntax/SVO tools; attributed price-movement explanation questions need external series, quotes, claim spans, and evidence. "
             "Avoid redundant parallel full-corpus searches; use filter_working_set for narrower slices that can be derived from an existing broad retrieve_all working set. "
             "Do not invent source/outlet aliases for broad geographic media phrases; use source filters only for explicit outlet names or metadata-backed source names. "
             "Use documented build_evidence_table task names, especially noun_frequency_distribution for noun/POS lemma counts, and do not plot document evidence rows as aggregate plots."
