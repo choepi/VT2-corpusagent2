@@ -181,7 +181,7 @@ def _fake_yfinance_rows(*, ticker: str, start: str, end: str, interval: str = "1
         {
             "ticker": ticker,
             "date": "2022-02-01",
-            "time_bin": "2022-02",
+            "time_bin": "2022-02-01",
             "market_close": 180.5,
             "market_return": -0.03,
             "market_drawdown": -0.03,
@@ -189,7 +189,7 @@ def _fake_yfinance_rows(*, ticker: str, start: str, end: str, interval: str = "1
         {
             "ticker": ticker,
             "date": "2022-03-01",
-            "time_bin": "2022-03",
+            "time_bin": "2022-03-01",
             "market_close": 165.0,
             "market_return": -0.05,
             "market_drawdown": -0.08,
@@ -309,6 +309,16 @@ def _execute_smoke_suite(tmp_path: Path) -> tuple[dict[str, ToolExecutionResult]
             if not passed:
                 failure_reason = f"{tool_name}: expected non-empty smoke output but got payload={result.payload!r}"
                 failures.append(failure_reason)
+            elif tool_name == "join_external_series":
+                market_fields = ("market_close", "market_return", "market_drawdown")
+                if not any(
+                    any(str(row.get(field, "")).strip() for field in market_fields)
+                    for row in items
+                    if isinstance(row, dict)
+                ):
+                    passed = False
+                    failure_reason = f"{tool_name}: expected joined market fields but got payload={result.payload!r}"
+                    failures.append(failure_reason)
             elif tool_name == "plot_artifact":
                 artifact_path = Path(str(result.payload.get("artifact_path", "")))
                 if not artifact_path.exists():

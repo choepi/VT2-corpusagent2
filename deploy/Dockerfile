@@ -22,25 +22,39 @@ COPY scripts/17_download_provider_assets.py ./scripts/17_download_provider_asset
 
 ARG CORPUSAGENT2_DOCKER_TORCH_PROFILE=cpu
 ARG CORPUSAGENT2_DOCKER_INSTALL_NLP_PROVIDERS=false
-RUN if [ "$CORPUSAGENT2_DOCKER_TORCH_PROFILE" = "cuda" ]; then \
-      if [ "$CORPUSAGENT2_DOCKER_INSTALL_NLP_PROVIDERS" = "true" ]; then \
-        uv sync --frozen --extra nlp-providers --no-install-project; \
-      else \
-        uv sync --frozen --no-install-project; \
-      fi; \
-    else \
-      uv venv; \
-      uv pip install \
-        --index-url https://pypi.org/simple \
-        --extra-index-url https://download.pytorch.org/whl/cpu \
-        -r deploy/requirements.docker-cpu.txt; \
-      if [ "$CORPUSAGENT2_DOCKER_INSTALL_NLP_PROVIDERS" = "true" ]; then \
-        uv pip install \
-          --index-url https://pypi.org/simple \
-          --extra-index-url https://download.pytorch.org/whl/cpu \
-          -r deploy/requirements.docker-nlp-providers.txt; \
-      fi; \
-    fi
+RUN set -eu; \
+    case "$CORPUSAGENT2_DOCKER_TORCH_PROFILE" in \
+      cuda) \
+        if [ "$CORPUSAGENT2_DOCKER_INSTALL_NLP_PROVIDERS" = "true" ]; then \
+          uv sync --frozen --extra nlp-providers --no-install-project; \
+        else \
+          uv sync --frozen --no-install-project; \
+        fi; \
+        ;; \
+      cpu) \
+        uv venv; \
+        if [ "$CORPUSAGENT2_DOCKER_INSTALL_NLP_PROVIDERS" = "true" ]; then \
+          uv pip install \
+            --torch-backend cpu \
+            --index-strategy unsafe-best-match \
+            --index-url https://pypi.org/simple \
+            --extra-index-url https://download.pytorch.org/whl/cpu \
+            -r deploy/requirements.docker-cpu.txt \
+            -r deploy/requirements.docker-nlp-providers.txt; \
+        else \
+          uv pip install \
+            --torch-backend cpu \
+            --index-strategy unsafe-best-match \
+            --index-url https://pypi.org/simple \
+            --extra-index-url https://download.pytorch.org/whl/cpu \
+            -r deploy/requirements.docker-cpu.txt; \
+        fi; \
+        ;; \
+      *) \
+        echo "Unsupported CORPUSAGENT2_DOCKER_TORCH_PROFILE=$CORPUSAGENT2_DOCKER_TORCH_PROFILE; expected cpu or cuda." >&2; \
+        exit 2; \
+        ;; \
+    esac
 
 ARG CORPUSAGENT2_DOCKER_DOWNLOAD_PROVIDER_ASSETS=false
 RUN if [ "$CORPUSAGENT2_DOCKER_DOWNLOAD_PROVIDER_ASSETS" = "true" ]; then \
@@ -51,13 +65,22 @@ COPY config ./config
 COPY scripts ./scripts
 COPY src ./src
 
-RUN if [ "$CORPUSAGENT2_DOCKER_TORCH_PROFILE" = "cuda" ]; then \
-      if [ "$CORPUSAGENT2_DOCKER_INSTALL_NLP_PROVIDERS" = "true" ]; then \
-        uv sync --frozen --extra nlp-providers --inexact; \
-      else \
-        uv sync --frozen --inexact; \
-      fi; \
-    fi
+RUN set -eu; \
+    case "$CORPUSAGENT2_DOCKER_TORCH_PROFILE" in \
+      cuda) \
+        if [ "$CORPUSAGENT2_DOCKER_INSTALL_NLP_PROVIDERS" = "true" ]; then \
+          uv sync --frozen --extra nlp-providers --inexact; \
+        else \
+          uv sync --frozen --inexact; \
+        fi; \
+        ;; \
+      cpu) \
+        ;; \
+      *) \
+        echo "Unsupported CORPUSAGENT2_DOCKER_TORCH_PROFILE=$CORPUSAGENT2_DOCKER_TORCH_PROFILE; expected cpu or cuda." >&2; \
+        exit 2; \
+        ;; \
+    esac
 
 ENV PATH="/app/.venv/bin:${PATH}"
 

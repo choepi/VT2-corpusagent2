@@ -4864,6 +4864,7 @@ def _series_match_terms(item: dict[str, Any]) -> list[str]:
 def _time_series_rows_from_document_series(
     params: dict[str, Any],
     deps: dict[str, ToolExecutionResult],
+    context: AgentExecutionContext,
     *,
     granularity: str,
 ) -> tuple[list[dict[str, Any]], int] | None:
@@ -4872,7 +4873,7 @@ def _time_series_rows_from_document_series(
     if not series_items or (metric_names and not metric_names.intersection({"document_count", "doc_count", "count"})):
         return None
     source = _time_series_source_name(params)
-    docs = _dependency_rows_for_source(deps, source) if source else _payload_rows_from_all_dependencies(deps)
+    docs = _time_series_source_rows(params, deps, context, source)
     docs = [_coerce_text_document_row(dict(doc)) for doc in docs if isinstance(doc, dict) and _row_has_text_payload(doc)]
     if not docs:
         return [], 0
@@ -4939,6 +4940,7 @@ def _time_series_rows_from_document_series(
 def _time_series_rows_from_named_metrics(
     params: dict[str, Any],
     deps: dict[str, ToolExecutionResult],
+    context: AgentExecutionContext,
     *,
     granularity: str,
 ) -> tuple[list[dict[str, Any]], int] | None:
@@ -4971,7 +4973,7 @@ def _time_series_rows_from_named_metrics(
     if not normalized_metrics:
         return None
     source = _time_series_source_name(params)
-    source_rows = _dependency_rows_for_source(deps, source) if source else _payload_rows_from_all_dependencies(deps)
+    source_rows = _time_series_source_rows(params, deps, context, source)
     if not source_rows:
         return [], 0
     raw_group_by = params.get("group_by", params.get("series_key", ""))
@@ -5135,18 +5137,18 @@ def _time_series_aggregate(params: dict[str, Any], deps: dict[str, ToolExecution
             ),
         )
     ).strip().lower() or "month"
-    metric_series = _time_series_rows_from_metric_specs(params, deps, granularity=granularity)
+    metric_series = _time_series_rows_from_metric_specs(params, deps, context, granularity=granularity)
     if metric_series is not None:
         rows, skipped_rows = metric_series
         caveats = []
         if skipped_rows:
             caveats.append(f"Skipped {skipped_rows} metric rows that could not be assigned to a requested series or numeric metric.")
         return ToolExecutionResult(payload={"rows": rows, "skipped_row_count": skipped_rows}, caveats=caveats)
-    document_series = _time_series_rows_from_document_series(params, deps, granularity=granularity)
+    document_series = _time_series_rows_from_document_series(params, deps, context, granularity=granularity)
     if document_series is not None:
         rows, skipped_rows = document_series
         return ToolExecutionResult(payload={"rows": rows, "skipped_row_count": skipped_rows})
-    named_metric_series = _time_series_rows_from_named_metrics(params, deps, granularity=granularity)
+    named_metric_series = _time_series_rows_from_named_metrics(params, deps, context, granularity=granularity)
     if named_metric_series is not None:
         rows, skipped_rows = named_metric_series
         caveats = []
@@ -5154,7 +5156,7 @@ def _time_series_aggregate(params: dict[str, Any], deps: dict[str, ToolExecution
             caveats.append(f"Skipped {skipped_rows} time-series rows with unsupported entity labels or unusable series names.")
         return ToolExecutionResult(payload={"rows": rows, "skipped_row_count": skipped_rows}, caveats=caveats)
     preferred_source = _time_series_source_name(params)
-    source_rows = _dependency_rows_for_source(deps, preferred_source) if preferred_source else []
+    source_rows = _time_series_source_rows(params, deps, context, preferred_source) if preferred_source else []
     if not source_rows:
         for result in deps.values():
             payload = result.payload
@@ -5760,6 +5762,27 @@ def _dependency_rows_for_source(deps: dict[str, ToolExecutionResult], source: st
     return _payload_rows_from_all_dependencies(deps)
 
 
+def _time_series_source_rows(
+    params: dict[str, Any],
+    deps: dict[str, ToolExecutionResult],
+    context: AgentExecutionContext,
+    source: str = "",
+) -> list[dict[str, Any]]:
+    rows = _dependency_rows_for_source(deps, source) if source else _payload_rows_from_all_dependencies(deps)
+    if rows:
+        return rows
+    working_set_ref = _resolve_working_set_ref(params, deps)
+    if not working_set_ref:
+        return []
+    max_documents = _working_set_analysis_max_documents()
+    documents, _metadata, _caveats = _analysis_document_rows_from_deps(
+        deps,
+        context,
+        max_documents=max_documents,
+    )
+    return documents
+
+
 def _series_definitions(params: dict[str, Any]) -> list[tuple[str, list[str]]]:
     raw_series = params.get("series_definitions", params.get("series", []))
     if isinstance(raw_series, dict):
@@ -5861,6 +5884,7 @@ def _metric_value(row: dict[str, Any], metric: dict[str, Any]) -> float | None:
 def _time_series_rows_from_metric_specs(
     params: dict[str, Any],
     deps: dict[str, ToolExecutionResult],
+    context: AgentExecutionContext,
     *,
     granularity: str,
 ) -> tuple[list[dict[str, Any]], int] | None:
@@ -5884,7 +5908,7 @@ def _time_series_rows_from_metric_specs(
         metric_name = str(metric.get("name") or metric.get("as") or metric.get("output_field") or metric.get("field") or "").strip()
         aggregations[metric_name] = str(metric.get("aggregation", metric.get("agg", "sum")) or "sum").strip().lower()
         source = str(metric.get("source", metric.get("source_node", metric.get("source_node_id", ""))) or "").strip()
-        for row in _dependency_rows_for_source(deps, source):
+        for row in _time_series_source_rows(params, deps, context, source):
             series = _row_series_name(row, groups) if groups else "__all__"
             if not series:
                 skipped += 1
@@ -6454,6 +6478,49 @@ def _infer_external_series_bounds(left_rows: list[dict[str, Any]], key: str) -> 
     return _period_start(first), _exclusive_period_end(last)
 
 
+def _infer_join_time_granularity(rows: list[dict[str, Any]], key: str) -> str:
+    values = [
+        str(
+            _first_nonempty_field(
+                row,
+                [key, "time_bin", "month", "period", "time_period", "date", "published_at"],
+            )
+        ).strip()
+        for row in rows
+        if isinstance(row, dict)
+    ]
+    values = [value for value in values if value and not _is_placeholder_axis_label(value)]
+    if not values:
+        return ""
+    if all(re.fullmatch(r"\d{4}", value) for value in values):
+        return "year"
+    if all(re.fullmatch(r"\d{4}-\d{2}", value) for value in values):
+        return "month"
+    if all(re.fullmatch(r"\d{4}-\d{2}-\d{2}", value) for value in values):
+        return "day"
+    if any(re.fullmatch(r"\d{4}-\d{2}", value) for value in values):
+        return "month"
+    return ""
+
+
+def _align_external_series_join_key(
+    right_df: pd.DataFrame,
+    *,
+    right_key: str,
+    target_granularity: str,
+) -> tuple[pd.DataFrame, bool]:
+    normalized_granularity = str(target_granularity or "").strip().lower()
+    if normalized_granularity not in {"day", "month", "year"} or right_df.empty:
+        return right_df, False
+    if right_key not in right_df.columns:
+        return right_df, False
+    source_column = "date" if "date" in right_df.columns else right_key
+    aligned = right_df.copy()
+    original_values = aligned[right_key].astype(str).tolist()
+    aligned[right_key] = aligned[source_column].astype(str).map(lambda value: _time_bin(value, normalized_granularity))
+    return aligned, aligned[right_key].astype(str).tolist() != original_values
+
+
 def _join_external_series(params: dict[str, Any], deps: dict[str, ToolExecutionResult], context: AgentExecutionContext) -> ToolExecutionResult:
     params = _merged_payload_params(params)
     external_spec = params.get("external_series") if isinstance(params.get("external_series"), dict) else {}
@@ -6481,8 +6548,13 @@ def _join_external_series(params: dict[str, Any], deps: dict[str, ToolExecutionR
         or external_spec.get("end_date")
         or ""
     ).strip()
-    interval = str(params.get("interval") or external_spec.get("interval") or external_spec.get("frequency") or "1d").strip() or "1d"
+    requested_join_granularity = str(params.get("join_granularity") or params.get("granularity") or "").strip().lower()
+    interval = str(params.get("interval") or external_spec.get("interval") or external_spec.get("frequency") or "").strip()
     interval_aliases = {"daily": "1d", "day": "1d", "weekly": "1wk", "week": "1wk", "monthly": "1mo", "month": "1mo"}
+    if not interval and requested_join_granularity in interval_aliases:
+        interval = requested_join_granularity
+    if not interval:
+        interval = "1d"
     interval = interval_aliases.get(interval.lower(), interval)
     left_rows: list[dict[str, Any]] = []
     bound_rows: list[dict[str, Any]] = []
@@ -6565,6 +6637,16 @@ def _join_external_series(params: dict[str, Any], deps: dict[str, ToolExecutionR
             return ToolExecutionResult(payload={"rows": left_rows}, caveats=[f"Join key '{left_key}' is missing from internal rows."])
     if right_key not in right_df.columns:
         return ToolExecutionResult(payload={"rows": left_rows}, caveats=[f"Join key '{right_key}' is missing from external series rows."])
+    target_granularity = _infer_join_time_granularity(left_rows, left_key)
+    if not target_granularity and requested_join_granularity in {"day", "month", "year"}:
+        target_granularity = requested_join_granularity
+    right_df, aligned_external_key = _align_external_series_join_key(
+        right_df,
+        right_key=right_key,
+        target_granularity=target_granularity,
+    )
+    if aligned_external_key:
+        caveats.append(f"Aligned external series to {target_granularity} time bins before joining with corpus rows.")
     if right_df[right_key].duplicated().any():
         aggregations: dict[str, str] = {}
         for column, method in (

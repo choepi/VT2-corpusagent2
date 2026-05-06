@@ -47,6 +47,17 @@ def test_expected_pgvector_index_names_follow_vm_defaults() -> None:
     assert names == {"idx_article_corpus_embedding_ivfflat"}
 
 
+def test_gpu_compose_args_include_mcp_base_before_gpu_overlay() -> None:
+    module = _load_prepare_vm_stack()
+
+    args = module._compose_file_args(use_gpu=True)
+
+    assert str(module.COMPOSE_FILE) in args
+    assert str(module.MCP_COMPOSE_FILE) in args
+    assert str(module.GPU_COMPOSE_FILE) in args
+    assert args.index(str(module.MCP_COMPOSE_FILE)) < args.index(str(module.GPU_COMPOSE_FILE))
+
+
 def test_pgvector_backfill_complete_requires_full_row_coverage() -> None:
     module = _load_prepare_vm_stack()
 

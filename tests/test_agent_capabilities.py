@@ -1710,6 +1710,54 @@ def test_time_series_aggregate_unwraps_payload_metric_specs_with_as_alias(tmp_pa
     assert rows["2018-01-03"]["avg_sentiment"] == 0.8
 
 
+def test_time_series_aggregate_streams_metric_specs_from_working_set_ref(tmp_path: Path) -> None:
+    store = InMemoryWorkingSetStore()
+    run_id = "run"
+    docs = [
+        {"doc_id": "d1", "title": "Tesla one", "text": "Tesla coverage.", "published_at": "2018-01-02"},
+        {"doc_id": "d2", "title": "Tesla two", "text": "Tesla coverage.", "published_at": "2018-01-20"},
+        {"doc_id": "d3", "title": "Tesla three", "text": "Tesla coverage.", "published_at": "2018-02-03"},
+    ]
+    store.document_lookup.update({row["doc_id"]: dict(row) for row in docs})
+    store.record_working_set(run_id, "tesla_docs", docs)
+    context = AgentExecutionContext(
+        run_id=run_id,
+        artifacts_dir=tmp_path,
+        search_backend=None,
+        working_store=store,
+        runtime=None,
+    )
+    deps = {
+        "working": ToolExecutionResult(
+            payload={
+                "working_set_ref": "tesla_docs",
+                "working_set_doc_ids": ["d1"],
+                "document_count": 3,
+                "working_set_truncated": True,
+            }
+        )
+    }
+
+    result = _time_series_aggregate(
+        {
+            "payload": {
+                "working_set": "working",
+                "date_field": "published_at",
+                "granularity": "month",
+                "metrics": [
+                    {"name": "document_count", "field": "doc_id", "aggregation": "count"},
+                ],
+            }
+        },
+        deps,
+        context,
+    )
+
+    rows = {row["time_bin"]: row for row in result.payload["rows"]}
+    assert rows["2018-01"]["document_count"] == 2
+    assert rows["2018-02"]["document_count"] == 1
+
+
 def test_time_series_aggregate_handles_document_series_and_string_metrics(tmp_path: Path) -> None:
     context = AgentExecutionContext(
         run_id="run",
@@ -3272,6 +3320,58 @@ def test_join_external_series_aggregates_daily_rows_to_time_bin(monkeypatch, tmp
     assert result.payload["rows"][0]["market_close"] == 64.0
     assert result.payload["rows"][0]["market_volume"] == 25
     assert any("Aggregated external series" in caveat for caveat in result.caveats)
+
+
+def test_join_external_series_aligns_daily_market_bins_to_monthly_corpus_bins(monkeypatch, tmp_path: Path) -> None:
+    def _fake_series(**kwargs):
+        assert kwargs["ticker"] == "TSLA"
+        assert kwargs["start"] == "2018-03-01"
+        assert kwargs["end"] == "2018-04-01"
+        return [
+            {
+                "ticker": "TSLA",
+                "date": "2018-03-01",
+                "time_bin": "2018-03-01",
+                "market_open": 20.0,
+                "market_high": 22.0,
+                "market_low": 19.0,
+                "market_close": 21.0,
+                "market_volume": 100,
+                "market_return": 0.0,
+                "market_drawdown": 0.0,
+            },
+            {
+                "ticker": "TSLA",
+                "date": "2018-03-30",
+                "time_bin": "2018-03-30",
+                "market_open": 21.0,
+                "market_high": 25.0,
+                "market_low": 20.0,
+                "market_close": 24.0,
+                "market_volume": 150,
+                "market_return": 0.03,
+                "market_drawdown": -0.01,
+            },
+        ]
+
+    monkeypatch.setattr(agent_capabilities, "_fetch_yfinance_series_rows", _fake_series)
+    context = AgentExecutionContext(
+        run_id="run",
+        artifacts_dir=tmp_path,
+        search_backend=None,
+        working_store=_ExplodingStore(),
+        runtime=None,
+    )
+    deps = {"series": ToolExecutionResult(payload={"rows": [{"entity": "__all__", "time_bin": "2018-03", "document_count": 10}]})}
+
+    result = _join_external_series({"ticker": "TSLA", "left_key": "time_bin", "right_key": "time_bin"}, deps, context)
+
+    assert len(result.payload["rows"]) == 1
+    assert result.payload["rows"][0]["ticker"] == "TSLA"
+    assert result.payload["rows"][0]["market_open"] == 20.0
+    assert result.payload["rows"][0]["market_close"] == 24.0
+    assert result.payload["rows"][0]["market_volume"] == 250
+    assert any("Aligned external series to month time bins" in caveat for caveat in result.caveats)
 
 
 def test_infer_market_ticker_maps_oil_price_to_crude_futures() -> None:
