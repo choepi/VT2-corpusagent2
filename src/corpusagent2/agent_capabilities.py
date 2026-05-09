@@ -7055,6 +7055,84 @@ def _merge_actor_prominence_rows(params: dict[str, Any], deps: dict[str, ToolExe
     return rows, {"provider": "analytics_actor_prominence_merge", "input_row_count": len(aggregate_rows)}, []
 
 
+def _is_syntax_role_evidence_task(task: str, params: dict[str, Any]) -> bool:
+    normalized = re.sub(r"[^a-z0-9]+", "_", str(task or "").strip().lower()).strip("_")
+    if normalized in {"syntax_role_evidence", "svo_evidence", "subject_verb_object_evidence"}:
+        return True
+    requested = " ".join(str(value or "") for value in (task, params.get("task_name"), params.get("description")))
+    requested = requested.lower()
+    return bool(("evidence" in requested or "examples" in requested) and ("svo" in requested or "subject-verb-object" in requested))
+
+
+def _row_has_syntax_role_shape(row: dict[str, Any]) -> bool:
+    explicit_fields = ("subject", "verb", "object", "semantic_actor", "semantic_target")
+    if any(str(row.get(field, "")).strip() for field in explicit_fields):
+        return True
+    return bool(
+        str(row.get("actor_group", "")).strip()
+        and str(row.get("target_group", "")).strip()
+        and str(row.get("sentence", row.get("excerpt", row.get("text", "")))).strip()
+    )
+
+
+def _syntax_role_evidence_rows(params: dict[str, Any], deps: dict[str, ToolExecutionResult]) -> list[dict[str, Any]]:
+    limit = _int_param(params, "top_k", "limit", "max_rows", default=100, maximum=1000)
+    rows: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, str, str, str, str, str]] = set()
+    for result in deps.values():
+        payload = result.payload if isinstance(result.payload, dict) else {}
+        upstream_rows = payload.get("rows")
+        if not isinstance(upstream_rows, list):
+            continue
+        for item in upstream_rows:
+            if not isinstance(item, dict) or not _row_has_syntax_role_shape(item):
+                continue
+            doc_id = str(item.get("doc_id", "") or "").strip()
+            subject = str(item.get("subject", item.get("semantic_actor", "")) or "").strip()
+            verb = str(item.get("verb", item.get("predicate", "")) or "").strip()
+            obj = str(item.get("object", item.get("semantic_target", "")) or "").strip()
+            actor = str(item.get("semantic_actor", subject) or subject).strip()
+            target = str(item.get("semantic_target", obj) or obj or subject).strip()
+            sentence = str(item.get("sentence", item.get("excerpt", item.get("text", ""))) or "").strip()
+            if not sentence and (actor or verb or target):
+                sentence = " ".join(part for part in (actor, verb, target) if part).strip()
+            if not sentence:
+                continue
+            dedupe_key = (doc_id, sentence, subject, verb, obj, actor, target)
+            if dedupe_key in seen:
+                continue
+            seen.add(dedupe_key)
+            score = _coerce_score(item.get("score", item.get("mention_count", item.get("count", 1.0))))
+            if score <= 0:
+                score = 1.0
+            role_pattern = " -> ".join(part for part in (actor or subject, verb or "acts on", target or obj) if part)
+            rows.append(
+                {
+                    "doc_id": doc_id,
+                    "outlet": str(item.get("outlet", item.get("source", "")) or ""),
+                    "date": str(item.get("date", item.get("published_at", item.get("time_bin", ""))) or ""),
+                    "published_at": str(item.get("published_at", item.get("date", "")) or ""),
+                    "excerpt": sentence[:320],
+                    "score": score,
+                    "score_display": _score_display(score),
+                    "subject": subject,
+                    "verb": verb,
+                    "object": obj,
+                    "semantic_actor": actor,
+                    "semantic_target": target,
+                    "actor_group": str(item.get("actor_group", "") or ""),
+                    "target_group": str(item.get("target_group", "") or ""),
+                    "voice": str(item.get("voice", "") or ""),
+                    "role_pattern": role_pattern,
+                    "provider": str(item.get("provider", "") or ""),
+                }
+            )
+    rows.sort(key=lambda row: (-_coerce_score(row.get("score", 0.0)), str(row.get("date", "")), str(row.get("role_pattern", ""))))
+    for rank, row in enumerate(rows[:limit], start=1):
+        row["rank"] = rank
+    return rows[:limit]
+
+
 def _build_evidence_table(params: dict[str, Any], deps: dict[str, ToolExecutionResult], context: AgentExecutionContext) -> ToolExecutionResult:
     params = _analysis_params(params)
     task = _task_name(params)
@@ -7189,6 +7267,24 @@ def _build_evidence_table(params: dict[str, Any], deps: dict[str, ToolExecutionR
             evidence=[],
             caveats=caveats,
             metadata={"no_data": not entity_rows, **entity_metadata},
+        )
+    if _is_syntax_role_evidence_task(task, params):
+        evidence_rows = _syntax_role_evidence_rows(params, deps)
+        caveats = [] if evidence_rows else ["No subject-verb-object rows were available for syntax role evidence."]
+        metadata = {
+            "no_data": not evidence_rows,
+            "task": task,
+            "provider": "analytics_syntax_role_evidence",
+            "input_dependency_count": len(deps),
+            "evidence_row_count": len(evidence_rows),
+        }
+        if not evidence_rows:
+            metadata["no_data_reason"] = "no_svo_triples"
+        return ToolExecutionResult(
+            payload={"rows": evidence_rows},
+            evidence=evidence_rows,
+            caveats=caveats,
+            metadata=metadata,
         )
     rows = []
     search_score_lookup = {
@@ -7788,6 +7884,45 @@ def _plot_field_looks_time_like(rows: list[dict[str, Any]], field: str) -> bool:
     return bool(sampled and matched / sampled >= 0.8)
 
 
+def _distinct_usable_plot_values(rows: list[dict[str, Any]], field: str, *, time_axis_like: bool = False) -> set[str]:
+    values: set[str] = set()
+    for row in rows:
+        value = row.get(field)
+        if not _plot_axis_label_is_usable(value, time_axis_like=time_axis_like):
+            continue
+        values.add(str(value).strip())
+        if len(values) > 1:
+            break
+    return values
+
+
+def _inferred_plot_x_priority(rows: list[dict[str, Any]]) -> tuple[str, ...]:
+    base_priority = tuple(PLOT_X_FIELD_PRIORITY)
+    if not rows:
+        return base_priority
+    keys = _ordered_plot_keys(rows)
+    time_like_fields = [key for key in keys if _plot_field_looks_time_like(rows, key)]
+    has_single_time_axis = any(
+        _plot_field_coverage(rows, field) > 0
+        and len(_distinct_usable_plot_values(rows, field, time_axis_like=True)) <= 1
+        for field in time_like_fields
+    )
+    if not has_single_time_axis:
+        return base_priority
+    categorical_candidates = [
+        field
+        for field in base_priority
+        if field not in PLOT_TIME_AXIS_FIELDS
+        and (resolved := _resolve_existing_plot_field(rows, field, require_numeric=False))
+        and not _plot_field_looks_time_like(rows, resolved)
+        and len(_distinct_usable_plot_values(rows, resolved)) > 1
+    ]
+    if not categorical_candidates:
+        return base_priority
+    remaining = [field for field in base_priority if field not in categorical_candidates]
+    return tuple(categorical_candidates + remaining)
+
+
 def _infer_plot_series_field(rows: list[dict[str, Any]]) -> str:
     for candidate in PLOT_FIELD_ALIASES["series"]:
         resolved = _resolve_existing_plot_field(rows, candidate, require_numeric=False)
@@ -7860,7 +7995,7 @@ def _resolve_plot_field(
         return resolved, None
     if field or not allow_infer:
         return field, None
-    priority = PLOT_Y_FIELD_PRIORITY if require_numeric else PLOT_X_FIELD_PRIORITY
+    priority = PLOT_Y_FIELD_PRIORITY if require_numeric else _inferred_plot_x_priority(rows)
     for candidate in priority:
         resolved = _resolve_existing_plot_field(rows, candidate, require_numeric=require_numeric)
         if resolved:
@@ -8235,6 +8370,7 @@ def _plot_artifact(params: dict[str, Any], deps: dict[str, ToolExecutionResult],
             artifacts=[str(fallback_target)],
             caveats=[*plot_field_caveats, f"matplotlib unavailable; generated SVG fallback plot instead: {exc}"],
             metadata={
+                "no_data": False,
                 "fallback": "svg",
                 "reason": "matplotlib_unavailable",
                 "resolved_x": x_key,
@@ -8407,6 +8543,7 @@ def _plot_artifact(params: dict[str, Any], deps: dict[str, ToolExecutionResult],
         artifacts=[str(target)],
         caveats=plot_field_caveats,
         metadata={
+            "no_data": False,
             "resolved_x": x_key,
             "resolved_y": y_key,
             "resolved_series": series_key,
