@@ -32,3 +32,15 @@ uv 0.8.20
 === staging repo to scratch ===
 === creating vllm env ===
 === installing vllm deps only ===
+=== vllm env sanity ===
+torch 2.11.0+cu128
+cuda_available True
+vllm 0.20.1
+has_infer_schema True
+=== creating agent env ===
+=== installing agent/repo deps ===
+=== agent env sanity ===
+openai 2.36.0
+corpusagent2 installed
+=== starting vllm ===
+=== waiting for vllm ===
