@@ -19,6 +19,8 @@ wheels/
 
 # Runtime outputs
 /outputs/**
+/outputs/.err
+/outputs/.out
 !/outputs/.gitkeep
 
 # Logs
