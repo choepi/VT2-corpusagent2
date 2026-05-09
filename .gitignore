@@ -22,7 +22,8 @@ wheels/
 /outputs/.err
 /outputs/.out
 !/outputs/.gitkeep
-
+/slurm/.err
+/slurm/.err
 # Logs
 /log/*.log
 /log/**/*.out

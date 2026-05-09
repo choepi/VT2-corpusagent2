@@ -44,3 +44,6 @@ openai 2.36.0
 corpusagent2 installed
 === starting vllm ===
 === waiting for vllm ===
+vLLM ready
+=== running coding agent inside slurm job ===
+=== cleanup ===
