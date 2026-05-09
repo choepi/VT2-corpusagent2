@@ -630,3 +630,91 @@ Installed 127 packages in 225ms
 + curl -fsS -H 'Authorization: Bearer local-slurm-token' http://127.0.0.1:33759/v1/models
 + kill -0 1897048
 + sleep 10
++ for i in $(seq 1 240)
++ curl -fsS -H 'Authorization: Bearer local-slurm-token' http://127.0.0.1:33759/v1/models
++ kill -0 1897048
++ sleep 10
++ for i in $(seq 1 240)
++ curl -fsS -H 'Authorization: Bearer local-slurm-token' http://127.0.0.1:33759/v1/models
++ kill -0 1897048
++ sleep 10
++ for i in $(seq 1 240)
++ curl -fsS -H 'Authorization: Bearer local-slurm-token' http://127.0.0.1:33759/v1/models
++ kill -0 1897048
++ sleep 10
++ for i in $(seq 1 240)
++ curl -fsS -H 'Authorization: Bearer local-slurm-token' http://127.0.0.1:33759/v1/models
++ kill -0 1897048
++ sleep 10
++ for i in $(seq 1 240)
++ curl -fsS -H 'Authorization: Bearer local-slurm-token' http://127.0.0.1:33759/v1/models
++ kill -0 1897048
++ sleep 10
++ for i in $(seq 1 240)
++ curl -fsS -H 'Authorization: Bearer local-slurm-token' http://127.0.0.1:33759/v1/models
++ kill -0 1897048
++ sleep 10
++ for i in $(seq 1 240)
++ curl -fsS -H 'Authorization: Bearer local-slurm-token' http://127.0.0.1:33759/v1/models
++ kill -0 1897048
++ sleep 10
++ for i in $(seq 1 240)
++ curl -fsS -H 'Authorization: Bearer local-slurm-token' http://127.0.0.1:33759/v1/models
++ kill -0 1897048
++ sleep 10
++ for i in $(seq 1 240)
++ curl -fsS -H 'Authorization: Bearer local-slurm-token' http://127.0.0.1:33759/v1/models
++ kill -0 1897048
++ sleep 10
++ for i in $(seq 1 240)
++ curl -fsS -H 'Authorization: Bearer local-slurm-token' http://127.0.0.1:33759/v1/models
++ kill -0 1897048
++ sleep 10
++ for i in $(seq 1 240)
++ curl -fsS -H 'Authorization: Bearer local-slurm-token' http://127.0.0.1:33759/v1/models
++ kill -0 1897048
++ sleep 10
++ for i in $(seq 1 240)
++ curl -fsS -H 'Authorization: Bearer local-slurm-token' http://127.0.0.1:33759/v1/models
++ kill -0 1897048
++ sleep 10
++ for i in $(seq 1 240)
++ curl -fsS -H 'Authorization: Bearer local-slurm-token' http://127.0.0.1:33759/v1/models
++ kill -0 1897048
++ sleep 10
++ for i in $(seq 1 240)
++ curl -fsS -H 'Authorization: Bearer local-slurm-token' http://127.0.0.1:33759/v1/models
++ kill -0 1897048
++ sleep 10
++ for i in $(seq 1 240)
++ curl -fsS -H 'Authorization: Bearer local-slurm-token' http://127.0.0.1:33759/v1/models
++ kill -0 1897048
++ sleep 10
++ for i in $(seq 1 240)
++ curl -fsS -H 'Authorization: Bearer local-slurm-token' http://127.0.0.1:33759/v1/models
++ kill -0 1897048
++ sleep 10
++ for i in $(seq 1 240)
++ curl -fsS -H 'Authorization: Bearer local-slurm-token' http://127.0.0.1:33759/v1/models
++ kill -0 1897048
++ sleep 10
++ for i in $(seq 1 240)
++ curl -fsS -H 'Authorization: Bearer local-slurm-token' http://127.0.0.1:33759/v1/models
++ kill -0 1897048
++ sleep 10
++ for i in $(seq 1 240)
++ curl -fsS -H 'Authorization: Bearer local-slurm-token' http://127.0.0.1:33759/v1/models
++ kill -0 1897048
++ sleep 10
++ for i in $(seq 1 240)
++ curl -fsS -H 'Authorization: Bearer local-slurm-token' http://127.0.0.1:33759/v1/models
++ echo 'vLLM ready'
++ break
++ '[' '!' -s /cluster/home/dongtten/VT2/VT2-corpusagent2/outputs/coding_agent/15759/vllm_models.json ']'
++ echo '=== running coding agent inside slurm job ==='
++ export PATH=/scratch/dongtten/venvs/vt2_agent_clean_20260509/bin:/cluster/home/dongtten/.local/bin:/usr/local/bin:/usr/bin:/bin
++ PATH=/scratch/dongtten/venvs/vt2_agent_clean_20260509/bin:/cluster/home/dongtten/.local/bin:/usr/local/bin:/usr/bin:/bin
++ /scratch/dongtten/venvs/vt2_agent_clean_20260509/bin/python /cluster/home/dongtten/VT2/VT2-corpusagent2/slurm/coding_agent_runner.py
++ cleanup
++ echo '=== cleanup ==='
++ kill 1897048
