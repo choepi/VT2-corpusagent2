@@ -108,7 +108,11 @@ def _tool_usage_reason(
 
 
 SOURCE_CANDIDATE_LEADING_NOISE = {
+    "a",
+    "after",
+    "an",
     "and",
+    "before",
     "between",
     "compare",
     "compared",
@@ -127,6 +131,7 @@ SOURCE_CANDIDATE_LEADING_NOISE = {
     "press",
     "source",
     "sources",
+    "the",
     "versus",
     "vs",
     "what",
@@ -134,7 +139,11 @@ SOURCE_CANDIDATE_LEADING_NOISE = {
 }
 SOURCE_CANDIDATE_TRAILING_NOISE = {
     "about",
+    "after",
     "and",
+    "announcement",
+    "announcements",
+    "before",
     "compare",
     "compared",
     "comparison",
@@ -145,6 +154,7 @@ SOURCE_CANDIDATE_TRAILING_NOISE = {
     "different",
     "differently",
     "during",
+    "event",
     "explain",
     "explained",
     "explains",
@@ -161,17 +171,26 @@ SOURCE_CANDIDATE_TRAILING_NOISE = {
     "outlet",
     "outlets",
     "over",
+    "period",
+    "phase",
     "press",
     "report",
     "reported",
     "reports",
     "source",
     "sources",
+    "window",
     "write",
     "writes",
     "wrote",
 }
 SOURCE_CANDIDATE_GENERIC_VALUES = {
+    "after announcement",
+    "after the announcement",
+    "announcement",
+    "before announcement",
+    "before the announcement",
+    "event",
     "media",
     "news",
     "newspaper",
@@ -179,6 +198,7 @@ SOURCE_CANDIDATE_GENERIC_VALUES = {
     "outlet",
     "outlets",
     "press",
+    "the announcement",
     "source",
     "sources",
 }
@@ -1517,19 +1537,18 @@ class MagicBoxOrchestrator:
                     optional=True,
                 )
             )
-        if not any(node.capability == "plot_artifact" and role_counts_id in node.depends_on for node in normalized_nodes):
+        if (
+            self._question_requires_capability(question_text, "plot_artifact")
+            and not any(node.capability == "plot_artifact" and role_counts_id in node.depends_on for node in normalized_nodes)
+        ):
             normalized_nodes.append(
                 AgentPlanNode(
-                    node_id=unique_node_id("plot_svo_roles"),
+                    node_id=unique_node_id("plot_syntax_roles"),
                     capability="plot_artifact",
                     inputs={
-                        "plot_name": "svo_role_patterns",
-                        "plot_type": "bar",
-                        "x": "entity",
-                        "y": "mention_count",
-                        "series": "series_name",
+                        "plot_name": "syntax_role_patterns",
                         "top_k": 8,
-                        "title": "Subject-verb-object role patterns",
+                        "title": "Syntax role pattern summary",
                     },
                     depends_on=[role_counts_id],
                     optional=True,
@@ -1542,11 +1561,8 @@ class MagicBoxOrchestrator:
             lemma_id,
             dependency_id,
             noun_chunks_id,
-            entity_link_id,
             attributed_quotes_id,
             svo_id,
-            role_counts_id,
-            target_counts_id,
         ]
         has_role_evidence = any(
             node.capability == "build_evidence_table" and any(dep in node.depends_on for dep in role_evidence_deps)
@@ -2352,11 +2368,20 @@ class MagicBoxOrchestrator:
             year = year_values[0]
             if re.search(r"\bduring\b", text, flags=re.IGNORECASE):
                 return {"date_from": f"{year}-01-01", "date_to": f"{year}-12-31"}
-            if re.search(
-                r"\b(?:from|since|starting|started|beginning|began|after|through|until|to)\b",
-                text,
-                flags=re.IGNORECASE,
-            ):
+            year_pattern = re.escape(str(year))
+            has_open_start_marker = bool(
+                re.search(
+                    rf"\b(?:from|since|starting|started|beginning|began|after)\b(?:\W+\w+){{0,4}}\W+{year_pattern}\b",
+                    text,
+                    flags=re.IGNORECASE,
+                )
+                or re.search(
+                    rf"\b{year_pattern}\b.{0,40}\b(?:onward|onwards|forward|and\s+after|to\s+present|through\s+present)\b",
+                    text,
+                    flags=re.IGNORECASE,
+                )
+            )
+            if has_open_start_marker:
                 return {"date_from": f"{year}-01-01"}
             return {"date_from": f"{year}-01-01", "date_to": f"{year}-12-31"}
         return {
@@ -2607,6 +2632,51 @@ class MagicBoxOrchestrator:
             return not bool(set(meaningful_tokens) & set(fallback_tokens))
         return False
 
+    def _query_has_unbalanced_parentheses(self, query_text: str) -> bool:
+        depth = 0
+        quote: str | None = None
+        for char in str(query_text or ""):
+            if quote:
+                if char == quote:
+                    quote = None
+                continue
+            if char in {"'", '"'}:
+                quote = char
+                continue
+            if char == "(":
+                depth += 1
+            elif char == ")":
+                depth -= 1
+                if depth < 0:
+                    return True
+        return depth != 0 or quote is not None
+
+    def _query_lost_meaning_after_source_filter_removal(self, candidate_query: str, fallback_query: str) -> bool:
+        syntax_tokens = {"and", "or", "not"}
+        candidate_tokens = [
+            token.lower()
+            for token in re.findall(r"[A-Za-z][A-Za-z0-9]+", str(candidate_query or ""))
+            if token.lower() not in syntax_tokens
+        ]
+        fallback_tokens = [
+            token.lower()
+            for token in re.findall(r"[A-Za-z][A-Za-z0-9]+", str(fallback_query or ""))
+            if token.lower() not in syntax_tokens
+        ]
+        if len(fallback_tokens) < 2 or not candidate_tokens:
+            return False
+        candidate_set = set(candidate_tokens)
+        fallback_set = set(fallback_tokens)
+        if not candidate_set or not candidate_set.issubset(fallback_set):
+            return False
+        if not fallback_set - candidate_set:
+            return False
+        has_fragment_syntax = bool(
+            re.search(r"\bOR\b", str(candidate_query or ""), flags=re.IGNORECASE)
+            or re.search(r'"[^"]*\s+"|\'[^\']*\s+\'', str(candidate_query or ""))
+        )
+        return has_fragment_syntax or len(candidate_set) < len(fallback_set)
+
     def _compact_comparison_entity_query(self, query_text: str) -> str:
         text = str(query_text or "").strip()
         lowered = text.lower()
@@ -2651,8 +2721,17 @@ class MagicBoxOrchestrator:
         fallback = str(fallback_query or "").strip()
         if not planned:
             return fallback
+        had_source_filter = bool(re.search(r"\bsource\s*:", planned, flags=re.IGNORECASE))
         planned_without_source_filters = self._remove_source_field_filters(planned)
         repair_candidate = planned_without_source_filters or planned
+        if had_source_filter and fallback and self._query_has_unbalanced_parentheses(repair_candidate):
+            return fallback
+        if (
+            had_source_filter
+            and fallback
+            and self._query_lost_meaning_after_source_filter_removal(repair_candidate, fallback)
+        ):
+            return fallback
         compacted_comparison = self._compact_comparison_entity_query(repair_candidate)
         if compacted_comparison:
             return compacted_comparison
@@ -2693,6 +2772,8 @@ class MagicBoxOrchestrator:
         while len(tokens) > 1 and tokens[-1].lower().rstrip(".") in topic_tail_tokens:
             tokens = tokens[:-1]
         if not tokens:
+            return ""
+        if len(tokens) > 5:
             return ""
         if tokens[0].isupper() and len(tokens[0]) <= 8 and any(token.islower() for token in tokens[1:]):
             tokens = tokens[:1]
@@ -3087,12 +3168,15 @@ class MagicBoxOrchestrator:
             lightweight=lightweight,
         )
         search_inputs = budget.to_inputs()
+        fallback_query = self._compact_query_terms(question_text, self._query_anchor_terms(question_text)) or question_text
         if query_text:
             search_inputs["query"] = self._apply_source_scope_to_query(query_text, question_text)
         elif "query" in merged_inputs and str(merged_inputs.get("query", "")).strip():
-            search_inputs["query"] = self._apply_source_scope_to_query(str(merged_inputs["query"]), question_text)
+            repaired_query = self._repair_search_query(str(merged_inputs["query"]), fallback_query)
+            search_inputs["query"] = self._apply_source_scope_to_query(repaired_query, question_text)
         elif str(search_inputs.get("query", "")).strip():
-            search_inputs["query"] = self._apply_source_scope_to_query(str(search_inputs["query"]), question_text)
+            repaired_query = self._repair_search_query(str(search_inputs["query"]), fallback_query)
+            search_inputs["query"] = self._apply_source_scope_to_query(repaired_query, question_text)
         for key in ("top_k", "lexical_top_k", "dense_top_k", "fallback_top_k", "rerank_top_k", "date_from", "date_to", "year_balance", "retrieve_all", "retrieval_strategy"):
             if key in merged_inputs and merged_inputs.get(key) not in (None, ""):
                 search_inputs[key] = merged_inputs[key]
@@ -3362,79 +3446,81 @@ class MagicBoxOrchestrator:
                 overrides=syntax_overrides,
             )
             date_window = self._extract_date_window(rewritten)
-            dag = AgentPlanDAG(
-                nodes=[
-                    AgentPlanNode("search", "db_search", inputs=search_inputs),
-                    AgentPlanNode("fetch", "fetch_documents", depends_on=["search"]),
-                    AgentPlanNode("working_set", "create_working_set", depends_on=["fetch"]),
-                    AgentPlanNode("sentences", "sentence_split", depends_on=["fetch"]),
-                    AgentPlanNode("tokens", "tokenize", depends_on=["fetch"]),
-                    AgentPlanNode("pos", "pos_morph", depends_on=["fetch"]),
-                    AgentPlanNode("lemmas", "lemmatize", depends_on=["fetch"]),
-                    AgentPlanNode("dependencies", "dependency_parse", depends_on=["fetch"]),
-                    AgentPlanNode("svo_triples", "extract_svo_triples", depends_on=["fetch"]),
-                    AgentPlanNode("noun_chunks", "noun_chunks", depends_on=["fetch"]),
-                    AgentPlanNode("entities", "ner", depends_on=["fetch"], optional=True),
-                    AgentPlanNode("entity_link", "entity_link", depends_on=["entities"], optional=True),
-                    AgentPlanNode("quotes", "quote_extract", depends_on=["fetch"]),
-                    AgentPlanNode("quote_attribution", "quote_attribute", depends_on=["quotes"]),
-                    AgentPlanNode(
-                        "syntax_role_counts",
-                        "time_series_aggregate",
-                        inputs={
-                            "group_by": "actor_group",
-                            "metrics": ["mention_count"],
-                            "bucket_granularity": "year",
-                            "fallback_time_bin": date_window.get("date_from", ""),
-                            "top_k": 8,
-                        },
-                        depends_on=["svo_triples"],
-                        optional=True,
-                    ),
-                    AgentPlanNode(
-                        "syntax_target_counts",
-                        "time_series_aggregate",
-                        inputs={
-                            "group_by": "target_group",
-                            "metrics": ["mention_count"],
-                            "bucket_granularity": "year",
-                            "fallback_time_bin": date_window.get("date_from", ""),
-                            "top_k": 8,
-                        },
-                        depends_on=["svo_triples"],
-                        optional=True,
-                    ),
+            nodes = [
+                AgentPlanNode("search", "db_search", inputs=search_inputs),
+                AgentPlanNode("fetch", "fetch_documents", depends_on=["search"]),
+                AgentPlanNode("working_set", "create_working_set", depends_on=["fetch"]),
+                AgentPlanNode("sentences", "sentence_split", depends_on=["fetch"]),
+                AgentPlanNode("tokens", "tokenize", depends_on=["fetch"]),
+                AgentPlanNode("pos", "pos_morph", depends_on=["fetch"]),
+                AgentPlanNode("lemmas", "lemmatize", depends_on=["fetch"]),
+                AgentPlanNode("dependencies", "dependency_parse", depends_on=["fetch"]),
+                AgentPlanNode("svo_triples", "extract_svo_triples", depends_on=["fetch"]),
+                AgentPlanNode("noun_chunks", "noun_chunks", depends_on=["fetch"]),
+                AgentPlanNode("entities", "ner", depends_on=["fetch"], optional=True),
+                AgentPlanNode("entity_link", "entity_link", depends_on=["entities"], optional=True),
+                AgentPlanNode("quotes", "quote_extract", depends_on=["fetch"]),
+                AgentPlanNode("quote_attribution", "quote_attribute", depends_on=["quotes"]),
+                AgentPlanNode(
+                    "syntax_role_counts",
+                    "time_series_aggregate",
+                    inputs={
+                        "group_by": "actor_group",
+                        "metrics": ["mention_count"],
+                        "bucket_granularity": "year",
+                        "fallback_time_bin": date_window.get("date_from", ""),
+                        "top_k": 8,
+                    },
+                    depends_on=["svo_triples"],
+                    optional=True,
+                ),
+                AgentPlanNode(
+                    "syntax_target_counts",
+                    "time_series_aggregate",
+                    inputs={
+                        "group_by": "target_group",
+                        "metrics": ["mention_count"],
+                        "bucket_granularity": "year",
+                        "fallback_time_bin": date_window.get("date_from", ""),
+                        "top_k": 8,
+                    },
+                    depends_on=["svo_triples"],
+                    optional=True,
+                ),
+            ]
+            if self._question_requires_capability(rewritten, "plot_artifact"):
+                nodes.append(
                     AgentPlanNode(
                         "plot",
                         "plot_artifact",
                         inputs={
-                            "plot_name": "svo_role_patterns",
-                            "plot_type": "bar",
-                            "x": "entity",
-                            "y": "mention_count",
-                            "series": "series_name",
+                            "plot_name": "syntax_role_patterns",
                             "top_k": 8,
+                            "title": "Syntax role pattern summary",
                         },
                         depends_on=["syntax_role_counts"],
                         optional=True,
-                    ),
-                    AgentPlanNode(
-                        "evidence",
-                        "build_evidence_table",
-                        inputs={"task": "syntax_role_evidence"},
-                        depends_on=[
-                            "sentences",
-                            "tokens",
-                            "pos",
-                            "lemmas",
-                            "dependencies",
-                            "noun_chunks",
-                            "entity_link",
-                            "quote_attribution",
-                            "svo_triples",
-                        ],
-                    ),
-                ],
+                    )
+                )
+            nodes.append(
+                AgentPlanNode(
+                    "evidence",
+                    "build_evidence_table",
+                    inputs={"task": "syntax_role_evidence"},
+                    depends_on=[
+                        "sentences",
+                        "tokens",
+                        "pos",
+                        "lemmas",
+                        "dependencies",
+                        "noun_chunks",
+                        "quote_attribution",
+                        "svo_triples",
+                    ],
+                )
+            )
+            dag = AgentPlanDAG(
+                nodes=nodes,
                 metadata={"question_family": "syntax_role_patterns"},
             )
             return PlannerAction(
@@ -4915,6 +5001,7 @@ class AgentRuntime:
         self._provider_modules_cache: dict[str, bool] | None = None
         self._device_report_cache: dict[str, Any] | None = None
         self._retrieval_health_cache: tuple[float, dict[str, Any]] | None = None
+        self._corpus_date_bounds_cache: tuple[str, str] | None = None
         try:
             self._runtime_info_health_ttl_s = max(
                 0.0,
@@ -4952,6 +5039,49 @@ class AgentRuntime:
         store = InMemoryWorkingSetStore()
         store.document_lookup.update(self.runtime.doc_lookup())
         return store
+
+    def _corpus_date_bounds(self) -> tuple[str, str] | None:
+        if self._corpus_date_bounds_cache is not None:
+            return self._corpus_date_bounds_cache
+        try:
+            metadata = self.runtime.load_metadata()
+        except Exception:
+            return None
+        if metadata is None or getattr(metadata, "empty", True):
+            return None
+        date_column = next((column for column in ("published_at", "date") if column in metadata.columns), "")
+        if not date_column:
+            return None
+        values = metadata[date_column].dropna().astype(str).str.slice(0, 10)
+        valid = sorted(value for value in values if re.fullmatch(r"\d{4}-\d{2}-\d{2}", value))
+        if not valid:
+            return None
+        self._corpus_date_bounds_cache = (valid[0], valid[-1])
+        return self._corpus_date_bounds_cache
+
+    def _date_window_unsupported_reason(self, question_text: str) -> str:
+        requested = self.orchestrator._extract_date_window(question_text)
+        if not requested:
+            return ""
+        bounds = self._corpus_date_bounds()
+        if not bounds:
+            return ""
+        corpus_start, corpus_end = bounds
+        requested_start = str(requested.get("date_from", "") or "")
+        requested_end = str(requested.get("date_to", "") or "")
+        if not requested_end and requested_start:
+            requested_end = "9999-12-31"
+        if not requested_start and requested_end:
+            requested_start = "0001-01-01"
+        if not requested_start or not requested_end:
+            return ""
+        if requested_start[:10] <= corpus_end and requested_end[:10] >= corpus_start:
+            return ""
+        requested_label = requested_start[:10] if requested_start == requested_end else f"{requested_start[:10]} to {requested_end[:10]}"
+        return (
+            f"The requested time window ({requested_label}) is outside the loaded corpus date range "
+            f"({corpus_start} to {corpus_end}), so this corpus cannot support the requested temporal analysis."
+        )
 
     def capability_catalog(self) -> list[dict[str, Any]]:
         specs = sorted(
@@ -5825,6 +5955,48 @@ class AgentRuntime:
                 assumptions=list(state.assumptions),
                 planner_actions=list(state.planner_actions),
                 detail="Waiting for clarification before planning",
+            )
+            self._persist_manifest(manifest)
+            return manifest
+
+        unsupported_date_reason = self._date_window_unsupported_reason(
+            self.orchestrator._planning_context_text(state, state.rewritten_question)
+        )
+        if unsupported_date_reason:
+            manifest = AgentRunManifest(
+                run_id=run_id,
+                question=question,
+                rewritten_question=state.rewritten_question,
+                status="rejected",
+                clarification_questions=[],
+                assumptions=list(state.assumptions),
+                planner_actions=list(state.planner_actions),
+                plan_dags=[],
+                tool_calls=self._current_tool_calls(run_id),
+                selected_docs=[],
+                node_records=[],
+                provenance_records=[],
+                evidence_table=[],
+                final_answer=FinalAnswerPayload(
+                    answer_text=unsupported_date_reason,
+                    unsupported_parts=[unsupported_date_reason],
+                    caveats=[],
+                ),
+                artifacts_dir=str(artifacts_dir),
+                metadata={
+                    "force_answer": bool(state.force_answer),
+                    "no_cache": bool(state.no_cache),
+                    "llm_traces": list(state.llm_traces),
+                    "runtime_info": self.runtime_info(),
+                },
+            )
+            self._set_live_status(
+                run_id,
+                status="rejected",
+                current_phase="unsupported_corpus_scope",
+                detail=unsupported_date_reason,
+                planner_actions=list(state.planner_actions),
+                llm_traces=list(state.llm_traces),
             )
             self._persist_manifest(manifest)
             return manifest
