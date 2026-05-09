@@ -1,0 +1,73 @@
++ PROJECT_ROOT=/cluster/home/dongtten/VT2/VT2-corpusagent2
++ PROMPT_FILE=/cluster/home/dongtten/VT2/VT2-corpusagent2/slurm/coding_agent_prompt.md
++ JOB_ROOT=/scratch/dongtten/vt2_coding_agent_15752
++ RUN_ROOT=/scratch/dongtten/vt2_coding_agent_15752/repo
++ OUTPUT_ROOT=/cluster/home/dongtten/VT2/VT2-corpusagent2/outputs/coding_agent/15752
++ CACHE_ROOT=/scratch/dongtten/hf_cache
++ VENV_ROOT=/scratch/dongtten/venvs/vt2_coding_agent
++ MODEL_ID=Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8
++ MAX_MODEL_LEN=32768
++ VLLM_PORT=33752
++ VLLM_API_KEY=local-slurm-token
++ unset VIRTUAL_ENV
++ unset CONDA_PREFIX
++ unset PYTHONPATH
++ export PATH=/usr/local/bin:/usr/bin:/bin:/cluster/home/dongtten/.local/bin:/cluster/home/dongtten/VT1/active_stt-main/.venv/bin:/cluster/home/dongtten/.vscode-server/cli/servers/Stable-8b640eef5a6c6089c029249d48efa5c99adf7d51/server/bin/remote-cli:/cluster/home/dongtten/.local/bin:/cluster/home/dongtten/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games:/usr/local/games:/snap/bin
++ PATH=/usr/local/bin:/usr/bin:/bin:/cluster/home/dongtten/.local/bin:/cluster/home/dongtten/VT1/active_stt-main/.venv/bin:/cluster/home/dongtten/.vscode-server/cli/servers/Stable-8b640eef5a6c6089c029249d48efa5c99adf7d51/server/bin/remote-cli:/cluster/home/dongtten/.local/bin:/cluster/home/dongtten/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games:/usr/local/games:/snap/bin
++ export HF_HOME=/scratch/dongtten/hf_cache/hf_home
++ HF_HOME=/scratch/dongtten/hf_cache/hf_home
++ export TRANSFORMERS_CACHE=/scratch/dongtten/hf_cache/transformers
++ TRANSFORMERS_CACHE=/scratch/dongtten/hf_cache/transformers
++ export HF_HUB_CACHE=/scratch/dongtten/hf_cache/hub
++ HF_HUB_CACHE=/scratch/dongtten/hf_cache/hub
++ export XDG_CACHE_HOME=/scratch/dongtten/hf_cache/xdg
++ XDG_CACHE_HOME=/scratch/dongtten/hf_cache/xdg
++ export PIP_CACHE_DIR=/scratch/dongtten/hf_cache/pip
++ PIP_CACHE_DIR=/scratch/dongtten/hf_cache/pip
++ export TOKENIZERS_PARALLELISM=false
++ TOKENIZERS_PARALLELISM=false
++ export AGENT_RUN_ROOT=/scratch/dongtten/vt2_coding_agent_15752/repo
++ AGENT_RUN_ROOT=/scratch/dongtten/vt2_coding_agent_15752/repo
++ export AGENT_OUTPUT_ROOT=/cluster/home/dongtten/VT2/VT2-corpusagent2/outputs/coding_agent/15752
++ AGENT_OUTPUT_ROOT=/cluster/home/dongtten/VT2/VT2-corpusagent2/outputs/coding_agent/15752
++ export AGENT_PROMPT_FILE=/cluster/home/dongtten/VT2/VT2-corpusagent2/slurm/coding_agent_prompt.md
++ AGENT_PROMPT_FILE=/cluster/home/dongtten/VT2/VT2-corpusagent2/slurm/coding_agent_prompt.md
++ export AGENT_MODEL_ID=Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8
++ AGENT_MODEL_ID=Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8
++ export AGENT_BASE_URL=http://127.0.0.1:33752/v1
++ AGENT_BASE_URL=http://127.0.0.1:33752/v1
++ export AGENT_API_KEY=local-slurm-token
++ AGENT_API_KEY=local-slurm-token
++ export AGENT_MAX_STEPS=24
++ AGENT_MAX_STEPS=24
++ export AGENT_CONTEXT_CHAR_BUDGET=90000
++ AGENT_CONTEXT_CHAR_BUDGET=90000
+++ dirname /scratch/dongtten/venvs/vt2_coding_agent
++ mkdir -p /scratch/dongtten/vt2_coding_agent_15752 /scratch/dongtten/vt2_coding_agent_15752/repo /cluster/home/dongtten/VT2/VT2-corpusagent2/outputs/coding_agent/15752 /scratch/dongtten/hf_cache /scratch/dongtten/venvs
++ echo '=== job started ==='
++ echo SLURM_JOB_ID=15752
++ echo PROJECT_ROOT=/cluster/home/dongtten/VT2/VT2-corpusagent2
++ echo JOB_ROOT=/scratch/dongtten/vt2_coding_agent_15752
++ echo RUN_ROOT=/scratch/dongtten/vt2_coding_agent_15752/repo
++ echo OUTPUT_ROOT=/cluster/home/dongtten/VT2/VT2-corpusagent2/outputs/coding_agent/15752
+++ hostname
++ echo HOST=fresko
++ date
++ echo '=== gpu ==='
++ nvidia-smi
++ echo '=== required files ==='
++ ls -lah /cluster/home/dongtten/VT2/VT2-corpusagent2/slurm
++ test -d /cluster/home/dongtten/VT2/VT2-corpusagent2
++ test -f /cluster/home/dongtten/VT2/VT2-corpusagent2/slurm/coding_agent_prompt.md
++ test -f /cluster/home/dongtten/VT2/VT2-corpusagent2/slurm/coding_agent_runner.py
++ echo '=== staging repo to scratch ==='
++ rsync -aL --delete --exclude .venv --exclude __pycache__ --exclude .pytest_cache --exclude .mypy_cache --exclude .ruff_cache --exclude .git/lfs --exclude data/raw --exclude data/processed --exclude data/indices --exclude outputs --exclude log /cluster/home/dongtten/VT2/VT2-corpusagent2/ /scratch/dongtten/vt2_coding_agent_15752/repo/
++ echo '=== choosing python ==='
++ command -v python3.11
++ command -v python3
+++ command -v python3
++ PYTHON_BIN=/usr/bin/python3
++ echo PYTHON_BIN=/usr/bin/python3
++ echo '=== creating/reusing venv on scratch ==='
++ '[' '!' -x /scratch/dongtten/venvs/vt2_coding_agent/bin/python ']'
++ /usr/bin/python3 -m venv /scratch/dongtten/venvs/vt2_coding_agent

@@ -1,0 +1,57 @@
+=== job started ===
+SLURM_JOB_ID=15753
+PROJECT_ROOT=/cluster/home/dongtten/VT2/VT2-corpusagent2
+RUN_ROOT=/scratch/dongtten/vt2_coding_agent_15753/repo
+OUTPUT_ROOT=/cluster/home/dongtten/VT2/VT2-corpusagent2/outputs/coding_agent/15753
+HOST=fresko
+Sat May  9 19:41:01 CEST 2026
+=== gpu ===
+Sat May  9 19:41:01 2026       
++-----------------------------------------------------------------------------------------+
+| NVIDIA-SMI 580.126.20             Driver Version: 580.126.20     CUDA Version: 13.0     |
++-----------------------------------------+------------------------+----------------------+
+| GPU  Name                 Persistence-M | Bus-Id          Disp.A | Volatile Uncorr. ECC |
+| Fan  Temp   Perf          Pwr:Usage/Cap |           Memory-Usage | GPU-Util  Compute M. |
+|                                         |                        |               MIG M. |
+|=========================================+========================+======================|
+|   0  NVIDIA L40S                    Off |   00000000:36:00.0 Off |                    0 |
+| N/A   30C    P8             34W /  350W |       0MiB /  46068MiB |      0%      Default |
+|                                         |                        |                  N/A |
++-----------------------------------------+------------------------+----------------------+
+
++-----------------------------------------------------------------------------------------+
+| Processes:                                                                              |
+|  GPU   GI   CI              PID   Type   Process name                        GPU Memory |
+|        ID   ID                                                               Usage      |
+|=========================================================================================|
+|  No running processes found                                                             |
++-----------------------------------------------------------------------------------------+
+=== required files ===
+=== checking uv ===
+UV_BIN=/cluster/home/dongtten/.local/bin/uv
+uv 0.8.20
+=== staging repo to scratch ===
+=== creating/reusing uv venv on scratch ===
+PYTHON_BIN=/scratch/dongtten/venvs/vt2_coding_agent_uv/bin/python
+Python 3.11.13
+=== installing runtime dependencies inside slurm job ===
+=== installing repo package inside slurm job ===
+=== versions ===
+Python 3.11.13
+openai 2.36.0
+vllm 0.20.1
+=== starting vllm ===
+=== waiting for vllm ===
+vLLM died. Last 200 log lines:
+Traceback (most recent call last):
+  File "/scratch/dongtten/venvs/vt2_coding_agent_uv/bin/vllm", line 4, in <module>
+    from vllm.entrypoints.cli.main import main
+  File "/scratch/dongtten/venvs/vt2_coding_agent_uv/lib/python3.11/site-packages/vllm/__init__.py", line 14, in <module>
+    import vllm.env_override  # noqa: F401
+    ^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/scratch/dongtten/venvs/vt2_coding_agent_uv/lib/python3.11/site-packages/vllm/env_override.py", line 90, in <module>
+    from vllm.utils.torch_utils import is_torch_equal, is_torch_equal_or_newer
+  File "/scratch/dongtten/venvs/vt2_coding_agent_uv/lib/python3.11/site-packages/vllm/utils/torch_utils.py", line 16, in <module>
+    from torch.library import Library, infer_schema
+ImportError: cannot import name 'infer_schema' from 'torch.library' (/scratch/dongtten/venvs/vt2_coding_agent_uv/lib/python3.11/site-packages/torch/library.py)
+=== cleanup ===

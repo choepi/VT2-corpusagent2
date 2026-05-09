@@ -20,8 +20,11 @@ wheels/
 
 # Runtime outputs
 /outputs/**
+/outputs/.err
+/outputs/.out
 !/outputs/.gitkeep
-
+/slurm/.err
+/slurm/.err
 # Logs
 /log/*.log
 /log/**/*.out
