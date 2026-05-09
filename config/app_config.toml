@@ -44,10 +44,11 @@ verify_ssl = false
 timeout_s = 20
 
 [provider_order]
+lang_id = ["langdetect"]
 tokenize = ["spacy", "stanza", "nltk", "regex"]
-sentence_split = ["spacy", "stanza", "nltk", "heuristic"]
-pos_morph = ["spacy", "stanza", "flair", "nltk", "heuristic"]
-lemmatize = ["spacy", "stanza", "textblob", "heuristic"]
-ner = ["spacy", "stanza", "flair", "regex"]
-sentiment = ["flair", "textblob", "heuristic"]
-topic_model = ["textacy", "gensim", "heuristic"]
+sentence_split = ["spacy", "stanza", "nltk"]
+pos_morph = ["spacy", "stanza", "flair", "nltk"]
+lemmatize = ["spacy", "stanza", "textblob"]
+ner = ["spacy", "stanza", "flair"]
+sentiment = ["flair", "textblob"]
+topic_model = ["textacy", "gensim"]

@@ -8,6 +8,7 @@ import sys
 from types import SimpleNamespace
 
 import corpusagent2.retrieval as retrieval
+import numpy as np
 import pandas as pd
 
 from corpusagent2 import agent_capabilities
@@ -18,14 +19,19 @@ from corpusagent2.agent_capabilities import (
     _clean_normalize,
     _create_working_set,
     _db_search,
+    _dependency_parse,
+    _entity_link,
     _fetch_documents,
+    _extract_svo_triples,
     _extract_keyterms,
     _filter_working_set,
     _join_external_series,
     _lang_id,
     _ner,
+    _noun_chunks,
     _plot_artifact,
     _sql_query_search,
+    _text_classify,
     _time_series_aggregate,
     _topic_model,
 )
@@ -438,6 +444,115 @@ def test_filter_working_set_structured_filters_fail_closed_when_metadata_absent(
     assert "source_country" in " ".join(result.caveats)
 
 
+def test_filter_working_set_applies_min_text_length_from_document_text() -> None:
+    store = InMemoryWorkingSetStore()
+    store.document_lookup.update(
+        {
+            "short": {
+                "doc_id": "short",
+                "title": "AI",
+                "text": "Tiny.",
+                "published_at": "2018-02-01",
+                "source": "example.com",
+            },
+            "long": {
+                "doc_id": "long",
+                "title": "AI coverage",
+                "text": "Artificial intelligence coverage with enough words for a length-based filter.",
+                "published_at": "2018-02-01",
+                "source": "example.com",
+            },
+        }
+    )
+    store.record_working_set(
+        "run",
+        "broad",
+        [{"doc_id": "short", "rank": 1, "score": 1.0}, {"doc_id": "long", "rank": 2, "score": 0.9}],
+    )
+    context = AgentExecutionContext(
+        run_id="run",
+        artifacts_dir=Path("."),
+        search_backend=None,
+        working_store=store,
+        runtime=None,
+    )
+    deps = {"working_set": ToolExecutionResult(payload={"working_set_ref": "broad", "document_count": 2})}
+
+    result = _filter_working_set(
+        {"payload": {"working_set": "working_set", "filters": {"min_text_length": 40}}},
+        deps,
+        context,
+    )
+
+    assert result.payload["document_count"] == 1
+    assert result.payload["results"][0]["doc_id"] == "long"
+    assert result.metadata["min_text_length"] == 40
+    assert any("minimum text length" in caveat for caveat in result.caveats)
+
+
+def test_filter_working_set_applies_structured_published_at_range_filter() -> None:
+    store = InMemoryWorkingSetStore()
+    store.document_lookup.update(
+        {
+            "old": {
+                "doc_id": "old",
+                "title": "AI coverage",
+                "text": "Older artificial intelligence article.",
+                "published_at": "2018-07-04",
+                "source": "example.com",
+            },
+            "new": {
+                "doc_id": "new",
+                "title": "AI coverage",
+                "text": "Newer artificial intelligence article.",
+                "published_at": "2020-02-01",
+                "source": "example.com",
+            },
+            "missing-date": {
+                "doc_id": "missing-date",
+                "title": "AI coverage",
+                "text": "Undated artificial intelligence article.",
+                "source": "example.com",
+            },
+        }
+    )
+    store.record_working_set(
+        "run",
+        "broad",
+        [
+            {"doc_id": "old", "rank": 1, "score": 1.0},
+            {"doc_id": "new", "rank": 2, "score": 0.9},
+            {"doc_id": "missing-date", "rank": 3, "score": 0.8},
+        ],
+    )
+    context = AgentExecutionContext(
+        run_id="run",
+        artifacts_dir=Path("."),
+        search_backend=None,
+        working_store=store,
+        runtime=None,
+    )
+    deps = {"working_set": ToolExecutionResult(payload={"working_set_ref": "broad", "document_count": 3})}
+
+    result = _filter_working_set(
+        {
+            "payload": {
+                "working_set": "working_set",
+                "filters": {"published_at": {"gte": "2020-01-01", "lte": "2021-12-31"}},
+            }
+        },
+        deps,
+        context,
+    )
+
+    assert result.payload["document_count"] == 1
+    assert result.payload["results"][0]["doc_id"] == "new"
+    assert result.metadata["date_from"] == "2020-01-01"
+    assert result.metadata["date_to"] == "2021-12-31"
+    assert result.metadata["missing_date_count"] == 1
+    assert any("date window filter" in caveat for caveat in result.caveats)
+
+
 def test_clean_normalize_lang_id_and_working_set_flow_preserves_documents() -> None:
     store = InMemoryWorkingSetStore()
     context = AgentExecutionContext(
@@ -471,6 +586,167 @@ def test_clean_normalize_lang_id_and_working_set_flow_preserves_documents() -> N
     assert cleaned.payload["documents"][0]["text"] == "Football match report in English."
     assert detected.payload["rows"][0]["language"] == "en"
     assert working_set.payload["working_set_doc_ids"] == ["doc-1"]
+
+
+def test_clean_normalize_streams_documents_from_working_set_ref(tmp_path: Path) -> None:
+    store = InMemoryWorkingSetStore()
+    store.record_documents(
+        "run",
+        [
+            {
+                "doc_id": "doc-1",
+                "title": "AI coverage",
+                "text": "  Artificial intelligence coverage text.  ",
+                "published_at": "2018-05-01",
+                "source": "example.com",
+            }
+        ],
+    )
+    store.record_working_set("run", "ws_ai", [{"doc_id": "doc-1", "rank": 1, "score": 1.0}])
+    context = AgentExecutionContext(
+        run_id="run",
+        artifacts_dir=tmp_path,
+        search_backend=None,
+        working_store=store,
+        runtime=None,
+    )
+
+    result = _clean_normalize({}, {"working_set": ToolExecutionResult(payload={"working_set_ref": "ws_ai"})}, context)
+
+    assert result.payload["documents"][0]["doc_id"] == "doc-1"
+    assert result.payload["documents"][0]["cleaned_text"] == "Artificial intelligence coverage text."
+    assert result.metadata["documents_from"] == "working_set_ref"
+
+
+def test_lang_id_streams_truncated_working_set_ref(tmp_path: Path) -> None:
+    store = InMemoryWorkingSetStore()
+    store.record_documents(
+        "run",
+        [
+            {
+                "doc_id": "doc-1",
+                "title": "English AI report",
+                "text": "This article describes artificial intelligence systems in English.",
+                "published_at": "2018-01-01",
+                "source": "example.com",
+            },
+            {
+                "doc_id": "doc-2",
+                "title": "English machine learning report",
+                "text": "This article discusses machine learning research and technology.",
+                "published_at": "2018-01-02",
+                "source": "example.com",
+            },
+        ],
+    )
+    store.record_working_set("run", "all_docs", [{"doc_id": "doc-1"}, {"doc_id": "doc-2"}])
+    context = AgentExecutionContext(
+        run_id="run",
+        artifacts_dir=tmp_path,
+        search_backend=None,
+        working_store=store,
+        runtime=None,
+    )
+    fetch_preview = ToolExecutionResult(
+        payload={
+            "documents": [],
+            "working_set_ref": "all_docs",
+            "document_count": 2,
+            "returned_document_count": 0,
+            "documents_truncated": True,
+        }
+    )
+
+    result = _lang_id({}, {"fetch": fetch_preview}, context)
+
+    assert len(result.payload["rows"]) == 2
+    assert result.metadata["documents_from"] == "working_set_ref"
+    assert result.metadata["analyzed_document_count"] == 2
+
+
+def test_working_set_filter_uses_annotation_rows_by_doc_id(tmp_path: Path) -> None:
+    store = InMemoryWorkingSetStore()
+    docs = [
+        {"doc_id": "doc-en", "title": "English", "text": "AI coverage", "published_at": "2018-01-01", "source": "a"},
+        {"doc_id": "doc-de", "title": "Deutsch", "text": "KI Bericht", "published_at": "2018-01-02", "source": "b"},
+    ]
+    store.record_documents("run", docs)
+    store.record_working_set("run", "ws_ai", [{"doc_id": row["doc_id"], "rank": index, "score": 1.0} for index, row in enumerate(docs, start=1)])
+    context = AgentExecutionContext(
+        run_id="run",
+        artifacts_dir=tmp_path,
+        search_backend=None,
+        working_store=store,
+        runtime=None,
+    )
+    deps = {
+        "lang": ToolExecutionResult(
+            payload={
+                "rows": [
+                    {"doc_id": "doc-en", "language": "en", "confidence": 0.99},
+                    {"doc_id": "doc-de", "language": "de", "confidence": 0.99},
+                ]
+            }
+        )
+    }
+
+    result = _filter_working_set(
+        {
+            "working_set_ref": "ws_ai",
+            "predicate": {
+                "language": {"source": "lang", "equals": "en"},
+                "language_source": "lang",
+                "language_source_node": "lang",
+            },
+        },
+        deps,
+        context,
+    )
+
+    assert result.payload["document_count"] == 1
+    assert result.payload["results"][0]["doc_id"] == "doc-en"
+    assert result.metadata["annotation_filter_doc_count"] == 1
+    assert any("annotation-backed filters" in caveat for caveat in result.caveats)
+    assert not any("language_source" in caveat for caveat in result.caveats)
+    assert not any("language_source_node" in caveat for caveat in result.caveats)
+
+
+def test_working_set_filter_accepts_nested_annotation_filter_values(tmp_path: Path) -> None:
+    store = InMemoryWorkingSetStore()
+    docs = [
+        {"doc_id": "doc-en", "title": "English", "text": "AI coverage", "published_at": "2018-01-01", "source": "a"},
+        {"doc_id": "doc-de", "title": "Deutsch", "text": "KI Bericht", "published_at": "2018-01-02", "source": "b"},
+    ]
+    for doc in docs:
+        store.document_lookup[doc["doc_id"]] = doc
+    store.record_working_set("run", "ws_ai", [{"doc_id": item["doc_id"], "rank": index} for index, item in enumerate(docs, start=1)])
+    context = AgentExecutionContext(
+        run_id="run",
+        artifacts_dir=tmp_path,
+        search_backend=None,
+        working_store=store,
+        runtime=None,
+    )
+    deps = {
+        "lang": ToolExecutionResult(
+            payload={
+                "rows": [
+                    {"doc_id": "doc-en", "language": "en", "confidence": 0.99},
+                    {"doc_id": "doc-de", "language": "de", "confidence": 0.99},
+                ]
+            }
+        )
+    }
+
+    result = _filter_working_set(
+        {"working_set_ref": "ws_ai", "filters": {"language": {"source": "lang", "field": "language", "in": [{"eq": "en"}]}}},
+        deps,
+        context,
+    )
+
+    assert result.payload["document_count"] == 1
+    assert result.payload["results"][0]["doc_id"] == "doc-en"
+    assert result.metadata["annotation_filter_doc_count"] == 1
 
 
 def test_build_evidence_table_can_aggregate_noun_distribution() -> None:
@@ -576,6 +852,55 @@ def test_build_evidence_table_uses_heuristic_noun_distribution_without_pos_rows(
     assert rows_by_lemma["club"]["document_frequency"] == 2
     assert result.metadata["provider"] == "heuristic_batch"
     assert result.metadata["preview_only"] is False
+    assert any("explicit heuristic token/POS fallback" in caveat for caveat in result.caveats)
+
+
+def test_build_evidence_table_reports_provider_backed_noun_distribution_without_pos_rows(
+    monkeypatch, tmp_path: Path
+) -> None:
+    context = AgentExecutionContext(
+        run_id="run",
+        artifacts_dir=tmp_path,
+        search_backend=None,
+        working_store=InMemoryWorkingSetStore(),
+        runtime=None,
+    )
+    deps = {
+        "fetch": ToolExecutionResult(
+            payload={
+                "documents": [{"doc_id": "doc-1", "text": "Football club player player"}],
+                "document_count": 1,
+                "returned_document_count": 1,
+                "documents_truncated": False,
+            }
+        )
+    }
+
+    def fake_noun_frequency_rows_from_documents(*args, **kwargs):
+        return (
+            [
+                {
+                    "lemma": "player",
+                    "count": 2,
+                    "document_frequency": 1,
+                    "normalized_per_1000_tokens": 666.67,
+                }
+            ],
+            {"provider": "spacy_batch", "analyzed_document_count": 1},
+        )
+
+    monkeypatch.setattr(
+        agent_capabilities,
+        "_noun_frequency_rows_from_documents",
+        fake_noun_frequency_rows_from_documents,
+    )
+
+    result = _build_evidence_table({"task": "noun_frequency_distribution", "top_k": 5}, deps, context)
+
+    assert result.payload["rows"][0]["lemma"] == "player"
+    assert result.metadata["provider"] == "spacy_batch"
+    assert not any("heuristic token/POS fallback" in caveat for caveat in result.caveats)
+    assert any("provider-backed spacy_batch" in caveat for caveat in result.caveats)
 
 
 def test_noun_distribution_ignores_machine_payload_terms(monkeypatch, tmp_path: Path) -> None:
@@ -777,6 +1102,37 @@ def test_plot_artifact_resolves_month_and_series_aliases(tmp_path: Path) -> None
     assert result.payload["resolved_y"] == "document_frequency"
     assert result.payload["resolved_series"] == "linked_entity"
     assert agent_capabilities._image_has_visual_content(Path(result.payload["artifact_path"]))
+
+
+def test_plot_artifact_resolves_quarter_alias_to_available_time_axis(tmp_path: Path) -> None:
+    context = AgentExecutionContext(
+        run_id="run",
+        artifacts_dir=tmp_path,
+        search_backend=None,
+        working_store=InMemoryWorkingSetStore(),
+        runtime=None,
+    )
+    deps = {
+        "table": ToolExecutionResult(
+            payload={
+                "rows": [
+                    {"time_bin": "2017-01", "series_name": "Fed", "count": 4},
+                    {"time_bin": "2017-02", "series_name": "Fed", "count": 7},
+                ]
+            }
+        )
+    }
+
+    result = _plot_artifact(
+        {"plot_type": "line", "x": "quarter", "y": "frequency", "series": "series_name", "title": "Fed Terms"},
+        deps,
+        context,
+    )
+
+    assert result.artifacts
+    assert result.payload["resolved_x"] == "time_bin"
+    assert result.payload["resolved_y"] == "count"
+    assert any("Resolved plot x field 'quarter'" in caveat for caveat in result.caveats)
 
 
 def test_plot_artifact_keeps_temporal_bins_for_grouped_period_series(tmp_path: Path) -> None:
@@ -1806,6 +2162,43 @@ def test_time_series_aggregate_handles_document_series_and_string_metrics(tmp_pa
     assert rows[("Lionel Messi", "2018-03")]["period_document_count"] == 2
 
 
+def test_time_series_aggregate_respects_quarter_granularity(tmp_path: Path) -> None:
+    context = AgentExecutionContext(
+        run_id="run",
+        artifacts_dir=tmp_path,
+        search_backend=None,
+        working_store=InMemoryWorkingSetStore(),
+        runtime=None,
+    )
+    deps = {
+        "docs": ToolExecutionResult(
+            payload={
+                "documents": [
+                    {"doc_id": "d1", "text": "Fed monetary policy risks", "published_at": "2018-01-20"},
+                    {"doc_id": "d2", "text": "Fed monetary policy concerns", "published_at": "2018-03-21"},
+                    {"doc_id": "d3", "text": "Fed rate concerns", "published_at": "2018-04-02"},
+                ]
+            }
+        )
+    }
+
+    result = _time_series_aggregate(
+        {
+            "documents_node": "docs",
+            "interval": "quarter",
+            "series": [{"name": "Fed", "entity_terms": ["Fed"]}],
+            "metrics": ["document_count"],
+        },
+        deps,
+        context,
+    )
+
+    rows = {(row["series_name"], row["time_bin"]): row for row in result.payload["rows"]}
+    assert rows[("Fed", "2018-Q1")]["document_count"] == 2
+    assert rows[("Fed", "2018-Q1")]["quarter"] == "2018-Q1"
+    assert rows[("Fed", "2018-Q2")]["document_count"] == 1
+
+
 def test_time_series_aggregate_handles_named_average_metrics(tmp_path: Path) -> None:
     context = AgentExecutionContext(
         run_id="run",
@@ -2456,9 +2849,9 @@ def test_ner_streams_full_working_set_when_fetch_is_preview(tmp_path: Path, monk
 
     assert result.metadata["analyzed_document_count"] == 3
     assert result.metadata["analysis_document_limit"] is None
-    assert result.metadata["provider"] == "regex"
+    assert result.metadata["provider"] in {"spacy", "stanza", "flair"}
     assert not any("capped" in caveat.lower() for caveat in result.caveats)
-    assert any("provider ner was skipped" in caveat.lower() for caveat in result.caveats)
+    assert any("provider ner is running despite large working set" in caveat.lower() for caveat in result.caveats)
 
 
 def test_sentiment_streams_full_working_set_when_fetch_is_preview(tmp_path: Path, monkeypatch) -> None:
@@ -3513,6 +3906,299 @@ def test_time_series_aggregate_filters_invalid_entities_and_adds_normalized_valu
         }
     ]
     assert result.payload["skipped_row_count"] == 2
+
+
+def test_time_series_aggregate_filters_stopword_like_series_labels(tmp_path: Path) -> None:
+    context = AgentExecutionContext(
+        run_id="run",
+        artifacts_dir=tmp_path,
+        search_backend=None,
+        working_store=_ExplodingStore(),
+        runtime=None,
+    )
+    deps = {
+        "svo": ToolExecutionResult(
+            payload={
+                "rows": [
+                    {"actor_group": "The", "published_at": "2020-06-01", "mention_count": 9},
+                    {"actor_group": "After", "published_at": "2020-06-01", "mention_count": 7},
+                    {"actor_group": "police", "published_at": "2020-06-01", "mention_count": 3},
+                    {"actor_group": "protesters", "published_at": "2020-06-01", "mention_count": 2},
+                ]
+            }
+        )
+    }
+
+    result = _time_series_aggregate(
+        {"group_by": "actor_group", "bucket_granularity": "year", "metrics": ["mention_count"]},
+        deps,
+        context,
+    )
+
+    entities = {row["entity"] for row in result.payload["rows"]}
+    assert entities == {"police", "protesters"}
+    assert result.payload["skipped_row_count"] == 2
+
+
+def test_extract_svo_triples_emits_actor_and_target_role_groups(tmp_path: Path) -> None:
+    context = AgentExecutionContext(
+        run_id="run",
+        artifacts_dir=tmp_path,
+        search_backend=None,
+        working_store=_ExplodingStore(),
+        runtime=None,
+    )
+    deps = {
+        "documents": ToolExecutionResult(
+            payload={
+                "documents": [
+                    {
+                        "doc_id": "d1",
+                        "published_at": "2020-06-01",
+                        "source": "example.org",
+                        "title": "Police and protesters clash",
+                        "text": (
+                            "Police arrested protesters outside city hall. "
+                            "Protesters were pushed by officers near the courthouse. "
+                            "The mayor criticized the department."
+                        ),
+                    }
+                ]
+            }
+        )
+    }
+
+    result = _extract_svo_triples({}, deps, context)
+
+    rows = result.payload["rows"]
+    assert any(
+        row["subject"] == "Police"
+        and row["verb"] == "arrest"
+        and row["actor_group"] == "police"
+        and row["target_group"] == "protesters"
+        for row in rows
+    )
+    assert any(
+        row["voice"] == "passive"
+        and row["semantic_actor"] == "officers"
+        and row["actor_group"] == "police"
+        and row["semantic_target"] == "Protesters"
+        and row["target_group"] == "protesters"
+        for row in rows
+    )
+    assert any(row["actor_group"] == "politicians" and row["target_group"] == "institutions" for row in rows)
+    assert {row["provider"] for row in rows} <= {"spacy", "stanza"}
+
+
+def test_dependency_parse_uses_real_dependency_labels_not_adjacent_token_mock(tmp_path: Path) -> None:
+    context = AgentExecutionContext(
+        run_id="run",
+        artifacts_dir=tmp_path,
+        search_backend=None,
+        working_store=_ExplodingStore(),
+        runtime=None,
+    )
+    deps = {
+        "documents": ToolExecutionResult(
+            payload={
+                "documents": [
+                    {
+                        "doc_id": "d1",
+                        "published_at": "2020-06-01",
+                        "source": "example.org",
+                        "text": "Police arrested protesters outside city hall.",
+                    }
+                ]
+            }
+        )
+    }
+
+    result = _dependency_parse({}, deps, context)
+
+    dependencies = result.payload["rows"][0]["dependencies"]
+    assert result.metadata["provider"] in {"spacy", "stanza"}
+    assert any(item["dep"] in {"nsubj", "obj", "dobj", "ROOT", "root"} for item in dependencies)
+    assert not all(item["dep"] == "next" for item in dependencies)
+
+
+def test_noun_chunks_prefers_parser_backed_chunks_over_pos_sequence_fallback(tmp_path: Path) -> None:
+    context = AgentExecutionContext(
+        run_id="run",
+        artifacts_dir=tmp_path,
+        search_backend=None,
+        working_store=_ExplodingStore(),
+        runtime=None,
+    )
+    deps = {
+        "documents": ToolExecutionResult(
+            payload={
+                "documents": [
+                    {
+                        "doc_id": "d1",
+                        "published_at": "2020-06-01",
+                        "source": "example.org",
+                        "text": "The city council criticized police tactics.",
+                    }
+                ]
+            }
+        )
+    }
+
+    result = _noun_chunks({}, deps, context)
+
+    chunks = result.payload["rows"][0]["noun_chunks"]
+    assert result.metadata["provider"] == "spacy"
+    assert any("city council" in chunk.lower() for chunk in chunks)
+
+
+def test_ner_provider_no_entity_output_returns_structured_no_data(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("CORPUSAGENT2_PROVIDER_ORDER_NER", "spacy")
+    context = AgentExecutionContext(
+        run_id="run",
+        artifacts_dir=tmp_path,
+        search_backend=None,
+        working_store=_ExplodingStore(),
+        runtime=None,
+    )
+    deps = {
+        "documents": ToolExecutionResult(
+            payload={
+                "documents": [
+                    {
+                        "doc_id": "d1",
+                        "published_at": "2020-06-01",
+                        "source": "example.org",
+                        "text": "and the or but if then",
+                    }
+                ]
+            }
+        )
+    }
+
+    result = _ner({}, deps, context)
+
+    assert result.payload["rows"] == []
+    assert result.metadata["provider"] == "spacy"
+    assert result.metadata["no_data"] is True
+    assert result.metadata["no_data_reason"] == "no_entities_extracted"
+
+
+def test_provider_backed_nlp_tools_report_no_input_documents(tmp_path: Path) -> None:
+    context = AgentExecutionContext(
+        run_id="run",
+        artifacts_dir=tmp_path,
+        search_backend=None,
+        working_store=_ExplodingStore(),
+        runtime=None,
+    )
+    tools = [
+        ("sentence_split", agent_capabilities._sentence_split_docs),
+        ("tokenize", agent_capabilities._tokenize_docs),
+        ("pos_morph", agent_capabilities._pos_morph),
+        ("lemmatize", agent_capabilities._lemmatize_docs),
+        ("dependency_parse", agent_capabilities._dependency_parse),
+        ("noun_chunks", agent_capabilities._noun_chunks),
+        ("ner", agent_capabilities._ner),
+        ("extract_svo_triples", agent_capabilities._extract_svo_triples),
+        ("topic_model", agent_capabilities._topic_model),
+        ("sentiment", agent_capabilities._sentiment),
+    ]
+
+    for capability, tool in tools:
+        result = tool({}, {}, context)
+        assert result.metadata["no_data"] is True, capability
+        assert result.metadata["no_data_reason"] == "no_input_documents", capability
+
+
+def test_entity_link_does_not_fabricate_knowledge_base_urls(tmp_path: Path) -> None:
+    context = AgentExecutionContext(
+        run_id="run",
+        artifacts_dir=tmp_path,
+        search_backend=None,
+        working_store=_ExplodingStore(),
+        runtime=None,
+    )
+    deps = {
+        "entities": ToolExecutionResult(
+            payload={"rows": [{"doc_id": "d1", "entity": "New York", "label": "GPE", "published_at": "2020-06-01"}]}
+        )
+    }
+
+    result = _entity_link({}, deps, context)
+
+    row = result.payload["rows"][0]
+    assert row["canonical_entity"] == "New York"
+    assert row["kb_id"] == ""
+    assert row["kb_url"] == ""
+    assert row["link_method"] == "string_canonicalization"
+    assert row["link_status"] == "unresolved"
+    assert "knowledge-base resolver" in " ".join(result.caveats)
+
+
+def test_entity_link_preserves_upstream_no_input_reason(tmp_path: Path) -> None:
+    context = AgentExecutionContext(
+        run_id="run",
+        artifacts_dir=tmp_path,
+        search_backend=None,
+        working_store=_ExplodingStore(),
+        runtime=None,
+    )
+
+    result = _entity_link({}, {}, context)
+
+    assert result.payload["rows"] == []
+    assert result.metadata["no_data"] is True
+    assert result.metadata["no_data_reason"] == "no_input_documents"
+
+
+def test_text_classify_uses_candidate_labels_when_supplied(monkeypatch, tmp_path: Path) -> None:
+    context = AgentExecutionContext(
+        run_id="run",
+        artifacts_dir=tmp_path,
+        search_backend=None,
+        working_store=_ExplodingStore(),
+        runtime=None,
+    )
+    deps = {
+        "documents": ToolExecutionResult(
+            payload={
+                "documents": [
+                    {
+                        "doc_id": "d1",
+                        "published_at": "2020-06-01",
+                        "source": "example.org",
+                        "text": "Officers arrested protesters during a march.",
+                    }
+                ]
+            }
+        )
+    }
+
+    def fake_encode(texts: list[str], *, model_id: str, normalize: bool = True):
+        vectors = []
+        for text in texts:
+            lowered = str(text).lower()
+            if "police" in lowered or "officer" in lowered or "arrest" in lowered:
+                vectors.append(np.array([1.0, 0.0], dtype=np.float32))
+            elif "climate" in lowered:
+                vectors.append(np.array([0.0, 1.0], dtype=np.float32))
+            else:
+                vectors.append(np.array([0.5, 0.5], dtype=np.float32))
+        return np.vstack(vectors), "cpu"
+
+    monkeypatch.setattr(agent_capabilities, "_encode_texts", fake_encode)
+
+    result = _text_classify(
+        {"candidate_labels": ["police action", "climate policy"]},
+        deps,
+        context,
+    )
+
+    row = result.payload["rows"][0]
+    assert row["label"] == "police action"
+    assert row["labels"][0] == "police action"
+    assert result.metadata["provider"] == "sentence_transformer"
+    assert result.metadata["classification_mode"] != "sentiment_proxy"
 
 
 def test_topic_model_emits_time_slices_instead_of_all_bucket(monkeypatch, tmp_path: Path) -> None:

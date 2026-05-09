@@ -90,6 +90,8 @@ let submissionInFlight = false;
 let activePollSessionId = 0;
 let notificationPermissionRequested = false;
 const notifiedRunIds = new Set();
+const notificationEligibleRunIds = new Set();
+const notificationObservedActiveRunIds = new Set();
 const POLL_INTERVAL_MS = 250;
 const MANIFEST_FETCH_RETRY_DELAY_MS = 400;
 const MANIFEST_FETCH_MAX_ATTEMPTS = 5;
@@ -565,6 +567,9 @@ function notifyRunFinished(manifest, statusPayload) {
   }
   const runId = manifest?.run_id || statusPayload?.run_id || currentRunId;
   if (!runId || notifiedRunIds.has(runId)) {
+    return;
+  }
+  if (!notificationEligibleRunIds.has(runId) || !notificationObservedActiveRunIds.has(runId)) {
     return;
   }
   notifiedRunIds.add(runId);
@@ -2223,6 +2228,8 @@ async function submitQuery({ preserveClarificationHistory = false } = {}) {
   submissionInFlight = true;
   activePollSessionId += 1;
   const pollSessionId = activePollSessionId;
+  notificationEligibleRunIds.clear();
+  notificationObservedActiveRunIds.clear();
   currentRunStartedAtUtc = "";
   currentRunFinishedAtUtc = "";
   currentManifestSavedPath = "";
@@ -2279,6 +2286,12 @@ async function submitQuery({ preserveClarificationHistory = false } = {}) {
       return;
     }
     currentRunId = payload.run_id || "";
+    if (currentRunId) {
+      notificationEligibleRunIds.add(currentRunId);
+      if (!isTerminalStatus(payload.status)) {
+        notificationObservedActiveRunIds.add(currentRunId);
+      }
+    }
     setStatus(payload);
     pollTimer = setInterval(() => {
       void pollRun(payload.run_id, pollSessionId);
@@ -2304,6 +2317,9 @@ async function pollRun(runId, pollSessionId = activePollSessionId) {
     }
     currentRunId = runId;
     setStatus(statusPayload);
+    if (!isTerminalStatus(statusPayload.status)) {
+      notificationObservedActiveRunIds.add(runId);
+    }
 
     if (isTerminalStatus(statusPayload.status)) {
       clearInterval(pollTimer);

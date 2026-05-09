@@ -143,8 +143,11 @@ TEMPLATE_TERM_STOPWORDS = {
     "mix", "thumbnail", "thumbnails", "interstitial", "gallery", "caption", "close", "photo", "image",
     "javascript", "subscribe", "subscription", "email", "advertisement", "advertisements", "ad", "ads",
     "script", "function", "return", "var", "let", "const", "try", "catch", "error", "undefined",
-    "tmr", "banner",
+    "tmr", "banner", "click", "scroll", "start", "continue", "read", "watch", "video", "photo",
 }
+SERIES_SURFACE_STOPWORDS = (
+    STOPWORDS | STRUCTURAL_TERM_STOPWORDS | FUNCTION_WORD_STOPWORDS | TEMPLATE_TERM_STOPWORDS | ENTITY_SURFACE_STOPWORDS
+)
 
 
 def _is_placeholder_axis_label(value: Any) -> bool:
@@ -2417,6 +2420,24 @@ def _time_bin(value: str, granularity: str | None = None) -> str:
     if _is_placeholder_axis_label(text):
         return "unknown"
     mode = str(granularity or _default_time_granularity()).strip().lower() or "month"
+    if mode in {"quarter", "q"}:
+        quarter_match = re.match(r"^(\d{4})[-_/ ]?Q([1-4])$", text, flags=re.IGNORECASE)
+        if quarter_match:
+            return f"{quarter_match.group(1)}-Q{quarter_match.group(2)}"
+        if len(text) >= 7 and text[4] == "-":
+            try:
+                month = int(text[5:7])
+            except ValueError:
+                month = 0
+            if 1 <= month <= 12:
+                return f"{text[:4]}-Q{((month - 1) // 3) + 1}"
+        if re.match(r"^\d{4}", text):
+            return text[:4]
+        return "unknown"
+    if mode in {"year", "annual", "annually"}:
+        if re.match(r"^\d{4}", text):
+            return text[:4]
+        return "unknown"
     if mode == "day":
         if len(text) >= 10 and text[4] == "-" and text[7] == "-":
             return text[:10]
@@ -2434,6 +2455,23 @@ def _time_bin(value: str, granularity: str | None = None) -> str:
     if re.match(r"^\d{4}", text):
         return text[:4]
     return "unknown"
+
+
+def _time_bin_fields(time_bin: str, granularity: str | None = None) -> dict[str, str]:
+    rendered = str(time_bin or "unknown")
+    fields = {
+        "time_bin": rendered,
+        "bucket": rendered,
+        "month": rendered,
+        "period": rendered,
+        "time_period": rendered,
+    }
+    mode = str(granularity or _default_time_granularity()).strip().lower()
+    if mode in {"quarter", "q"} or re.match(r"^\d{4}-Q[1-4]$", rendered):
+        fields["quarter"] = rendered
+    if mode in {"year", "annual", "annually"} or re.match(r"^\d{4}$", rendered):
+        fields["year"] = rendered[:4]
+    return fields
 
 
 def _row_timestamp(row: dict[str, Any]) -> str:
@@ -2466,15 +2504,14 @@ def _infer_language(text: str) -> tuple[str, float]:
 
 def _link_entity_row(entity: str, label: str) -> dict[str, Any]:
     normalized = entity.strip()
-    slug = quote(normalized.replace(" ", "_"))
-    kb_id = f"kb:{slug.lower()}"
-    url = f"https://www.wikidata.org/wiki/Special:EntityPage/{slug}"
     return {
         "entity": normalized,
         "label": label,
-        "kb_id": kb_id,
-        "kb_url": url,
-        "confidence": 0.35 if normalized else 0.0,
+        "kb_id": "",
+        "kb_url": "",
+        "confidence": 0.25 if normalized else 0.0,
+        "link_method": "string_canonicalization",
+        "link_status": "unresolved",
     }
 
 
@@ -2494,6 +2531,35 @@ def _metadata(provider: str, tool_name: str, **extra: Any) -> dict[str, Any]:
     payload = {"provider": provider, "tool_name": tool_name}
     payload.update(extra)
     return payload
+
+
+def _provider_unavailable_result(capability: str, *, caveats: list[str] | None = None, **metadata: Any) -> ToolExecutionResult:
+    reason = f"{capability}_provider_unavailable"
+    return ToolExecutionResult(
+        payload={"rows": [], **metadata},
+        caveats=[
+            *(caveats or []),
+            (
+                f"No provider-backed implementation was available for {capability}. "
+                "Heuristic NLP fallbacks are disabled unless explicitly requested in provider_order."
+            ),
+        ],
+        metadata={"no_data": True, "no_data_reason": reason, **metadata},
+    )
+
+
+def _no_input_documents_result(
+    capability: str,
+    *,
+    rows_key: str = "rows",
+    caveats: list[str] | None = None,
+    **metadata: Any,
+) -> ToolExecutionResult:
+    return ToolExecutionResult(
+        payload={rows_key: [], **metadata},
+        caveats=list(caveats or [f"No input documents were available for {capability}."]),
+        metadata={"no_data": True, "no_data_reason": "no_input_documents", "provider": "", **metadata},
+    )
 
 
 def _sentence_embedding_model_id(context: AgentExecutionContext, params: dict[str, Any]) -> str:
@@ -3283,9 +3349,32 @@ def _filter_expected_values(value: Any, mode: str) -> list[str]:
                 return _filter_expected_values(value.get(key), next_mode)
         return []
     if isinstance(value, (list, tuple, set)):
-        return [str(item).strip() for item in value if str(item).strip()]
+        values: list[str] = []
+        for item in value:
+            if isinstance(item, dict):
+                values.extend(_filter_expected_values(item, mode))
+                continue
+            text = str(item).strip()
+            if text:
+                values.append(text)
+        return values
     text = str(value).strip()
     return [text] if text else []
+
+
+def _is_filter_control_metadata_key(key: str) -> bool:
+    normalized = str(key or "").strip().lower()
+    if normalized in {
+        "source_node",
+        "source_node_id",
+        "source_ref",
+        "source_result",
+        "working_set_node",
+        "working_set_source_node",
+        "working_set_source_node_id",
+    }:
+        return True
+    return normalized.endswith(("_source", "_source_node", "_source_node_id", "_source_ref", "_source_result"))
 
 
 def _row_filter_actual_values(row: dict[str, Any], key: str) -> tuple[list[str], bool]:
@@ -3310,6 +3399,12 @@ def _structured_filter_matches(row: dict[str, Any], filters: dict[str, Any]) -> 
     for raw_key, expected in filters.items():
         key, mode = _normalise_structured_filter_key(str(raw_key))
         actual_values, supported = _row_filter_actual_values(row, key)
+        if isinstance(expected, dict) and "exists" in expected:
+            should_exist = bool(expected.get("exists"))
+            has_value = bool(actual_values)
+            if should_exist != has_value:
+                return False, unsupported
+            continue
         expected_values = _filter_expected_values(expected, mode)
         if not expected_values:
             continue
@@ -3402,10 +3497,79 @@ def _filter_working_set(params: dict[str, Any], deps: dict[str, ToolExecutionRes
     query = str(params.get("query", "") or "").strip()
     filters = params.get("filters", params.get("filter", {}))
     filters = dict(filters) if isinstance(filters, dict) else {}
-    limit = _positive_int_param(params.get("limit", params.get("top_k", params.get("max_documents"))))
-    sort_specs = _working_set_sort_specs(params)
+    predicate = params.get("predicate", {})
+    if isinstance(predicate, dict):
+        filters = {**filters, **predicate}
+    filters = {
+        key: value
+        for key, value in filters.items()
+        if not _is_filter_control_metadata_key(str(key))
+    }
+    min_text_length = None
+    for length_key in ("min_text_length", "minimum_text_length", "text_min_length"):
+        if length_key in filters:
+            min_text_length = _positive_int_param(filters.pop(length_key))
+            break
     date_from = str(params.get("date_from", "") or "").strip()
     date_to = str(params.get("date_to", "") or "").strip()
+    for date_key in ("published_at", "date"):
+        date_filter = filters.get(date_key)
+        if not isinstance(date_filter, dict):
+            continue
+        extracted_from = str(
+            date_filter.get("gte")
+            or date_filter.get("from")
+            or date_filter.get("after")
+            or date_filter.get("start")
+            or ""
+        ).strip()
+        extracted_to = str(
+            date_filter.get("lte")
+            or date_filter.get("to")
+            or date_filter.get("before")
+            or date_filter.get("end")
+            or ""
+        ).strip()
+        if extracted_from and not date_from:
+            date_from = extracted_from
+        if extracted_to and not date_to:
+            date_to = extracted_to
+        filters.pop(date_key, None)
+        break
+    annotation_doc_ids: set[str] | None = None
+    annotation_filter_keys: set[str] = set()
+    annotation_filter_caveats: list[str] = []
+    for field_name, spec in list(filters.items()):
+        if not isinstance(spec, dict) or not str(spec.get("source", "") or "").strip():
+            continue
+        source_name = str(spec.get("source", "") or "").strip()
+        source_result = deps.get(source_name)
+        if source_result is None:
+            annotation_filter_caveats.append(f"Annotation filter '{field_name}' referenced missing source '{source_name}'.")
+            annotation_filter_keys.add(str(field_name))
+            annotation_doc_ids = set()
+            continue
+        source_payload = source_result.payload if isinstance(source_result.payload, dict) else {}
+        source_rows = source_payload.get("rows", []) if isinstance(source_payload, dict) else []
+        if not isinstance(source_rows, list):
+            source_rows = []
+        expected_values = {str(item).strip().lower() for item in _filter_expected_values(spec, "in")}
+        expected_values.discard("")
+        annotation_field = str(spec.get("field", field_name) or field_name)
+        matched_doc_ids = {
+            str(row.get("doc_id", "")).strip()
+            for row in source_rows
+            if str(row.get("doc_id", "")).strip()
+            and (
+                not expected_values
+                or str(row.get(annotation_field, row.get(field_name, "")) or "").strip().lower() in expected_values
+            )
+        }
+        annotation_doc_ids = matched_doc_ids if annotation_doc_ids is None else annotation_doc_ids.intersection(matched_doc_ids)
+        annotation_filter_keys.add(str(field_name))
+    document_filters = {key: value for key, value in filters.items() if str(key) not in annotation_filter_keys}
+    limit = _positive_int_param(params.get("limit", params.get("top_k", params.get("max_documents"))))
+    sort_specs = _working_set_sort_specs(params)
     upstream_ref = str(params.get("working_set_ref", "") or _resolve_working_set_ref(params, deps)).strip()
     if not upstream_ref:
         return ToolExecutionResult(
@@ -3419,7 +3583,16 @@ def _filter_working_set(params: dict[str, Any], deps: dict[str, ToolExecutionRes
             caveats=["Run abort was requested before working-set filtering started."],
             metadata={"cancelled": True, "no_data": True, "no_data_reason": "cancelled"},
         )
-    if not query and not filters and not date_from and not date_to and not limit and not sort_specs:
+    if (
+        not query
+        and not document_filters
+        and annotation_doc_ids is None
+        and min_text_length is None
+        and not date_from
+        and not date_to
+        and not limit
+        and not sort_specs
+    ):
         count = _count_working_set(context, upstream_ref, 0)
         preview_ids = _fetch_working_set_ids(context, upstream_ref, limit=_result_preview_limit())
         return ToolExecutionResult(
@@ -3448,6 +3621,7 @@ def _filter_working_set(params: dict[str, Any], deps: dict[str, ToolExecutionRes
 
     filtered_rows: list[dict[str, Any]] = []
     unsupported_filter_keys: set[str] = set()
+    missing_date_count = 0
     offset = 0
     cancelled = False
     while True:
@@ -3463,19 +3637,29 @@ def _filter_working_set(params: dict[str, Any], deps: dict[str, ToolExecutionRes
                 break
             row = _with_cleaned_document_text(dict(raw_row))
             published_at = str(row.get("published_at", row.get("date", "")) or "")
+            if (date_from or date_to) and not published_at:
+                missing_date_count += 1
+                continue
             if date_from and published_at and published_at < date_from:
                 continue
             if date_to and published_at and published_at > date_to:
                 continue
-            if filters:
-                filter_matched, unsupported = _structured_filter_matches(row, filters)
+            doc_id = str(row.get("doc_id", "")).strip()
+            if annotation_doc_ids is not None and doc_id not in annotation_doc_ids:
+                continue
+            if min_text_length is not None:
+                text_for_length = _row_analysis_text(row)
+                if len(text_for_length) < min_text_length:
+                    continue
+            if document_filters:
+                filter_matched, unsupported = _structured_filter_matches(row, document_filters)
                 unsupported_filter_keys.update(unsupported)
                 if not filter_matched:
                     continue
             if not query or _row_matches_query_expression(row, query):
                 filtered_rows.append(
                     {
-                        "doc_id": str(row.get("doc_id", "")).strip(),
+                        "doc_id": doc_id,
                         "title": str(row.get("title", "")),
                         "snippet": str(row.get("text", row.get("cleaned_text", "")))[:360],
                         "outlet": str(row.get("outlet", row.get("source", ""))),
@@ -3551,12 +3735,30 @@ def _filter_working_set(params: dict[str, Any], deps: dict[str, ToolExecutionRes
             f"another full-corpus retrieval; matched {matched_count_before_limit} of {total or offset} upstream documents."
         )
     ]
-    if filters:
+    if document_filters or annotation_filter_keys:
         caveats.append(
             "Applied structured working-set filters: "
             + json.dumps(filters, ensure_ascii=False, sort_keys=True)
             + "."
         )
+    if annotation_filter_keys:
+        caveats.append(
+            "Resolved annotation-backed filters by doc_id from dependency rows: "
+            + ", ".join(sorted(annotation_filter_keys))
+            + f" ({len(annotation_doc_ids or set())} matching doc ids)."
+        )
+    if min_text_length is not None:
+        caveats.append(f"Applied minimum text length filter: {min_text_length} characters.")
+    if date_from or date_to:
+        date_parts = []
+        if date_from:
+            date_parts.append(f"from {date_from}")
+        if date_to:
+            date_parts.append(f"to {date_to}")
+        caveats.append("Applied date window filter: " + " ".join(date_parts) + ".")
+    if missing_date_count:
+        caveats.append(f"Skipped {missing_date_count} rows without date metadata while applying the date window filter.")
+    caveats.extend(annotation_filter_caveats)
     if sort_specs:
         caveats.append("Applied working-set ordering: " + json.dumps(sort_specs, ensure_ascii=False, sort_keys=True) + ".")
     if limit is not None and matched_count_before_limit > len(deduped):
@@ -3590,6 +3792,11 @@ def _filter_working_set(params: dict[str, Any], deps: dict[str, ToolExecutionRes
             "source_working_set_ref": upstream_ref,
             "full_result_count": result_count,
             "full_match_count_before_limit": matched_count_before_limit,
+            "annotation_filter_doc_count": len(annotation_doc_ids or set()) if annotation_doc_ids is not None else None,
+            "min_text_length": min_text_length,
+            "date_from": date_from,
+            "date_to": date_to,
+            "missing_date_count": missing_date_count,
             "filtered_from_working_set": True,
             "payload_truncated": result_count > len(preview_rows),
         },
@@ -3597,11 +3804,34 @@ def _filter_working_set(params: dict[str, Any], deps: dict[str, ToolExecutionRes
 
 
 def _lang_id(params: dict[str, Any], deps: dict[str, ToolExecutionResult], context: AgentExecutionContext) -> ToolExecutionResult:
-    rows = _text_rows(deps)
+    rows, source_metadata, source_caveats = _analysis_document_rows_from_deps(deps, context)
+    if not rows:
+        return _no_input_documents_result("lang_id")
     detected = []
+    providers = _provider_order("lang_id", ["langdetect"])
+    used_provider = ""
     for row in rows:
         text = _row_analysis_text(row)
-        language, confidence = _infer_language(text)
+        language = "unknown"
+        confidence = 0.0
+        for provider in providers:
+            try:
+                if provider == "langdetect" and _module_available("langdetect"):
+                    from langdetect import DetectorFactory, detect_langs
+
+                    DetectorFactory.seed = 0
+                    candidates = detect_langs(text) if text.strip() else []
+                    if candidates:
+                        language = str(candidates[0].lang or "unknown").lower()
+                        confidence = round(float(candidates[0].prob or 0.0), 3)
+                        used_provider = "langdetect"
+                        break
+                elif provider == "heuristic":
+                    language, confidence = _infer_language(text)
+                    used_provider = "heuristic"
+                    break
+            except Exception:
+                continue
         detected.append(
             {
                 "doc_id": str(row.get("doc_id", "")),
@@ -3609,14 +3839,32 @@ def _lang_id(params: dict[str, Any], deps: dict[str, ToolExecutionResult], conte
                 "confidence": confidence,
             }
         )
+    if not detected:
+        return _provider_unavailable_result("lang_id")
+    caveats = list(source_caveats)
+    if not used_provider:
+        caveats.append("No configured language detection provider produced a result.")
+    elif used_provider == "heuristic":
+        caveats.append("Language detection used explicit lexical heuristic fallback.")
     return ToolExecutionResult(
         payload={"rows": detected},
-        caveats=["Prototype language detection uses lightweight lexical heuristics when no dedicated model is installed."],
+        caveats=caveats,
+        metadata={**source_metadata, **_metadata(used_provider, f"{used_provider}_language_detection")},
     )
 
 
 def _clean_normalize(params: dict[str, Any], deps: dict[str, ToolExecutionResult], context: AgentExecutionContext) -> ToolExecutionResult:
-    rows = _doc_rows(deps)
+    rows, source_metadata, source_caveats = _analysis_document_rows_from_deps(
+        deps,
+        context,
+        max_documents=_working_set_analysis_max_documents(),
+    )
+    if not rows:
+        return ToolExecutionResult(
+            payload={"documents": [], "rows": [], **source_metadata},
+            caveats=source_caveats or ["No input documents were available for clean_normalize."],
+            metadata={"no_data": True, "no_data_reason": "no_input_documents", **source_metadata},
+        )
     cleaned = []
     for row in rows:
         raw_body_text = str(row.get("text", row.get("cleaned_text", "")) or "").replace("\x00", " ")
@@ -3646,14 +3894,20 @@ def _clean_normalize(params: dict[str, Any], deps: dict[str, ToolExecutionResult
                 "analysis_text_truncated": bool(flags.get("truncated")),
             }
         )
-    return ToolExecutionResult(payload={"documents": cleaned, "rows": cleaned})
+    return ToolExecutionResult(
+        payload={"documents": cleaned, "rows": cleaned, **source_metadata},
+        caveats=source_caveats,
+        metadata={"no_data": not cleaned, "no_data_reason": "" if cleaned else "no_input_documents", **source_metadata},
+    )
 
 
 def _tokenize_docs(params: dict[str, Any], deps: dict[str, ToolExecutionResult], context: AgentExecutionContext) -> ToolExecutionResult:
     rows = _doc_rows(deps)
+    if not rows:
+        return _no_input_documents_result("tokenize")
     providers = _provider_order("tokenize", ["spacy", "stanza", "nltk", "regex"])
     output = []
-    used_provider = "regex"
+    used_provider = ""
     for row in rows:
         text = _row_analysis_text(row)
         tokens: list[str] | None = None
@@ -3690,9 +3944,11 @@ def _tokenize_docs(params: dict[str, Any], deps: dict[str, ToolExecutionResult],
 
 def _sentence_split_docs(params: dict[str, Any], deps: dict[str, ToolExecutionResult], context: AgentExecutionContext) -> ToolExecutionResult:
     rows = _doc_rows(deps)
-    providers = _provider_order("sentence_split", ["spacy", "stanza", "nltk", "heuristic"])
+    if not rows:
+        return _no_input_documents_result("sentence_split")
+    providers = _provider_order("sentence_split", ["spacy", "stanza", "nltk"])
     output = []
-    used_provider = "heuristic"
+    used_provider = ""
     for row in rows:
         text = _row_analysis_text(row)
         sentences: list[str] | None = None
@@ -3727,7 +3983,7 @@ def _sentence_split_docs(params: dict[str, Any], deps: dict[str, ToolExecutionRe
                     break
             except Exception:
                 sentences = None
-        sentence_rows = sentences or simple_sentence_split(text)
+        sentence_rows = sentences or []
         output_row = {
             key: row.get(key)
             for key in ("doc_id", "title", "date", "published_at", "outlet", "source", "rank", "score")
@@ -3736,6 +3992,8 @@ def _sentence_split_docs(params: dict[str, Any], deps: dict[str, ToolExecutionRe
         output_row["sentences"] = sentence_rows
         output_row["text"] = " ".join(sentence_rows)
         output.append(output_row)
+    if not any(row.get("sentences") for row in output):
+        return _provider_unavailable_result("sentence_split")
     return ToolExecutionResult(
         payload={"rows": output},
         metadata=_metadata(used_provider, f"{used_provider}_sentence_split"),
@@ -3744,16 +4002,21 @@ def _sentence_split_docs(params: dict[str, Any], deps: dict[str, ToolExecutionRe
 
 def _pos_morph(params: dict[str, Any], deps: dict[str, ToolExecutionResult], context: AgentExecutionContext) -> ToolExecutionResult:
     rows = _doc_rows(deps)
+    if not rows:
+        return _no_input_documents_result("pos_morph")
     output: list[dict[str, Any]] = []
-    providers = _provider_order("pos_morph", ["spacy", "stanza", "flair", "nltk", "heuristic"])
-    used_provider = "heuristic"
+    providers = _provider_order("pos_morph", ["spacy", "stanza", "flair", "nltk"])
+    used_provider = ""
     for provider in providers:
         try:
             if provider == "spacy":
                 nlp = _load_spacy_model()
                 if nlp is None or "tagger" not in getattr(nlp, "pipe_names", []):
                     continue
-                docs = nlp.pipe([_row_analysis_text(row) for row in rows], batch_size=16)
+                docs = nlp.pipe(
+                    [str(row.get("text") or row.get("cleaned_text") or row.get("body") or _row_analysis_text(row)) for row in rows],
+                    batch_size=16,
+                )
                 for row, doc in zip(rows, docs, strict=False):
                     for token in doc:
                         output.append(
@@ -3768,13 +4031,14 @@ def _pos_morph(params: dict[str, Any], deps: dict[str, ToolExecutionResult], con
                             }
                         )
                 used_provider = "spacy"
+                provider_ran = True
                 break
             if provider == "stanza":
                 pipeline = _load_stanza_pipeline("tokenize,pos,lemma,depparse")
                 if pipeline is None:
                     continue
                 for row in rows:
-                    doc = pipeline(_row_analysis_text(row))
+                    doc = pipeline(str(row.get("text") or row.get("cleaned_text") or row.get("body") or _row_analysis_text(row)))
                     for sentence in doc.sentences:
                         for word in sentence.words:
                             output.append(
@@ -3789,6 +4053,7 @@ def _pos_morph(params: dict[str, Any], deps: dict[str, ToolExecutionResult], con
                                 }
                             )
                 used_provider = "stanza"
+                provider_ran = True
                 break
             if provider == "flair":
                 tagger = _load_flair_object("pos")
@@ -3812,6 +4077,7 @@ def _pos_morph(params: dict[str, Any], deps: dict[str, ToolExecutionResult], con
                             }
                         )
                 used_provider = "flair"
+                provider_ran = True
                 break
             if provider == "nltk" and _module_available("nltk"):
                 import nltk
@@ -3836,7 +4102,7 @@ def _pos_morph(params: dict[str, Any], deps: dict[str, ToolExecutionResult], con
             output = []
             continue
 
-    if not output:
+    if not output and "heuristic" in providers:
         for row in rows:
             for token in _tokenize(_row_analysis_text(row)):
                 output.append(
@@ -3850,6 +4116,10 @@ def _pos_morph(params: dict[str, Any], deps: dict[str, ToolExecutionResult], con
                         "time_bin": _time_bin(_row_timestamp(row)),
                     }
                 )
+        if output:
+            used_provider = "heuristic"
+    if not output:
+        return _provider_unavailable_result("pos_morph")
     return ToolExecutionResult(
         payload={"rows": output},
         metadata=_metadata(used_provider, f"{used_provider}_pos_morph"),
@@ -3858,9 +4128,11 @@ def _pos_morph(params: dict[str, Any], deps: dict[str, ToolExecutionResult], con
 
 def _lemmatize_docs(params: dict[str, Any], deps: dict[str, ToolExecutionResult], context: AgentExecutionContext) -> ToolExecutionResult:
     rows = _doc_rows(deps)
-    providers = _provider_order("lemmatize", ["spacy", "stanza", "textblob", "heuristic"])
+    if not rows:
+        return _no_input_documents_result("lemmatize")
+    providers = _provider_order("lemmatize", ["spacy", "stanza", "textblob"])
     output = []
-    used_provider = "heuristic"
+    used_provider = ""
     for provider in providers:
         try:
             if provider == "spacy":
@@ -3910,11 +4182,15 @@ def _lemmatize_docs(params: dict[str, Any], deps: dict[str, ToolExecutionResult]
         except Exception:
             output = []
             continue
-    if not output:
+    if not output and "heuristic" in providers:
         output = [
             {"doc_id": row["doc_id"], "lemmas": [_lemma(token) for token in _tokenize(_row_analysis_text(row))]}
             for row in rows
         ]
+        if output:
+            used_provider = "heuristic"
+    if not output:
+        return _provider_unavailable_result("lemmatize")
     return ToolExecutionResult(
         payload={"rows": output},
         metadata=_metadata(used_provider, f"{used_provider}_lemmatize"),
@@ -3923,25 +4199,126 @@ def _lemmatize_docs(params: dict[str, Any], deps: dict[str, ToolExecutionResult]
 
 def _dependency_parse(params: dict[str, Any], deps: dict[str, ToolExecutionResult], context: AgentExecutionContext) -> ToolExecutionResult:
     rows = _doc_rows(deps)
-    parsed = []
-    for row in rows:
-        sentences = simple_sentence_split(_row_analysis_text(row))[:8]
-        deps_rows = []
-        for sentence in sentences:
-            tokens = _tokenize(sentence)
-            for idx, token in enumerate(tokens[1:], start=1):
-                deps_rows.append({"head": tokens[idx - 1], "child": token, "dep": "next"})
-        parsed.append({"doc_id": row["doc_id"], "dependencies": deps_rows})
-    return ToolExecutionResult(payload={"rows": parsed})
+    if not rows:
+        return _no_input_documents_result("dependency_parse")
+    providers = _provider_order("dependency_parse", ["spacy", "stanza"])
+    parsed: list[dict[str, Any]] = []
+    used_provider = ""
+    for provider in providers:
+        try:
+            if provider == "spacy":
+                nlp = _load_spacy_model()
+                if nlp is None or "parser" not in getattr(nlp, "pipe_names", []):
+                    continue
+                docs = nlp.pipe([_row_analysis_text(row) for row in rows], batch_size=16)
+                for row, doc in zip(rows, docs, strict=False):
+                    deps_rows = []
+                    for sent in doc.sents:
+                        sentence_text = sent.text.strip()
+                        for token in sent:
+                            deps_rows.append(
+                                {
+                                    "token": token.text,
+                                    "child": token.text,
+                                    "child_i": int(token.i),
+                                    "head": token.head.text if token.head is not None else "ROOT",
+                                    "head_i": int(token.head.i) if token.head is not None else -1,
+                                    "dep": token.dep_,
+                                    "pos": token.pos_,
+                                    "lemma": (token.lemma_ or token.text).lower(),
+                                    "sentence": sentence_text,
+                                    "is_root": bool(token.head is token),
+                                }
+                            )
+                    parsed.append({"doc_id": row["doc_id"], "dependencies": deps_rows, "provider": provider})
+                used_provider = provider
+                break
+            if provider == "stanza":
+                pipeline = _load_stanza_pipeline("tokenize,pos,lemma,depparse")
+                if pipeline is None:
+                    continue
+                for row in rows:
+                    doc = pipeline(_row_analysis_text(row))
+                    deps_rows = []
+                    for sentence in doc.sentences:
+                        words = list(sentence.words)
+                        sentence_text = " ".join(word.text for word in words).strip()
+                        for word in words:
+                            head_index = int(word.head or 0)
+                            head_text = "ROOT" if head_index <= 0 else words[head_index - 1].text
+                            deps_rows.append(
+                                {
+                                    "token": word.text,
+                                    "child": word.text,
+                                    "child_i": int(word.id),
+                                    "head": head_text,
+                                    "head_i": head_index,
+                                    "dep": word.deprel or "",
+                                    "pos": word.upos or "",
+                                    "lemma": (word.lemma or word.text).lower(),
+                                    "sentence": sentence_text,
+                                    "is_root": head_index <= 0,
+                                }
+                            )
+                    parsed.append({"doc_id": row["doc_id"], "dependencies": deps_rows, "provider": provider})
+                used_provider = provider
+                break
+        except Exception:
+            parsed = []
+            continue
+    if not parsed:
+        return _provider_unavailable_result("dependency_parse")
+    return ToolExecutionResult(payload={"rows": parsed}, metadata=_metadata(used_provider, f"{used_provider}_dependency_parse"))
 
 
 def _noun_chunks(params: dict[str, Any], deps: dict[str, ToolExecutionResult], context: AgentExecutionContext) -> ToolExecutionResult:
+    doc_rows = _doc_rows(deps)
+    has_any_input_rows = bool(doc_rows)
+    providers = _provider_order("noun_chunks", ["spacy"])
+    chunks_by_doc: defaultdict[str, list[str]] = defaultdict(list)
+    used_provider = ""
+    if doc_rows:
+        for provider in providers:
+            try:
+                if provider == "spacy":
+                    nlp = _load_spacy_model()
+                    if nlp is None or "parser" not in getattr(nlp, "pipe_names", []):
+                        continue
+                    docs = nlp.pipe([_row_analysis_text(row) for row in doc_rows], batch_size=16)
+                    for row, doc in zip(doc_rows, docs, strict=False):
+                        doc_id = str(row.get("doc_id", ""))
+                        for chunk in doc.noun_chunks:
+                            value = _canonical_entity(chunk.text)
+                            if value and _valid_series_surface(value):
+                                chunks_by_doc[doc_id].append(value)
+                    used_provider = provider
+                    break
+            except Exception:
+                chunks_by_doc.clear()
+                continue
+    if chunks_by_doc:
+        return ToolExecutionResult(
+            payload={"rows": [{"doc_id": doc_id, "noun_chunks": values} for doc_id, values in chunks_by_doc.items()]},
+            metadata=_metadata(used_provider, f"{used_provider}_noun_chunks"),
+        )
     pos_rows = []
+    pos_provider = ""
     for result in deps.values():
         payload = result.payload
         if isinstance(payload, dict) and "rows" in payload and payload["rows"] and "pos" in payload["rows"][0]:
             pos_rows = payload["rows"]
+            pos_provider = str(result.metadata.get("provider", "") if isinstance(result.metadata, dict) else "")
             break
+    if not pos_rows:
+        if not has_any_input_rows:
+            return _no_input_documents_result("noun_chunks")
+        return _provider_unavailable_result("noun_chunks")
+    if "heuristic" in pos_provider and "heuristic" not in providers and "pos_sequence" not in providers:
+        return _provider_unavailable_result(
+            "noun_chunks",
+            caveats=["Only heuristic POS rows were available, so noun chunk fallback was not used."],
+            upstream_provider=pos_provider,
+        )
     chunks: defaultdict[str, list[str]] = defaultdict(list)
     current: list[str] = []
     current_doc = ""
@@ -3958,8 +4335,12 @@ def _noun_chunks(params: dict[str, Any], deps: dict[str, ToolExecutionResult], c
             current = []
     if current:
         chunks[current_doc].append(" ".join(current))
+    if not chunks:
+        return _provider_unavailable_result("noun_chunks", upstream_provider=pos_provider)
     return ToolExecutionResult(
-        payload={"rows": [{"doc_id": doc_id, "noun_chunks": values} for doc_id, values in chunks.items()]}
+        payload={"rows": [{"doc_id": doc_id, "noun_chunks": values} for doc_id, values in chunks.items()]},
+        caveats=["Used POS-sequence fallback for noun chunks because parser-backed noun chunks were unavailable."],
+        metadata=_metadata("pos_sequence", "pos_sequence_noun_chunks", upstream_provider=pos_provider),
     )
 
 
@@ -3969,20 +4350,22 @@ def _ner(params: dict[str, Any], deps: dict[str, ToolExecutionResult], context: 
         context,
         max_documents=_entity_analysis_max_documents(),
     )
+    if not rows:
+        return _no_input_documents_result("ner", caveats=source_caveats, **source_metadata)
     entities: list[dict[str, Any]] = []
     cancelled = _cancel_requested(context)
-    providers = _provider_order("ner", ["spacy", "stanza", "flair", "regex"])
+    providers = _provider_order("ner", ["spacy", "stanza", "flair"])
     provider_limit = _entity_provider_max_documents()
     provider_order_explicit = os.getenv("CORPUSAGENT2_PROVIDER_ORDER_NER") is not None
     working_set_count = int(source_metadata.get("working_set_document_count") or source_metadata.get("analyzed_document_count") or len(rows))
     if provider_limit is not None and working_set_count > provider_limit and not provider_order_explicit:
-        providers = ["regex"]
         source_caveats.append(
-            f"Provider NER was skipped for this large working set: working_set_document_count {working_set_count} "
+            f"Provider NER is running despite large working set: working_set_document_count {working_set_count} "
             f"exceeds CORPUSAGENT2_ENTITY_PROVIDER_MAX_DOCS={provider_limit}. "
-            "Set CORPUSAGENT2_ENTITY_PROVIDER_MAX_DOCS=-1 or CORPUSAGENT2_PROVIDER_ORDER_NER to force provider NER."
+            "Heuristic regex NER is only used when explicitly requested via CORPUSAGENT2_PROVIDER_ORDER_NER."
         )
-    used_provider = "regex"
+    used_provider = ""
+    provider_ran = False
 
     def finish() -> ToolExecutionResult:
         caveats = list(source_caveats)
@@ -4029,6 +4412,7 @@ def _ner(params: dict[str, Any], deps: dict[str, ToolExecutionResult], context: 
                             }
                         )
                 used_provider = "spacy"
+                provider_ran = True
                 break
             if provider == "stanza":
                 pipeline = _load_stanza_pipeline("tokenize,ner")
@@ -4052,6 +4436,7 @@ def _ner(params: dict[str, Any], deps: dict[str, ToolExecutionResult], context: 
                             }
                         )
                 used_provider = "stanza"
+                provider_ran = True
                 break
             if provider == "flair":
                 tagger = _load_flair_object("ner")
@@ -4078,12 +4463,13 @@ def _ner(params: dict[str, Any], deps: dict[str, ToolExecutionResult], context: 
                             }
                         )
                 used_provider = "flair"
+                provider_ran = True
                 break
         except Exception:
             entities = []
             continue
 
-    if not entities:
+    if not entities and "regex" in providers:
         for row in rows:
             if _cancel_requested(context):
                 cancelled = True
@@ -4100,6 +4486,22 @@ def _ner(params: dict[str, Any], deps: dict[str, ToolExecutionResult], context: 
                         "published_at": _row_timestamp(row),
                     }
                 )
+        if entities:
+            used_provider = "regex"
+            provider_ran = True
+    if not entities and provider_ran:
+        return ToolExecutionResult(
+            payload={"rows": [], **source_metadata},
+            caveats=source_caveats,
+            metadata={
+                **_metadata(used_provider, f"{used_provider}_ner"),
+                "no_data": True,
+                "no_data_reason": "no_entities_extracted",
+                **source_metadata,
+            },
+        )
+    if not entities:
+        return _provider_unavailable_result("ner", caveats=source_caveats, **source_metadata)
     return finish()
 
 
@@ -4114,7 +4516,23 @@ def _entity_link(params: dict[str, Any], deps: dict[str, ToolExecutionResult], c
                 entity_rows = list(payload["rows"])
                 break
     if not entity_rows:
-        entity_rows = _ner(params, deps, context).payload["rows"]
+        ner_result = _ner(params, deps, context)
+        entity_rows = ner_result.payload["rows"]
+        if not entity_rows:
+            upstream_reason = ""
+            if isinstance(ner_result.metadata, dict):
+                upstream_reason = str(ner_result.metadata.get("no_data_reason", ""))
+            if upstream_reason == "no_input_documents":
+                return _no_input_documents_result("entity_link", caveats=ner_result.caveats)
+            return ToolExecutionResult(
+                payload={"rows": []},
+                caveats=list(ner_result.caveats or ["No entities were available to link."]),
+                metadata={
+                    "no_data": True,
+                    "no_data_reason": upstream_reason or "no_entities_to_link",
+                    "provider": "string_canonicalization",
+                },
+            )
     linked = []
     for row in entity_rows:
         link_payload = _link_entity_row(str(row.get("entity", "")), str(row.get("label", "")))
@@ -4145,7 +4563,10 @@ def _entity_link(params: dict[str, Any], deps: dict[str, ToolExecutionResult], c
         )
     return ToolExecutionResult(
         payload={"rows": linked},
-        caveats=["Entity linking is optional and currently uses a deterministic URI placeholder scheme unless a knowledge base is integrated."],
+        caveats=[
+            "Entity linking currently canonicalizes entity strings only; no external knowledge-base resolver is configured."
+        ],
+        metadata=_metadata("string_canonicalization", "entity_string_canonicalization"),
     )
 
 
@@ -4208,21 +4629,387 @@ def _extract_keyterms(params: dict[str, Any], deps: dict[str, ToolExecutionResul
     )
 
 
+SVO_VERB_LEMMAS = {
+    "arrest", "arrested", "attack", "attacked", "beat", "beaten", "block", "blocked", "call", "called",
+    "charge", "charged", "clash", "clashed", "clear", "cleared", "criticize", "criticized", "damage", "damaged",
+    "demand", "demanded", "detain", "detained", "fire", "fired", "force", "forced", "grapple", "grappled",
+    "haul", "hauled", "hit", "hold", "held", "injure", "injured", "kill", "killed", "march", "marched",
+    "meet", "met", "name", "named", "organize", "organized", "oppose", "opposed", "push", "pushed",
+    "release", "released", "remove", "removed", "resist", "resisted", "say", "said", "shoot", "shot",
+    "strike", "struck", "support", "supported", "target", "targeted", "throw", "threw", "use", "used",
+    "vandalize", "vandalized", "warn", "warned",
+}
+SVO_AUXILIARIES = {
+    "am", "is", "are", "was", "were", "be", "been", "being", "has", "have", "had", "will", "would",
+    "can", "could", "may", "might", "must", "shall", "should",
+}
+SVO_PHRASE_BREAKERS = SERIES_SURFACE_STOPWORDS | SVO_AUXILIARIES | {
+    "ed", "edt", "gmt", "pst", "pm", "am", "monday", "tuesday", "wednesday", "thursday", "friday",
+    "saturday", "sunday", "january", "february", "march", "april", "june", "july", "august",
+    "september", "october", "november", "december",
+}
+SVO_ROLE_GROUP_PATTERNS = (
+    (
+        "police",
+        re.compile(
+            r"\b(?:police|officers?|cops?|law enforcement|sheriff(?:s)?|troopers?|nypd|lapd|national guard|guards?)\b",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "protesters",
+        re.compile(
+            r"\b(?:protesters?|protestors?|demonstrators?|activists?|marchers?|rioters?|crowd|crowds|campaigners?)\b",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "politicians",
+        re.compile(
+            r"\b(?:president|mayor|governor|senators?|lawmakers?|congress(?:man|woman|person|people)?|politicians?|trump|biden|democrats?|republicans?)\b",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "institutions",
+        re.compile(
+            r"\b(?:government|court|department|agency|administration|parliament|congress|white house|city council|ice|fbi|justice department|prosecutors?|authorities|officials?)\b",
+            re.IGNORECASE,
+        ),
+    ),
+)
+
+
+def _svo_role_group(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return "other"
+    for label, pattern in SVO_ROLE_GROUP_PATTERNS:
+        if pattern.search(text):
+            return label
+    return "other"
+
+
+def _clean_svo_phrase(tokens: list[str]) -> str:
+    cleaned: list[str] = []
+    for token in tokens:
+        value = str(token or "").strip(" \t\r\n\"',;:()[]{}")
+        if not value:
+            continue
+        lowered = value.lower()
+        if lowered in SVO_PHRASE_BREAKERS:
+            if cleaned:
+                break
+            continue
+        if lowered in SVO_VERB_LEMMAS and cleaned:
+            break
+        cleaned.append(value)
+        if len(cleaned) >= 5:
+            break
+    phrase = _canonical_entity(" ".join(cleaned))
+    if not phrase or not _valid_series_surface(phrase):
+        return ""
+    return phrase
+
+
+def _svo_phrase_before(tokens: list[str], verb_index: int) -> str:
+    chunk: list[str] = []
+    for token in reversed(tokens[:verb_index]):
+        lowered = str(token or "").lower()
+        if lowered in SVO_PHRASE_BREAKERS or lowered in SVO_VERB_LEMMAS:
+            if chunk:
+                break
+            continue
+        chunk.append(str(token))
+        if len(chunk) >= 5:
+            break
+    return _clean_svo_phrase(list(reversed(chunk)))
+
+
+def _svo_phrase_after(tokens: list[str], start_index: int) -> str:
+    return _clean_svo_phrase([str(token) for token in tokens[start_index: start_index + 8]])
+
+
+def _svo_by_agent_phrase(tokens: list[str], verb_index: int) -> str:
+    for idx in range(verb_index + 1, min(len(tokens) - 1, verb_index + 10)):
+        if str(tokens[idx]).lower() == "by":
+            return _svo_phrase_after(tokens, idx + 1)
+    return ""
+
+
+def _svo_is_passive(tokens: list[str], verb_index: int) -> bool:
+    previous = {str(token).lower() for token in tokens[max(0, verb_index - 3): verb_index]}
+    return bool(previous & {"was", "were", "is", "are", "been", "being"})
+
+
+def _svo_verb_index(tokens: list[str]) -> int:
+    for idx in range(1, max(1, len(tokens) - 1)):
+        lowered = str(tokens[idx]).lower()
+        if lowered in SVO_AUXILIARIES or lowered in SVO_PHRASE_BREAKERS:
+            continue
+        if lowered in SVO_VERB_LEMMAS:
+            return idx
+        if lowered.endswith(("ed", "ing")) and _svo_phrase_before(tokens, idx):
+            return idx
+    return -1
+
+
 def _extract_svo_triples(params: dict[str, Any], deps: dict[str, ToolExecutionResult], context: AgentExecutionContext) -> ToolExecutionResult:
-    triples = []
-    for row in _doc_rows(deps):
-        for sentence in simple_sentence_split(_row_analysis_text(row))[:6]:
-            tokens = _tokenize(sentence)
-            if len(tokens) >= 3:
-                triples.append(
-                    {
-                        "doc_id": row["doc_id"],
-                        "subject": tokens[0],
-                        "verb": tokens[1],
-                        "object": " ".join(tokens[2:5]),
-                    }
+    rows, source_metadata, source_caveats = _analysis_document_rows_from_deps(
+        deps,
+        context,
+        max_documents=_working_set_analysis_max_documents(),
+    )
+    if not rows:
+        return _no_input_documents_result("extract_svo_triples", caveats=source_caveats, **source_metadata)
+    triples: list[dict[str, Any]] = []
+    seen_triples: set[tuple[str, str, str, str, str, str]] = set()
+    skipped_sentences = 0
+    max_sentences = _int_param(params, "max_sentences_per_doc", default=12, minimum=1, maximum=100)
+    providers = _provider_order("extract_svo_triples", ["spacy", "stanza"])
+    used_provider = ""
+    provider_ran = False
+
+    def add_triple(
+        row: dict[str, Any],
+        *,
+        sentence: str,
+        subject: str,
+        verb: str,
+        obj: str,
+        passive: bool,
+        by_agent: str = "",
+        provider: str,
+    ) -> None:
+        subject = _canonical_entity(subject)
+        obj = _canonical_entity(obj)
+        by_agent = _canonical_entity(by_agent)
+        if not subject or not _valid_series_surface(subject):
+            return
+        semantic_actor = by_agent if passive and by_agent else subject
+        semantic_target = subject if passive else obj
+        if not semantic_target:
+            semantic_target = obj or subject
+        if not semantic_actor or not semantic_target:
+            return
+        dedupe_key = (
+            str(row.get("doc_id", "") or ""),
+            sentence,
+            subject,
+            str(verb or "").lower(),
+            obj,
+            semantic_actor,
+        )
+        if dedupe_key in seen_triples:
+            return
+        seen_triples.add(dedupe_key)
+        triples.append(
+            {
+                "doc_id": str(row.get("doc_id", "") or ""),
+                "published_at": row.get("published_at") or row.get("date") or "",
+                "date": row.get("date") or row.get("published_at") or "",
+                "source": row.get("source") or row.get("outlet") or "",
+                "sentence": sentence,
+                "subject": subject,
+                "verb": str(verb or "").lower(),
+                "object": obj,
+                "voice": "passive" if passive else "active",
+                "semantic_actor": semantic_actor,
+                "semantic_target": semantic_target,
+                "subject_group": _svo_role_group(subject),
+                "object_group": _svo_role_group(obj),
+                "actor_group": _svo_role_group(semantic_actor),
+                "target_group": _svo_role_group(semantic_target),
+                "mention_count": 1,
+                "count": 1,
+                "provider": provider,
+            }
+        )
+
+    def spacy_phrase(token: Any) -> str:
+        left = min(item.i for item in token.subtree)
+        right = max(item.i for item in token.subtree)
+        doc = token.doc
+        return doc[left : right + 1].text
+
+    def spacy_conjuncts(token: Any) -> list[Any]:
+        items = [token]
+        items.extend(child for child in token.children if child.dep_ == "conj")
+        return items
+
+    for provider in providers:
+        try:
+            if provider == "spacy":
+                nlp = _load_spacy_model()
+                if nlp is None or "parser" not in getattr(nlp, "pipe_names", []):
+                    continue
+                provider_ran = True
+                used_provider = "spacy"
+                docs = nlp.pipe([_row_analysis_text(row) for row in rows], batch_size=16)
+                for row, doc in zip(rows, docs, strict=False):
+                    for sent in list(doc.sents)[:max_sentences]:
+                        sentence_text = sent.text.strip()
+                        sentence_matched = False
+                        for verb_token in sent:
+                            if verb_token.pos_ not in {"VERB", "AUX"} or verb_token.dep_ in {"aux", "auxpass"}:
+                                continue
+                            subjects = [
+                                item
+                                for child in verb_token.children
+                                if child.dep_ in {"nsubj", "nsubjpass", "csubj", "csubjpass"}
+                                for item in spacy_conjuncts(child)
+                            ]
+                            objects = [
+                                item
+                                for child in verb_token.children
+                                if child.dep_ in {"dobj", "obj", "iobj", "attr", "oprd", "dative"}
+                                for item in spacy_conjuncts(child)
+                            ]
+                            if not objects:
+                                objects.extend(
+                                    item
+                                    for prep in verb_token.children
+                                    if prep.dep_ == "prep"
+                                    for child in prep.children
+                                    if child.dep_ in {"pobj", "obj"} and str(prep.text).lower() not in {"in", "on", "at", "near", "outside", "inside", "during", "before", "after"}
+                                    for item in spacy_conjuncts(child)
+                                )
+                            agents = [
+                                item
+                                for child in verb_token.children
+                                if child.dep_ == "agent"
+                                for pobj in child.children
+                                if pobj.dep_ in {"pobj", "obj"}
+                                for item in spacy_conjuncts(pobj)
+                            ]
+                            passive = any(child.dep_ == "auxpass" for child in verb_token.children) or any(
+                                subject.dep_ in {"nsubjpass", "csubjpass"} for subject in subjects
+                            )
+                            if not subjects:
+                                continue
+                            if not objects and not agents and not passive:
+                                continue
+                            for subject in subjects:
+                                selected_objects = objects or agents or [subject]
+                                for obj_token in selected_objects:
+                                    add_triple(
+                                        row,
+                                        sentence=sentence_text,
+                                        subject=spacy_phrase(subject),
+                                        verb=verb_token.lemma_ or verb_token.text,
+                                        obj=spacy_phrase(obj_token),
+                                        passive=passive,
+                                        by_agent=spacy_phrase(agents[0]) if agents else "",
+                                        provider="spacy",
+                                    )
+                                    sentence_matched = True
+                        if not sentence_matched:
+                            skipped_sentences += 1
+                if triples:
+                    break
+            elif provider == "stanza":
+                pipeline = _load_stanza_pipeline("tokenize,pos,lemma,depparse")
+                if pipeline is None:
+                    continue
+                provider_ran = True
+                used_provider = "stanza"
+                for row in rows:
+                    doc = pipeline(_row_analysis_text(row))
+                    for sentence in doc.sentences[:max_sentences]:
+                        words = list(sentence.words)
+                        by_id = {int(word.id): word for word in words}
+                        sentence_text = " ".join(word.text for word in words).strip()
+                        sentence_matched = False
+                        for word in words:
+                            if str(word.upos or "") not in {"VERB", "AUX"}:
+                                continue
+                            children = [candidate for candidate in words if int(candidate.head or 0) == int(word.id)]
+                            subjects = [child for child in children if str(child.deprel or "") in {"nsubj", "nsubj:pass", "csubj", "csubj:pass"}]
+                            objects = [child for child in children if str(child.deprel or "") in {"obj", "iobj", "obl"}]
+                            agents = [
+                                child
+                                for child in children
+                                if str(child.deprel or "") in {"obl:agent", "agent"} or str(child.text).lower() == "by"
+                            ]
+                            passive = any(":pass" in str(child.deprel or "") for child in subjects + children)
+                            if not subjects:
+                                continue
+                            selected_objects = objects or agents
+                            if not selected_objects and not passive:
+                                continue
+                            for subject in subjects:
+                                for obj_word in selected_objects or [subject]:
+                                    add_triple(
+                                        row,
+                                        sentence=sentence_text,
+                                        subject=subject.text,
+                                        verb=word.lemma or word.text,
+                                        obj=obj_word.text,
+                                        passive=passive,
+                                        by_agent=agents[0].text if agents else "",
+                                        provider="stanza",
+                                    )
+                                    sentence_matched = True
+                        if not sentence_matched:
+                            skipped_sentences += 1
+                if triples:
+                    break
+        except Exception:
+            triples = []
+            continue
+
+    if not triples and "heuristic" in providers:
+        provider_ran = True
+        used_provider = "heuristic"
+        for row in rows:
+            doc_id = str(row.get("doc_id", "") or "")
+            analysis_text = str(row.get("text") or row.get("cleaned_text") or row.get("body") or _row_analysis_text(row))
+            for sentence in simple_sentence_split(analysis_text)[:max_sentences]:
+                tokens = _tokenize(sentence)
+                if len(tokens) < 3:
+                    skipped_sentences += 1
+                    continue
+                verb_index = _svo_verb_index(tokens)
+                if verb_index <= 0:
+                    skipped_sentences += 1
+                    continue
+                subject = _svo_phrase_before(tokens, verb_index)
+                obj = _svo_phrase_after(tokens, verb_index + 1)
+                if not subject:
+                    skipped_sentences += 1
+                    continue
+                by_agent = _svo_by_agent_phrase(tokens, verb_index)
+                add_triple(
+                    row,
+                    sentence=sentence,
+                    subject=subject,
+                    verb=str(tokens[verb_index]).lower(),
+                    obj=obj,
+                    passive=_svo_is_passive(tokens, verb_index),
+                    by_agent=by_agent,
+                    provider="heuristic",
                 )
-    return ToolExecutionResult(payload={"rows": triples})
+    caveats = list(source_caveats)
+    if skipped_sentences:
+        caveats.append(f"Skipped {skipped_sentences} sentences without a usable subject-verb-object pattern.")
+    if not triples:
+        if provider_ran:
+            return ToolExecutionResult(
+                payload={"rows": [], "skipped_sentence_count": skipped_sentences, **source_metadata},
+                caveats=caveats,
+                metadata={
+                    "provider": used_provider,
+                    "no_data": True,
+                    "no_data_reason": "no_svo_triples_extracted",
+                    **source_metadata,
+                },
+            )
+        return _provider_unavailable_result("extract_svo_triples", caveats=caveats, **source_metadata)
+    return ToolExecutionResult(
+        payload={"rows": triples, "skipped_sentence_count": skipped_sentences, **source_metadata},
+        caveats=caveats,
+        metadata={"provider": used_provider or str(triples[0].get("provider", "")), "no_data": False, "no_data_reason": "", **source_metadata},
+    )
 
 
 def _topic_model(params: dict[str, Any], deps: dict[str, ToolExecutionResult], context: AgentExecutionContext) -> ToolExecutionResult:
@@ -4231,9 +5018,11 @@ def _topic_model(params: dict[str, Any], deps: dict[str, ToolExecutionResult], c
         context,
         max_documents=_topic_model_analysis_max_documents(),
     )
-    providers = _provider_order("topic_model", ["textacy", "gensim", "heuristic"])
+    if not rows:
+        return _no_input_documents_result("topic_model", caveats=source_caveats, **source_metadata)
+    providers = _provider_order("topic_model", ["textacy", "gensim"])
     payload: list[dict[str, Any]] = []
-    used_provider = "heuristic"
+    used_provider = ""
     texts = [_row_analysis_text(row) for row in rows]
     num_topics = int(params.get("num_topics", 4))
     granularity = str(params.get("granularity", _default_time_granularity())).strip().lower() or "month"
@@ -4318,7 +5107,7 @@ def _topic_model(params: dict[str, Any], deps: dict[str, ToolExecutionResult], c
             payload = []
             continue
 
-    if not payload:
+    if not payload and "heuristic" in providers:
         grouped: defaultdict[str, Counter] = defaultdict(Counter)
         for row in rows:
             time_bin = _time_bin(_row_timestamp(row), granularity)
@@ -4335,6 +5124,10 @@ def _topic_model(params: dict[str, Any], deps: dict[str, ToolExecutionResult], c
                     "weight": float(sum(counts.values())),
                 }
             )
+        if payload:
+            used_provider = "heuristic"
+    if not payload:
+        return _provider_unavailable_result("topic_model", caveats=source_caveats, **source_metadata)
     return ToolExecutionResult(
         payload={"rows": payload, **source_metadata},
         caveats=source_caveats,
@@ -4541,13 +5334,15 @@ def _sentiment(params: dict[str, Any], deps: dict[str, ToolExecutionResult], con
         context,
         max_documents=_sentiment_analysis_max_documents(),
     )
+    if not docs:
+        return _no_input_documents_result("sentiment", caveats=source_caveats, **source_metadata)
     units = _targeted_text_units(docs, params, context)
     if any(unit.get("target_context_fallback") for unit in units):
         source_caveats.append(
             "No target-local context windows matched the inferred aliases, so sentiment fell back to full document text."
         )
-    providers = _provider_order("sentiment", ["flair", "textblob", "heuristic"])
-    used_provider = "heuristic"
+    providers = _provider_order("sentiment", ["flair", "textblob"])
+    used_provider = ""
     cancelled = _cancel_requested(context)
 
     def finish() -> ToolExecutionResult:
@@ -4641,7 +5436,7 @@ def _sentiment(params: dict[str, Any], deps: dict[str, ToolExecutionResult], con
             rows = []
             continue
 
-    if not rows:
+    if not rows and "heuristic" in providers:
         for unit in units:
             if _cancel_requested(context):
                 cancelled = True
@@ -4667,18 +5462,64 @@ def _sentiment(params: dict[str, Any], deps: dict[str, ToolExecutionResult], con
                     **_series_identity_fields(doc),
                 }
             )
+        if rows:
+            used_provider = "heuristic"
+    if not rows:
+        return _provider_unavailable_result("sentiment", caveats=source_caveats, **source_metadata)
     return finish()
 
 
 def _text_classify(params: dict[str, Any], deps: dict[str, ToolExecutionResult], context: AgentExecutionContext) -> ToolExecutionResult:
-    sentiment_rows = _sentiment(params, deps, context).payload["rows"]
+    candidate_labels = params.get("candidate_labels", params.get("labels", params.get("classes", [])))
+    if isinstance(candidate_labels, str):
+        candidate_labels = [item.strip() for item in re.split(r"[,|]", candidate_labels) if item.strip()]
+    candidate_labels = [str(label).strip() for label in candidate_labels if str(label).strip()]
+    if candidate_labels:
+        docs = _doc_rows(deps)
+        texts = [_row_analysis_text(doc) for doc in docs]
+        if not docs or not texts:
+            return ToolExecutionResult(payload={"rows": []}, metadata={"no_data": True, "no_data_reason": "no_documents"})
+        model_id = _sentence_embedding_model_id(context, params)
+        embeddings, resolved_device = _encode_texts(candidate_labels + texts, model_id=model_id, normalize=True)
+        label_vectors = embeddings[: len(candidate_labels)]
+        doc_vectors = embeddings[len(candidate_labels) :]
+        rows = []
+        for doc, vector in zip(docs, doc_vectors, strict=False):
+            scores = [float(vector @ label_vector) for label_vector in label_vectors]
+            shifted = [max(score, -1.0) + 1.0 for score in scores]
+            total = sum(shifted) or 1.0
+            probs = [round(value / total, 6) for value in shifted]
+            ranked = sorted(zip(candidate_labels, probs, scores, strict=False), key=lambda item: item[1], reverse=True)
+            rows.append(
+                {
+                    "doc_id": str(doc.get("doc_id", "")),
+                    "labels": [label for label, _, _ in ranked],
+                    "probs": [prob for _, prob, _ in ranked],
+                    "scores": [round(score, 6) for _, _, score in ranked],
+                    "label": ranked[0][0] if ranked else "",
+                    "confidence": ranked[0][1] if ranked else 0.0,
+                }
+            )
+        return ToolExecutionResult(
+            payload={"rows": rows},
+            metadata=_metadata(
+                "sentence_transformer",
+                "embedding_zero_shot_text_classification",
+                device=resolved_device,
+                classification_mode="zero_shot_embedding",
+            ),
+        )
+    sentiment_result = _sentiment(params, deps, context)
+    sentiment_rows = sentiment_result.payload["rows"]
     return ToolExecutionResult(
         payload={
             "rows": [
-                {"doc_id": row["doc_id"], "labels": [row["label"]], "probs": [abs(float(row["score"]))]}
+                {"doc_id": row["doc_id"], "labels": [row["label"]], "probs": [abs(float(row["score"]))], "label": row["label"]}
                 for row in sentiment_rows
             ]
-        }
+        },
+        caveats=["No candidate labels were supplied, so text_classify returned sentiment labels from the sentiment provider."],
+        metadata={**sentiment_result.metadata, "classification_mode": "sentiment_proxy"},
     )
 
 
@@ -4939,11 +5780,7 @@ def _time_series_rows_from_document_series(
                 "entity": series_name,
                 "canonical_entity": series_name,
                 "entity_label": series_name,
-                "time_bin": time_bin,
-                "bucket": time_bin,
-                "month": time_bin,
-                "period": time_bin,
-                "time_period": time_bin,
+                **_time_bin_fields(time_bin, granularity),
                 "document_count": document_count,
                 "doc_count": document_count,
                 "count": document_count,
@@ -5101,11 +5938,7 @@ def _time_series_rows_from_named_metrics(
             "target_label": entity,
             "series_name": entity,
             "target_entity": entity,
-            "time_bin": time_bin,
-            "bucket": time_bin,
-            "month": time_bin,
-            "period": time_bin,
-            "time_period": time_bin,
+            **_time_bin_fields(time_bin, granularity),
         }
         if any(metric in normalized_metrics for metric in ("document_count", "doc_count")):
             rows_by_key[key]["document_count"] = document_count
@@ -5137,11 +5970,7 @@ def _time_series_rows_from_named_metrics(
                 "target_label": entity,
                 "series_name": entity,
                 "target_entity": entity,
-                "time_bin": time_bin,
-                "bucket": time_bin,
-                "month": time_bin,
-                "period": time_bin,
-                "time_period": time_bin,
+                **_time_bin_fields(time_bin, granularity),
             },
         )
         target[metric] = round(sum(metric_values) / max(len(metric_values), 1), 6)
@@ -5280,11 +6109,7 @@ def _time_series_aggregate(params: dict[str, Any], deps: dict[str, ToolExecution
             "actor": entity,
             "entity_label": entity,
             "series_name": entity,
-            "time_bin": time_bin,
-            "bucket": time_bin,
-            "month": time_bin,
-            "period": time_bin,
-            "time_period": time_bin,
+            **_time_bin_fields(time_bin, granularity),
             "count": rendered_count,
             "mention_count": rendered_count,
             "mention_count_normalized": round(normalized, 6),
@@ -5775,11 +6600,11 @@ def _valid_entity_surface(entity: str) -> bool:
 def _valid_series_surface(series: str) -> bool:
     if not series or len(series) < 2:
         return False
+    lowered = series.lower()
+    if lowered in SERIES_SURFACE_STOPWORDS:
+        return False
     if _valid_entity_surface(series):
         return True
-    lowered = series.lower()
-    if lowered in ENTITY_SURFACE_STOPWORDS:
-        return False
     if re.fullmatch(r"[0-9a-f]{24,}", lowered):
         return False
     if re.fullmatch(r"[\d\s,./:-]+", series):
@@ -5969,11 +6794,7 @@ def _time_series_rows_from_metric_specs(
                 "target_entity": series,
                 "entity": series,
                 "canonical_entity": series,
-                "time_bin": time_bin,
-                "bucket": time_bin,
-                "month": time_bin,
-                "period": time_bin,
-                "time_period": time_bin,
+                **_time_bin_fields(time_bin, granularity),
             },
         )
         aggregation = aggregations.get(metric_name, "sum")
@@ -6288,7 +7109,7 @@ def _build_evidence_table(params: dict[str, Any], deps: dict[str, ToolExecutionR
                 pos_rows = [dict(item) for item in rows if isinstance(item, dict)]
                 break
         if not pos_rows and documents:
-            noun_rows, heuristic_metadata = _noun_frequency_rows_from_documents(
+            noun_rows, noun_metadata = _noun_frequency_rows_from_documents(
                 documents,
                 top_k=top_k,
                 full_working_set=False,
@@ -6296,22 +7117,29 @@ def _build_evidence_table(params: dict[str, Any], deps: dict[str, ToolExecutionR
             )
             caveats = [] if noun_rows else ["No noun distribution rows were produced from the upstream documents."]
             if noun_rows:
-                caveats.append(
-                    "No POS rows were provided, so noun distribution was computed with heuristic token/POS fallback over fetched documents."
-                )
+                noun_provider = str(noun_metadata.get("provider") or "").strip()
+                if noun_provider.startswith("heuristic"):
+                    caveats.append(
+                        "No POS rows were provided, so noun distribution was computed with explicit heuristic token/POS fallback over fetched documents."
+                    )
+                else:
+                    caveats.append(
+                        "No POS rows were provided, so noun distribution was computed directly "
+                        f"with provider-backed {noun_provider or 'NLP'} over fetched documents."
+                    )
             if documents_truncated:
                 caveats.append(
                     "Noun distribution is preview-only because upstream documents were truncated and no batch working_set_ref was available."
                 )
             return ToolExecutionResult(
-                payload={"rows": noun_rows, "source_document_count": full_document_count, **heuristic_metadata},
+                payload={"rows": noun_rows, "source_document_count": full_document_count, **noun_metadata},
                 evidence=[],
                 caveats=caveats,
                 metadata={
                     "no_data": not noun_rows,
                     "task": task,
                     "preview_only": bool(documents_truncated),
-                    **heuristic_metadata,
+                    **noun_metadata,
                 },
             )
         noun_rows = _noun_frequency_rows(documents, pos_rows, top_k=top_k)
@@ -6749,6 +7577,7 @@ PLOT_FIELD_ALIASES = {
     "time_bucket": ("time_bin", "period", "month", "date", "published_at"),
     "bucket": ("bucket", "time_bin", "period", "month", "date", "published_at"),
     "period": ("period", "time_bin", "month", "date", "published_at"),
+    "quarter": ("quarter", "time_bin", "period", "time_period", "month", "date", "published_at"),
     "month": ("month", "time_bin", "period", "date", "published_at"),
     "time_period": ("time_period", "time_bin", "period", "month", "date", "published_at"),
     "year": ("year", "time_bin", "period", "date", "published_at"),
@@ -6847,8 +7676,11 @@ PLOT_Y_FIELD_PRIORITY = (
 )
 PLOT_NUMERIC_FIELD_EXCLUDES = {"rank", "id", "doc_id", "topic_id", "year", "month", "day"}
 PLOT_NULL_AXIS_LABELS = NULL_AXIS_LABELS
-PLOT_TIME_AXIS_FIELDS = {"time_bin", "month", "period", "date", "published_at", "year", "time_period", "bucket"}
-PLOT_TIME_VALUE_PATTERN = re.compile(r"^\d{4}(?:[-/]\d{1,2}(?:[-/]\d{1,2})?)?(?:[ T]\d{1,2}:\d{2}(?::\d{2})?)?$")
+PLOT_TIME_AXIS_FIELDS = {"time_bin", "month", "quarter", "period", "date", "published_at", "year", "time_period", "bucket"}
+PLOT_TIME_VALUE_PATTERN = re.compile(
+    r"^\d{4}(?:[-/](?:Q[1-4]|\d{1,2})(?:[-/]\d{1,2})?)?(?:[ T]\d{1,2}:\d{2}(?::\d{2})?)?$",
+    re.IGNORECASE,
+)
 
 
 def _normalize_plot_field_name(value: str) -> str:
@@ -6940,7 +7772,7 @@ def _plot_field_looks_time_like(rows: list[dict[str, Any]], field: str) -> bool:
     if not field:
         return False
     normalized = str(field).strip().lower()
-    if normalized in PLOT_TIME_AXIS_FIELDS or any(token in normalized for token in ("time", "date", "month", "period", "year")):
+    if normalized in PLOT_TIME_AXIS_FIELDS or any(token in normalized for token in ("time", "date", "month", "quarter", "period", "year")):
         return True
     sampled = 0
     matched = 0

@@ -19,14 +19,33 @@ def _serialize(value: Any) -> Any:
 
 
 def _coerce_string_list(value: Any) -> list[str]:
+    def coerce_item(item: Any) -> str:
+        if isinstance(item, dict):
+            part = str(item.get("part", item.get("claim", item.get("item", ""))) or "").strip()
+            reason = str(item.get("reason", item.get("explanation", item.get("why", ""))) or "").strip()
+            if part and reason:
+                return f"{part}: {reason}"
+            if part:
+                return part
+            if reason:
+                return reason
+            return "; ".join(
+                f"{key}: {value}"
+                for key, value in item.items()
+                if str(key).strip() and str(value).strip()
+            )
+        return str(item).strip()
+
     if value is None:
         return []
     if isinstance(value, str):
         item = value.strip()
         return [item] if item else []
     if isinstance(value, list):
-        return [str(item).strip() for item in value if str(item).strip()]
-    return [str(value).strip()] if str(value).strip() else []
+        coerced = [coerce_item(item) for item in value]
+        return [item for item in coerced if item]
+    item = coerce_item(value)
+    return [item] if item else []
 
 
 def _coerce_dict_list(value: Any) -> list[dict[str, Any]]:

@@ -9,7 +9,7 @@ import time
 from corpusagent2 import agent_capabilities
 from corpusagent2.agent_capabilities import AgentExecutionContext
 from corpusagent2.agent_backends import InMemoryWorkingSetStore
-from corpusagent2.agent_models import AgentPlanDAG, AgentPlanNode, AgentRunState
+from corpusagent2.agent_models import AgentNodeExecutionRecord, AgentPlanDAG, AgentPlanNode, AgentRunState
 from corpusagent2.api import build_app
 from corpusagent2.agent_executor import AgentExecutionSnapshot, AsyncPlanExecutor
 from corpusagent2.python_runner_service import PythonRunnerResult, SandboxArtifact
@@ -202,6 +202,126 @@ def test_plan_compiler_rejects_comment_only_python_runner_code(tmp_path: Path) -
     assert "plot" not in node_ids
 
 
+def test_plan_compiler_rewrites_plain_language_working_set_filter_to_annotation_dependency(tmp_path: Path) -> None:
+    runtime = build_test_runtime(
+        tmp_path=tmp_path,
+        documents=_sample_documents(),
+        search_rows_by_query=_search_rows(_sample_documents()),
+    )
+    dag = AgentPlanDAG(
+        nodes=[
+            AgentPlanNode(node_id="search", capability="db_search", inputs={"query": "AI coverage"}),
+            AgentPlanNode(node_id="fetch", capability="fetch_documents", depends_on=["search"]),
+            AgentPlanNode(node_id="lang", capability="lang_id", depends_on=["fetch"]),
+            AgentPlanNode(node_id="working_set", capability="create_working_set", depends_on=["fetch"]),
+            AgentPlanNode(
+                node_id="english_only",
+                capability="filter_working_set",
+                inputs={
+                    "payload": {
+                        "working_set": "working_set",
+                        "filters": {
+                            "language": "en",
+                            "language_source": "lang",
+                            "language_source_node": "lang",
+                            "min_text_length": 200,
+                        },
+                    }
+                },
+                depends_on=["working_set"],
+            ),
+            AgentPlanNode(node_id="topics", capability="topic_model", depends_on=["english_only"]),
+        ]
+    )
+
+    compiled = runtime.orchestrator._normalize_plan_dag(
+        dag,
+        "What were the main topics in English-language AI coverage between 2016 and 2021?",
+    )
+
+    filter_node = next(node for node in compiled.nodes if node.node_id == "english_only")
+    language_spec = filter_node.inputs["payload"]["filters"]["language"]
+    notes = " | ".join(compiled.metadata.get("compiler_notes", []))
+
+    assert "lang" in filter_node.depends_on
+    assert language_spec == {"source": "lang", "field": "language", "in": ["en"]}
+    assert "language_source" not in filter_node.inputs["payload"]["filters"]
+    assert "language_source_node" not in filter_node.inputs["payload"]["filters"]
+    assert "rewrote plain language filter to annotation-backed dependency lang" in notes
+
+
+def test_plan_compiler_infers_working_set_from_and_lang_id_predicate_dependencies(tmp_path: Path) -> None:
+    runtime = build_test_runtime(
+        tmp_path=tmp_path,
+        documents=_sample_documents(),
+        search_rows_by_query=_search_rows(_sample_documents()),
+    )
+    dag = AgentPlanDAG(
+        nodes=[
+            AgentPlanNode(node_id="search", capability="db_search", inputs={"query": "AI coverage"}),
+            AgentPlanNode(node_id="working_set", capability="create_working_set", inputs={"input_from": "search"}),
+            AgentPlanNode(node_id="lang", capability="lang_id", depends_on=["working_set"]),
+            AgentPlanNode(
+                node_id="english_only",
+                capability="filter_working_set",
+                inputs={
+                    "payload": {
+                        "working_set_from": "working_set",
+                        "predicate": {"lang_id": {"eq": "en"}},
+                    }
+                },
+            ),
+            AgentPlanNode(node_id="topics", capability="topic_model", depends_on=["english_only"]),
+        ]
+    )
+
+    compiled = runtime.orchestrator._normalize_plan_dag(
+        dag,
+        "What were the main topics in English-language AI coverage between 2016 and 2021?",
+    )
+
+    filter_node = next(node for node in compiled.nodes if node.node_id == "english_only")
+    language_spec = filter_node.inputs["payload"]["predicate"]["lang_id"]
+    notes = " | ".join(compiled.metadata.get("compiler_notes", []))
+
+    assert "working_set" in filter_node.depends_on
+    assert "lang" in filter_node.depends_on
+    assert language_spec == {"source": "lang", "field": "language", "in": [{"eq": "en"}]}
+    assert "inferred dependencies" in notes
+    assert "rewrote plain language filter to annotation-backed dependency lang" in notes
+
+
+def test_plan_compiler_marks_unrequested_plot_artifact_optional(tmp_path: Path) -> None:
+    runtime = build_test_runtime(
+        tmp_path=tmp_path,
+        documents=_sample_documents(),
+        search_rows_by_query=_search_rows(_sample_documents()),
+    )
+    dag = AgentPlanDAG(
+        nodes=[
+            AgentPlanNode(node_id="search", capability="db_search", inputs={"query": "AI coverage"}),
+            AgentPlanNode(node_id="fetch", capability="fetch_documents", depends_on=["search"]),
+            AgentPlanNode(node_id="topics", capability="topic_model", depends_on=["fetch"]),
+            AgentPlanNode(
+                node_id="topic_plot",
+                capability="plot_artifact",
+                inputs={"x": "year", "y": "term", "value": "frequency_share"},
+                depends_on=["topics"],
+            ),
+        ]
+    )
+
+    compiled = runtime.orchestrator._normalize_plan_dag(
+        dag,
+        "What were the main topics in English-language AI coverage between 2016 and 2021?",
+    )
+
+    plot_node = next(node for node in compiled.nodes if node.node_id == "topic_plot")
+
+    assert plot_node.optional is True
+    assert any("marked optional supporting analysis" in note for note in compiled.metadata.get("compiler_notes", []))
+
+
 def test_plan_compiler_drops_unrequested_expensive_leaf_analysis(tmp_path: Path) -> None:
     runtime = build_test_runtime(
         tmp_path=tmp_path,
@@ -282,7 +402,7 @@ def test_temporal_market_plan_joins_market_to_framing_aggregate(tmp_path: Path) 
     plot_node = node_map["plot_market_drawdown"]
     assert framing_node.optional is False
     assert market_node.optional is False
-    assert plot_node.optional is False
+    assert plot_node.optional is True
     assert market_node.depends_on == ["framing_series"]
     assert market_node.inputs["interval"] == "1mo"
     assert plot_node.inputs["y"] == ["share_of_documents", "market_drawdown"]
@@ -513,6 +633,21 @@ def test_snapshot_caveats_summarize_internal_tool_noise(tmp_path: Path) -> None:
                 caveats=["No rows available for plotting."],
                 metadata={"no_data": True, "no_data_reason": "python_runner_non_python_code"},
             ),
+            "nlp": ToolExecutionResult(
+                payload={"rows": []},
+                caveats=["No input documents were available for sentence_split."],
+                metadata={"no_data": True, "no_data_reason": "no_input_documents"},
+            ),
+            "field_repair": ToolExecutionResult(
+                payload={"rows": [{"time_bin": "2018-01", "count": 2}]},
+                caveats=[
+                    "Applied structured working-set filters: {\"language_source\": \"n4\"}.",
+                    "Resolved annotation-backed filters by doc_id from dependency rows: language (2 matching doc ids).",
+                    "Resolved plot x field 'published_at' to upstream field 'time_bin'.",
+                    "Inferred plot y field 'weight' from upstream rows.",
+                    "Year-balanced retrieval was applied across 2016, 2017.",
+                ],
+            ),
             "market": ToolExecutionResult(
                 payload={"rows": [{"time_bin": "2018-03", "market_drawdown": -0.05}]},
                 caveats=["Resolved requested market ticker 'FB' to yfinance symbol 'META' after the requested symbol returned no rows."],
@@ -527,8 +662,15 @@ def test_snapshot_caveats_summarize_internal_tool_noise(tmp_path: Path) -> None:
     caveats = runtime.orchestrator._snapshot_caveats(snapshot)
 
     assert not any("python_runner" in caveat for caveat in caveats)
+    assert not any("no_input_documents" in caveat for caveat in caveats)
+    assert not any("No input documents were available" in caveat for caveat in caveats)
     assert not any("Missing plot x field" in caveat for caveat in caveats)
     assert not any("No rows available for plotting" in caveat for caveat in caveats)
+    assert not any("Applied structured working-set filters" in caveat for caveat in caveats)
+    assert not any("Resolved annotation-backed filters" in caveat for caveat in caveats)
+    assert not any("Resolved plot" in caveat for caveat in caveats)
+    assert not any("Inferred plot" in caveat for caveat in caveats)
+    assert not any("Year-balanced retrieval" in caveat for caveat in caveats)
     assert any("supporting tool outputs were empty" in caveat for caveat in caveats)
     assert any("Resolved requested market ticker" in caveat for caveat in caveats)
 
@@ -970,6 +1112,15 @@ def test_syntax_role_question_forces_dependency_svo_preprocessing_and_quotes(tmp
         "build_evidence_table",
         "plot_artifact",
     }.issubset(capabilities)
+    search_node = next(node for node in normalized.nodes if node.capability == "db_search")
+    assert search_node.inputs["retrieval_strategy"] == "exhaustive_analytic"
+    assert search_node.inputs["retrieve_all"] is True
+    assert search_node.inputs["top_k"] == 0
+    assert "demonstrators" in search_node.inputs["query"]
+    role_counts_node = next(node for node in normalized.nodes if node.node_id == "syntax_role_counts")
+    target_counts_node = next(node for node in normalized.nodes if node.node_id == "syntax_target_counts")
+    assert role_counts_node.inputs["group_by"] == "actor_group"
+    assert target_counts_node.inputs["group_by"] == "target_group"
     assert normalized.metadata["question_family"] == "syntax_role_patterns"
 
 
@@ -2210,6 +2361,71 @@ def test_infer_retrieval_budget_uses_semantic_strategy_for_similarity_questions(
 
     assert budget.retrieval_strategy == "semantic_exploratory"
     assert budget.retrieval_mode == "dense"
+
+
+def test_infer_retrieval_budget_marks_aggregate_svo_questions_as_exhaustive() -> None:
+    budget = infer_retrieval_budget(
+        "In 2020 protest coverage, who was most often described as acting and how did SVO patterns differ between groups?"
+    )
+
+    assert budget.scope == "broad"
+    assert budget.retrieve_all_requested is True
+    assert budget.retrieval_strategy == "exhaustive_analytic"
+
+
+def test_derive_summary_includes_run_diagnostics_for_synthesis_scope(tmp_path: Path) -> None:
+    runtime = build_test_runtime(
+        tmp_path=tmp_path,
+        documents=_sample_documents(),
+        search_rows_by_query=_search_rows(_sample_documents()),
+    )
+    snapshot = AgentExecutionSnapshot(
+        node_records=[
+            AgentNodeExecutionRecord(node_id="search", capability="db_search", status="completed"),
+            AgentNodeExecutionRecord(node_id="svo", capability="extract_svo_triples", status="completed"),
+            AgentNodeExecutionRecord(node_id="series", capability="time_series_aggregate", status="completed"),
+        ],
+        node_results={
+            "search": ToolExecutionResult(
+                payload={
+                    "results": [{"doc_id": "p1"}, {"doc_id": "p2"}],
+                    "retrieval_strategy": "precision_ranked",
+                    "retrieve_all": False,
+                    "document_count": 27,
+                    "working_set_ref": "hybrid_search_small",
+                }
+            ),
+            "svo": ToolExecutionResult(
+                payload={"rows": [{"actor_group": "police", "target_group": "protesters"}], "analyzed_document_count": 27},
+                metadata={"analyzed_document_count": 27, "working_set_document_count": 27},
+            ),
+            "series": ToolExecutionResult(
+                payload={"rows": [], "no_data_reason": "no_time_bins"},
+                metadata={"no_data": True, "no_data_reason": "no_time_bins"},
+            ),
+        },
+        failures=[],
+        provenance_records=[],
+        selected_docs=[],
+        status="completed",
+    )
+
+    summary = runtime.orchestrator._derive_summary(snapshot)
+    diagnostics = summary["run_diagnostics"]
+
+    assert diagnostics["search_nodes"] == [
+        {
+            "node_id": "search",
+            "retrieval_strategy": "precision_ranked",
+            "retrieve_all": False,
+            "document_count": 27,
+            "returned_count": 2,
+            "working_set_ref": "hybrid_search_small",
+        }
+    ]
+    assert diagnostics["analysis_nodes"][0]["capability"] == "extract_svo_triples"
+    assert diagnostics["analysis_nodes"][0]["analyzed_document_count"] == 27
+    assert diagnostics["no_data_nodes"] == [{"node_id": "series", "capability": "time_series_aggregate", "reason": "no_time_bins"}]
 
 
 def test_planner_search_budget_is_normalized_up_for_broad_scope_questions(tmp_path: Path) -> None:

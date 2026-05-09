@@ -202,6 +202,37 @@ def _dependency_results_have_plot_rows(dependency_results: dict[str, ToolExecuti
     return False
 
 
+def _node_record_lookup(records: list[AgentNodeExecutionRecord]) -> dict[str, AgentNodeExecutionRecord]:
+    return {record.node_id: record for record in records}
+
+
+def _node_record_brief(record: AgentNodeExecutionRecord) -> str:
+    tool = f" via {record.tool_name}" if record.tool_name else ""
+    reason = str(record.error or "").strip()
+    if not reason and record.caveats:
+        reason = str(record.caveats[0]).strip()
+    if not reason:
+        reason = record.status
+    return f"{record.node_id} ({record.capability}{tool}): {reason}"
+
+
+def _dependency_skip_reason(
+    *,
+    prefix: str,
+    dependency_ids: list[str],
+    node_records: list[AgentNodeExecutionRecord],
+) -> str:
+    records_by_id = _node_record_lookup(node_records)
+    details = [
+        _node_record_brief(records_by_id[dependency_id])
+        for dependency_id in dependency_ids
+        if dependency_id in records_by_id
+    ]
+    if details:
+        return f"{prefix}: {'; '.join(details)}"
+    return f"{prefix}: {', '.join(dependency_ids)}"
+
+
 def _matches_schema_type(value: Any, schema_type: str) -> bool:
     normalized = str(schema_type or "").strip().lower()
     if normalized in {"", "any", "object"}:
@@ -895,7 +926,11 @@ class AsyncPlanExecutor:
                 if not skipped_dependencies:
                     continue
                 pending.discard(node_id)
-                message = f"Skipped because dependencies did not produce executable data: {', '.join(skipped_dependencies)}"
+                message = _dependency_skip_reason(
+                    prefix="Skipped because dependencies did not produce executable data",
+                    dependency_ids=skipped_dependencies,
+                    node_records=node_records,
+                )
                 now = _utc_now()
                 if node.optional:
                     node_records.append(
@@ -933,7 +968,13 @@ class AsyncPlanExecutor:
                         error=message,
                     )
                 )
-                mark_pending_skipped("Skipped because the run stopped after an unmet required dependency.")
+                mark_pending_skipped(
+                    _dependency_skip_reason(
+                        prefix="Skipped because the run stopped after an unmet required dependency",
+                        dependency_ids=[node.node_id],
+                        node_records=node_records,
+                    )
+                )
                 return AgentExecutionSnapshot(
                     node_records=node_records,
                     node_results=completed,
@@ -983,6 +1024,13 @@ class AsyncPlanExecutor:
                             error_type="core_no_data",
                             message=reason,
                             retriable=True,
+                            details={
+                                "node_id": node.node_id,
+                                "capability": node.capability,
+                                "tool_name": record.tool_name,
+                                "dependency_nodes": list(node.depends_on),
+                                "inputs": _safe_json(node.inputs),
+                            },
                         )
                 node_records.append(record)
                 if provenance_row is not None:
@@ -994,8 +1042,19 @@ class AsyncPlanExecutor:
                         selected_docs = list(payload.get("documents", []))
                 if effective_failure is not None:
                     failures.append(effective_failure)
-            if any(item.status == "failed" and not node_map[item.node_id].optional for item in node_records if item.node_id in ready_ids):
-                mark_pending_skipped("Skipped because the run stopped after a required node failed.")
+            failed_ready_ids = [
+                item.node_id
+                for item in node_records
+                if item.node_id in ready_ids and item.status == "failed" and not node_map[item.node_id].optional
+            ]
+            if failed_ready_ids:
+                mark_pending_skipped(
+                    _dependency_skip_reason(
+                        prefix="Skipped because the run stopped after a required node failed",
+                        dependency_ids=failed_ready_ids,
+                        node_records=node_records,
+                    )
+                )
                 return AgentExecutionSnapshot(
                     node_records=node_records,
                     node_results=completed,
