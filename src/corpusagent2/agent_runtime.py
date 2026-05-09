@@ -191,6 +191,10 @@ TOPIC_QUERY_EXPANSIONS = (
         "triggers": ("climate", "klima", "climat"),
         "query": "climate OR klima OR climat OR klimawandel OR rechauffement OR réchauffement",
     },
+    {
+        "triggers": ("protest", "protests", "protester", "protesters", "demonstration", "demonstrators", "unrest"),
+        "query": "protest OR protests OR protesters OR protestors OR demonstrators OR demonstrations OR unrest OR police OR \"law enforcement\"",
+    },
 )
 
 
@@ -578,7 +582,10 @@ class MagicBoxOrchestrator:
         "table_from",
         "documents_node",
         "document_source",
+        "input_from",
         "series_source",
+        "working_set",
+        "working_set_from",
         "working_set_id",
         "working_set_source",
         "working_set_source_node_id",
@@ -603,6 +610,7 @@ class MagicBoxOrchestrator:
     }
     _EXPENSIVE_OPTIONAL_CAPABILITIES = _EXPENSIVE_LEAF_CAPABILITIES | {
         "extract_keyterms",
+        "plot_artifact",
         "sentiment",
         "topic_model",
     }
@@ -637,6 +645,82 @@ class MagicBoxOrchestrator:
                     if isinstance(item, dict):
                         references.extend(cls._input_source_references(item, node_ids))
         return list(dict.fromkeys(references))
+
+    @staticmethod
+    def _language_filter_base_key(raw_key: str) -> str:
+        key = str(raw_key or "").strip().lower()
+        for suffix in ("_contains", "_in", "_equals", "_eq"):
+            if key.endswith(suffix):
+                return key[: -len(suffix)]
+        return key
+
+    @staticmethod
+    def _filter_control_metadata_key(raw_key: str) -> bool:
+        key = str(raw_key or "").strip().lower()
+        if key in {
+            "source_node",
+            "source_node_id",
+            "source_ref",
+            "source_result",
+            "working_set_node",
+            "working_set_source_node",
+            "working_set_source_node_id",
+        }:
+            return True
+        return key.endswith(("_source", "_source_node", "_source_node_id", "_source_ref", "_source_result"))
+
+    @classmethod
+    def _has_plain_language_filter(cls, inputs: dict[str, Any]) -> bool:
+        for container_key in ("filters", "filter", "predicate"):
+            filters = inputs.get(container_key)
+            if not isinstance(filters, dict):
+                continue
+            for raw_key, value in filters.items():
+                if cls._language_filter_base_key(str(raw_key)) not in {"language", "lang", "lang_id", "language_id"}:
+                    continue
+                if isinstance(value, dict) and str(value.get("source", "") or "").strip():
+                    continue
+                return True
+        return False
+
+    @classmethod
+    def _rewrite_plain_language_filter_inputs(cls, inputs: dict[str, Any], lang_node_id: str) -> tuple[dict[str, Any], bool]:
+        changed = False
+        rewritten_inputs = dict(inputs)
+        payload = rewritten_inputs.get("payload")
+        payload_is_dict = isinstance(payload, dict)
+        target = dict(payload) if payload_is_dict else rewritten_inputs
+
+        for container_key in ("filters", "filter", "predicate"):
+            filters = target.get(container_key)
+            if not isinstance(filters, dict):
+                continue
+            rewritten_filters = dict(filters)
+            for raw_key, value in list(filters.items()):
+                if cls._filter_control_metadata_key(str(raw_key)):
+                    rewritten_filters.pop(raw_key, None)
+                    changed = True
+                    continue
+                base_key = cls._language_filter_base_key(str(raw_key))
+                if base_key not in {"language", "lang", "lang_id", "language_id"}:
+                    continue
+                if isinstance(value, dict) and str(value.get("source", "") or "").strip():
+                    continue
+                expected_values = value if isinstance(value, list) else [value]
+                rewritten_filters[raw_key] = {
+                    "source": lang_node_id,
+                    "field": "language",
+                    "in": expected_values,
+                }
+                changed = True
+            if rewritten_filters != filters:
+                target[container_key] = rewritten_filters
+
+        if not changed:
+            return inputs, False
+        if payload_is_dict:
+            rewritten_inputs["payload"] = target
+        return rewritten_inputs, True
 
     @staticmethod
     def _has_executable_python_code(value: Any) -> bool:
@@ -698,6 +782,7 @@ class MagicBoxOrchestrator:
             "join_external_series": ("stock", "drawdown", "market", "price", "oil", "equity", "ticker"),
             "ner": ("named entities", "named entity", "actors", "actor", "entities", "named people", "institutions"),
             "noun_chunks": ("noun chunk", "noun phrase", "noun phrases", "syntax", "grammatical", "subject", "verb", "object", "acted upon"),
+            "plot_artifact": ("chart", "plot", "graph", "visualize", "visualise", "visualization", "visualisation"),
             "pos_morph": ("part of speech", "pos", "noun distribution", "nouns", "syntax", "grammatical", "subject", "verb", "object", "acted upon"),
             "quote_attribute": ("quote", "quoted", "attribution", "attributed", "directly attributed", "named people", "named institutions", "described as acting"),
             "quote_extract": ("quote", "quoted", "quotation", "said", "according to", "directly attributed", "described as acting"),
@@ -790,6 +875,54 @@ class MagicBoxOrchestrator:
             node_id = f"{preferred}_{index}"
             retained_ids.add(node_id)
             return node_id
+
+        has_plain_language_filter = any(
+            node.capability == "filter_working_set"
+            and self._has_plain_language_filter(self._effective_node_inputs(node))
+            for node in retained_nodes
+        )
+        language_node_id = next((node.node_id for node in retained_nodes if node.capability == "lang_id"), "")
+        if has_plain_language_filter and not language_node_id:
+            fetch_node_id = next((node.node_id for node in retained_nodes if node.capability == "fetch_documents"), "")
+            if fetch_node_id:
+                language_node_id = unique_retained_node_id("language_annotations")
+                retained_nodes.append(
+                    AgentPlanNode(
+                        node_id=language_node_id,
+                        capability="lang_id",
+                        depends_on=[fetch_node_id],
+                        description="Compiler-added language annotations for working-set language filters.",
+                    )
+                )
+                compiler_notes.append(
+                    f"node {language_node_id}: added language annotations for working-set language filter"
+                )
+        if language_node_id:
+            rewritten_nodes: list[AgentPlanNode] = []
+            for node in retained_nodes:
+                if node.capability != "filter_working_set":
+                    rewritten_nodes.append(node)
+                    continue
+                rewritten_inputs, rewritten = self._rewrite_plain_language_filter_inputs(node.inputs, language_node_id)
+                if rewritten:
+                    rewritten_nodes.append(
+                        AgentPlanNode(
+                            node_id=node.node_id,
+                            capability=node.capability,
+                            tool_name=node.tool_name,
+                            inputs=rewritten_inputs,
+                            depends_on=list(dict.fromkeys([*node.depends_on, language_node_id])),
+                            optional=node.optional,
+                            cacheable=node.cacheable,
+                            description=node.description,
+                        )
+                    )
+                    compiler_notes.append(
+                        f"node {node.node_id}: rewrote plain language filter to annotation-backed dependency {language_node_id}"
+                    )
+                else:
+                    rewritten_nodes.append(node)
+            retained_nodes = rewritten_nodes
 
         market_ticker = self._infer_market_ticker(question_text)
         if (
@@ -925,7 +1058,19 @@ class MagicBoxOrchestrator:
         if needs_semantic_similarity:
             search_inputs["retrieval_strategy"] = "semantic_exploratory"
             search_inputs["retrieval_mode"] = "dense"
-        if needs_syntax_roles or needs_attributed_explanations:
+        if needs_syntax_roles:
+            syntax_role_overrides = (
+                {"retrieval_strategy": "exhaustive_analytic", "retrieve_all": True, "top_k": 0}
+                if self._syntax_role_needs_population_analysis(dag_text)
+                else {"retrieval_strategy": "precision_ranked"}
+            )
+            precision_search_inputs = infer_retrieval_budget(
+                dag_text,
+                inputs=syntax_role_overrides,
+                configured_mode=os.getenv("CORPUSAGENT2_DEFAULT_RETRIEVAL_MODE", "hybrid"),
+            ).to_inputs()
+            search_inputs.update(precision_search_inputs)
+        elif needs_attributed_explanations:
             precision_search_inputs = infer_retrieval_budget(
                 dag_text,
                 inputs={"retrieval_strategy": "precision_ranked"},
@@ -1106,6 +1251,17 @@ class MagicBoxOrchestrator:
             or re.search(r"\b(?:subject[- ]verb[- ]object|svo|subject|verb|object|dependency|grammatical role|grammatical roles)\b", lowered)
             or re.search(r"\b(?:acting|acted)\b.{0,80}\b(?:acted upon|upon|against|by)\b", lowered)
             or re.search(r"\bwho\b.{0,80}\b(?:acting|acted upon|acted on|action patterns?|patterns differ)\b", lowered)
+        )
+
+    @staticmethod
+    def _syntax_role_needs_population_analysis(text: str) -> bool:
+        lowered = str(text or "").lower()
+        return bool(
+            re.search(r"\b(?:most\s+(?:often|frequent(?:ly)?|common)|frequency|distribution|dominant|dominated)\b", lowered)
+            or re.search(r"\bpatterns?\s+(?:differ|changed?|shifted?)\b", lowered)
+            or re.search(r"\bdiffer(?:ed|s|ent)?\s+between\b", lowered)
+            or re.search(r"\b(?:across|between)\b.{0,80}\b(?:groups?|categories|actors?|institutions?|outlets?|sources?)\b", lowered)
+            or re.search(r"\b(?:coverage|corpus|reports?|articles?)\b.{0,80}\b(?:who|subject|object|acted upon|acting)\b", lowered)
         )
 
     @staticmethod
@@ -1310,7 +1466,7 @@ class MagicBoxOrchestrator:
         lemma_id = ensure_node("lemmatize", "lemmas", [fetch_node_id])
         dependency_id = ensure_node("dependency_parse", "dependencies", [fetch_node_id])
         svo_id = ensure_node("extract_svo_triples", "svo_triples", [fetch_node_id])
-        noun_chunks_id = ensure_node("noun_chunks", "noun_chunks", [pos_id])
+        noun_chunks_id = ensure_node("noun_chunks", "noun_chunks", [fetch_node_id])
         ner_id = ensure_node("ner", "entities", [fetch_node_id], optional=True)
         entity_link_id = ensure_node("entity_link", "entity_link", [ner_id], optional=True)
         quotes_id = ensure_node("quote_extract", "quotes", [fetch_node_id])
@@ -1323,7 +1479,7 @@ class MagicBoxOrchestrator:
             lemma_id: [fetch_node_id],
             dependency_id: [fetch_node_id],
             svo_id: [fetch_node_id],
-            noun_chunks_id: [pos_id],
+            noun_chunks_id: [fetch_node_id],
             quotes_id: [fetch_node_id],
             attributed_quotes_id: [quotes_id],
         }
@@ -1335,14 +1491,32 @@ class MagicBoxOrchestrator:
             "syntax_role_counts",
             [svo_id],
             inputs={
-                "group_by": "subject",
+                "group_by": "actor_group",
                 "metrics": ["mention_count"],
                 "bucket_granularity": "year",
                 "fallback_time_bin": date_window.get("date_from", ""),
-                "top_k": 30,
+                "top_k": 8,
             },
             optional=True,
         )
+        target_counts_id = next((node.node_id for node in normalized_nodes if node.node_id == "syntax_target_counts"), "")
+        if not target_counts_id:
+            target_counts_id = unique_node_id("syntax_target_counts")
+            normalized_nodes.append(
+                AgentPlanNode(
+                    node_id=target_counts_id,
+                    capability="time_series_aggregate",
+                    inputs={
+                        "group_by": "target_group",
+                        "metrics": ["mention_count"],
+                        "bucket_granularity": "year",
+                        "fallback_time_bin": date_window.get("date_from", ""),
+                        "top_k": 8,
+                    },
+                    depends_on=[svo_id],
+                    optional=True,
+                )
+            )
         if not any(node.capability == "plot_artifact" and role_counts_id in node.depends_on for node in normalized_nodes):
             normalized_nodes.append(
                 AgentPlanNode(
@@ -1354,7 +1528,7 @@ class MagicBoxOrchestrator:
                         "x": "entity",
                         "y": "mention_count",
                         "series": "series_name",
-                        "top_k": 30,
+                        "top_k": 8,
                         "title": "Subject-verb-object role patterns",
                     },
                     depends_on=[role_counts_id],
@@ -1371,6 +1545,8 @@ class MagicBoxOrchestrator:
             entity_link_id,
             attributed_quotes_id,
             svo_id,
+            role_counts_id,
+            target_counts_id,
         ]
         has_role_evidence = any(
             node.capability == "build_evidence_table" and any(dep in node.depends_on for dep in role_evidence_deps)
@@ -3175,10 +3351,15 @@ class MagicBoxOrchestrator:
                 plan_dag=dag,
             )
         if self._needs_syntax_role_analysis(rewritten):
+            syntax_overrides = (
+                {"retrieval_strategy": "exhaustive_analytic", "retrieve_all": True, "top_k": 0}
+                if self._syntax_role_needs_population_analysis(rewritten)
+                else {"retrieval_strategy": "precision_ranked"}
+            )
             search_inputs = self._search_inputs_for_question(
                 rewritten,
                 query_text=query_text,
-                overrides={"retrieval_strategy": "precision_ranked"},
+                overrides=syntax_overrides,
             )
             date_window = self._extract_date_window(rewritten)
             dag = AgentPlanDAG(
@@ -3192,7 +3373,7 @@ class MagicBoxOrchestrator:
                     AgentPlanNode("lemmas", "lemmatize", depends_on=["fetch"]),
                     AgentPlanNode("dependencies", "dependency_parse", depends_on=["fetch"]),
                     AgentPlanNode("svo_triples", "extract_svo_triples", depends_on=["fetch"]),
-                    AgentPlanNode("noun_chunks", "noun_chunks", depends_on=["pos"]),
+                    AgentPlanNode("noun_chunks", "noun_chunks", depends_on=["fetch"]),
                     AgentPlanNode("entities", "ner", depends_on=["fetch"], optional=True),
                     AgentPlanNode("entity_link", "entity_link", depends_on=["entities"], optional=True),
                     AgentPlanNode("quotes", "quote_extract", depends_on=["fetch"]),
@@ -3201,11 +3382,24 @@ class MagicBoxOrchestrator:
                         "syntax_role_counts",
                         "time_series_aggregate",
                         inputs={
-                            "group_by": "subject",
+                            "group_by": "actor_group",
                             "metrics": ["mention_count"],
                             "bucket_granularity": "year",
                             "fallback_time_bin": date_window.get("date_from", ""),
-                            "top_k": 30,
+                            "top_k": 8,
+                        },
+                        depends_on=["svo_triples"],
+                        optional=True,
+                    ),
+                    AgentPlanNode(
+                        "syntax_target_counts",
+                        "time_series_aggregate",
+                        inputs={
+                            "group_by": "target_group",
+                            "metrics": ["mention_count"],
+                            "bucket_granularity": "year",
+                            "fallback_time_bin": date_window.get("date_from", ""),
+                            "top_k": 8,
                         },
                         depends_on=["svo_triples"],
                         optional=True,
@@ -3219,7 +3413,7 @@ class MagicBoxOrchestrator:
                             "x": "entity",
                             "y": "mention_count",
                             "series": "series_name",
-                            "top_k": 30,
+                            "top_k": 8,
                         },
                         depends_on=["syntax_role_counts"],
                         optional=True,
@@ -3969,7 +4163,8 @@ class MagicBoxOrchestrator:
                     "Use only the provided summaries, tool outputs, and evidence. "
                     "Do not claim direct correspondence to stock-price moves or external market behavior unless an external series was explicitly attached. "
                     "When has_external_series is true and summary.external_series is present, use that compact external-series summary and do not say the external series is missing. "
-                    "When summary contains entity_trend_time_series or time_series_summaries, treat those as valid temporal analysis rows; do not say a time breakdown is missing solely because evidence_rows are only examples."
+                    "When summary contains entity_trend_time_series or time_series_summaries, treat those as valid temporal analysis rows; do not say a time breakdown is missing solely because evidence_rows are only examples. "
+                    "Use summary.run_diagnostics to qualify answer scope: for aggregate questions, do not generalize beyond a small ranked slice, preview rows, or noisy/no-data analytical outputs."
                 ),
             },
             {
@@ -4071,19 +4266,33 @@ class MagicBoxOrchestrator:
         if not lowered:
             return True
         internal_markers = (
+            "applied date window filter",
+            "applied minimum text length filter",
+            "applied structured working-set filters",
             "dependency nodes",
+            "exhaustive analytical retrieval",
             "fetched preview",
             "fetched 250 preview",
             "fetched 1000 preview",
+            "inferred plot ",
             "input docs",
             "missing plot",
+            "missing_working_set_ref",
+            "no input documents were available",
             "no rows available for plotting",
+            "no_input_documents",
+            "no_data",
             "plot requested",
+            "provider_unavailable",
             "preview/batch",
             "python_runner",
+            "resolved annotation-backed filters",
+            "resolved plot ",
             "streamed from working_set_ref",
             "upstream fetched documents were only a preview",
+            "working set '",
             "working_set_ref",
+            "year-balanced retrieval was applied",
         )
         return any(marker in lowered for marker in internal_markers)
 
@@ -4352,6 +4561,9 @@ class MagicBoxOrchestrator:
 
     def _derive_summary(self, snapshot: AgentExecutionSnapshot) -> dict[str, Any]:
         summary: dict[str, Any] = {}
+        diagnostics = self._run_quality_diagnostics(snapshot)
+        if diagnostics:
+            summary["run_diagnostics"] = diagnostics
         external_summary = self._external_series_summary(snapshot)
         if external_summary:
             summary["external_series"] = external_summary
@@ -4461,6 +4673,64 @@ class MagicBoxOrchestrator:
             elif {"doc_id", "outlet", "date", "excerpt", "score"}.issubset(first.keys()):
                 summary["evidence_rows"] = rows[:10]
         return summary
+
+    def _run_quality_diagnostics(self, snapshot: AgentExecutionSnapshot) -> dict[str, Any]:
+        diagnostics: dict[str, Any] = {}
+        search_nodes: list[dict[str, Any]] = []
+        analysis_nodes: list[dict[str, Any]] = []
+        no_data_nodes: list[dict[str, Any]] = []
+        records_by_id = {record.node_id: record for record in snapshot.node_records}
+        for node_id, result in snapshot.node_results.items():
+            record = records_by_id.get(node_id)
+            payload = result.payload if isinstance(result.payload, dict) else {}
+            metadata = result.metadata if isinstance(result.metadata, dict) else {}
+            rows = payload.get("rows") if isinstance(payload.get("rows"), list) else []
+            documents = payload.get("documents") if isinstance(payload.get("documents"), list) else []
+            results = payload.get("results") if isinstance(payload.get("results"), list) else []
+            if record and record.capability == "db_search":
+                search_nodes.append(
+                    {
+                        "node_id": node_id,
+                        "retrieval_strategy": payload.get("retrieval_strategy", ""),
+                        "retrieve_all": bool(payload.get("retrieve_all", False)),
+                        "document_count": payload.get("document_count", len(results)),
+                        "returned_count": len(results),
+                        "working_set_ref": payload.get("working_set_ref", ""),
+                    }
+                )
+            analyzed_count = (
+                metadata.get("analyzed_document_count")
+                or payload.get("analyzed_document_count")
+                or payload.get("returned_document_count")
+                or len(documents)
+            )
+            working_set_count = metadata.get("working_set_document_count") or payload.get("document_count")
+            if record and record.capability not in {"db_search", "fetch_documents", "create_working_set", "plot_artifact"}:
+                analysis_nodes.append(
+                    {
+                        "node_id": node_id,
+                        "capability": record.capability,
+                        "row_count": len(rows),
+                        "analyzed_document_count": analyzed_count,
+                        "working_set_document_count": working_set_count,
+                    }
+                )
+            no_data_reason = metadata.get("no_data_reason") or payload.get("no_data_reason") or ""
+            if (metadata.get("no_data") or payload.get("no_data") or (record and record.status == "completed" and not rows and not documents and not results)) and no_data_reason:
+                no_data_nodes.append(
+                    {
+                        "node_id": node_id,
+                        "capability": record.capability if record else "",
+                        "reason": no_data_reason,
+                    }
+                )
+        if search_nodes:
+            diagnostics["search_nodes"] = search_nodes
+        if analysis_nodes:
+            diagnostics["analysis_nodes"] = analysis_nodes[:20]
+        if no_data_nodes:
+            diagnostics["no_data_nodes"] = no_data_nodes[:20]
+        return diagnostics
 
     def _has_external_series(self, snapshot: AgentExecutionSnapshot) -> bool:
         return bool(self._external_series_rows(snapshot))

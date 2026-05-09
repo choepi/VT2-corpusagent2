@@ -121,7 +121,7 @@ def _smoke_documents() -> list[dict[str, str]]:
         {
             "doc_id": "ukr-2",
             "title": "Ukraine markets fear wider conflict",
-            "text": '"The threat remains high," Bob Smith warned in Kyiv. NATO allies argued sanctions could improve stability, but traders still saw weak sentiment, loss, and risk as the invasion threat grew.',
+            "text": '"The threat remains high," Bob Smith warned in Kyiv. NATO allies argued sanctions could improve stability, but traders still saw weak sentiment, loss, and risk as the invasion threat grew. Police arrested protesters after demonstrators were pushed by officers outside parliament.',
             "published_at": "2022-02-20",
             "date": "2022-02-20",
             "source": "FT",
@@ -235,13 +235,14 @@ def _execute_smoke_suite(tmp_path: Path) -> tuple[dict[str, ToolExecutionResult]
 
     monkeypatch = MonkeyPatch()
     try:
-        monkeypatch.setenv("CORPUSAGENT2_PROVIDER_ORDER_TOKENIZE", "regex")
-        monkeypatch.setenv("CORPUSAGENT2_PROVIDER_ORDER_SENTENCE_SPLIT", "heuristic")
-        monkeypatch.setenv("CORPUSAGENT2_PROVIDER_ORDER_POS_MORPH", "heuristic")
-        monkeypatch.setenv("CORPUSAGENT2_PROVIDER_ORDER_LEMMATIZE", "heuristic")
-        monkeypatch.setenv("CORPUSAGENT2_PROVIDER_ORDER_NER", "regex")
-        monkeypatch.setenv("CORPUSAGENT2_PROVIDER_ORDER_SENTIMENT", "heuristic")
-        monkeypatch.setenv("CORPUSAGENT2_PROVIDER_ORDER_TOPIC_MODEL", "heuristic")
+        monkeypatch.setenv("CORPUSAGENT2_PROVIDER_ORDER_TOKENIZE", "spacy")
+        monkeypatch.setenv("CORPUSAGENT2_PROVIDER_ORDER_SENTENCE_SPLIT", "spacy")
+        monkeypatch.setenv("CORPUSAGENT2_PROVIDER_ORDER_POS_MORPH", "spacy")
+        monkeypatch.setenv("CORPUSAGENT2_PROVIDER_ORDER_LEMMATIZE", "spacy")
+        monkeypatch.setenv("CORPUSAGENT2_PROVIDER_ORDER_NER", "spacy")
+        monkeypatch.setenv("CORPUSAGENT2_PROVIDER_ORDER_SENTIMENT", "textblob")
+        monkeypatch.setenv("CORPUSAGENT2_PROVIDER_ORDER_TOPIC_MODEL", "textacy")
+        monkeypatch.setenv("CORPUSAGENT2_PROVIDER_ORDER_EXTRACT_SVO_TRIPLES", "spacy")
         monkeypatch.setattr(agent_capabilities, "_encode_texts", _fake_encode_texts)
         monkeypatch.setattr(agent_capabilities, "_fetch_yfinance_series_rows", _fake_yfinance_rows)
 
@@ -384,7 +385,7 @@ def _execute_smoke_suite(tmp_path: Path) -> tuple[dict[str, ToolExecutionResult]
         for tool_name, capability, params in doc_tools:
             execute(tool_name, capability, params=params, deps={"documents": fetch_result})
 
-        execute("noun_chunks", "noun_chunks", deps={"pos_rows": results["pos_morph"]})
+        execute("noun_chunks", "noun_chunks", deps={"documents": fetch_result})
         execute("entity_link", "entity_link", deps={"entities": results["ner"]})
         execute(
             "time_series_aggregate",
@@ -574,8 +575,19 @@ def test_smoke_suite_verifies_weak_tool_families_with_structured_outputs(tmp_pat
     assert any(row.get("sentences") for row in by_tool["sentence_split"].output_payload["rows"])
     assert any(row.get("lemmas") for row in by_tool["lemmatize"].output_payload["rows"])
     assert any(row.get("pos") and row.get("lemma") for row in by_tool["pos_morph"].output_payload["rows"])
-    assert any(row.get("dependencies") for row in by_tool["dependency_parse"].output_payload["rows"])
+    assert by_tool["dependency_parse"].metadata.get("provider") in {"spacy", "stanza"}
+    assert by_tool["topic_model"].metadata.get("provider") in {"textacy", "gensim"}
+    assert by_tool["sentiment"].metadata.get("provider") in {"flair", "textblob"}
+    assert any(
+        dep.get("dep") not in {"next", ""}
+        for row in by_tool["dependency_parse"].output_payload["rows"]
+        for dep in row.get("dependencies", [])
+    )
     assert any(row.get("subject") and row.get("verb") and row.get("object") for row in by_tool["extract_svo_triples"].output_payload["rows"])
+    assert any(
+        row.get("actor_group") == "police" and row.get("target_group") == "protesters"
+        for row in by_tool["extract_svo_triples"].output_payload["rows"]
+    )
     assert any(row.get("noun_chunks") for row in by_tool["noun_chunks"].output_payload["rows"])
 
     assert any(row.get("quote") for row in by_tool["quote_extract"].output_payload["rows"])

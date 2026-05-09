@@ -121,6 +121,51 @@ def test_async_executor_stops_scheduling_after_cancel_requested(tmp_path: Path) 
     assert second_started is False
 
 
+def test_async_executor_skipped_nodes_include_failed_dependency_reason(tmp_path: Path) -> None:
+    registry = ToolRegistry()
+    downstream_started = False
+
+    registry.register(
+        StaticAdapter(
+            tool_name="series_tool",
+            capability="time_series_aggregate",
+            run_fn=lambda _p, _d, _c: ToolExecutionResult(
+                payload={"rows": []},
+                metadata={"no_data": True, "no_data_reason": "Missing time field: quarter"},
+            ),
+        )
+    )
+
+    def downstream(_params, _deps, _context):
+        nonlocal downstream_started
+        downstream_started = True
+        return ToolExecutionResult(payload={"ok": True})
+
+    registry.register(StaticAdapter(tool_name="plot_tool", capability="plot_artifact", run_fn=downstream))
+    plan = AgentPlanDAG(
+        nodes=[
+            AgentPlanNode("series", "time_series_aggregate"),
+            AgentPlanNode("plot", "plot_artifact", depends_on=["series"]),
+        ]
+    )
+    context = AgentExecutionContext(
+        run_id="run_dependency_reason",
+        artifacts_dir=tmp_path,
+        search_backend=_SearchBackend(),
+        working_store=InMemoryWorkingSetStore(),
+    )
+
+    snapshot = asyncio.run(AsyncPlanExecutor(registry).execute(plan, context))
+
+    records = {record.node_id: record for record in snapshot.node_records}
+    assert snapshot.status == "failed"
+    assert records["series"].status == "failed"
+    assert records["plot"].status == "skipped"
+    assert "series (time_series_aggregate via series_tool): Missing time field: quarter" in records["plot"].error
+    assert downstream_started is False
+    assert snapshot.failures[0].details["dependency_nodes"] == []
+
+
 def test_summarize_tool_result_distinguishes_input_docs_and_no_data() -> None:
     dependency_results = {
         "fetch": ToolExecutionResult(
