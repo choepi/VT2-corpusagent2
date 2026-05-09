@@ -47,6 +47,7 @@ const activeSteps = document.getElementById("activeSteps");
 const completedSteps = document.getElementById("completedSteps");
 const failedSteps = document.getElementById("failedSteps");
 const assumptionsList = document.getElementById("assumptionsList");
+const answerModeBanner = document.getElementById("answerModeBanner");
 const answerText = document.getElementById("answerText");
 const caveatsList = document.getElementById("caveatsList");
 const unsupportedList = document.getElementById("unsupportedList");
@@ -1934,7 +1935,14 @@ function renderArtifacts(manifest) {
   });
 }
 
-function renderAnswerPayload(finalAnswer) {
+function renderAnswerPayload(finalAnswer, metadata = {}) {
+  const outOfCorpusModelAnswer = Boolean(metadata?.out_of_corpus_model_answer);
+  if (answerModeBanner) {
+    answerModeBanner.classList.toggle("hidden", !outOfCorpusModelAnswer);
+    answerModeBanner.textContent = outOfCorpusModelAnswer
+      ? "MODEL-ONLY OUT-OF-CORPUS ANSWER: no corpus-grounded evidence was available; this uses the configured planner model's prior knowledge."
+      : "";
+  }
   answerText.textContent = finalAnswer?.answer_text || "No answer text returned.";
   const verdicts = finalAnswer?.claim_verdicts || [];
   if (!verdicts.length) {
@@ -1962,7 +1970,7 @@ function renderManifest(manifest) {
   latestManifest = manifest;
   currentManifestSavedPath = manifest?.artifacts_dir ? `${manifest.artifacts_dir}/run_manifest.json` : currentManifestSavedPath;
   updateRunSaveDisplay();
-  renderAnswerPayload(manifest.final_answer || {});
+  renderAnswerPayload(manifest.final_answer || {}, manifest.metadata || {});
   renderEvidence(manifest.evidence_table || manifest.final_answer?.evidence_items || []);
   renderArtifacts(manifest);
   renderPlannerActions(manifest.planner_actions || []);
