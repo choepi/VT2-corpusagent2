@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import gzip
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -106,17 +107,37 @@ def _matches_filters(payload: dict, filters: list[tuple[str, str]]) -> bool:
     return True
 
 
+def _sample_key(payload: dict, sample_seed: int) -> float:
+    stable_parts = [
+        str(sample_seed),
+        _first_value(payload, DEFAULT_FIELD_CANDIDATES["id"]),
+        _first_value(payload, DEFAULT_FIELD_CANDIDATES["source"]),
+        _first_value(payload, DEFAULT_FIELD_CANDIDATES["published_at"]),
+        _first_value(payload, DEFAULT_FIELD_CANDIDATES["title"]),
+    ]
+    if not any(part for part in stable_parts[1:]):
+        stable_parts.append(json.dumps(payload, sort_keys=True, ensure_ascii=True, default=str)[:4096])
+    digest = hashlib.blake2b("\n".join(stable_parts).encode("utf-8"), digest_size=8).digest()
+    return int.from_bytes(digest, "big") / float(2**64)
+
+
 def _iter_normalized_records(
     records: Iterable[dict],
     *,
     filters: list[tuple[str, str]] | None = None,
     max_rows: int = 0,
+    sample_fraction: float = 1.0,
+    sample_seed: int = 42,
 ) -> Iterable[dict[str, str]]:
+    if sample_fraction <= 0.0 or sample_fraction > 1.0:
+        raise ValueError("sample_fraction must be > 0 and <= 1.")
     written = 0
     active_filters = filters or []
     for payload in records:
         row = dict(payload)
         if active_filters and not _matches_filters(row, active_filters):
+            continue
+        if sample_fraction < 1.0 and _sample_key(row, sample_seed) >= sample_fraction:
             continue
         normalized = _normalize_record(row)
         if not normalized["text"]:
@@ -174,6 +195,8 @@ def _convert_source_file(
     label: str = "",
     max_rows: int = 0,
     filters: list[tuple[str, str]] | None = None,
+    sample_fraction: float = 1.0,
+    sample_seed: int = 42,
 ) -> dict[str, object]:
     source = source.expanduser().resolve()
     if not source.exists():
@@ -182,7 +205,13 @@ def _convert_source_file(
     base_name = _slug(label or source.stem)
     target = incoming_root / f"{base_name}.jsonl.gz"
     row_count = _write_jsonl_gz(
-        _iter_normalized_records(_records_from_tabular_file(source), filters=filters, max_rows=max_rows),
+        _iter_normalized_records(
+            _records_from_tabular_file(source),
+            filters=filters,
+            max_rows=max_rows,
+            sample_fraction=sample_fraction,
+            sample_seed=sample_seed,
+        ),
         target,
     )
     return {
@@ -203,6 +232,8 @@ def _export_hf_dataset(
     streaming: bool,
     max_rows: int,
     filters: list[tuple[str, str]] | None = None,
+    sample_fraction: float = 1.0,
+    sample_seed: int = 42,
 ) -> dict[str, object]:
     from datasets import load_dataset
 
@@ -216,7 +247,13 @@ def _export_hf_dataset(
     dataset = load_dataset(**load_kwargs)
     target = incoming_root / f"{_slug(dataset_name)}_{_slug(config_name or split_name)}.jsonl.gz"
     row_count = _write_jsonl_gz(
-        _iter_normalized_records((dict(row) for row in dataset), filters=filters, max_rows=max_rows),
+        _iter_normalized_records(
+            (dict(row) for row in dataset),
+            filters=filters,
+            max_rows=max_rows,
+            sample_fraction=sample_fraction,
+            sample_seed=sample_seed,
+        ),
         target,
     )
     return {
@@ -308,6 +345,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--hf-streaming", action="store_true", help="Stream Hugging Face rows instead of materializing the full split locally first.")
     parser.add_argument("--hf-max-rows", type=int, default=0, help="Optional limit after filtering/normalization. 0 means no limit.")
     parser.add_argument(
+        "--sample-fraction",
+        type=float,
+        default=1.0,
+        help="Deterministically keep this fraction of rows after filters. Use 0.10 for a paper-style 10%% slice.",
+    )
+    parser.add_argument("--sample-seed", type=int, default=42, help="Seed for deterministic streaming sampling.")
+    parser.add_argument(
         "--hf-filter",
         action="append",
         default=[],
@@ -327,6 +371,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
+    if args.sample_fraction <= 0.0 or args.sample_fraction > 1.0:
+        raise ValueError("--sample-fraction must be > 0 and <= 1.")
     incoming_root = REPO_ROOT / "data" / "raw" / "incoming"
     active_filters = _parse_filters(args.hf_filter)
     if args.clean_existing:
@@ -344,6 +390,8 @@ def main(argv: list[str] | None = None) -> None:
                 streaming=args.hf_streaming,
                 max_rows=max(args.hf_max_rows, 0),
                 filters=active_filters,
+                sample_fraction=float(args.sample_fraction),
+                sample_seed=int(args.sample_seed),
             )
         )
     for item in args.source_file:
@@ -353,6 +401,8 @@ def main(argv: list[str] | None = None) -> None:
                 incoming_root,
                 max_rows=max(args.hf_max_rows, 0),
                 filters=active_filters,
+                sample_fraction=float(args.sample_fraction),
+                sample_seed=int(args.sample_seed),
             )
         )
 
@@ -393,6 +443,8 @@ def main(argv: list[str] | None = None) -> None:
         "hf_streaming": bool(args.hf_streaming),
         "hf_max_rows": int(max(args.hf_max_rows, 0)),
         "hf_filters": [f"{field}={value}" for field, value in active_filters],
+        "sample_fraction": float(args.sample_fraction),
+        "sample_seed": int(args.sample_seed),
         "include_nlp_outputs": not args.skip_nlp,
         "sources": source_rows,
         "bundle_members": [str(path.relative_to(REPO_ROOT).as_posix()) for path in members],

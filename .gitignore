@@ -16,6 +16,7 @@ wheels/
 /data/indices/*.parquet
 /data/indices/**/*.joblib
 /data/indices/**/*.npy
+/data/archive/
 
 # Runtime outputs
 /outputs/**
