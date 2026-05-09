@@ -21,9 +21,12 @@ RUN_ROOT="${JOB_ROOT}/repo"
 OUTPUT_ROOT="${PROJECT_ROOT}/outputs/coding_agent/${SLURM_JOB_ID}"
 
 CACHE_ROOT="/scratch/${USER}/hf_cache"
-VENV_ROOT="/scratch/${USER}/venvs/vt2_coding_agent_uv"
 
-# L40S-safe first version. Do not start with 30B/32k. That was too greedy.
+# Separate envs. Do not mix vLLM and repo deps.
+VLLM_VENV_ROOT="/scratch/${USER}/venvs/vt2_vllm_clean_20260509"
+AGENT_VENV_ROOT="/scratch/${USER}/venvs/vt2_agent_clean_20260509"
+
+# L40S-safe first. Upgrade only after this works.
 MODEL_ID="Qwen/Qwen2.5-Coder-14B-Instruct"
 MAX_MODEL_LEN="16384"
 
@@ -41,6 +44,7 @@ export HF_HUB_CACHE="${CACHE_ROOT}/hub"
 export XDG_CACHE_HOME="${CACHE_ROOT}/xdg"
 export PIP_CACHE_DIR="${CACHE_ROOT}/pip"
 export UV_CACHE_DIR="${CACHE_ROOT}/uv"
+export UV_TORCH_BACKEND="auto"
 export TOKENIZERS_PARALLELISM=false
 
 export AGENT_RUN_ROOT="${RUN_ROOT}"
@@ -52,7 +56,7 @@ export AGENT_API_KEY="${VLLM_API_KEY}"
 export AGENT_MAX_STEPS="24"
 export AGENT_CONTEXT_CHAR_BUDGET="45000"
 
-mkdir -p "${JOB_ROOT}" "${RUN_ROOT}" "${OUTPUT_ROOT}" "${CACHE_ROOT}" "$(dirname "${VENV_ROOT}")"
+mkdir -p "${JOB_ROOT}" "${RUN_ROOT}" "${OUTPUT_ROOT}" "${CACHE_ROOT}" "$(dirname "${VLLM_VENV_ROOT}")" "$(dirname "${AGENT_VENV_ROOT}")"
 
 echo "=== job started ==="
 echo "SLURM_JOB_ID=${SLURM_JOB_ID}"
@@ -74,12 +78,8 @@ echo "=== checking uv ==="
 if ! command -v uv >/dev/null 2>&1; then
   echo "ERROR: uv not found on compute node."
   echo "PATH=${PATH}"
-  echo "You probably have uv on login in ~/.local/bin, but not visible here, or it is not installed."
-  echo "Install uv once in your home bin, or use your existing run_prebuilt_bundle env strategy."
   exit 20
 fi
-UV_BIN="$(command -v uv)"
-echo "UV_BIN=${UV_BIN}"
 uv --version
 
 echo "=== staging repo to scratch ==="
@@ -97,33 +97,54 @@ rsync -aL --delete \
   --exclude "log" \
   "${PROJECT_ROOT}/" "${RUN_ROOT}/"
 
-echo "=== creating/reusing uv venv on scratch ==="
-if [ ! -x "${VENV_ROOT}/bin/python" ]; then
-  uv venv --python 3.11 "${VENV_ROOT}" || uv venv --python 3.12 "${VENV_ROOT}" || uv venv "${VENV_ROOT}"
+echo "=== creating vllm env ==="
+if [ ! -x "${VLLM_VENV_ROOT}/bin/python" ]; then
+  uv venv --python 3.11 "${VLLM_VENV_ROOT}" || uv venv --python 3.12 "${VLLM_VENV_ROOT}" || uv venv "${VLLM_VENV_ROOT}"
 fi
+VLLM_PYTHON="${VLLM_VENV_ROOT}/bin/python"
 
-PYTHON_BIN="${VENV_ROOT}/bin/python"
-echo "PYTHON_BIN=${PYTHON_BIN}"
-"${PYTHON_BIN}" --version
+echo "=== installing vllm deps only ==="
+uv pip install --python "${VLLM_PYTHON}" --upgrade pip wheel setuptools
+uv pip install --python "${VLLM_PYTHON}" --torch-backend=auto "vllm>=0.8.5"
 
-echo "=== installing runtime dependencies inside slurm job ==="
-uv pip install --python "${PYTHON_BIN}" --upgrade pip wheel setuptools
-uv pip install --python "${PYTHON_BIN}" "openai>=1.0.0" "vllm>=0.8.3"
+echo "=== vllm env sanity ==="
+"${VLLM_PYTHON}" - <<'PY'
+import torch
+import vllm
+print("torch", torch.__version__)
+print("cuda_available", torch.cuda.is_available())
+print("vllm", vllm.__version__)
+print("has_infer_schema", hasattr(torch.library, "infer_schema"))
+if not hasattr(torch.library, "infer_schema"):
+    raise SystemExit("torch.library.infer_schema missing; vLLM/Torch mismatch")
+PY
 
-echo "=== installing repo package inside slurm job ==="
+echo "=== creating agent env ==="
+if [ ! -x "${AGENT_VENV_ROOT}/bin/python" ]; then
+  uv venv --python 3.11 "${AGENT_VENV_ROOT}" || uv venv --python 3.12 "${AGENT_VENV_ROOT}" || uv venv "${AGENT_VENV_ROOT}"
+fi
+AGENT_PYTHON="${AGENT_VENV_ROOT}/bin/python"
+
+echo "=== installing agent/repo deps ==="
+uv pip install --python "${AGENT_PYTHON}" --upgrade pip wheel setuptools
+uv pip install --python "${AGENT_PYTHON}" "openai>=1.0.0"
+
 cd "${RUN_ROOT}"
-uv pip install --python "${PYTHON_BIN}" -e .
+uv pip install --python "${AGENT_PYTHON}" -e .
 
-echo "=== versions ==="
-"${PYTHON_BIN}" --version
-"${PYTHON_BIN}" - <<'PY'
+echo "=== agent env sanity ==="
+"${AGENT_PYTHON}" - <<'PY'
 import importlib.metadata as md
-for pkg in ["openai", "vllm"]:
-    print(pkg, md.version(pkg))
+print("openai", md.version("openai"))
+try:
+    print("corpusagent2 installed")
+    import corpusagent2
+except Exception as exc:
+    print("corpusagent2 import warning:", repr(exc))
 PY
 
 echo "=== starting vllm ==="
-"${VENV_ROOT}/bin/vllm" serve "${MODEL_ID}" \
+"${VLLM_VENV_ROOT}/bin/vllm" serve "${MODEL_ID}" \
   --host 127.0.0.1 \
   --port "${VLLM_PORT}" \
   --api-key "${VLLM_API_KEY}" \
@@ -168,7 +189,9 @@ if [ ! -s "${OUTPUT_ROOT}/vllm_models.json" ]; then
 fi
 
 echo "=== running coding agent inside slurm job ==="
-"${PYTHON_BIN}" "${PROJECT_ROOT}/slurm/coding_agent_runner.py" \
+export PATH="${AGENT_VENV_ROOT}/bin:${PATH}"
+
+"${AGENT_PYTHON}" "${PROJECT_ROOT}/slurm/coding_agent_runner.py" \
   > "${OUTPUT_ROOT}/agent_stdout.log" \
   2> "${OUTPUT_ROOT}/agent_stderr.log"
 
