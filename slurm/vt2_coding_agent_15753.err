@@ -1,0 +1,204 @@
++ PROJECT_ROOT=/cluster/home/dongtten/VT2/VT2-corpusagent2
++ PROMPT_FILE=/cluster/home/dongtten/VT2/VT2-corpusagent2/slurm/coding_agent_prompt.md
++ JOB_ROOT=/scratch/dongtten/vt2_coding_agent_15753
++ RUN_ROOT=/scratch/dongtten/vt2_coding_agent_15753/repo
++ OUTPUT_ROOT=/cluster/home/dongtten/VT2/VT2-corpusagent2/outputs/coding_agent/15753
++ CACHE_ROOT=/scratch/dongtten/hf_cache
++ VENV_ROOT=/scratch/dongtten/venvs/vt2_coding_agent_uv
++ MODEL_ID=Qwen/Qwen2.5-Coder-14B-Instruct
++ MAX_MODEL_LEN=16384
++ VLLM_PORT=33753
++ VLLM_API_KEY=local-slurm-token
++ unset VIRTUAL_ENV
++ unset CONDA_PREFIX
++ unset PYTHONPATH
++ export PATH=/cluster/home/dongtten/.local/bin:/usr/local/bin:/usr/bin:/bin
++ PATH=/cluster/home/dongtten/.local/bin:/usr/local/bin:/usr/bin:/bin
++ export HF_HOME=/scratch/dongtten/hf_cache/hf_home
++ HF_HOME=/scratch/dongtten/hf_cache/hf_home
++ export TRANSFORMERS_CACHE=/scratch/dongtten/hf_cache/transformers
++ TRANSFORMERS_CACHE=/scratch/dongtten/hf_cache/transformers
++ export HF_HUB_CACHE=/scratch/dongtten/hf_cache/hub
++ HF_HUB_CACHE=/scratch/dongtten/hf_cache/hub
++ export XDG_CACHE_HOME=/scratch/dongtten/hf_cache/xdg
++ XDG_CACHE_HOME=/scratch/dongtten/hf_cache/xdg
++ export PIP_CACHE_DIR=/scratch/dongtten/hf_cache/pip
++ PIP_CACHE_DIR=/scratch/dongtten/hf_cache/pip
++ export UV_CACHE_DIR=/scratch/dongtten/hf_cache/uv
++ UV_CACHE_DIR=/scratch/dongtten/hf_cache/uv
++ export TOKENIZERS_PARALLELISM=false
++ TOKENIZERS_PARALLELISM=false
++ export AGENT_RUN_ROOT=/scratch/dongtten/vt2_coding_agent_15753/repo
++ AGENT_RUN_ROOT=/scratch/dongtten/vt2_coding_agent_15753/repo
++ export AGENT_OUTPUT_ROOT=/cluster/home/dongtten/VT2/VT2-corpusagent2/outputs/coding_agent/15753
++ AGENT_OUTPUT_ROOT=/cluster/home/dongtten/VT2/VT2-corpusagent2/outputs/coding_agent/15753
++ export AGENT_PROMPT_FILE=/cluster/home/dongtten/VT2/VT2-corpusagent2/slurm/coding_agent_prompt.md
++ AGENT_PROMPT_FILE=/cluster/home/dongtten/VT2/VT2-corpusagent2/slurm/coding_agent_prompt.md
++ export AGENT_MODEL_ID=Qwen/Qwen2.5-Coder-14B-Instruct
++ AGENT_MODEL_ID=Qwen/Qwen2.5-Coder-14B-Instruct
++ export AGENT_BASE_URL=http://127.0.0.1:33753/v1
++ AGENT_BASE_URL=http://127.0.0.1:33753/v1
++ export AGENT_API_KEY=local-slurm-token
++ AGENT_API_KEY=local-slurm-token
++ export AGENT_MAX_STEPS=24
++ AGENT_MAX_STEPS=24
++ export AGENT_CONTEXT_CHAR_BUDGET=45000
++ AGENT_CONTEXT_CHAR_BUDGET=45000
+++ dirname /scratch/dongtten/venvs/vt2_coding_agent_uv
++ mkdir -p /scratch/dongtten/vt2_coding_agent_15753 /scratch/dongtten/vt2_coding_agent_15753/repo /cluster/home/dongtten/VT2/VT2-corpusagent2/outputs/coding_agent/15753 /scratch/dongtten/hf_cache /scratch/dongtten/venvs
++ echo '=== job started ==='
++ echo SLURM_JOB_ID=15753
++ echo PROJECT_ROOT=/cluster/home/dongtten/VT2/VT2-corpusagent2
++ echo RUN_ROOT=/scratch/dongtten/vt2_coding_agent_15753/repo
++ echo OUTPUT_ROOT=/cluster/home/dongtten/VT2/VT2-corpusagent2/outputs/coding_agent/15753
+++ hostname
++ echo HOST=fresko
++ date
++ echo '=== gpu ==='
++ nvidia-smi
++ echo '=== required files ==='
++ test -d /cluster/home/dongtten/VT2/VT2-corpusagent2
++ test -f /cluster/home/dongtten/VT2/VT2-corpusagent2/slurm/coding_agent_prompt.md
++ test -f /cluster/home/dongtten/VT2/VT2-corpusagent2/slurm/coding_agent_runner.py
++ echo '=== checking uv ==='
++ command -v uv
+++ command -v uv
++ UV_BIN=/cluster/home/dongtten/.local/bin/uv
++ echo UV_BIN=/cluster/home/dongtten/.local/bin/uv
++ uv --version
++ echo '=== staging repo to scratch ==='
++ rsync -aL --delete --exclude .venv --exclude __pycache__ --exclude .pytest_cache --exclude .mypy_cache --exclude .ruff_cache --exclude .git/lfs --exclude data/raw --exclude data/processed --exclude data/indices --exclude outputs --exclude log /cluster/home/dongtten/VT2/VT2-corpusagent2/ /scratch/dongtten/vt2_coding_agent_15753/repo/
++ echo '=== creating/reusing uv venv on scratch ==='
++ '[' '!' -x /scratch/dongtten/venvs/vt2_coding_agent_uv/bin/python ']'
++ uv venv --python 3.11 /scratch/dongtten/venvs/vt2_coding_agent_uv
+Downloading cpython-3.11.13-linux-x86_64-gnu (download) (28.8MiB)
+ Downloading cpython-3.11.13-linux-x86_64-gnu (download)
+Using CPython 3.11.13
+Creating virtual environment at: /scratch/dongtten/venvs/vt2_coding_agent_uv
+Activate with: source /scratch/dongtten/venvs/vt2_coding_agent_uv/bin/activate
++ PYTHON_BIN=/scratch/dongtten/venvs/vt2_coding_agent_uv/bin/python
++ echo PYTHON_BIN=/scratch/dongtten/venvs/vt2_coding_agent_uv/bin/python
++ /scratch/dongtten/venvs/vt2_coding_agent_uv/bin/python --version
++ echo '=== installing runtime dependencies inside slurm job ==='
++ uv pip install --python /scratch/dongtten/venvs/vt2_coding_agent_uv/bin/python --upgrade pip wheel setuptools
+Using Python 3.11.13 environment at: /scratch/dongtten/venvs/vt2_coding_agent_uv
+Resolved 4 packages in 171ms
+Downloading pip (1.7MiB)
+ Downloading pip
+Prepared 4 packages in 121ms
+Installed 4 packages in 12ms
+ + packaging==26.2
+ + pip==26.1.1
+ + setuptools==82.0.1
+ + wheel==0.47.0
++ uv pip install --python /scratch/dongtten/venvs/vt2_coding_agent_uv/bin/python 'openai>=1.0.0' 'vllm>=0.8.3'
+Using Python 3.11.13 environment at: /scratch/dongtten/venvs/vt2_coding_agent_uv
+Resolved 179 packages in 1.48s
+Downloading sympy (6.0MiB)
+Downloading ml-dtypes (4.8MiB)
+Downloading pydantic-core (2.0MiB)
+Downloading networkx (2.0MiB)
+Downloading tokenizers (3.1MiB)
+Downloading cryptography (4.5MiB)
+Downloading uvloop (3.6MiB)
+Downloading hf-xet (4.3MiB)
+Downloading xgrammar (42.5MiB)
+Downloading pillow (6.8MiB)
+Downloading llvmlite (53.7MiB)
+Downloading nvidia-cuda-runtime (2.1MiB)
+Downloading nvidia-nvjitlink (38.8MiB)
+Downloading nvidia-cudnn-frontend (2.1MiB)
+Downloading nvidia-nvshmem-cu13 (57.6MiB)
+Downloading numba (3.6MiB)
+Downloading aiohttp (1.7MiB)
+Downloading nvidia-cudnn-cu13 (349.1MiB)
+Downloading nvidia-cusparselt-cu13 (162.0MiB)
+Downloading torchaudio (1.7MiB)
+Downloading grpcio (6.5MiB)
+Downloading nvidia-cuda-nvrtc (86.0MiB)
+Downloading fastsafetensors (1.7MiB)
+Downloading torch (506.0MiB)
+Downloading triton (179.5MiB)
+Downloading nvidia-cutlass-dsl-libs-base (71.1MiB)
+Downloading nvidia-cublas (403.5MiB)
+Downloading llguidance (2.9MiB)
+Downloading nvidia-cusolver (191.6MiB)
+Downloading opencv-python-headless (57.6MiB)
+Downloading mistral-common (6.2MiB)
+Downloading apache-tvm-ffi (2.2MiB)
+Downloading numpy (16.1MiB)
+Downloading outlines-core (2.2MiB)
+Downloading cuda-bindings (6.0MiB)
+Downloading nvidia-curand (56.8MiB)
+Downloading nvidia-cuda-cupti (10.2MiB)
+Downloading z3-solver (27.9MiB)
+Downloading vllm (233.1MiB)
+Downloading pycountry (7.7MiB)
+Downloading tilelang (43.3MiB)
+Downloading transformers (10.1MiB)
+Downloading nvidia-nccl-cu13 (187.4MiB)
+Downloading torchvision (7.2MiB)
+Downloading nvidia-cusparse (139.2MiB)
+Downloading sentencepiece (1.3MiB)
+Downloading flashinfer-cubin (281.5MiB)
+Downloading openai-harmony (2.8MiB)
+Downloading nvidia-cufft (204.2MiB)
+Downloading flashinfer-python (9.0MiB)
+ Downloading sentencepiece
+Downloading openai (1.2MiB)
+ Downloading aiohttp
+ Downloading torchaudio
+ Downloading fastsafetensors
+Downloading pygments (1.2MiB)
+Downloading nvidia-cufile (1.2MiB)
+Downloading tiktoken (1.1MiB)
+ Downloading networkx
+ Downloading pydantic-core
+Downloading setuptools (1.0MiB)
+ Downloading nvidia-cudnn-frontend
+ Downloading apache-tvm-ffi
+ Downloading nvidia-cuda-runtime
+ Downloading outlines-core
+ Downloading openai
+ Downloading tiktoken
+ Downloading llguidance
+ Downloading openai-harmony
+ Downloading pygments
+ Downloading nvidia-cufile
+ Downloading setuptools
+ Downloading tokenizers
+ Downloading numba
+ Downloading uvloop
+ Downloading hf-xet
+ Downloading cryptography
+ Downloading ml-dtypes
+ Downloading sympy
+ Downloading cuda-bindings
+ Downloading mistral-common
+ Downloading grpcio
+ Downloading pillow
+ Downloading torchvision
+ Downloading pycountry
+ Downloading flashinfer-python
+ Downloading transformers
+ Downloading nvidia-cuda-cupti
+ Downloading numpy
+ Downloading z3-solver
+ Downloading nvidia-nvjitlink
+ Downloading xgrammar
+ Downloading tilelang
+ Downloading llvmlite
+ Downloading nvidia-curand
+ Downloading opencv-python-headless
+ Downloading nvidia-nvshmem-cu13
+ Downloading nvidia-cutlass-dsl-libs-base
+ Downloading nvidia-cuda-nvrtc
+ Downloading nvidia-cusparse
+ Downloading nvidia-cusparselt-cu13
+ Downloading triton
+ Downloading nvidia-nccl-cu13
+ Downloading nvidia-cusolver
+ Downloading nvidia-cufft
+ Downloading vllm
+ Downloading flashinfer-cubin
+ Downloading nvidia-cudnn-cu13
