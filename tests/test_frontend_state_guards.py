@@ -26,3 +26,16 @@ def test_frontend_layout_keeps_evidence_single_and_moves_usage_to_advanced() -> 
     assert advanced_index < usage_index
     assert evidence_index < advanced_index
     assert "class=\"claim-verdict-grid\"" in index_html
+
+
+def test_frontend_suppresses_notifications_for_restored_or_instant_cached_runs() -> None:
+    project_root = Path(__file__).resolve().parents[1]
+    app_js = (project_root / "web" / "app.js").read_text(encoding="utf-8")
+
+    assert "const notificationEligibleRunIds = new Set();" in app_js
+    assert "const notificationObservedActiveRunIds = new Set();" in app_js
+    assert "!notificationEligibleRunIds.has(runId) || !notificationObservedActiveRunIds.has(runId)" in app_js
+    assert "notificationEligibleRunIds.clear();" in app_js
+    assert "notificationObservedActiveRunIds.clear();" in app_js
+    assert "notificationEligibleRunIds.add(currentRunId);" in app_js
+    assert "notificationObservedActiveRunIds.add(runId);" in app_js

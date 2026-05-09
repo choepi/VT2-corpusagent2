@@ -104,6 +104,10 @@ _EXHAUSTIVE_PATTERNS = (
 _BROAD_ANALYSIS_PATTERNS = (
     re.compile(r"\bdistribution\b"),
     re.compile(r"\bfrequency\b"),
+    re.compile(r"\bmost\s+(?:often|frequent(?:ly)?|common)\b"),
+    re.compile(r"\bdominant|dominated|dominate(?:d|s)?\b"),
+    re.compile(r"\bpatterns?\s+(?:differ|changed?|shifted?)\b"),
+    re.compile(r"\bdiffer(?:ed|s|ent)?\s+between\b"),
     re.compile(r"\bshare\b"),
     re.compile(r"\bproportion\b"),
     re.compile(r"\bbreakdown\b"),
@@ -127,6 +131,10 @@ _BROAD_ANALYSIS_PATTERNS = (
 _ANALYTIC_INTENT_PATTERNS = (
     re.compile(r"\bdistribution\b"),
     re.compile(r"\bfrequency\b"),
+    re.compile(r"\bmost\s+(?:often|frequent(?:ly)?|common)\b"),
+    re.compile(r"\bdominant|dominated|dominate(?:d|s)?\b"),
+    re.compile(r"\bpatterns?\s+(?:differ|changed?|shifted?)\b"),
+    re.compile(r"\bdiffer(?:ed|s|ent)?\s+between\b"),
     re.compile(r"\bshare\b"),
     re.compile(r"\bproportion\b"),
     re.compile(r"\bbreakdown\b"),
