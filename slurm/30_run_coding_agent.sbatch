@@ -1,7 +1,3 @@
-cd ~/VT2/VT2-corpusagent2
-mkdir -p slurm outputs/coding_agent
-
-cat > slurm/30_run_coding_agent.sbatch <<'BASH'
 #!/bin/bash -l
 #SBATCH --job-name=vt2_coding_agent
 #SBATCH --partition=gpu_top
@@ -10,12 +6,14 @@ cat > slurm/30_run_coding_agent.sbatch <<'BASH'
 #SBATCH --mem=96G
 #SBATCH --time=24:00:00
 #SBATCH --account=cai_nlp
-#SBATCH --output=slurm/%x_%j.out
-#SBATCH --error=slurm/%x_%j.err
+#SBATCH --chdir=/cluster/home/dongtten/VT2/VT2-corpusagent2
+#SBATCH --output=/cluster/home/dongtten/VT2/VT2-corpusagent2/slurm/%x_%j.out
+#SBATCH --error=/cluster/home/dongtten/VT2/VT2-corpusagent2/slurm/%x_%j.err
 
 set -euo pipefail
+set -x
 
-PROJECT_ROOT="${SLURM_SUBMIT_DIR}"
+PROJECT_ROOT="/cluster/home/dongtten/VT2/VT2-corpusagent2"
 PROMPT_FILE="${PROJECT_ROOT}/slurm/coding_agent_prompt.md"
 
 JOB_ROOT="/scratch/${USER}/vt2_coding_agent_${SLURM_JOB_ID}"
@@ -23,18 +21,30 @@ RUN_ROOT="${JOB_ROOT}/repo"
 OUTPUT_ROOT="${PROJECT_ROOT}/outputs/coding_agent/${SLURM_JOB_ID}"
 
 CACHE_ROOT="/scratch/${USER}/hf_cache"
-VENV_ROOT="/scratch/${USER}/venvs/vt2_coding_agent"
 
-MODEL_ID="Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8"
-MAX_MODEL_LEN="32768"
+# Separate envs. Do not mix vLLM and repo deps.
+VLLM_VENV_ROOT="/scratch/${USER}/venvs/vt2_vllm_clean_20260509"
+AGENT_VENV_ROOT="/scratch/${USER}/venvs/vt2_agent_clean_20260509"
+
+# L40S-safe first. Upgrade only after this works.
+MODEL_ID="Qwen/Qwen2.5-Coder-14B-Instruct"
+MAX_MODEL_LEN="16384"
+
 VLLM_PORT="$((18000 + SLURM_JOB_ID % 20000))"
 VLLM_API_KEY="local-slurm-token"
 
+unset VIRTUAL_ENV || true
+unset CONDA_PREFIX || true
+unset PYTHONPATH || true
+
+export PATH="/cluster/home/${USER}/.local/bin:/usr/local/bin:/usr/bin:/bin"
 export HF_HOME="${CACHE_ROOT}/hf_home"
 export TRANSFORMERS_CACHE="${CACHE_ROOT}/transformers"
 export HF_HUB_CACHE="${CACHE_ROOT}/hub"
 export XDG_CACHE_HOME="${CACHE_ROOT}/xdg"
 export PIP_CACHE_DIR="${CACHE_ROOT}/pip"
+export UV_CACHE_DIR="${CACHE_ROOT}/uv"
+export UV_TORCH_BACKEND="auto"
 export TOKENIZERS_PARALLELISM=false
 
 export AGENT_RUN_ROOT="${RUN_ROOT}"
@@ -44,21 +54,33 @@ export AGENT_MODEL_ID="${MODEL_ID}"
 export AGENT_BASE_URL="http://127.0.0.1:${VLLM_PORT}/v1"
 export AGENT_API_KEY="${VLLM_API_KEY}"
 export AGENT_MAX_STEPS="24"
-export AGENT_CONTEXT_CHAR_BUDGET="90000"
+export AGENT_CONTEXT_CHAR_BUDGET="45000"
 
-mkdir -p "${JOB_ROOT}" "${RUN_ROOT}" "${OUTPUT_ROOT}" "${CACHE_ROOT}" "$(dirname "${VENV_ROOT}")"
+mkdir -p "${JOB_ROOT}" "${RUN_ROOT}" "${OUTPUT_ROOT}" "${CACHE_ROOT}" "$(dirname "${VLLM_VENV_ROOT}")" "$(dirname "${AGENT_VENV_ROOT}")"
 
-echo "=== job info ==="
+echo "=== job started ==="
 echo "SLURM_JOB_ID=${SLURM_JOB_ID}"
-echo "SLURM_SUBMIT_DIR=${SLURM_SUBMIT_DIR}"
-hostname
+echo "PROJECT_ROOT=${PROJECT_ROOT}"
+echo "RUN_ROOT=${RUN_ROOT}"
+echo "OUTPUT_ROOT=${OUTPUT_ROOT}"
+echo "HOST=$(hostname)"
 date
+
+echo "=== gpu ==="
 nvidia-smi || true
 
-echo "=== validating required files ==="
+echo "=== required files ==="
 test -d "${PROJECT_ROOT}"
 test -f "${PROMPT_FILE}"
 test -f "${PROJECT_ROOT}/slurm/coding_agent_runner.py"
+
+echo "=== checking uv ==="
+if ! command -v uv >/dev/null 2>&1; then
+  echo "ERROR: uv not found on compute node."
+  echo "PATH=${PATH}"
+  exit 20
+fi
+uv --version
 
 echo "=== staging repo to scratch ==="
 rsync -aL --delete \
@@ -75,45 +97,60 @@ rsync -aL --delete \
   --exclude "log" \
   "${PROJECT_ROOT}/" "${RUN_ROOT}/"
 
-echo "=== choosing python ==="
-if command -v python3.11 >/dev/null 2>&1; then
-  PYTHON_BIN="$(command -v python3.11)"
-else
-  PYTHON_BIN="$(command -v python3)"
+echo "=== creating vllm env ==="
+if [ ! -x "${VLLM_VENV_ROOT}/bin/python" ]; then
+  uv venv --python 3.11 "${VLLM_VENV_ROOT}" || uv venv --python 3.12 "${VLLM_VENV_ROOT}" || uv venv "${VLLM_VENV_ROOT}"
 fi
-echo "PYTHON_BIN=${PYTHON_BIN}"
+VLLM_PYTHON="${VLLM_VENV_ROOT}/bin/python"
 
-echo "=== creating/reusing venv on scratch ==="
-if [ ! -x "${VENV_ROOT}/bin/python" ]; then
-  "${PYTHON_BIN}" -m venv "${VENV_ROOT}"
+echo "=== installing vllm deps only ==="
+uv pip install --python "${VLLM_PYTHON}" --upgrade pip wheel setuptools
+uv pip install --python "${VLLM_PYTHON}" --torch-backend=auto "vllm>=0.8.5"
+
+echo "=== vllm env sanity ==="
+"${VLLM_PYTHON}" - <<'PY'
+import torch
+import vllm
+print("torch", torch.__version__)
+print("cuda_available", torch.cuda.is_available())
+print("vllm", vllm.__version__)
+print("has_infer_schema", hasattr(torch.library, "infer_schema"))
+if not hasattr(torch.library, "infer_schema"):
+    raise SystemExit("torch.library.infer_schema missing; vLLM/Torch mismatch")
+PY
+
+echo "=== creating agent env ==="
+if [ ! -x "${AGENT_VENV_ROOT}/bin/python" ]; then
+  uv venv --python 3.11 "${AGENT_VENV_ROOT}" || uv venv --python 3.12 "${AGENT_VENV_ROOT}" || uv venv "${AGENT_VENV_ROOT}"
 fi
+AGENT_PYTHON="${AGENT_VENV_ROOT}/bin/python"
 
-source "${VENV_ROOT}/bin/activate"
+echo "=== installing agent/repo deps ==="
+uv pip install --python "${AGENT_PYTHON}" --upgrade pip wheel setuptools
+uv pip install --python "${AGENT_PYTHON}" "openai>=1.0.0"
 
-echo "=== installing runtime dependencies inside slurm job ==="
-python -m pip install --upgrade pip wheel setuptools
-python -m pip install "openai>=1.0.0" "vllm>=0.8.3"
-
-echo "=== installing repo package inside slurm job ==="
 cd "${RUN_ROOT}"
-python -m pip install -e .
+uv pip install --python "${AGENT_PYTHON}" -e .
 
-echo "=== versions ==="
-python --version
-python - <<'PY'
+echo "=== agent env sanity ==="
+"${AGENT_PYTHON}" - <<'PY'
 import importlib.metadata as md
-for pkg in ["openai", "vllm"]:
-    print(pkg, md.version(pkg))
+print("openai", md.version("openai"))
+try:
+    print("corpusagent2 installed")
+    import corpusagent2
+except Exception as exc:
+    print("corpusagent2 import warning:", repr(exc))
 PY
 
 echo "=== starting vllm ==="
-vllm serve "${MODEL_ID}" \
+"${VLLM_VENV_ROOT}/bin/vllm" serve "${MODEL_ID}" \
   --host 127.0.0.1 \
   --port "${VLLM_PORT}" \
   --api-key "${VLLM_API_KEY}" \
   --dtype auto \
   --max-model-len "${MAX_MODEL_LEN}" \
-  --gpu-memory-utilization 0.90 \
+  --gpu-memory-utilization 0.88 \
   --trust-remote-code \
   > "${OUTPUT_ROOT}/vllm_server.log" 2>&1 &
 
@@ -127,7 +164,7 @@ cleanup() {
 trap cleanup EXIT
 
 echo "=== waiting for vllm ==="
-for i in $(seq 1 180); do
+for i in $(seq 1 240); do
   if curl -fsS \
     -H "Authorization: Bearer ${VLLM_API_KEY}" \
     "http://127.0.0.1:${VLLM_PORT}/v1/models" \
@@ -139,7 +176,7 @@ for i in $(seq 1 180); do
   if ! kill -0 "${VLLM_PID}" 2>/dev/null; then
     echo "vLLM died. Last 200 log lines:"
     tail -200 "${OUTPUT_ROOT}/vllm_server.log" || true
-    exit 1
+    exit 30
   fi
 
   sleep 10
@@ -148,11 +185,13 @@ done
 if [ ! -s "${OUTPUT_ROOT}/vllm_models.json" ]; then
   echo "vLLM did not become ready. Last 200 log lines:"
   tail -200 "${OUTPUT_ROOT}/vllm_server.log" || true
-  exit 1
+  exit 31
 fi
 
 echo "=== running coding agent inside slurm job ==="
-python "${PROJECT_ROOT}/slurm/coding_agent_runner.py" \
+export PATH="${AGENT_VENV_ROOT}/bin:${PATH}"
+
+"${AGENT_PYTHON}" "${PROJECT_ROOT}/slurm/coding_agent_runner.py" \
   > "${OUTPUT_ROOT}/agent_stdout.log" \
   2> "${OUTPUT_ROOT}/agent_stderr.log"
 
@@ -169,4 +208,4 @@ echo "${OUTPUT_ROOT}"
 find "${OUTPUT_ROOT}" -maxdepth 2 -type f -print | sort
 
 date
-BASH
+echo "=== job finished ==="

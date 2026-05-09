@@ -1,0 +1,567 @@
++ PROJECT_ROOT=/cluster/home/dongtten/VT2/VT2-corpusagent2
++ PROMPT_FILE=/cluster/home/dongtten/VT2/VT2-corpusagent2/slurm/coding_agent_prompt.md
++ JOB_ROOT=/scratch/dongtten/vt2_coding_agent_15753
++ RUN_ROOT=/scratch/dongtten/vt2_coding_agent_15753/repo
++ OUTPUT_ROOT=/cluster/home/dongtten/VT2/VT2-corpusagent2/outputs/coding_agent/15753
++ CACHE_ROOT=/scratch/dongtten/hf_cache
++ VENV_ROOT=/scratch/dongtten/venvs/vt2_coding_agent_uv
++ MODEL_ID=Qwen/Qwen2.5-Coder-14B-Instruct
++ MAX_MODEL_LEN=16384
++ VLLM_PORT=33753
++ VLLM_API_KEY=local-slurm-token
++ unset VIRTUAL_ENV
++ unset CONDA_PREFIX
++ unset PYTHONPATH
++ export PATH=/cluster/home/dongtten/.local/bin:/usr/local/bin:/usr/bin:/bin
++ PATH=/cluster/home/dongtten/.local/bin:/usr/local/bin:/usr/bin:/bin
++ export HF_HOME=/scratch/dongtten/hf_cache/hf_home
++ HF_HOME=/scratch/dongtten/hf_cache/hf_home
++ export TRANSFORMERS_CACHE=/scratch/dongtten/hf_cache/transformers
++ TRANSFORMERS_CACHE=/scratch/dongtten/hf_cache/transformers
++ export HF_HUB_CACHE=/scratch/dongtten/hf_cache/hub
++ HF_HUB_CACHE=/scratch/dongtten/hf_cache/hub
++ export XDG_CACHE_HOME=/scratch/dongtten/hf_cache/xdg
++ XDG_CACHE_HOME=/scratch/dongtten/hf_cache/xdg
++ export PIP_CACHE_DIR=/scratch/dongtten/hf_cache/pip
++ PIP_CACHE_DIR=/scratch/dongtten/hf_cache/pip
++ export UV_CACHE_DIR=/scratch/dongtten/hf_cache/uv
++ UV_CACHE_DIR=/scratch/dongtten/hf_cache/uv
++ export TOKENIZERS_PARALLELISM=false
++ TOKENIZERS_PARALLELISM=false
++ export AGENT_RUN_ROOT=/scratch/dongtten/vt2_coding_agent_15753/repo
++ AGENT_RUN_ROOT=/scratch/dongtten/vt2_coding_agent_15753/repo
++ export AGENT_OUTPUT_ROOT=/cluster/home/dongtten/VT2/VT2-corpusagent2/outputs/coding_agent/15753
++ AGENT_OUTPUT_ROOT=/cluster/home/dongtten/VT2/VT2-corpusagent2/outputs/coding_agent/15753
++ export AGENT_PROMPT_FILE=/cluster/home/dongtten/VT2/VT2-corpusagent2/slurm/coding_agent_prompt.md
++ AGENT_PROMPT_FILE=/cluster/home/dongtten/VT2/VT2-corpusagent2/slurm/coding_agent_prompt.md
++ export AGENT_MODEL_ID=Qwen/Qwen2.5-Coder-14B-Instruct
++ AGENT_MODEL_ID=Qwen/Qwen2.5-Coder-14B-Instruct
++ export AGENT_BASE_URL=http://127.0.0.1:33753/v1
++ AGENT_BASE_URL=http://127.0.0.1:33753/v1
++ export AGENT_API_KEY=local-slurm-token
++ AGENT_API_KEY=local-slurm-token
++ export AGENT_MAX_STEPS=24
++ AGENT_MAX_STEPS=24
++ export AGENT_CONTEXT_CHAR_BUDGET=45000
++ AGENT_CONTEXT_CHAR_BUDGET=45000
+++ dirname /scratch/dongtten/venvs/vt2_coding_agent_uv
++ mkdir -p /scratch/dongtten/vt2_coding_agent_15753 /scratch/dongtten/vt2_coding_agent_15753/repo /cluster/home/dongtten/VT2/VT2-corpusagent2/outputs/coding_agent/15753 /scratch/dongtten/hf_cache /scratch/dongtten/venvs
++ echo '=== job started ==='
++ echo SLURM_JOB_ID=15753
++ echo PROJECT_ROOT=/cluster/home/dongtten/VT2/VT2-corpusagent2
++ echo RUN_ROOT=/scratch/dongtten/vt2_coding_agent_15753/repo
++ echo OUTPUT_ROOT=/cluster/home/dongtten/VT2/VT2-corpusagent2/outputs/coding_agent/15753
+++ hostname
++ echo HOST=fresko
++ date
++ echo '=== gpu ==='
++ nvidia-smi
++ echo '=== required files ==='
++ test -d /cluster/home/dongtten/VT2/VT2-corpusagent2
++ test -f /cluster/home/dongtten/VT2/VT2-corpusagent2/slurm/coding_agent_prompt.md
++ test -f /cluster/home/dongtten/VT2/VT2-corpusagent2/slurm/coding_agent_runner.py
++ echo '=== checking uv ==='
++ command -v uv
+++ command -v uv
++ UV_BIN=/cluster/home/dongtten/.local/bin/uv
++ echo UV_BIN=/cluster/home/dongtten/.local/bin/uv
++ uv --version
++ echo '=== staging repo to scratch ==='
++ rsync -aL --delete --exclude .venv --exclude __pycache__ --exclude .pytest_cache --exclude .mypy_cache --exclude .ruff_cache --exclude .git/lfs --exclude data/raw --exclude data/processed --exclude data/indices --exclude outputs --exclude log /cluster/home/dongtten/VT2/VT2-corpusagent2/ /scratch/dongtten/vt2_coding_agent_15753/repo/
++ echo '=== creating/reusing uv venv on scratch ==='
++ '[' '!' -x /scratch/dongtten/venvs/vt2_coding_agent_uv/bin/python ']'
++ uv venv --python 3.11 /scratch/dongtten/venvs/vt2_coding_agent_uv
+Downloading cpython-3.11.13-linux-x86_64-gnu (download) (28.8MiB)
+ Downloading cpython-3.11.13-linux-x86_64-gnu (download)
+Using CPython 3.11.13
+Creating virtual environment at: /scratch/dongtten/venvs/vt2_coding_agent_uv
+Activate with: source /scratch/dongtten/venvs/vt2_coding_agent_uv/bin/activate
++ PYTHON_BIN=/scratch/dongtten/venvs/vt2_coding_agent_uv/bin/python
++ echo PYTHON_BIN=/scratch/dongtten/venvs/vt2_coding_agent_uv/bin/python
++ /scratch/dongtten/venvs/vt2_coding_agent_uv/bin/python --version
++ echo '=== installing runtime dependencies inside slurm job ==='
++ uv pip install --python /scratch/dongtten/venvs/vt2_coding_agent_uv/bin/python --upgrade pip wheel setuptools
+Using Python 3.11.13 environment at: /scratch/dongtten/venvs/vt2_coding_agent_uv
+Resolved 4 packages in 171ms
+Downloading pip (1.7MiB)
+ Downloading pip
+Prepared 4 packages in 121ms
+Installed 4 packages in 12ms
+ + packaging==26.2
+ + pip==26.1.1
+ + setuptools==82.0.1
+ + wheel==0.47.0
++ uv pip install --python /scratch/dongtten/venvs/vt2_coding_agent_uv/bin/python 'openai>=1.0.0' 'vllm>=0.8.3'
+Using Python 3.11.13 environment at: /scratch/dongtten/venvs/vt2_coding_agent_uv
+Resolved 179 packages in 1.48s
+Downloading sympy (6.0MiB)
+Downloading ml-dtypes (4.8MiB)
+Downloading pydantic-core (2.0MiB)
+Downloading networkx (2.0MiB)
+Downloading tokenizers (3.1MiB)
+Downloading cryptography (4.5MiB)
+Downloading uvloop (3.6MiB)
+Downloading hf-xet (4.3MiB)
+Downloading xgrammar (42.5MiB)
+Downloading pillow (6.8MiB)
+Downloading llvmlite (53.7MiB)
+Downloading nvidia-cuda-runtime (2.1MiB)
+Downloading nvidia-nvjitlink (38.8MiB)
+Downloading nvidia-cudnn-frontend (2.1MiB)
+Downloading nvidia-nvshmem-cu13 (57.6MiB)
+Downloading numba (3.6MiB)
+Downloading aiohttp (1.7MiB)
+Downloading nvidia-cudnn-cu13 (349.1MiB)
+Downloading nvidia-cusparselt-cu13 (162.0MiB)
+Downloading torchaudio (1.7MiB)
+Downloading grpcio (6.5MiB)
+Downloading nvidia-cuda-nvrtc (86.0MiB)
+Downloading fastsafetensors (1.7MiB)
+Downloading torch (506.0MiB)
+Downloading triton (179.5MiB)
+Downloading nvidia-cutlass-dsl-libs-base (71.1MiB)
+Downloading nvidia-cublas (403.5MiB)
+Downloading llguidance (2.9MiB)
+Downloading nvidia-cusolver (191.6MiB)
+Downloading opencv-python-headless (57.6MiB)
+Downloading mistral-common (6.2MiB)
+Downloading apache-tvm-ffi (2.2MiB)
+Downloading numpy (16.1MiB)
+Downloading outlines-core (2.2MiB)
+Downloading cuda-bindings (6.0MiB)
+Downloading nvidia-curand (56.8MiB)
+Downloading nvidia-cuda-cupti (10.2MiB)
+Downloading z3-solver (27.9MiB)
+Downloading vllm (233.1MiB)
+Downloading pycountry (7.7MiB)
+Downloading tilelang (43.3MiB)
+Downloading transformers (10.1MiB)
+Downloading nvidia-nccl-cu13 (187.4MiB)
+Downloading torchvision (7.2MiB)
+Downloading nvidia-cusparse (139.2MiB)
+Downloading sentencepiece (1.3MiB)
+Downloading flashinfer-cubin (281.5MiB)
+Downloading openai-harmony (2.8MiB)
+Downloading nvidia-cufft (204.2MiB)
+Downloading flashinfer-python (9.0MiB)
+ Downloading sentencepiece
+Downloading openai (1.2MiB)
+ Downloading aiohttp
+ Downloading torchaudio
+ Downloading fastsafetensors
+Downloading pygments (1.2MiB)
+Downloading nvidia-cufile (1.2MiB)
+Downloading tiktoken (1.1MiB)
+ Downloading networkx
+ Downloading pydantic-core
+Downloading setuptools (1.0MiB)
+ Downloading nvidia-cudnn-frontend
+ Downloading apache-tvm-ffi
+ Downloading nvidia-cuda-runtime
+ Downloading outlines-core
+ Downloading openai
+ Downloading tiktoken
+ Downloading llguidance
+ Downloading openai-harmony
+ Downloading pygments
+ Downloading nvidia-cufile
+ Downloading setuptools
+ Downloading tokenizers
+ Downloading numba
+ Downloading uvloop
+ Downloading hf-xet
+ Downloading cryptography
+ Downloading ml-dtypes
+ Downloading sympy
+ Downloading cuda-bindings
+ Downloading mistral-common
+ Downloading grpcio
+ Downloading pillow
+ Downloading torchvision
+ Downloading pycountry
+ Downloading flashinfer-python
+ Downloading transformers
+ Downloading nvidia-cuda-cupti
+ Downloading numpy
+ Downloading z3-solver
+ Downloading nvidia-nvjitlink
+ Downloading xgrammar
+ Downloading tilelang
+ Downloading llvmlite
+ Downloading nvidia-curand
+ Downloading opencv-python-headless
+ Downloading nvidia-nvshmem-cu13
+ Downloading nvidia-cutlass-dsl-libs-base
+ Downloading nvidia-cuda-nvrtc
+ Downloading nvidia-cusparse
+ Downloading nvidia-cusparselt-cu13
+ Downloading triton
+ Downloading nvidia-nccl-cu13
+ Downloading nvidia-cusolver
+ Downloading nvidia-cufft
+ Downloading vllm
+ Downloading flashinfer-cubin
+ Downloading nvidia-cudnn-cu13
+ Downloading nvidia-cublas
+ Downloading torch
+Prepared 178 packages in 42.12s
+Uninstalled 1 package in 10ms
+Installed 178 packages in 296ms
+ + aiohappyeyeballs==2.6.1
+ + aiohttp==3.13.5
+ + aiosignal==1.4.0
+ + annotated-doc==0.0.4
+ + annotated-types==0.7.0
+ + anthropic==0.100.0
+ + anyio==4.13.0
+ + apache-tvm-ffi==0.1.9
+ + astor==0.8.1
+ + attrs==26.1.0
+ + blake3==1.0.8
+ + cachetools==7.1.1
+ + cbor2==6.0.1
+ + certifi==2026.4.22
+ + cffi==2.0.0
+ + charset-normalizer==3.4.7
+ + click==8.3.3
+ + cloudpickle==3.1.2
+ + compressed-tensors==0.15.0.1
+ + cryptography==48.0.0
+ + cuda-bindings==13.2.0
+ + cuda-pathfinder==1.5.4
+ + cuda-python==13.2.0
+ + cuda-tile==1.3.0
+ + cuda-toolkit==13.0.2
+ + depyf==0.20.0
+ + dill==0.4.1
+ + diskcache==5.6.3
+ + distro==1.9.0
+ + dnspython==2.8.0
+ + docstring-parser==0.18.0
+ + einops==0.8.2
+ + email-validator==2.3.0
+ + fastapi==0.136.1
+ + fastapi-cli==0.0.24
+ + fastapi-cloud-cli==0.17.1
+ + fastar==0.11.0
+ + fastsafetensors==0.3.1
+ + filelock==3.29.0
+ + flashinfer-cubin==0.6.8.post1
+ + flashinfer-python==0.6.8.post1
+ + frozenlist==1.8.0
+ + fsspec==2026.4.0
+ + gguf==0.19.0
+ + googleapis-common-protos==1.75.0
+ + grpcio==1.80.0
+ + h11==0.16.0
+ + hf-xet==1.5.0
+ + httpcore==1.0.9
+ + httptools==0.7.1
+ + httpx==0.28.1
+ + httpx-sse==0.4.3
+ + huggingface-hub==1.14.0
+ + idna==3.13
+ + ijson==3.5.0
+ + importlib-metadata==8.7.1
+ + interegular==0.3.3
+ + jinja2==3.1.6
+ + jiter==0.14.0
+ + jmespath==1.1.0
+ + jsonschema==4.26.0
+ + jsonschema-specifications==2025.9.1
+ + lark==1.2.2
+ + llguidance==1.3.0
+ + llvmlite==0.47.0
+ + lm-format-enforcer==0.11.3
+ + loguru==0.7.3
+ + markdown-it-py==4.2.0
+ + markupsafe==3.0.3
+ + mcp==1.27.1
+ + mdurl==0.1.2
+ + mistral-common==1.11.2
+ + ml-dtypes==0.5.4
+ + model-hosting-container-standards==0.1.15
+ + mpmath==1.3.0
+ + msgspec==0.21.1
+ + multidict==6.7.1
+ + networkx==3.6.1
+ + ninja==1.13.0
+ + numba==0.65.0
+ + numpy==2.3.5
+ + nvidia-cublas==13.1.0.3
+ + nvidia-cuda-cupti==13.0.85
+ + nvidia-cuda-nvrtc==13.0.88
+ + nvidia-cuda-runtime==13.0.96
+ + nvidia-cudnn-cu13==9.19.0.56
+ + nvidia-cudnn-frontend==1.18.0
+ + nvidia-cufft==12.0.0.61
+ + nvidia-cufile==1.15.1.6
+ + nvidia-curand==10.4.0.35
+ + nvidia-cusolver==12.0.4.66
+ + nvidia-cusparse==12.6.3.3
+ + nvidia-cusparselt-cu13==0.8.0
+ + nvidia-cutlass-dsl==4.5.0
+ + nvidia-cutlass-dsl-libs-base==4.5.0
+ + nvidia-ml-py==13.595.45
+ + nvidia-nccl-cu13==2.28.9
+ + nvidia-nvjitlink==13.0.88
+ + nvidia-nvshmem-cu13==3.4.5
+ + nvidia-nvtx==13.0.85
+ + openai==2.36.0
+ + openai-harmony==0.0.8
+ + opencv-python-headless==4.13.0.92
+ + opentelemetry-api==1.41.1
+ + opentelemetry-exporter-otlp==1.41.1
+ + opentelemetry-exporter-otlp-proto-common==1.41.1
+ + opentelemetry-exporter-otlp-proto-grpc==1.41.1
+ + opentelemetry-exporter-otlp-proto-http==1.41.1
+ + opentelemetry-proto==1.41.1
+ + opentelemetry-sdk==1.41.1
+ + opentelemetry-semantic-conventions==0.62b1
+ + opentelemetry-semantic-conventions-ai==0.5.1
+ + outlines-core==0.2.14
+ + partial-json-parser==0.2.1.1.post7
+ + pillow==12.2.0
+ + prometheus-client==0.25.0
+ + prometheus-fastapi-instrumentator==7.1.0
+ + propcache==0.5.2
+ + protobuf==6.33.6
+ + psutil==7.2.2
+ + py-cpuinfo==9.0.0
+ + pybase64==1.4.3
+ + pycountry==26.2.16
+ + pycparser==3.0
+ + pydantic==2.13.4
+ + pydantic-core==2.46.4
+ + pydantic-extra-types==2.11.1
+ + pydantic-settings==2.14.1
+ + pygments==2.20.0
+ + pyjwt==2.12.1
+ + python-dotenv==1.2.2
+ + python-json-logger==4.1.0
+ + python-multipart==0.0.27
+ + pyyaml==6.0.3
+ + pyzmq==27.1.0
+ + quack-kernels==0.4.1
+ + referencing==0.37.0
+ + regex==2026.4.4
+ + requests==2.33.1
+ + rich==15.0.0
+ + rich-toolkit==0.19.7
+ + rignore==0.7.6
+ + rpds-py==0.30.0
+ + safetensors==0.7.0
+ + sentencepiece==0.2.1
+ + sentry-sdk==2.59.0
+ + setproctitle==1.3.7
+ - setuptools==82.0.1
+ + setuptools==81.0.0
+ + shellingham==1.5.4
+ + sniffio==1.3.1
+ + sse-starlette==3.4.2
+ + starlette==0.52.1
+ + supervisor==4.3.0
+ + sympy==1.14.0
+ + tabulate==0.10.0
+ + tiktoken==0.12.0
+ + tilelang==0.1.9
+ + tokenizers==0.22.2
+ + torch==2.11.0
+ + torch-c-dlpack-ext==0.1.5
+ + torchaudio==2.11.0
+ + torchvision==0.26.0
+ + tqdm==4.67.3
+ + transformers==5.8.0
+ + triton==3.6.0
+ + typer==0.25.1
+ + typing-extensions==4.15.0
+ + typing-inspection==0.4.2
+ + urllib3==2.7.0
+ + uvicorn==0.46.0
+ + uvloop==0.22.1
+ + vllm==0.20.1
+ + watchfiles==1.1.1
+ + websockets==16.0
+ + xgrammar==0.2.0
+ + yarl==1.23.0
+ + z3-solver==4.15.4.0
+ + zipp==3.23.1
++ echo '=== installing repo package inside slurm job ==='
++ cd /scratch/dongtten/vt2_coding_agent_15753/repo
++ uv pip install --python /scratch/dongtten/venvs/vt2_coding_agent_uv/bin/python -e .
+Using Python 3.11.13 environment at: /scratch/dongtten/venvs/vt2_coding_agent_uv
+Resolved 141 packages in 1.54s
+   Building corpusagent2 @ file:///scratch/dongtten/vt2_coding_agent_15753/repo
+Downloading torch (800.8MiB)
+Downloading torchaudio (3.1MiB)
+Downloading torchvision (6.0MiB)
+Downloading fonttools (4.8MiB)
+Downloading triton (160.3MiB)
+Downloading scipy (33.7MiB)
+Downloading nvidia-cusolver-cu11 (122.3MiB)
+Downloading kiwisolver (1.4MiB)
+Downloading nvidia-nccl-cu11 (136.3MiB)
+Downloading pandas (10.7MiB)
+Downloading transformers (11.4MiB)
+Downloading numpy (17.4MiB)
+Downloading pyarrow (46.6MiB)
+Downloading nvidia-cufft-cu11 (160.6MiB)
+Downloading spacy (30.8MiB)
+Downloading blis (10.9MiB)
+Downloading curl-cffi (10.6MiB)
+Downloading matplotlib (8.4MiB)
+Downloading nvidia-cuda-cupti-cu11 (12.5MiB)
+Downloading thinc (3.9MiB)
+Downloading nvidia-cuda-nvrtc-cu11 (22.1MiB)
+Downloading nvidia-cusparse-cu11 (194.7MiB)
+Downloading nvidia-cublas-cu11 (398.5MiB)
+Downloading srsly (1.1MiB)
+Downloading hdbscan (4.4MiB)
+Downloading nvidia-curand-cu11 (55.4MiB)
+Downloading psycopg-binary (4.9MiB)
+Downloading scikit-learn (8.7MiB)
+Downloading nvidia-cudnn-cu11 (694.7MiB)
+Downloading plotly (9.4MiB)
+ Downloading torchaudio
+ Downloading torchvision
+ Downloading srsly
+      Built corpusagent2 @ file:///scratch/dongtten/vt2_coding_agent_15753/repo
+ Downloading kiwisolver
+ Downloading thinc
+ Downloading hdbscan
+ Downloading fonttools
+ Downloading psycopg-binary
+ Downloading plotly
+ Downloading scikit-learn
+ Downloading matplotlib
+ Downloading curl-cffi
+ Downloading blis
+ Downloading nvidia-cuda-cupti-cu11
+ Downloading numpy
+ Downloading nvidia-cuda-nvrtc-cu11
+ Downloading transformers
+ Downloading pandas
+ Downloading scipy
+ Downloading spacy
+ Downloading torch
+ Downloading pyarrow
+ Downloading nvidia-curand-cu11
+ Downloading nvidia-cusolver-cu11
+ Downloading nvidia-nccl-cu11
+ Downloading triton
+ Downloading nvidia-cufft-cu11
+ Downloading nvidia-cusparse-cu11
+ Downloading nvidia-cublas-cu11
+ Downloading nvidia-cudnn-cu11
+Prepared 74 packages in 32.56s
+Uninstalled 8 packages in 304ms
+Installed 74 packages in 223ms
+ + beautifulsoup4==4.14.3
+ + bertopic==0.17.4
+ + blis==1.3.3
+ + catalogue==2.0.10
+ + cloudpathlib==0.24.0
+ + confection==1.3.3
+ + contourpy==1.3.3
+ + corpusagent2==0.1.0 (from file:///scratch/dongtten/vt2_coding_agent_15753/repo)
+ + curl-cffi==0.15.0
+ + cycler==0.12.1
+ + cymem==2.0.13
+ + datasets==4.8.5
+ + fonttools==4.62.1
+ + frozendict==2.4.7
+ - fsspec==2026.4.0
+ + fsspec==2026.2.0
+ + hdbscan==0.8.42
+ - huggingface-hub==1.14.0
+ + huggingface-hub==0.36.2
+ + iniconfig==2.3.0
+ + joblib==1.5.3
+ + kiwisolver==1.5.0
+ + matplotlib==3.10.9
+ + multiprocess==0.70.19
+ + multitasking==0.0.13
+ + murmurhash==1.0.15
+ + narwhals==2.21.0
+ - numpy==2.3.5
+ + numpy==1.26.4
+ + nvidia-cublas-cu11==11.11.3.6
+ + nvidia-cuda-cupti-cu11==11.8.87
+ + nvidia-cuda-nvrtc-cu11==11.8.89
+ + nvidia-cuda-runtime-cu11==11.8.89
+ + nvidia-cudnn-cu11==8.7.0.84
+ + nvidia-cufft-cu11==10.9.0.58
+ + nvidia-curand-cu11==10.3.0.86
+ + nvidia-cusolver-cu11==11.4.1.48
+ + nvidia-cusparse-cu11==11.7.5.86
+ + nvidia-nccl-cu11==2.20.5
+ + nvidia-nvtx-cu11==11.8.86
+ + pandas==3.0.2
+ + peewee==4.0.5
+ + platformdirs==4.9.6
+ + plotly==6.7.0
+ + pluggy==1.6.0
+ + preshed==3.0.13
+ + psycopg==3.3.4
+ + psycopg-binary==3.3.4
+ + pyarrow==24.0.0
+ + pynndescent==0.6.0
+ + pyparsing==3.3.2
+ + pytest==9.0.3
+ + python-dateutil==2.9.0.post0
+ + pytz==2026.2
+ + scikit-learn==1.8.0
+ + scipy==1.17.1
+ + sentence-transformers==5.4.1
+ + six==1.17.0
+ + smart-open==7.6.1
+ + soupsieve==2.8.3
+ + spacy==3.8.14
+ + spacy-legacy==3.0.12
+ + spacy-loggers==1.0.5
+ + srsly==2.5.3
+ + thinc==8.3.13
+ + threadpoolctl==3.6.0
+ - torch==2.11.0
+ + torch==2.3.1+cu118
+ - torchaudio==2.11.0
+ + torchaudio==2.3.1+cu118
+ - torchvision==0.26.0
+ + torchvision==0.18.1+cu118
+ - transformers==5.8.0
+ + transformers==4.57.6
+ - triton==3.6.0
+ + triton==2.3.1
+ + umap-learn==0.5.12
+ + wasabi==1.1.3
+ + weasel==1.0.0
+ + wrapt==2.1.2
+ + xxhash==3.7.0
+ + yfinance==1.3.0
++ echo '=== versions ==='
++ /scratch/dongtten/venvs/vt2_coding_agent_uv/bin/python --version
++ /scratch/dongtten/venvs/vt2_coding_agent_uv/bin/python -
++ echo '=== starting vllm ==='
++ VLLM_PID=1895911
++ echo 1895911
++ /scratch/dongtten/venvs/vt2_coding_agent_uv/bin/vllm serve Qwen/Qwen2.5-Coder-14B-Instruct --host 127.0.0.1 --port 33753 --api-key local-slurm-token --dtype auto --max-model-len 16384 --gpu-memory-utilization 0.88 --trust-remote-code
++ trap cleanup EXIT
++ echo '=== waiting for vllm ==='
+++ seq 1 240
++ for i in $(seq 1 240)
++ curl -fsS -H 'Authorization: Bearer local-slurm-token' http://127.0.0.1:33753/v1/models
++ kill -0 1895911
++ sleep 10
++ for i in $(seq 1 240)
++ curl -fsS -H 'Authorization: Bearer local-slurm-token' http://127.0.0.1:33753/v1/models
++ kill -0 1895911
++ echo 'vLLM died. Last 200 log lines:'
++ tail -200 /cluster/home/dongtten/VT2/VT2-corpusagent2/outputs/coding_agent/15753/vllm_server.log
++ exit 30
+++ '[' 1 = 1 ']'
+++ '[' -x /usr/bin/clear_console ']'
+++ /usr/bin/clear_console -q
++ cleanup
++ echo '=== cleanup ==='
++ kill 1895911
++ true
