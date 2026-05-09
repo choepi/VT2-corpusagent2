@@ -806,6 +806,10 @@ def test_single_year_open_ended_range_keeps_open_date_to(tmp_path: Path) -> None
         "date_from": "2022-01-01",
         "date_to": "2022-12-31",
     }
+    assert orchestrator._extract_date_window("2021 divorce announcement from Bill Gates") == {
+        "date_from": "2021-01-01",
+        "date_to": "2021-12-31",
+    }
 
 
 def test_plan_normalization_removes_planner_invented_same_year_end_for_open_range(tmp_path: Path) -> None:
@@ -880,6 +884,101 @@ def test_planner_query_repair_recovers_company_coverage_from_malformed_source_fi
     assert "source:" not in repaired
 
 
+def test_planner_query_repair_recovers_entity_after_prose_source_filter_fragments(tmp_path: Path) -> None:
+    runtime = build_test_runtime(
+        tmp_path=tmp_path,
+        documents=_sample_documents(),
+        search_rows_by_query=_search_rows(_sample_documents()),
+    )
+    orchestrator = runtime.orchestrator
+    question = (
+        "How did media coverage of the spouse of the Microsoft co-founder who runs a major "
+        "philanthropic foundation change around the 2021 divorce announcement? "
+        "How did media coverage of Melinda French Gates change around the 2021 announcement "
+        "of her divorce from Microsoft co-founder Bill Gates?"
+    )
+    bad_query = (
+        '("Melinda French " OR "Melinda ") AND '
+        'source:("philanthropic foundation change around the 2021 divorce announcement How did" '
+        'OR "as a leader of the Gates philanthropic foundation")'
+    )
+    fallback = orchestrator._compact_query_terms(question, orchestrator._query_anchor_terms(question))
+
+    repaired = orchestrator._repair_search_query(bad_query, fallback)
+    inputs = orchestrator._search_inputs_for_question(question, overrides={"query": bad_query})
+
+    assert fallback == "Melinda French Gates"
+    assert repaired == "Melinda French Gates"
+    assert inputs["query"] == "Melinda French Gates"
+    assert "source:" not in inputs["query"]
+
+
+def test_normalize_plan_dag_sanitizes_planner_prose_source_filter(tmp_path: Path) -> None:
+    runtime = build_test_runtime(
+        tmp_path=tmp_path,
+        documents=_sample_documents(),
+        search_rows_by_query=_search_rows(_sample_documents()),
+    )
+    question = (
+        "How did media coverage of the spouse of the Microsoft co-founder who runs a major "
+        "philanthropic foundation change around the 2021 divorce announcement? "
+        "How did media coverage of Melinda French Gates change around the 2021 announcement "
+        "of her divorce from Microsoft co-founder Bill Gates?"
+    )
+    dag = AgentPlanDAG(
+        nodes=[
+            AgentPlanNode(
+                "n1",
+                "db_search",
+                inputs={
+                    "query": (
+                        '("Melinda French " OR "Melinda ") AND '
+                        'source:("philanthropic foundation change around the 2021 divorce announcement How did" '
+                        'OR "as a leader of the Gates philanthropic foundation")'
+                    ),
+                    "retrieve_all": True,
+                    "top_k": 0,
+                },
+            ),
+            AgentPlanNode("n2", "fetch_documents", depends_on=["n1"], inputs={}),
+            AgentPlanNode("series", "time_series_aggregate", depends_on=["n2"], inputs={}),
+        ],
+        metadata={"question_family": "temporal_portrayal_shift"},
+    )
+
+    normalized = runtime.orchestrator._normalize_plan_dag(dag, question_text=question)
+    search_node = next(node for node in normalized.nodes if node.capability == "db_search")
+
+    assert search_node.inputs["query"] == "Melinda French Gates"
+    assert "source:" not in search_node.inputs["query"]
+
+
+def test_planner_query_repair_falls_back_after_unbalanced_source_filter_removal(tmp_path: Path) -> None:
+    runtime = build_test_runtime(
+        tmp_path=tmp_path,
+        documents=_sample_documents(),
+        search_rows_by_query=_search_rows(_sample_documents()),
+    )
+    orchestrator = runtime.orchestrator
+    question = (
+        "How did coverage of Melinda French Gates change around the time of the 2021 divorce "
+        "announcement from Bill Gates, focusing on her portrayal in media before versus after the announcement?"
+    )
+    bad_query = (
+        '("Melinda French Gates" OR "Melinda Gates" OR (("Bill Gates" AND divorce) '
+        'AND (Melinda OR wife OR spouse) AND source:("after the announcement")'
+    )
+    fallback = orchestrator._compact_query_terms(question, orchestrator._query_anchor_terms(question))
+
+    repaired = orchestrator._repair_search_query(bad_query, fallback)
+    scoped = orchestrator._apply_source_scope_to_query(repaired, question)
+
+    assert fallback == "Melinda French Gates"
+    assert repaired == "Melinda French Gates"
+    assert scoped == "Melinda French Gates"
+    assert "source:" not in scoped
+
+
 def test_search_inputs_do_not_invent_swiss_newspaper_source_aliases(tmp_path: Path) -> None:
     runtime = build_test_runtime(
         tmp_path=tmp_path,
@@ -944,6 +1043,24 @@ def test_source_scope_does_not_treat_year_range_as_outlets(tmp_path: Path) -> No
     assert "2018" not in repaired
 
 
+def test_source_scope_does_not_treat_before_after_event_phrases_as_outlets(tmp_path: Path) -> None:
+    runtime = build_test_runtime(
+        tmp_path=tmp_path,
+        documents=_sample_documents(),
+        search_rows_by_query=_search_rows(_sample_documents()),
+    )
+    question = (
+        "How did coverage of Melinda French Gates change around the 2021 divorce announcement, "
+        "focusing on media before versus after the announcement?"
+    )
+
+    assert runtime.orchestrator._source_scope_filters_for_question(question) == []
+    repaired = runtime.orchestrator._apply_source_scope_to_query("Melinda French Gates", question)
+
+    assert repaired == "Melinda French Gates"
+    assert "source:" not in repaired
+
+
 def test_source_scope_does_not_treat_entity_vs_as_outlets(tmp_path: Path) -> None:
     runtime = build_test_runtime(
         tmp_path=tmp_path,
@@ -962,6 +1079,35 @@ def test_source_scope_does_not_treat_entity_vs_as_outlets(tmp_path: Path) -> Non
     assert repaired != "source"
     assert "Ronaldo" in repaired
     assert "Messi" in repaired
+
+
+def test_runtime_rejects_date_window_outside_loaded_corpus_before_tools(tmp_path: Path) -> None:
+    documents = [
+        {
+            "doc_id": "old-1",
+            "title": "Older corpus document",
+            "text": "Bill and Melinda Gates foundation coverage before 2021.",
+            "published_at": "2018-05-31",
+            "date": "2018-05-31",
+            "source": "example.com",
+            "outlet": "example.com",
+        }
+    ]
+    runtime = build_test_runtime(
+        tmp_path=tmp_path,
+        documents=documents,
+        search_rows_by_query=_search_rows(documents),
+    )
+
+    manifest = runtime.handle_query(
+        "How did media coverage of Melinda French Gates change around the 2021 divorce announcement?",
+        force_answer=True,
+        no_cache=True,
+    )
+
+    assert manifest.status == "rejected"
+    assert manifest.node_records == []
+    assert "outside the loaded corpus date range" in manifest.final_answer.answer_text
 
 
 def test_search_inputs_expand_multilingual_topic_aliases_for_scoped_queries(tmp_path: Path) -> None:
@@ -1110,7 +1256,6 @@ def test_syntax_role_question_forces_dependency_svo_preprocessing_and_quotes(tmp
         "quote_extract",
         "quote_attribute",
         "build_evidence_table",
-        "plot_artifact",
     }.issubset(capabilities)
     search_node = next(node for node in normalized.nodes if node.capability == "db_search")
     assert search_node.inputs["retrieval_strategy"] == "exhaustive_analytic"
@@ -1119,9 +1264,39 @@ def test_syntax_role_question_forces_dependency_svo_preprocessing_and_quotes(tmp
     assert "demonstrators" in search_node.inputs["query"]
     role_counts_node = next(node for node in normalized.nodes if node.node_id == "syntax_role_counts")
     target_counts_node = next(node for node in normalized.nodes if node.node_id == "syntax_target_counts")
+    evidence_node = next(node for node in normalized.nodes if node.capability == "build_evidence_table")
     assert role_counts_node.inputs["group_by"] == "actor_group"
     assert target_counts_node.inputs["group_by"] == "target_group"
+    assert "syntax_role_counts" not in evidence_node.depends_on
+    assert "syntax_target_counts" not in evidence_node.depends_on
+    assert "entity_link" not in evidence_node.depends_on
+    assert "svo_triples" in evidence_node.depends_on
     assert normalized.metadata["question_family"] == "syntax_role_patterns"
+
+
+def test_syntax_role_plot_request_uses_generic_plot_inference(tmp_path: Path) -> None:
+    docs = _sample_documents()
+    runtime = build_test_runtime(tmp_path=tmp_path, documents=docs, search_rows_by_query=_search_rows(docs))
+    question = (
+        "Plot the 2020 US protest subject-verb-object role patterns by actor and target groups."
+    )
+    boring_dag = AgentPlanDAG(
+        nodes=[
+            AgentPlanNode("search", "db_search", inputs={"query": "US protest coverage", "top_k": 10}),
+            AgentPlanNode("fetch", "fetch_documents", depends_on=["search"]),
+        ],
+        metadata={"question_family": "generic"},
+    )
+
+    normalized = runtime.orchestrator._normalize_plan_dag(boring_dag, question_text=question)
+    plot_node = next(node for node in normalized.nodes if node.capability == "plot_artifact")
+
+    assert plot_node.depends_on == ["syntax_role_counts"]
+    assert plot_node.optional is True
+    assert "plot_type" not in plot_node.inputs
+    assert "x" not in plot_node.inputs
+    assert "y" not in plot_node.inputs
+    assert "series" not in plot_node.inputs
 
 
 def test_attributed_price_explanation_question_forces_quotes_claims_and_external_series(tmp_path: Path) -> None:

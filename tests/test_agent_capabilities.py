@@ -3940,6 +3940,74 @@ def test_time_series_aggregate_filters_stopword_like_series_labels(tmp_path: Pat
     assert result.payload["skipped_row_count"] == 2
 
 
+def test_build_evidence_table_syntax_role_evidence_uses_svo_rows(tmp_path: Path) -> None:
+    context = AgentExecutionContext(
+        run_id="run",
+        artifacts_dir=tmp_path,
+        search_backend=None,
+        working_store=_ExplodingStore(),
+        runtime=None,
+    )
+    deps = {
+        "syntax_role_counts": ToolExecutionResult(payload={"rows": []}, metadata={"no_data": True}),
+        "svo_triples": ToolExecutionResult(
+            payload={
+                "rows": [
+                    {
+                        "doc_id": "d1",
+                        "published_at": "2020-06-01",
+                        "source": "example.org",
+                        "sentence": "Police arrested protesters outside city hall.",
+                        "subject": "Police",
+                        "verb": "arrest",
+                        "object": "protesters",
+                        "semantic_actor": "Police",
+                        "semantic_target": "protesters",
+                        "actor_group": "police",
+                        "target_group": "protesters",
+                        "mention_count": 1,
+                        "provider": "spacy",
+                    }
+                ]
+            }
+        ),
+    }
+
+    result = _build_evidence_table({"task": "syntax_role_evidence"}, deps, context)
+
+    assert result.metadata["no_data"] is False
+    assert result.payload["rows"][0]["doc_id"] == "d1"
+    assert result.payload["rows"][0]["role_pattern"] == "Police -> arrest -> protesters"
+    assert result.evidence[0]["actor_group"] == "police"
+
+
+def test_plot_artifact_prefers_categorical_x_when_time_bin_has_single_value(tmp_path: Path) -> None:
+    context = AgentExecutionContext(
+        run_id="run",
+        artifacts_dir=tmp_path,
+        search_backend=None,
+        working_store=_ExplodingStore(),
+        runtime=None,
+    )
+    deps = {
+        "roles": ToolExecutionResult(
+            payload={
+                "rows": [
+                    {"entity": "police", "time_bin": "2020", "mention_count": 5},
+                    {"entity": "protesters", "time_bin": "2020", "mention_count": 3},
+                ]
+            }
+        )
+    }
+
+    result = _plot_artifact({"plot_name": "role_counts"}, deps, context)
+
+    assert result.metadata["no_data"] is False
+    assert result.metadata["resolved_x"] == "entity"
+    assert result.metadata["resolved_y"] == "mention_count"
+    assert result.artifacts
+
+
 def test_extract_svo_triples_emits_actor_and_target_role_groups(tmp_path: Path) -> None:
     context = AgentExecutionContext(
         run_id="run",
