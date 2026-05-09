@@ -1,45 +1,21 @@
-# Python-generated files
-__pycache__/
-*.py[oc]
-*.pyo
-build/
-dist/
-wheels/
-*.egg-info/
+# Generated corpus data / indexes / archives
+/data/archive/
+/data/raw/
+/data/staged/
+/data/processed/
+/data/indices/
 
-# Virtual environments
-.venv/
-
-# Data artifacts
-/data/raw/ccnews_staged/
-/data/processed/*.parquet
-/data/indices/*.parquet
-/data/indices/**/*.joblib
-/data/indices/**/*.npy
-
-# Runtime outputs
-/outputs/**
-!/outputs/.gitkeep
-
-# Logs
-/log/*.log
-/log/**/*.out
-/log/**/*.err
-/log/**/*.log
-
-# VM / Docker state
-/deploy/data/
-
-# IDE / OS
-.DS_Store
-Thumbs.db
-
-# Local environment
-.env
-.env.local
-.env.*.local
-
-# Local uv cache
-.uv-cache/
-*.jsonl
-*.jsonl.gz
+# Large/generated artifacts anywhere
+*.parquet
+*.npy
+*.npz
+*.joblib
+*.pkl
+*.pickle
+*.h5
+*.hdf5
+*.sqlite
+*.duckdb
+*.tar
+*.tar.gz
+*.zip
