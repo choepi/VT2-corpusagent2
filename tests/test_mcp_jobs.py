@@ -193,6 +193,33 @@ def test_mcp_job_store_does_not_regress_terminal_status_from_heartbeat(tmp_path:
     assert stale_heartbeat.result_summary == {"status": "completed"}
 
 
+def test_mcp_job_progress_update_does_not_regress_terminal_status(tmp_path: Path) -> None:
+    store = SQLiteMCPJobStore(tmp_path / "jobs.sqlite")
+    job = store.create_job(
+        MCPJobRecord(
+            job_id="mcpjob_progress_terminal_guard",
+            run_id="agent_progress_terminal_guard",
+            owner="",
+            question="question",
+            status="running",
+        )
+    )
+    completed = store.set_job_status(
+        job.job_id,
+        "completed",
+        result_summary={"status": "completed"},
+        finished=True,
+    )
+    assert completed is not None
+    assert completed.status == "completed"
+
+    stale_progress = store.update_progress(job.job_id, {"status": "running", "detail": "stale heartbeat"})
+
+    assert stale_progress is not None
+    assert stale_progress.status == "completed"
+    assert stale_progress.result_summary == {"status": "completed"}
+
+
 def test_create_mcp_server_registers_job_tools(tmp_path: Path) -> None:
     manager = MCPJobManager(
         project_root=tmp_path,

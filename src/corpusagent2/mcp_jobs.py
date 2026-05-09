@@ -25,6 +25,10 @@ def _is_terminal_status(status: str) -> bool:
     return status in MCP_JOB_TERMINAL_STATUSES
 
 
+def _sql_placeholders(count: int) -> str:
+    return ", ".join("?" for _ in range(max(0, count)))
+
+
 def _utc_now() -> str:
     return datetime.now(UTC).isoformat()
 
@@ -324,13 +328,14 @@ class SQLiteMCPJobStore:
         finished: bool = False,
     ) -> MCPJobRecord | None:
         self.ensure_schema()
-        current = self.get_job(job_id)
-        if current is None:
-            return None
-        if _is_terminal_status(current.status) and not _is_terminal_status(status):
-            return current
         now = _utc_now()
         with self._lock, closing(self._connect()) as conn:
+            current_row = conn.execute("SELECT * FROM ca_mcp_jobs WHERE job_id = ?", (job_id,)).fetchone()
+            if current_row is None:
+                return None
+            current = _record_from_mapping(dict(current_row))
+            if _is_terminal_status(current.status) and not _is_terminal_status(status):
+                return current
             conn.execute(
                 """
                 UPDATE ca_mcp_jobs
@@ -358,8 +363,9 @@ class SQLiteMCPJobStore:
                     job_id,
                 ),
             )
+            row = conn.execute("SELECT * FROM ca_mcp_jobs WHERE job_id = ?", (job_id,)).fetchone()
             conn.commit()
-        return self.get_job(job_id)
+        return _record_from_mapping(dict(row)) if row else None
 
     def update_progress(self, job_id: str, progress: dict[str, Any]) -> MCPJobRecord | None:
         current = self.get_job(job_id)
@@ -367,14 +373,22 @@ class SQLiteMCPJobStore:
             return None
         summary = dict(current.result_summary)
         summary["live_status"] = progress
-        return self.set_job_status(
-            job_id,
-            current.status,
-            hold_reason=current.hold_reason,
-            worker_id=current.worker_id,
-            error=current.error,
-            result_summary=summary,
-        )
+        terminal_statuses = tuple(sorted(MCP_JOB_TERMINAL_STATUSES))
+        placeholders = _sql_placeholders(len(terminal_statuses))
+        now = _utc_now()
+        with self._lock, closing(self._connect()) as conn:
+            conn.execute(
+                f"""
+                UPDATE ca_mcp_jobs
+                SET result_summary = ?,
+                    updated_at_utc = ?
+                WHERE job_id = ? AND status NOT IN ({placeholders})
+                """,
+                (_json_dumps(summary), now, job_id, *terminal_statuses),
+            )
+            row = conn.execute("SELECT * FROM ca_mcp_jobs WHERE job_id = ?", (job_id,)).fetchone()
+            conn.commit()
+        return _record_from_mapping(dict(row)) if row else None
 
     def cancel_job(self, job_id: str) -> MCPJobRecord | None:
         current = self.get_job(job_id)
@@ -604,14 +618,16 @@ class PostgresMCPJobStore:
         self.ensure_schema()
         from psycopg.types.json import Json
 
-        current = self.get_job(job_id)
-        if current is None:
-            return None
-        if _is_terminal_status(current.status) and not _is_terminal_status(status):
-            return current
         table = self.table_name
         with self._connect() as conn:
             with conn.cursor() as cursor:
+                cursor.execute(f"SELECT * FROM {table} WHERE job_id = %s FOR UPDATE", (job_id,))
+                current_row = cursor.fetchone()
+                if current_row is None:
+                    return None
+                current = self._row_to_record(current_row, cursor.description)
+                if _is_terminal_status(current.status) and not _is_terminal_status(status):
+                    return current
                 cursor.execute(
                     f"""
                     UPDATE {table}
@@ -649,14 +665,28 @@ class PostgresMCPJobStore:
             return None
         summary = dict(current.result_summary)
         summary["live_status"] = progress
-        return self.set_job_status(
-            job_id,
-            current.status,
-            hold_reason=current.hold_reason,
-            worker_id=current.worker_id,
-            error=current.error,
-            result_summary=summary,
-        )
+        terminal_statuses = tuple(sorted(MCP_JOB_TERMINAL_STATUSES))
+        placeholders = ", ".join("%s" for _ in terminal_statuses)
+        from psycopg.types.json import Json
+
+        with self._connect() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    f"""
+                    UPDATE {self.table_name}
+                    SET result_summary = %s,
+                        updated_at_utc = NOW()
+                    WHERE job_id = %s AND status NOT IN ({placeholders})
+                    RETURNING *
+                    """,
+                    (Json(summary), job_id, *terminal_statuses),
+                )
+                row = cursor.fetchone()
+                if row is None:
+                    conn.commit()
+                    return self.get_job(job_id)
+                conn.commit()
+                return self._row_to_record(row, cursor.description)
 
     def cancel_job(self, job_id: str) -> MCPJobRecord | None:
         current = self.get_job(job_id)

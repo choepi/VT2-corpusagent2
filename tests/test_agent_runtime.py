@@ -7,6 +7,7 @@ from pathlib import Path
 import time
 
 from corpusagent2 import agent_capabilities
+from corpusagent2.agent_runtime import OUT_OF_CORPUS_MODEL_ANSWER_FLAG
 from corpusagent2.agent_capabilities import AgentExecutionContext
 from corpusagent2.agent_backends import InMemoryWorkingSetStore
 from corpusagent2.agent_models import AgentNodeExecutionRecord, AgentPlanDAG, AgentPlanNode, AgentRunState
@@ -1107,7 +1108,69 @@ def test_runtime_rejects_date_window_outside_loaded_corpus_before_tools(tmp_path
 
     assert manifest.status == "rejected"
     assert manifest.node_records == []
+    assert manifest.metadata["out_of_corpus_model_answer"] is True
+    assert manifest.metadata["answer_grounding"] == "model_only_out_of_corpus"
+    assert OUT_OF_CORPUS_MODEL_ANSWER_FLAG in manifest.final_answer.answer_text
     assert "outside the loaded corpus date range" in manifest.final_answer.answer_text
+    assert "No corpus data was available" in manifest.final_answer.caveats[0]
+    assert any(trace["stage"] == "out_of_corpus_model_answer" for trace in manifest.metadata["llm_traces"])
+
+
+def test_runtime_adds_flagged_model_only_answer_for_out_of_corpus_scope(tmp_path: Path) -> None:
+    documents = [
+        {
+            "doc_id": "old-1",
+            "title": "Older corpus document",
+            "text": "AI coverage before the requested period.",
+            "published_at": "2018-05-31",
+            "date": "2018-05-31",
+            "source": "example.com",
+            "outlet": "example.com",
+        }
+    ]
+    llm = StaticLLMClient(
+        [
+            {
+                "action": "accept_with_assumptions",
+                "rewritten_question": "What were the main topics in English-language AI coverage between 2021 and 2022?",
+                "assumptions": [],
+                "clarification_question": "",
+                "rejection_reason": "",
+                "message": "",
+            },
+            {
+                "answer_text": "With no corpus evidence, a general model answer is that AI coverage often centered on generative models, regulation, labor effects, and investment.",
+                "unsupported_parts": ["No retrieved evidence supports these topic labels in this corpus."],
+                "caveats": ["This is model prior knowledge only."],
+                "claim_verdicts": [],
+            },
+        ]
+    )
+    runtime = build_test_runtime(
+        tmp_path=tmp_path,
+        documents=documents,
+        search_rows_by_query=_search_rows(documents),
+        llm_client=llm,
+    )
+
+    manifest = runtime.handle_query(
+        "What were the main topics in English-language AI coverage between 2021 and 2022?",
+        force_answer=True,
+        no_cache=True,
+    )
+
+    assert manifest.status == "rejected"
+    assert manifest.node_records == []
+    assert manifest.plan_dags == []
+    assert manifest.metadata["out_of_corpus_model_answer"] is True
+    assert manifest.metadata["out_of_corpus_model"]
+    assert OUT_OF_CORPUS_MODEL_ANSWER_FLAG in manifest.final_answer.answer_text
+    assert "Corpus status: The requested time window" in manifest.final_answer.answer_text
+    assert "general model answer" in manifest.final_answer.answer_text
+    assert "not grounded in retrieved documents" in manifest.final_answer.caveats[0]
+    assert "No retrieved evidence supports these topic labels in this corpus." in manifest.final_answer.unsupported_parts
+    stages = [trace["stage"] for trace in manifest.metadata["llm_traces"]]
+    assert stages == ["rephrase_or_clarify", "out_of_corpus_model_answer"]
 
 
 def test_search_inputs_expand_multilingual_topic_aliases_for_scoped_queries(tmp_path: Path) -> None:
