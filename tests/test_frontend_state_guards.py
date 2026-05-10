@@ -39,3 +39,13 @@ def test_frontend_suppresses_notifications_for_restored_or_instant_cached_runs()
     assert "notificationObservedActiveRunIds.clear();" in app_js
     assert "notificationEligibleRunIds.add(currentRunId);" in app_js
     assert "notificationObservedActiveRunIds.add(runId);" in app_js
+
+
+def test_frontend_prefers_local_runtime_api_base_for_static_launch() -> None:
+    project_root = Path(__file__).resolve().parents[1]
+    app_js = (project_root / "web" / "app.js").read_text(encoding="utf-8")
+
+    assert "function initialApiBase(savedValue = \"\")" in app_js
+    assert "runtimeConfig.preferRuntimeApiBase" in app_js
+    assert "127.0.1" in app_js
+    assert "localhost:5500" in app_js
