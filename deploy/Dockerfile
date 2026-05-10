@@ -35,18 +35,12 @@ RUN set -eu; \
         uv venv; \
         if [ "$CORPUSAGENT2_DOCKER_INSTALL_NLP_PROVIDERS" = "true" ]; then \
           uv pip install \
-            --torch-backend cpu \
-            --index-strategy unsafe-best-match \
             --index-url https://pypi.org/simple \
-            --extra-index-url https://download.pytorch.org/whl/cpu \
             -r deploy/requirements.docker-cpu.txt \
             -r deploy/requirements.docker-nlp-providers.txt; \
         else \
           uv pip install \
-            --torch-backend cpu \
-            --index-strategy unsafe-best-match \
             --index-url https://pypi.org/simple \
-            --extra-index-url https://download.pytorch.org/whl/cpu \
             -r deploy/requirements.docker-cpu.txt; \
         fi; \
         ;; \
