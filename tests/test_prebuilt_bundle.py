@@ -14,6 +14,16 @@ def _load_prebuilt_module():
     return module
 
 
+def _load_prepare_dataset_module():
+    script_path = Path(__file__).resolve().parents[1] / "scripts" / "01_prepare_dataset.py"
+    spec = importlib.util.spec_from_file_location("prepare_dataset", script_path)
+    assert spec is not None
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
+
+
 def test_streaming_sample_fraction_is_deterministic_and_applied_before_max_rows() -> None:
     module = _load_prebuilt_module()
     rows = [
@@ -46,3 +56,57 @@ def test_invalid_sample_fraction_is_rejected() -> None:
         assert "sample_fraction" in str(exc)
     else:
         raise AssertionError("Expected invalid sample_fraction to raise ValueError")
+
+
+def test_skip_dense_option_is_available_for_offline_smoke_builds() -> None:
+    module = _load_prebuilt_module()
+
+    args = module.parse_args(["--source-file", "example.jsonl", "--skip-dense"])
+
+    assert args.skip_dense is True
+
+
+def test_jsonl_source_accepts_utf8_bom_from_windows_powershell() -> None:
+    module = _load_prebuilt_module()
+    source_path = Path(__file__).with_name("_bom_source_tmp.jsonl")
+    try:
+        source_path.write_bytes(
+            b'\xef\xbb\xbf{"id":"doc-1","title":"Smoke","text":"Body","published_at":"2021","source":"local"}\n'
+        )
+
+        rows = list(module._records_from_tabular_file(source_path))
+
+        assert rows == [
+            {
+                "id": "doc-1",
+                "title": "Smoke",
+                "text": "Body",
+                "published_at": "2021",
+                "source": "local",
+            }
+        ]
+    finally:
+        source_path.unlink(missing_ok=True)
+
+
+def test_prepare_dataset_accepts_utf8_bom_from_staged_jsonl() -> None:
+    module = _load_prepare_dataset_module()
+    source_path = Path(__file__).with_name("_prepare_bom_source_tmp.jsonl")
+    try:
+        source_path.write_bytes(
+            b'\xef\xbb\xbf{"id":"doc-1","title":"Smoke","text":"Body","published_at":"2021","source":"local"}\n'
+        )
+
+        rows = list(module.iter_records(source_path))
+
+        assert rows == [
+            {
+                "id": "doc-1",
+                "title": "Smoke",
+                "text": "Body",
+                "published_at": "2021",
+                "source": "local",
+            }
+        ]
+    finally:
+        source_path.unlink(missing_ok=True)
