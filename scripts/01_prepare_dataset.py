@@ -36,7 +36,7 @@ def build_doc_id(title: str, text: str, published_at: str, fallback_id: str = ""
 
 def iter_records(file_path: Path):
     opener = gzip.open if file_path.suffix == ".gz" else open
-    with opener(file_path, "rt", encoding="utf-8") as handle:
+    with opener(file_path, "rt", encoding="utf-8-sig") as handle:
         for line in handle:
             stripped = line.strip()
             if not stripped:
