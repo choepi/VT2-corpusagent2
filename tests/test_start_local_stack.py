@@ -15,6 +15,17 @@ def _load_start_local_stack_module():
     return module
 
 
+def _load_static_frontend_module():
+    project_root = Path(__file__).resolve().parents[1]
+    script_path = project_root / "scripts" / "14_run_static_frontend.py"
+    spec = importlib.util.spec_from_file_location("run_static_frontend", script_path)
+    assert spec is not None
+    assert spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 def test_local_stack_points_frontend_at_local_backend(monkeypatch) -> None:
     module = _load_start_local_stack_module()
     monkeypatch.delenv("CORPUSAGENT2_SERVER_HOST", raising=False)
@@ -29,6 +40,28 @@ def test_local_stack_uses_browser_reachable_host_for_wildcard_bind(monkeypatch) 
     monkeypatch.setenv("CORPUSAGENT2_SERVER_PORT", "9000")
 
     assert module.local_api_base_url() == "http://127.0.0.1:9000"
+
+
+def test_static_frontend_defaults_to_local_backend_for_manual_launch(monkeypatch) -> None:
+    module = _load_static_frontend_module()
+    monkeypatch.delenv("CORPUSAGENT2_FRONTEND_API_BASE_URL", raising=False)
+    monkeypatch.delenv("CORPUSAGENT2_SERVER_HOST", raising=False)
+    monkeypatch.delenv("CORPUSAGENT2_SERVER_PORT", raising=False)
+
+    payload = module.static_frontend_runtime_payload()
+
+    assert payload["apiBaseUrl"] == "http://127.0.0.1:8001"
+    assert payload["preferRuntimeApiBase"] is True
+
+
+def test_static_frontend_honors_explicit_api_base_override(monkeypatch) -> None:
+    module = _load_static_frontend_module()
+    monkeypatch.setenv("CORPUSAGENT2_FRONTEND_API_BASE_URL", "https://demo.example.com/api")
+
+    payload = module.static_frontend_runtime_payload()
+
+    assert payload["apiBaseUrl"] == "https://demo.example.com/api"
+    assert payload["preferRuntimeApiBase"] is True
 
 
 def test_wait_for_backend_ready_polls_runtime_info(monkeypatch) -> None:

@@ -113,10 +113,27 @@ providerBadge.textContent = "LLM: loading...";
 
 function normalizeApiBase(value) {
   const normalized = String(value || "").trim().replace(/\/$/, "");
-  if (normalized === "http://127.0.0.1:5500") {
+  if (normalized === "http://127.0.0.1:5500" || normalized === "http://localhost:5500") {
     return LOCAL_API_BASE;
   }
+  try {
+    const parsedUrl = new URL(normalized);
+    const loopbackHosts = ["localhost", "127.0.0.1", "127.0.1", "0.0.0.0", "::1", "[::1]"];
+    if (parsedUrl.protocol === "http:" && parsedUrl.port === "8001" && loopbackHosts.includes(parsedUrl.hostname)) {
+      return LOCAL_API_BASE;
+    }
+  } catch (_error) {
+    return DEFAULT_API_BASE;
+  }
   return API_BASE_OPTIONS.includes(normalized) ? normalized : DEFAULT_API_BASE;
+}
+
+function initialApiBase(savedValue = "") {
+  const runtimeBase = normalizeApiBase(runtimeConfig.apiBaseUrl || DEFAULT_API_BASE);
+  if (runtimeConfig.preferRuntimeApiBase) {
+    return runtimeBase;
+  }
+  return normalizeApiBase(savedValue || runtimeConfig.apiBaseUrl || DEFAULT_API_BASE);
 }
 
 function questionStateKey(value) {
@@ -128,7 +145,7 @@ function clarificationMatchesCurrentQuestion() {
   return Boolean(currentQuestion && questionStateKey(clarificationBaseQuestion) === currentQuestion);
 }
 
-apiBaseInput.value = normalizeApiBase(runtimeConfig.apiBaseUrl || DEFAULT_API_BASE);
+apiBaseInput.value = initialApiBase();
 
 function isAccessGateEnabled() {
   return Boolean(accessGateConfig.enabled && accessGateConfig.passwordSha256);
@@ -215,7 +232,7 @@ function restoreUiState() {
       return;
     }
     const payload = JSON.parse(raw);
-    apiBaseInput.value = normalizeApiBase(payload.apiBase || runtimeConfig.apiBaseUrl || DEFAULT_API_BASE);
+    apiBaseInput.value = initialApiBase(payload.apiBase);
     questionInput.value = payload.question || questionInput.value;
     forceAnswerInput.checked = Boolean(payload.forceAnswer);
     noCacheInput.checked = Boolean(payload.noCache);
