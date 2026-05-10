@@ -149,7 +149,7 @@ def _iter_normalized_records(
 
 
 def _records_from_json(path: Path) -> Iterable[dict]:
-    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload = json.loads(path.read_text(encoding="utf-8-sig"))
     if isinstance(payload, list):
         for row in payload:
             if isinstance(row, dict):
@@ -167,7 +167,7 @@ def _records_from_tabular_file(path: Path) -> Iterable[dict]:
     suffixes = [part.lower() for part in path.suffixes]
     if suffixes[-2:] == [".jsonl", ".gz"] or path.suffix.lower() == ".jsonl":
         opener = gzip.open if path.suffix.lower() == ".gz" else open
-        with opener(path, "rt", encoding="utf-8") as handle:
+        with opener(path, "rt", encoding="utf-8-sig") as handle:
             for line in handle:
                 stripped = line.strip()
                 if stripped:
@@ -364,6 +364,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--dense-batch-size", type=int, default=128, help="Dense embedding batch size for cluster preprocessing.")
     parser.add_argument("--dense-chunk-size", type=int, default=2048, help="Dense embedding chunk size for streaming writes.")
     parser.add_argument("--sentiment-device", default="auto", help="Preferred sentiment device for NLP outputs, e.g. auto/cuda/mps/cpu.")
+    parser.add_argument("--skip-dense", action="store_true", help="Skip dense embedding assets; useful for offline CPU smoke builds.")
     parser.add_argument("--skip-nlp", action="store_true", help="Skip building outputs/nlp_tools artifacts.")
     parser.add_argument("--clean-existing", action="store_true", help="Delete existing incoming/staged/processed/index/output artifacts first.")
     return parser.parse_args(argv)
@@ -413,7 +414,7 @@ def main(argv: list[str] | None = None) -> None:
     env["CORPUSAGENT2_MODE"] = args.mode
     env["CORPUSAGENT2_TIME_GRANULARITY"] = args.granularity
     env["CORPUSAGENT2_BUILD_LEXICAL_ASSETS"] = "true"
-    env["CORPUSAGENT2_BUILD_DENSE_ASSETS"] = "true"
+    env["CORPUSAGENT2_BUILD_DENSE_ASSETS"] = "false" if args.skip_dense else "true"
     env["CORPUSAGENT2_STREAM_DENSE_ASSETS"] = "true"
     env["CORPUSAGENT2_DENSE_BATCH_SIZE"] = str(max(args.dense_batch_size, 1))
     env["CORPUSAGENT2_DENSE_CHUNK_SIZE"] = str(max(args.dense_chunk_size, 1))
@@ -440,6 +441,7 @@ def main(argv: list[str] | None = None) -> None:
         "dense_batch_size": int(env["CORPUSAGENT2_DENSE_BATCH_SIZE"]),
         "dense_chunk_size": int(env["CORPUSAGENT2_DENSE_CHUNK_SIZE"]),
         "sentiment_device": env["CORPUSAGENT2_SENTIMENT_DEVICE"],
+        "include_dense_assets": not args.skip_dense,
         "hf_streaming": bool(args.hf_streaming),
         "hf_max_rows": int(max(args.hf_max_rows, 0)),
         "hf_filters": [f"{field}={value}" for field, value in active_filters],
