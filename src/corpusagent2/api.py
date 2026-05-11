@@ -1,15 +1,18 @@
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
+from fastapi.staticfiles import StaticFiles
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field
 
 from .agent_runtime import AgentRuntime, AgentRuntimeConfig
+from .app_config import frontend_runtime_payload
 
 
 class QueryRequest(BaseModel):
@@ -36,8 +39,9 @@ class LLMSettingsResetRequest(BaseModel):
 
 
 def build_app(runtime: AgentRuntime | None = None, project_root: Path | None = None) -> FastAPI:
+    resolved_root = project_root or Path(__file__).resolve().parents[2]
     resolved_runtime = runtime or AgentRuntime(
-        config=AgentRuntimeConfig.from_project_root(project_root or Path(__file__).resolve().parents[2])
+        config=AgentRuntimeConfig.from_project_root(resolved_root)
     )
     app = FastAPI(title="CorpusAgent2 Agent Runtime", version="0.1.0")
     cors_origins = [
@@ -155,5 +159,32 @@ def build_app(runtime: AgentRuntime | None = None, project_root: Path | None = N
     @app.post("/runs/abort-all")
     def abort_all_runs() -> dict[str, Any]:
         return resolved_runtime.abort_all_runs()
+
+    serve_frontend = os.getenv("CORPUSAGENT2_SERVE_FRONTEND", "1").strip().lower() not in {"0", "false", "no", "off"}
+    web_root = resolved_root / "web"
+    if web_root.is_dir() and serve_frontend:
+
+        @app.get("/config.js")
+        def runtime_config_js(request: Request) -> Response:
+            payload = frontend_runtime_payload(resolved_root)
+            forwarded_proto = request.headers.get("x-forwarded-proto", "").strip().lower()
+            forwarded_host = request.headers.get("x-forwarded-host", "").strip()
+            scheme = forwarded_proto or request.url.scheme
+            netloc = forwarded_host or request.url.netloc
+            if netloc:
+                payload["apiBaseUrl"] = f"{scheme}://{netloc}"
+                payload["preferRuntimeApiBase"] = True
+            body = (
+                "window.CORPUSAGENT2_CONFIG = "
+                + json.dumps(payload, ensure_ascii=False, indent=2)
+                + ";\n"
+            )
+            return Response(
+                content=body,
+                media_type="application/javascript",
+                headers={"Cache-Control": "no-store, max-age=0"},
+            )
+
+        app.mount("/", StaticFiles(directory=str(web_root), html=True), name="frontend")
 
     return app
