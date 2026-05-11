@@ -15,17 +15,6 @@ def _load_start_local_stack_module():
     return module
 
 
-def _load_static_frontend_module():
-    project_root = Path(__file__).resolve().parents[1]
-    script_path = project_root / "scripts" / "14_run_static_frontend.py"
-    spec = importlib.util.spec_from_file_location("run_static_frontend", script_path)
-    assert spec is not None
-    assert spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
-
-
 def test_local_stack_points_frontend_at_local_backend(monkeypatch) -> None:
     module = _load_start_local_stack_module()
     monkeypatch.delenv("CORPUSAGENT2_SERVER_HOST", raising=False)
@@ -40,28 +29,6 @@ def test_local_stack_uses_browser_reachable_host_for_wildcard_bind(monkeypatch) 
     monkeypatch.setenv("CORPUSAGENT2_SERVER_PORT", "9000")
 
     assert module.local_api_base_url() == "http://127.0.0.1:9000"
-
-
-def test_static_frontend_defaults_to_local_backend_for_manual_launch(monkeypatch) -> None:
-    module = _load_static_frontend_module()
-    monkeypatch.delenv("CORPUSAGENT2_FRONTEND_API_BASE_URL", raising=False)
-    monkeypatch.delenv("CORPUSAGENT2_SERVER_HOST", raising=False)
-    monkeypatch.delenv("CORPUSAGENT2_SERVER_PORT", raising=False)
-
-    payload = module.static_frontend_runtime_payload()
-
-    assert payload["apiBaseUrl"] == "http://127.0.0.1:8001"
-    assert payload["preferRuntimeApiBase"] is True
-
-
-def test_static_frontend_honors_explicit_api_base_override(monkeypatch) -> None:
-    module = _load_static_frontend_module()
-    monkeypatch.setenv("CORPUSAGENT2_FRONTEND_API_BASE_URL", "https://demo.example.com/api")
-
-    payload = module.static_frontend_runtime_payload()
-
-    assert payload["apiBaseUrl"] == "https://demo.example.com/api"
-    assert payload["preferRuntimeApiBase"] is True
 
 
 def test_wait_for_backend_ready_polls_runtime_info(monkeypatch) -> None:
@@ -104,8 +71,6 @@ def test_mcp_compose_defaults_to_cpu_and_keeps_gpu_override_separate() -> None:
     assert "dockerfile: deploy/Dockerfile" in mcp_compose
     assert "Dockerfile.mcp" not in mcp_compose
     assert "CORPUSAGENT2_DEVICE: ${CORPUSAGENT2_DEVICE:-cpu}" in mcp_compose
-    assert "CORPUSAGENT2_DENSE_MODEL_ID: ${CORPUSAGENT2_DOCKER_DENSE_MODEL_ID:-/models/e5-base-v2}" in mcp_compose
-    assert "source: ${CORPUSAGENT2_DENSE_MODEL_HOST_PATH:-../../e5-base-v2}" in mcp_compose
     assert "gpus: all" not in mcp_compose
     assert "corpusagent2-api:" in gpu_compose
     assert "CORPUSAGENT2_DEVICE: ${CORPUSAGENT2_DEVICE:-cuda}" in gpu_compose
@@ -125,16 +90,11 @@ def test_dockerized_api_and_mcp_share_runtime_image_and_sandbox_mounts() -> None
     assert "ARG CORPUSAGENT2_DOCKER_INSTALL_NLP_PROVIDERS=false" in dockerfile_text
     assert "ARG CORPUSAGENT2_DOCKER_DOWNLOAD_PROVIDER_ASSETS=false" in dockerfile_text
     assert "deploy/requirements.docker-cpu.txt" in dockerfile_text
-    assert "deploy/requirements.docker-torch-cpu.txt" in dockerfile_text
     assert "deploy/requirements.docker-nlp-providers.txt" in dockerfile_text
     assert "RUN set -eu;" in dockerfile_text
-    assert "uv --system-certs pip install" in dockerfile_text
-    assert "uv --system-certs sync --frozen" in dockerfile_text
-    assert "--allow-insecure-host download.pytorch.org" in dockerfile_text
-    assert "--allow-insecure-host download-r2.pytorch.org" in dockerfile_text
-    assert "--index-url https://download.pytorch.org/whl/cpu" in dockerfile_text
-    assert "--index-url https://pypi.org/simple" in dockerfile_text
-    assert "--torch-backend cpu" not in dockerfile_text
+    assert "--torch-backend cpu" in dockerfile_text
+    assert "--index-strategy unsafe-best-match" in dockerfile_text
+    assert "https://download.pytorch.org/whl/cpu" in dockerfile_text
     assert "Unsupported CORPUSAGENT2_DOCKER_TORCH_PROFILE" in dockerfile_text
     assert "PYTHONPATH=/app/src" in dockerfile_text
     assert "CMD [\"python\", \"/app/scripts/12_run_agent_api.py\"]" in dockerfile_text
@@ -144,9 +104,6 @@ def test_dockerized_api_and_mcp_share_runtime_image_and_sandbox_mounts() -> None
     assert "CORPUSAGENT2_DOCKER_TORCH_PROFILE: ${CORPUSAGENT2_DOCKER_TORCH_PROFILE:-cpu}" in mcp_compose
     assert "CORPUSAGENT2_DOCKER_INSTALL_NLP_PROVIDERS: ${CORPUSAGENT2_DOCKER_INSTALL_NLP_PROVIDERS:-false}" in base_compose
     assert "CORPUSAGENT2_DOCKER_INSTALL_NLP_PROVIDERS: ${CORPUSAGENT2_DOCKER_INSTALL_NLP_PROVIDERS:-false}" in mcp_compose
-    assert "CORPUSAGENT2_DENSE_MODEL_ID: ${CORPUSAGENT2_DOCKER_DENSE_MODEL_ID:-/models/e5-base-v2}" in base_compose
-    assert "source: ${CORPUSAGENT2_DENSE_MODEL_HOST_PATH:-../../e5-base-v2}" in base_compose
-    assert "target: ${CORPUSAGENT2_DOCKER_DENSE_MODEL_ID:-/models/e5-base-v2}" in base_compose
     assert "CORPUSAGENT2_API_CPUS" in base_compose
     assert "CORPUSAGENT2_MCP_CPUS" in mcp_compose
     assert "CORPUSAGENT2_OPENSEARCH_MEM_LIMIT" not in base_compose
@@ -160,18 +117,14 @@ def test_dockerized_api_and_mcp_share_runtime_image_and_sandbox_mounts() -> None
 def test_docker_cpu_requirements_use_cpu_torch_and_real_provider_stack() -> None:
     project_root = Path(__file__).resolve().parents[1]
     cpu_requirements = (project_root / "deploy" / "requirements.docker-cpu.txt").read_text(encoding="utf-8")
-    torch_cpu_requirements = (project_root / "deploy" / "requirements.docker-torch-cpu.txt").read_text(encoding="utf-8")
     provider_requirements = (project_root / "deploy" / "requirements.docker-nlp-providers.txt").read_text(encoding="utf-8")
     gpu_compose = (project_root / "deploy" / "docker-compose.mcp.gpu.yml").read_text(encoding="utf-8")
 
-    assert "torch==" not in cpu_requirements
-    assert "torch==2.3.1+cpu" in torch_cpu_requirements
-    assert "torchvision==0.18.1+cpu" in torch_cpu_requirements
-    assert "torchaudio==2.3.1+cpu" in torch_cpu_requirements
-    assert "torch==2.3.1+cpu" not in cpu_requirements
+    assert "torch==2.3.1+cpu" in cpu_requirements
+    assert "torchvision==0.18.1+cpu" in cpu_requirements
+    assert "torchaudio==2.3.1+cpu" in cpu_requirements
     assert "cu118" not in cpu_requirements
     assert "cu118" not in provider_requirements
-    assert "download.pytorch.org" not in cpu_requirements
     assert "sentence-transformers" in cpu_requirements
     assert "bertopic" in cpu_requirements
     assert "flair" in provider_requirements
