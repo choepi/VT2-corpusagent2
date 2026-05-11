@@ -40,6 +40,7 @@ services:
       CORPUSAGENT2_MCP_HEARTBEAT_SECONDS: ${CORPUSAGENT2_MCP_HEARTBEAT_SECONDS:-5}
       CORPUSAGENT2_MCP_STALE_RUNNING_SECONDS: ${CORPUSAGENT2_MCP_STALE_RUNNING_SECONDS:-900}
       CORPUSAGENT2_DEVICE: ${CORPUSAGENT2_DEVICE:-cpu}
+      CORPUSAGENT2_DENSE_MODEL_ID: ${CORPUSAGENT2_DOCKER_DENSE_MODEL_ID:-/models/e5-base-v2}
       CORPUSAGENT2_PYTHON_RUNNER_SHARED_TMP: ${CORPUSAGENT2_PYTHON_RUNNER_SHARED_TMP:-/tmp/corpusagent2_python_runner}
     command: ["python", "-m", "corpusagent2.mcp_server"]
     ports:
@@ -47,6 +48,10 @@ services:
     volumes:
       - ../data:/app/data:ro
       - ../outputs:/app/outputs
+      - type: bind
+        source: ${CORPUSAGENT2_DENSE_MODEL_HOST_PATH:-../../e5-base-v2}
+        target: ${CORPUSAGENT2_DOCKER_DENSE_MODEL_ID:-/models/e5-base-v2}
+        read_only: true
       - /var/run/docker.sock:/var/run/docker.sock
       - ${CORPUSAGENT2_PYTHON_RUNNER_SHARED_TMP:-/tmp/corpusagent2_python_runner}:${CORPUSAGENT2_PYTHON_RUNNER_SHARED_TMP:-/tmp/corpusagent2_python_runner}
     cpus: "${CORPUSAGENT2_MCP_CPUS:-6}"

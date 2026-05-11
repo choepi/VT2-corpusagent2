@@ -14,6 +14,7 @@ if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
 from corpusagent2.metrics import evidence_completeness, mrr_at_k, ndcg_at_k, recall_at_k
+from corpusagent2.model_config import dense_model_id_from_env
 from corpusagent2.retrieval import (
     RetrievalResult,
     load_dense_assets,
@@ -31,7 +32,7 @@ DEFAULT_METADATA_PATH = (PROJECT_ROOT / "data" / "indices" / "doc_metadata.parqu
 DEFAULT_INDEX_ROOT = (PROJECT_ROOT / "data" / "indices").resolve()
 DEFAULT_AUDIT_DIR = (PROJECT_ROOT / "outputs" / "retrieval_audit").resolve()
 
-DENSE_MODEL_ID = "intfloat/e5-base-v2"
+DENSE_MODEL_ID = dense_model_id_from_env()
 BACKTEST_TOP_K = 100
 SNIPPET_CHARS = 320
 

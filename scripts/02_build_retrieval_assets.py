@@ -14,6 +14,7 @@ if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
 from corpusagent2.io_utils import ensure_absolute, ensure_exists, read_documents, write_json
+from corpusagent2.model_config import dense_model_id_from_env
 from corpusagent2.retrieval import (
     _load_sentence_transformer,
     build_dense_embeddings,
@@ -140,7 +141,7 @@ if __name__ == "__main__":
     INDEX_ROOT = (PROJECT_ROOT / "data" / "indices").resolve()
     SUMMARY_PATH = (PROJECT_ROOT / "outputs" / "build_retrieval_assets_summary.json").resolve()
 
-    DENSE_MODEL_ID = "intfloat/e5-base-v2"
+    DENSE_MODEL_ID = dense_model_id_from_env()
     DENSE_BATCH_SIZE = _env_int("CORPUSAGENT2_DENSE_BATCH_SIZE", 128)
     DENSE_CHUNK_SIZE = _env_int("CORPUSAGENT2_DENSE_CHUNK_SIZE", 2048)
     DENSE_DEVICE = None
