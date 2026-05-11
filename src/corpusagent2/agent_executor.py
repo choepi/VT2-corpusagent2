@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import time
+import traceback as _tb
 from typing import Any
 
 from .agent_capabilities import AgentExecutionContext
@@ -23,6 +24,40 @@ def _safe_json(value: Any) -> Any:
 
 def _utc_now() -> str:
     return datetime.now(UTC).isoformat()
+
+
+_TIMEOUT_HINTS = ("timeout", "timed out", "deadline")
+_NETWORK_HINTS = ("connection", "connect", "dns", "resolve", "network", "ssl", "tls", "unreachable")
+_LLM_HINTS = ("openai", "api key", "rate limit", "model", "completion", "chat", "llm")
+_DATA_HINTS = ("empty", "no rows", "no data", "missing field", "key error", "no_data")
+
+
+def _classify_exception(exc: BaseException) -> str:
+    cls_name = exc.__class__.__name__.lower()
+    text = (str(exc) or "").lower()
+    blob = f"{cls_name} {text}"
+    if any(hint in blob for hint in _TIMEOUT_HINTS):
+        return "timeout"
+    if "keyerror" in cls_name or "missing field" in blob:
+        return "missing_input"
+    if any(hint in blob for hint in _LLM_HINTS):
+        return "llm_error"
+    if any(hint in blob for hint in _NETWORK_HINTS):
+        return "network_error"
+    if any(hint in blob for hint in _DATA_HINTS):
+        return "data_empty"
+    return "tool_error"
+
+
+def _truncate_for_snapshot(value: Any, *, max_chars: int = 2000) -> Any:
+    try:
+        safe = _safe_json(value)
+    except Exception:
+        safe = str(value)
+    text = json.dumps(safe, default=str)
+    if len(text) <= max_chars:
+        return safe
+    return {"_truncated": True, "_preview": text[:max_chars] + "..."}
 
 
 def _result_items(payload: Any) -> tuple[str, list[Any]]:
@@ -334,6 +369,33 @@ class AsyncPlanExecutor:
         )
         return str(target)
 
+    def _write_failure_artifact(
+        self,
+        artifacts_dir: Path,
+        node: AgentPlanNode,
+        failure: AgentFailure,
+        *,
+        status: str,
+        started_at_utc: str,
+        finished_at_utc: str,
+        duration_ms: float,
+    ) -> str:
+        target = artifacts_dir / "nodes" / f"{node.node_id}.json"
+        write_json(
+            target,
+            {
+                "status": status,
+                "node_id": node.node_id,
+                "capability": node.capability,
+                "tool_name": node.tool_name,
+                "started_at_utc": started_at_utc,
+                "finished_at_utc": finished_at_utc,
+                "duration_ms": duration_ms,
+                "failure": failure.to_dict(),
+            },
+        )
+        return str(target)
+
     def _emit_event(self, context: AgentExecutionContext, payload: dict[str, Any]) -> None:
         if context.event_callback is None:
             return
@@ -352,6 +414,9 @@ class AsyncPlanExecutor:
         started_perf = time.perf_counter()
         attempts = 0
         last_error = ""
+        last_traceback = ""
+        last_exception_type = ""
+        last_category = "unknown"
 
         def cancelled_response(
             reason: str,
@@ -451,6 +516,8 @@ class AsyncPlanExecutor:
         except Exception as exc:
             finished_at = _utc_now()
             duration_ms = (time.perf_counter() - started_perf) * 1000.0
+            tb_text = _tb.format_exc()
+            category = _classify_exception(exc)
             self._emit_event(
                 context,
                 {
@@ -459,6 +526,7 @@ class AsyncPlanExecutor:
                     "capability": node.capability,
                     "status": "failed",
                     "error": str(exc),
+                    "error_category": category,
                     "started_at_utc": started_at,
                     "finished_at_utc": finished_at,
                     "duration_ms": duration_ms,
@@ -470,7 +538,23 @@ class AsyncPlanExecutor:
                 error_type=exc.__class__.__name__,
                 message=str(exc),
                 retriable=False,
+                traceback=tb_text,
+                input_snapshot=_truncate_for_snapshot(dict(node.inputs)),
+                retry_count=0,
+                category=category,
             )
+            try:
+                self._write_failure_artifact(
+                    context.artifacts_dir,
+                    node,
+                    failure,
+                    status="failed",
+                    started_at_utc=started_at,
+                    finished_at_utc=finished_at,
+                    duration_ms=duration_ms,
+                )
+            except Exception:
+                pass
             return (
                 AgentNodeExecutionRecord(
                     node_id=node.node_id,
@@ -814,6 +898,9 @@ class AsyncPlanExecutor:
                 )
             except Exception as exc:
                 last_error = str(exc)
+                last_traceback = _tb.format_exc()
+                last_exception_type = exc.__class__.__name__
+                last_category = _classify_exception(exc)
                 context.working_store.record_tool_call(
                     context.run_id,
                     node.node_id,
@@ -822,6 +909,8 @@ class AsyncPlanExecutor:
                     "failed",
                     {
                         "error": last_error,
+                        "error_category": last_category,
+                        "exception_type": last_exception_type,
                         "attempt": attempts,
                         "started_at_utc": started_at,
                         "inputs": _safe_json(node.inputs),
@@ -858,11 +947,27 @@ class AsyncPlanExecutor:
         failure = AgentFailure(
             node_id=node.node_id,
             capability=node.capability,
-            error_type="execution_failed",
+            error_type=last_exception_type or "execution_failed",
             message=last_error,
             retriable=node.optional,
+            traceback=last_traceback,
+            input_snapshot=_truncate_for_snapshot(dict(node.inputs)),
+            retry_count=attempts,
+            category=last_category,
         )
         status = "skipped" if node.optional else "failed"
+        try:
+            self._write_failure_artifact(
+                context.artifacts_dir,
+                node,
+                failure,
+                status=status,
+                started_at_utc=started_at,
+                finished_at_utc=finished_at,
+                duration_ms=duration_ms,
+            )
+        except Exception:
+            pass
         return (
             AgentNodeExecutionRecord(
                 node_id=node.node_id,
