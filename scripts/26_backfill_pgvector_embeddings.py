@@ -15,6 +15,7 @@ if str(SRC_ROOT) not in sys.path:
 
 from corpusagent2.app_config import load_project_configuration
 from corpusagent2.io_utils import ensure_absolute, write_json
+from corpusagent2.model_config import dense_model_id_from_env
 from corpusagent2.retrieval import _load_sentence_transformer, dense_asset_health, pg_dsn_from_env, pg_table_from_env
 from corpusagent2.seed import set_global_seed
 
@@ -50,7 +51,7 @@ if __name__ == "__main__":
     PROJECT_ROOT = Path(__file__).resolve().parents[1]
     SUMMARY_PATH = (PROJECT_ROOT / "outputs" / "postgres" / "backfill_dense_embeddings_summary.json").resolve()
     DENSE_DIR = (PROJECT_ROOT / "data" / "indices" / "dense").resolve()
-    DENSE_MODEL_ID = os.getenv("CORPUSAGENT2_DENSE_MODEL_ID", "intfloat/e5-base-v2").strip() or "intfloat/e5-base-v2"
+    DENSE_MODEL_ID = dense_model_id_from_env()
     FETCH_BATCH_SIZE = parse_int_env("CORPUSAGENT2_PG_BACKFILL_FETCH_BATCH_SIZE", 256)
     ENCODE_BATCH_SIZE = parse_int_env("CORPUSAGENT2_PG_BACKFILL_ENCODE_BATCH_SIZE", 64)
     LIMIT_ROWS = parse_int_env("CORPUSAGENT2_PG_BACKFILL_LIMIT_ROWS", 0) if os.getenv("CORPUSAGENT2_PG_BACKFILL_LIMIT_ROWS", "").strip() else 0

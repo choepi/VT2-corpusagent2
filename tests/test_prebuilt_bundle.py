@@ -66,6 +66,14 @@ def test_skip_dense_option_is_available_for_offline_smoke_builds() -> None:
     assert args.skip_dense is True
 
 
+def test_dense_model_id_option_accepts_local_model_path() -> None:
+    module = _load_prebuilt_module()
+
+    args = module.parse_args(["--source-file", "example.jsonl", "--dense-model-id", "C:/models/e5-base-v2"])
+
+    assert args.dense_model_id == "C:/models/e5-base-v2"
+
+
 def test_jsonl_source_accepts_utf8_bom_from_windows_powershell() -> None:
     module = _load_prebuilt_module()
     source_path = Path(__file__).with_name("_bom_source_tmp.jsonl")

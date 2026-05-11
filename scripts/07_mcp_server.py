@@ -15,6 +15,7 @@ if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
 from corpusagent2.faithfulness import NLIVerifier, evaluate_claims_with_nli
+from corpusagent2.model_config import dense_model_id_from_env
 from corpusagent2.retrieval import (
     load_dense_assets,
     load_lexical_assets,
@@ -35,7 +36,7 @@ from mcp.server.fastmcp import FastMCP
 
 INDEX_ROOT = (PROJECT_ROOT / "data" / "indices").resolve()
 NLP_OUTPUT_DIR = (PROJECT_ROOT / "outputs" / "nlp_tools").resolve()
-DENSE_MODEL_ID = "intfloat/e5-base-v2"
+DENSE_MODEL_ID = dense_model_id_from_env()
 RERANK_MODEL_ID = "cross-encoder/ms-marco-MiniLM-L-6-v2"
 NLI_MODEL_ID = "FacebookAI/roberta-large-mnli"
 RETRIEVAL_BACKEND = resolve_retrieval_backend("local")

@@ -24,6 +24,7 @@ from .io_utils import sentence_split as simple_sentence_split
 from .python_runner_service import DockerPythonRunnerService
 from .retrieval_budgeting import infer_retrieval_budget
 from .retrieval import _load_sentence_transformer, pg_dsn_from_env, retrieve_tfidf
+from .model_config import dense_model_id_from_env
 from .seed import resolve_device
 from .tool_registry import CapabilityToolAdapter, SchemaDescriptor, ToolExecutionResult, ToolRegistry, ToolSpec
 
@@ -2568,7 +2569,7 @@ def _sentence_embedding_model_id(context: AgentExecutionContext, params: dict[st
         return model_id
     if context.runtime is not None and getattr(context.runtime, "dense_model_id", ""):
         return str(context.runtime.dense_model_id)
-    return "intfloat/e5-base-v2"
+    return dense_model_id_from_env()
 
 
 def _encode_texts(

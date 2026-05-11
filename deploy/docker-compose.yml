@@ -29,6 +29,7 @@ services:
       CORPUSAGENT2_REQUIRE_BACKEND_SERVICES: "true"
       CORPUSAGENT2_ALLOW_LOCAL_FALLBACK: "false"
       CORPUSAGENT2_DEVICE: ${CORPUSAGENT2_DEVICE:-cpu}
+      CORPUSAGENT2_DENSE_MODEL_ID: ${CORPUSAGENT2_DOCKER_DENSE_MODEL_ID:-/models/e5-base-v2}
       CORPUSAGENT2_PYTHON_RUNNER_SHARED_TMP: ${CORPUSAGENT2_PYTHON_RUNNER_SHARED_TMP:-/tmp/corpusagent2_python_runner}
     command: ["python", "/app/scripts/12_run_agent_api.py"]
     ports:
@@ -36,6 +37,10 @@ services:
     volumes:
       - ../data:/app/data:ro
       - ../outputs:/app/outputs
+      - type: bind
+        source: ${CORPUSAGENT2_DENSE_MODEL_HOST_PATH:-../../e5-base-v2}
+        target: ${CORPUSAGENT2_DOCKER_DENSE_MODEL_ID:-/models/e5-base-v2}
+        read_only: true
       - /var/run/docker.sock:/var/run/docker.sock
       - ${CORPUSAGENT2_PYTHON_RUNNER_SHARED_TMP:-/tmp/corpusagent2_python_runner}:${CORPUSAGENT2_PYTHON_RUNNER_SHARED_TMP:-/tmp/corpusagent2_python_runner}
     cpus: "${CORPUSAGENT2_API_CPUS:-4}"

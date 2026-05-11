@@ -18,6 +18,7 @@ from corpusagent2.io_utils import (
     write_json,
     write_jsonl,
 )
+from corpusagent2.model_config import dense_model_id_from_env
 from corpusagent2.metrics import (
     bootstrap_confidence_interval,
     evidence_completeness,
@@ -64,7 +65,7 @@ if __name__ == "__main__":
     PER_QUERY_PATH = (OUTPUT_DIR / "per_query_metrics.jsonl").resolve()
     SUMMARY_PATH = (OUTPUT_DIR / "summary.json").resolve()
 
-    DENSE_MODEL_ID = "intfloat/e5-base-v2"
+    DENSE_MODEL_ID = dense_model_id_from_env()
     DENSE_DEVICE = None
     CROSS_ENCODER_MODEL_ID = "cross-encoder/ms-marco-MiniLM-L-6-v2"
     RETRIEVAL_BACKEND = resolve_retrieval_backend("local")
