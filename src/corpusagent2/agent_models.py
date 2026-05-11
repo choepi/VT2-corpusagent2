@@ -208,6 +208,27 @@ class PlannerAction:
         }
 
 
+_FAILURE_HEADLINE_BY_CATEGORY: dict[str, str] = {
+    "timeout": "Tool exceeded its time budget",
+    "missing_input": "Required input was missing or malformed",
+    "tool_error": "Tool raised an unexpected error",
+    "llm_error": "LLM call failed (rate-limit, auth, or model error)",
+    "network_error": "Network or backend service was unreachable",
+    "data_empty": "Upstream produced no usable rows",
+    "unknown": "Unclassified failure",
+}
+
+
+def short_failure_message(category: str, message: str) -> str:
+    headline = _FAILURE_HEADLINE_BY_CATEGORY.get(category, _FAILURE_HEADLINE_BY_CATEGORY["unknown"])
+    detail = str(message or "").strip().splitlines()[0] if message else ""
+    if not detail:
+        return headline
+    if len(detail) > 160:
+        detail = detail[:157].rstrip() + "..."
+    return f"{headline}: {detail}"
+
+
 @dataclass(slots=True)
 class AgentFailure:
     node_id: str
@@ -221,8 +242,14 @@ class AgentFailure:
     retry_count: int = 0
     category: str = "unknown"
 
+    @property
+    def short_message(self) -> str:
+        return short_failure_message(self.category, self.message)
+
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        payload = asdict(self)
+        payload["short_message"] = self.short_message
+        return payload
 
 
 @dataclass(slots=True)
