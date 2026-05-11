@@ -62,6 +62,65 @@ def _truncate_for_snapshot(value: Any, *, max_chars: int = 2000) -> Any:
     return {"_truncated": True, "_preview": text[:max_chars] + "..."}
 
 
+# Capabilities where falling back to the "heuristic" provider means the
+# intended NLP path failed and a token-counting shortcut was used. For
+# these the node must NOT be reported as a clean "completed" because the
+# thesis claim about real NLP would be invalid. Capabilities that are
+# heuristic-by-design (entity_link, claim_strength_score, ...) stay out
+# of this set: heuristic IS the intended provider there.
+_HEURISTIC_FALLBACK_DEGRADES_CAPABILITY: frozenset[str] = frozenset(
+    {
+        "ner",
+        "sentiment",
+        "topic_model",
+        "framing_series",
+        "extract_svo_triples",
+        "stance_detect",
+        "discourse_parse",
+        "coref_resolve",
+        "keyphrase_extract",
+        "readability_stats",
+        "lemmatize",
+    }
+)
+
+
+def _node_status_from_result(capability: str, result: ToolExecutionResult) -> str:
+    metadata = result.metadata or {}
+    if metadata.get("degraded") is True:
+        return "degraded"
+    provider = str(metadata.get("provider", "")).strip().lower()
+    if provider == "heuristic" and capability in _HEURISTIC_FALLBACK_DEGRADES_CAPABILITY:
+        return "degraded"
+    if metadata.get("provider_fallback_reason") and capability in _HEURISTIC_FALLBACK_DEGRADES_CAPABILITY:
+        return "degraded"
+    return "completed"
+
+
+def _build_degraded_recovery_result(
+    *,
+    reason: str,
+    capability: str,
+    upstream_rows: list[dict[str, Any]],
+) -> ToolExecutionResult:
+    return ToolExecutionResult(
+        payload={
+            "rows": upstream_rows,
+            "degraded": True,
+            "recovery_reason": reason,
+        },
+        caveats=[f"Recovery advisor marked {capability} degraded: {reason}"],
+        metadata={
+            "degraded": True,
+            "recovery": "mark_degraded",
+            "reason": reason,
+            "provider": "recovery_advisor",
+            "tool_name": "mark_degraded",
+            "no_data": not upstream_rows,
+        },
+    )
+
+
 def _result_items(payload: Any) -> tuple[str, list[Any]]:
     if not isinstance(payload, dict):
         return "", []
@@ -729,13 +788,14 @@ class AsyncPlanExecutor:
             resolved_provider = str(result.metadata.get("provider", resolution.spec.provider))
             resolved_tool_version = str(result.metadata.get("tool_version", resolution.spec.tool_version))
             resolved_model_id = str(result.metadata.get("model_id", resolution.spec.model_id))
+            node_status_cached = _node_status_from_result(node.capability, result)
             artifact_path = self._write_node_artifact(context.artifacts_dir, node, result)
             context.working_store.record_tool_call(
                 context.run_id,
                 node.node_id,
                 node.capability,
                 resolved_tool_name,
-                "completed",
+                node_status_cached,
                 {
                     "cache_hit": True,
                     "started_at_utc": started_at,
@@ -771,7 +831,8 @@ class AsyncPlanExecutor:
                     "event": "node_completed",
                     "node_id": node.node_id,
                     "capability": node.capability,
-                    "status": "completed",
+                    "status": node_status_cached,
+                    "degraded": node_status_cached == "degraded",
                     "cache_hit": True,
                     "tool_name": resolved_tool_name,
                     "provider": resolved_provider,
@@ -794,7 +855,7 @@ class AsyncPlanExecutor:
                 AgentNodeExecutionRecord(
                     node_id=node.node_id,
                     capability=node.capability,
-                    status="completed",
+                    status=node_status_cached,
                     started_at_utc=started_at,
                     finished_at_utc=finished_at,
                     duration_ms=duration_ms,
@@ -817,158 +878,322 @@ class AsyncPlanExecutor:
             )
 
         retry_policy = RetryPolicy.from_env()
-        while attempts < retry_policy.max_attempts:
-            if self._is_cancelled(context):
-                return cancelled_response(
-                    "Skipped because run abort was requested before this tool attempt started.",
-                    tool_name=resolution.spec.tool_name,
-                    provider=resolution.spec.provider,
-                )
-            if attempts >= 1:
-                # Only retry transient errors. Permanent failures should not
-                # consume more attempts.
-                if not retry_policy.is_retriable(last_category):
-                    break
-                delay_s = retry_policy.compute_delay_s(attempts + 1)
-                if delay_s > 0:
-                    time.sleep(delay_s)
-            attempts += 1
-            try:
-                context.working_store.record_tool_call(
-                    context.run_id,
-                    node.node_id,
-                    node.capability,
-                    resolution.spec.tool_name,
-                    "running",
-                    {
-                        "attempt": attempts,
-                        "started_at_utc": started_at,
-                        "inputs": _safe_json(node.inputs),
-                        "dependency_nodes": sorted(dependency_results.keys()),
-                        "cache_key": cache_key,
-                    },
-                )
-                result = await asyncio.to_thread(
-                    resolution.adapter.run,
-                    dict(node.inputs),
-                    dependency_results,
-                    context,
-                )
-                if not getattr(context.state, "no_cache", False) and node.cacheable:
-                    self._cache[cache_key] = result
-                artifact_path = self._write_node_artifact(context.artifacts_dir, node, result)
-                context.working_store.record_tool_call(
-                    context.run_id,
-                    node.node_id,
-                    node.capability,
-                    str(result.metadata.get("tool_name", resolution.spec.tool_name)),
-                    "completed",
-                    {
-                        "cache_hit": False,
-                        "attempt": attempts,
-                        "started_at_utc": started_at,
-                        "finished_at_utc": _utc_now(),
-                        "inputs": _safe_json(node.inputs),
-                        "dependency_nodes": sorted(dependency_results.keys()),
-                        "cache_key": cache_key,
-                        "summary": _summarize_tool_result(result, dependency_results=dependency_results),
-                        "payload": _compact_payload_for_storage(result.payload),
-                    },
-                )
-                context.working_store.record_artifact(
-                    context.run_id,
-                    node.node_id,
-                    artifact_path,
-                    {"capability": node.capability},
-                )
-                resolved_tool_name = str(result.metadata.get("tool_name", resolution.spec.tool_name))
-                resolved_provider = str(result.metadata.get("provider", resolution.spec.provider))
-                resolved_tool_version = str(result.metadata.get("tool_version", resolution.spec.tool_version))
-                resolved_model_id = str(result.metadata.get("model_id", resolution.spec.model_id))
-                provenance = make_provenance_record(
-                    run_id=context.run_id,
-                    tool_name=resolved_tool_name,
-                    tool_version=resolved_tool_version,
-                    model_id=resolved_model_id or resolved_provider,
-                    params=dict(node.inputs),
-                    inputs_ref={"node_id": node.node_id, "dependency_nodes": sorted(dependency_results.keys())},
-                    outputs_ref={"artifact_path": artifact_path},
-                    evidence=list(result.evidence_items),
-                ).to_dict()
-                finished_at = _utc_now()
-                duration_ms = (time.perf_counter() - started_perf) * 1000.0
-                self._emit_event(
-                    context,
-                    {
-                        "event": "node_completed",
-                        "node_id": node.node_id,
-                        "capability": node.capability,
-                        "status": "completed",
-                        "cache_hit": False,
-                        "tool_name": resolved_tool_name,
-                        "provider": resolved_provider,
-                        "tool_version": resolved_tool_version,
-                        "model_id": resolved_model_id,
-                        "tool_reason": resolution.reason,
-                        "inputs": _safe_json(node.inputs),
-                        "dependency_nodes": sorted(dependency_results.keys()),
-                        "documents_processed": _dependency_document_count(dependency_results),
-                        "cache_key": cache_key,
-                        "summary": _summarize_tool_result(result, dependency_results=dependency_results),
-                        "artifacts": list(result.artifacts_used) + [artifact_path],
-                        "started_at_utc": started_at,
-                        "finished_at_utc": finished_at,
-                        "duration_ms": duration_ms,
-                        "requested_tool_name": node.tool_name,
-                    },
-                )
-                return (
-                    AgentNodeExecutionRecord(
-                        node_id=node.node_id,
-                        capability=node.capability,
-                        status="completed",
-                        started_at_utc=started_at,
-                        finished_at_utc=finished_at,
-                        duration_ms=duration_ms,
-                        attempts=attempts,
-                        cache_key=cache_key,
-                        cache_hit=False,
+        recovery_max_attempts = _recovery_advisor.max_attempts() if _recovery_advisor.is_enabled() else 0
+        recovery_attempts_used = 0
+        recovery_actions_log: list[dict[str, Any]] = []
+        recovery_advisor_error: str = ""
+
+        while True:
+            # Reset retry state at the start of each recovery iteration so
+            # the next attempt is a clean run with potentially modified
+            # inputs from the advisor.
+            attempts = 0
+            last_error = ""
+            last_traceback = ""
+            last_exception_type = ""
+            last_category = "unknown"
+
+            while attempts < retry_policy.max_attempts:
+                if self._is_cancelled(context):
+                    return cancelled_response(
+                        "Skipped because run abort was requested before this tool attempt started.",
+                        tool_name=resolution.spec.tool_name,
+                        provider=resolution.spec.provider,
+                    )
+                if attempts >= 1:
+                    # Only retry transient errors. Permanent failures should
+                    # not consume more attempts.
+                    if not retry_policy.is_retriable(last_category):
+                        break
+                    delay_s = retry_policy.compute_delay_s(attempts + 1)
+                    if delay_s > 0:
+                        time.sleep(delay_s)
+                attempts += 1
+                try:
+                    context.working_store.record_tool_call(
+                        context.run_id,
+                        node.node_id,
+                        node.capability,
+                        resolution.spec.tool_name,
+                        "running",
+                        {
+                            "attempt": attempts,
+                            "started_at_utc": started_at,
+                            "inputs": _safe_json(node.inputs),
+                            "dependency_nodes": sorted(dependency_results.keys()),
+                            "cache_key": cache_key,
+                        },
+                    )
+                    result = await asyncio.to_thread(
+                        resolution.adapter.run,
+                        dict(node.inputs),
+                        dependency_results,
+                        context,
+                    )
+                    if not getattr(context.state, "no_cache", False) and node.cacheable:
+                        self._cache[cache_key] = result
+                    artifact_path = self._write_node_artifact(context.artifacts_dir, node, result)
+                    node_status_fresh = _node_status_from_result(node.capability, result)
+                    context.working_store.record_tool_call(
+                        context.run_id,
+                        node.node_id,
+                        node.capability,
+                        str(result.metadata.get("tool_name", resolution.spec.tool_name)),
+                        node_status_fresh,
+                        {
+                            "cache_hit": False,
+                            "attempt": attempts,
+                            "started_at_utc": started_at,
+                            "finished_at_utc": _utc_now(),
+                            "inputs": _safe_json(node.inputs),
+                            "dependency_nodes": sorted(dependency_results.keys()),
+                            "cache_key": cache_key,
+                            "summary": _summarize_tool_result(result, dependency_results=dependency_results),
+                            "payload": _compact_payload_for_storage(result.payload),
+                        },
+                    )
+                    context.working_store.record_artifact(
+                        context.run_id,
+                        node.node_id,
+                        artifact_path,
+                        {"capability": node.capability},
+                    )
+                    resolved_tool_name = str(result.metadata.get("tool_name", resolution.spec.tool_name))
+                    resolved_provider = str(result.metadata.get("provider", resolution.spec.provider))
+                    resolved_tool_version = str(result.metadata.get("tool_version", resolution.spec.tool_version))
+                    resolved_model_id = str(result.metadata.get("model_id", resolution.spec.model_id))
+                    provenance = make_provenance_record(
+                        run_id=context.run_id,
                         tool_name=resolved_tool_name,
-                        provider=resolved_provider,
                         tool_version=resolved_tool_version,
-                        model_id=resolved_model_id,
-                        tool_reason=resolution.reason,
-                        artifacts_used=list(result.artifacts_used) + [artifact_path],
-                        evidence_count=len(result.evidence_items),
-                        caveats=list(result.caveats),
-                        unsupported_parts=list(result.unsupported_parts),
-                    ),
-                    result,
-                    None,
-                    provenance,
-                )
-            except Exception as exc:
-                last_error = str(exc)
-                last_traceback = _tb.format_exc()
-                last_exception_type = exc.__class__.__name__
-                last_category = _classify_exception(exc)
-                context.working_store.record_tool_call(
-                    context.run_id,
-                    node.node_id,
-                    node.capability,
-                    resolution.spec.tool_name,
-                    "failed",
-                    {
-                        "error": last_error,
-                        "error_category": last_category,
-                        "exception_type": last_exception_type,
-                        "attempt": attempts,
-                        "started_at_utc": started_at,
-                        "inputs": _safe_json(node.inputs),
-                        "dependency_nodes": sorted(dependency_results.keys()),
-                        "cache_key": cache_key,
-                    },
-                )
+                        model_id=resolved_model_id or resolved_provider,
+                        params=dict(node.inputs),
+                        inputs_ref={"node_id": node.node_id, "dependency_nodes": sorted(dependency_results.keys())},
+                        outputs_ref={"artifact_path": artifact_path},
+                        evidence=list(result.evidence_items),
+                    ).to_dict()
+                    finished_at = _utc_now()
+                    duration_ms = (time.perf_counter() - started_perf) * 1000.0
+                    extra_event_fields: dict[str, Any] = {}
+                    if recovery_actions_log:
+                        extra_event_fields["recovery_actions"] = list(recovery_actions_log)
+                    self._emit_event(
+                        context,
+                        {
+                            "event": "node_completed",
+                            "node_id": node.node_id,
+                            "capability": node.capability,
+                            "status": node_status_fresh,
+                            "degraded": node_status_fresh == "degraded",
+                            "cache_hit": False,
+                            "tool_name": resolved_tool_name,
+                            "provider": resolved_provider,
+                            "tool_version": resolved_tool_version,
+                            "model_id": resolved_model_id,
+                            "tool_reason": resolution.reason,
+                            "inputs": _safe_json(node.inputs),
+                            "dependency_nodes": sorted(dependency_results.keys()),
+                            "documents_processed": _dependency_document_count(dependency_results),
+                            "cache_key": cache_key,
+                            "summary": _summarize_tool_result(result, dependency_results=dependency_results),
+                            "artifacts": list(result.artifacts_used) + [artifact_path],
+                            "started_at_utc": started_at,
+                            "finished_at_utc": finished_at,
+                            "duration_ms": duration_ms,
+                            "requested_tool_name": node.tool_name,
+                            **extra_event_fields,
+                        },
+                    )
+                    return (
+                        AgentNodeExecutionRecord(
+                            node_id=node.node_id,
+                            capability=node.capability,
+                            status=node_status_fresh,
+                            started_at_utc=started_at,
+                            finished_at_utc=finished_at,
+                            duration_ms=duration_ms,
+                            attempts=attempts,
+                            cache_key=cache_key,
+                            cache_hit=False,
+                            tool_name=resolved_tool_name,
+                            provider=resolved_provider,
+                            tool_version=resolved_tool_version,
+                            model_id=resolved_model_id,
+                            tool_reason=resolution.reason,
+                            artifacts_used=list(result.artifacts_used) + [artifact_path],
+                            evidence_count=len(result.evidence_items),
+                            caveats=list(result.caveats),
+                            unsupported_parts=list(result.unsupported_parts),
+                        ),
+                        result,
+                        None,
+                        provenance,
+                    )
+                except Exception as exc:
+                    last_error = str(exc)
+                    last_traceback = _tb.format_exc()
+                    last_exception_type = exc.__class__.__name__
+                    last_category = _classify_exception(exc)
+                    context.working_store.record_tool_call(
+                        context.run_id,
+                        node.node_id,
+                        node.capability,
+                        resolution.spec.tool_name,
+                        "failed",
+                        {
+                            "error": last_error,
+                            "error_category": last_category,
+                            "exception_type": last_exception_type,
+                            "attempt": attempts,
+                            "started_at_utc": started_at,
+                            "inputs": _safe_json(node.inputs),
+                            "dependency_nodes": sorted(dependency_results.keys()),
+                            "cache_key": cache_key,
+                        },
+                    )
+
+            # Retry loop exhausted. Consult the recovery advisor if enabled
+            # and the budget allows. The advisor can ask for a retry with
+            # modified inputs (continue outer loop), accept a degraded
+            # result, or fall back to fail. Plan topology is never touched.
+            if (
+                _recovery_advisor.is_enabled()
+                and getattr(self, "_recovery_advisor_factory", None) is not None
+                and recovery_attempts_used < recovery_max_attempts
+            ):
+                try:
+                    advisor = self._recovery_advisor_factory()  # type: ignore[attr-defined]
+                except Exception as exc:
+                    advisor = None
+                    recovery_advisor_error = f"factory error: {exc}"
+                if advisor is not None:
+                    try:
+                        action = advisor.advise(
+                            node_id=node.node_id,
+                            capability=node.capability,
+                            tool_name=resolution.spec.tool_name,
+                            inputs=dict(node.inputs),
+                            traceback=last_traceback,
+                            failure_category=last_category,
+                            upstream_summary={k: True for k in dependency_results},
+                            candidate_capabilities=self.registry.list_capabilities_in_same_category(node.capability)
+                            if hasattr(self.registry, "list_capabilities_in_same_category")
+                            else [],
+                        )
+                    except Exception as exc:
+                        recovery_advisor_error = f"advise error: {exc}"
+                        action = None
+                    if action is not None:
+                        recovery_attempts_used += 1
+                        recovery_actions_log.append(
+                            {
+                                "attempt": recovery_attempts_used,
+                                "from_category": last_category,
+                                **action.to_dict(),
+                            }
+                        )
+                        if (
+                            action.action == "retry_with_modified_inputs"
+                            and isinstance(action.inputs, dict)
+                            and action.inputs
+                        ):
+                            # Mutate in-place so the next retry uses the new
+                            # inputs. PlanDAG topology is untouched.
+                            node.inputs.update(action.inputs)
+                            continue
+                        if action.action == "mark_degraded":
+                            upstream_rows: list[dict[str, Any]] = []
+                            for dep_result in dependency_results.values():
+                                payload = dep_result.payload
+                                if isinstance(payload, dict) and isinstance(payload.get("rows"), list):
+                                    upstream_rows = [
+                                        dict(item) for item in payload["rows"] if isinstance(item, dict)
+                                    ]
+                                    if upstream_rows:
+                                        break
+                            degraded_result = _build_degraded_recovery_result(
+                                reason=action.reason or "advisor requested mark_degraded",
+                                capability=node.capability,
+                                upstream_rows=upstream_rows,
+                            )
+                            artifact_path = self._write_node_artifact(
+                                context.artifacts_dir, node, degraded_result
+                            )
+                            context.working_store.record_tool_call(
+                                context.run_id,
+                                node.node_id,
+                                node.capability,
+                                "mark_degraded",
+                                "degraded",
+                                {
+                                    "cache_hit": False,
+                                    "attempt": attempts,
+                                    "started_at_utc": started_at,
+                                    "finished_at_utc": _utc_now(),
+                                    "inputs": _safe_json(node.inputs),
+                                    "dependency_nodes": sorted(dependency_results.keys()),
+                                    "cache_key": cache_key,
+                                    "recovery_action": "mark_degraded",
+                                    "recovery_reason": action.reason,
+                                },
+                            )
+                            context.working_store.record_artifact(
+                                context.run_id,
+                                node.node_id,
+                                artifact_path,
+                                {"capability": node.capability, "degraded": True},
+                            )
+                            finished_at = _utc_now()
+                            duration_ms = (time.perf_counter() - started_perf) * 1000.0
+                            self._emit_event(
+                                context,
+                                {
+                                    "event": "node_completed",
+                                    "node_id": node.node_id,
+                                    "capability": node.capability,
+                                    "status": "degraded",
+                                    "degraded": True,
+                                    "cache_hit": False,
+                                    "tool_name": "mark_degraded",
+                                    "provider": "recovery_advisor",
+                                    "inputs": _safe_json(node.inputs),
+                                    "dependency_nodes": sorted(dependency_results.keys()),
+                                    "documents_processed": _dependency_document_count(dependency_results),
+                                    "cache_key": cache_key,
+                                    "artifacts": [artifact_path],
+                                    "started_at_utc": started_at,
+                                    "finished_at_utc": finished_at,
+                                    "duration_ms": duration_ms,
+                                    "recovery_actions": list(recovery_actions_log),
+                                    "recovery_reason": action.reason,
+                                },
+                            )
+                            return (
+                                AgentNodeExecutionRecord(
+                                    node_id=node.node_id,
+                                    capability=node.capability,
+                                    status="degraded",
+                                    started_at_utc=started_at,
+                                    finished_at_utc=finished_at,
+                                    duration_ms=duration_ms,
+                                    attempts=attempts,
+                                    cache_key=cache_key,
+                                    cache_hit=False,
+                                    tool_name="mark_degraded",
+                                    provider="recovery_advisor",
+                                    tool_reason=action.reason,
+                                    artifacts_used=[artifact_path],
+                                    evidence_count=0,
+                                    caveats=list(degraded_result.caveats),
+                                    unsupported_parts=list(degraded_result.unsupported_parts),
+                                ),
+                                degraded_result,
+                                None,
+                                None,
+                            )
+                        # substitute_capability and fail: log and exit recovery.
+                        break
+            break
 
         finished_at = _utc_now()
         duration_ms = (time.perf_counter() - started_perf) * 1000.0
@@ -993,6 +1218,7 @@ class AsyncPlanExecutor:
                 "finished_at_utc": finished_at,
                 "duration_ms": duration_ms,
                 "requested_tool_name": node.tool_name,
+                "recovery_actions": list(recovery_actions_log),
             },
         )
         failure = AgentFailure(
@@ -1007,30 +1233,10 @@ class AsyncPlanExecutor:
             category=last_category,
         )
         status = "skipped" if node.optional else "failed"
-        # Optional LLM recovery advisor: when CORPUSAGENT2_USE_LLM_RECOVERY=true
-        # is set, log the advisor's suggestion to the failure metadata.
-        # The advisor never mutates the plan; it surfaces a recommended
-        # next step that a human can inspect from the node JSON. Applying
-        # the action automatically is left as an opt-in follow-up.
-        if _recovery_advisor.is_enabled() and getattr(self, "_recovery_advisor_factory", None) is not None:
-            try:
-                advisor = self._recovery_advisor_factory()  # type: ignore[attr-defined]
-                if advisor is not None:
-                    action = advisor.advise(
-                        node_id=node.node_id,
-                        capability=node.capability,
-                        tool_name=resolution.spec.tool_name,
-                        inputs=dict(node.inputs),
-                        traceback=last_traceback,
-                        failure_category=last_category,
-                        upstream_summary={k: True for k in dependency_results},
-                        candidate_capabilities=self.registry.list_capabilities_in_same_category(node.capability)
-                        if hasattr(self.registry, "list_capabilities_in_same_category")
-                        else [],
-                    )
-                    failure.details["recovery_advisor"] = action.to_dict()
-            except Exception as exc:
-                failure.details["recovery_advisor_error"] = str(exc)
+        if recovery_actions_log:
+            failure.details["recovery_actions"] = list(recovery_actions_log)
+        if recovery_advisor_error:
+            failure.details["recovery_advisor_error"] = recovery_advisor_error
         try:
             self._write_failure_artifact(
                 context.artifacts_dir,
