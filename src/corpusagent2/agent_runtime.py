@@ -49,6 +49,48 @@ from .python_runner_service import DockerPythonRunnerService
 
 TERMINAL_RUN_STATUSES = {"completed", "partial", "failed", "rejected", "needs_clarification", "aborted"}
 
+
+def resolve_working_store(
+    *,
+    doc_lookup: dict[str, Any] | None = None,
+    require_backend_services: bool = False,
+) -> WorkingSetStore:
+    """Pick a WorkingSetStore based on env vars.
+
+    CORPUSAGENT2_WORKINGSET_BACKEND:
+      - ``memory``   force InMemoryWorkingSetStore (archive mode)
+      - ``postgres`` require a configured DSN; raise if missing
+      - ``auto``     try Postgres if DSN present, else fall back to memory
+      - unset (default) keep historical behaviour: use Postgres if DSN
+        present, else memory (unless ``require_backend_services`` is set).
+    """
+    backend = os.getenv("CORPUSAGENT2_WORKINGSET_BACKEND", "").strip().lower()
+    if backend == "memory":
+        store = InMemoryWorkingSetStore()
+        if doc_lookup:
+            store.document_lookup.update(doc_lookup)
+        return store
+    if backend not in {"", "postgres", "auto"}:
+        raise ValueError(
+            f"Unknown CORPUSAGENT2_WORKINGSET_BACKEND={backend!r}; expected 'postgres', 'memory', or 'auto'."
+        )
+    try:
+        dsn = pg_dsn_from_env(required=False)
+    except Exception:
+        dsn = ""
+    if dsn:
+        return PostgresWorkingSetStore(dsn=dsn, documents_table=pg_table_from_env(default="article_corpus"))
+    if backend == "postgres":
+        raise RuntimeError(
+            "CORPUSAGENT2_WORKINGSET_BACKEND=postgres but CORPUSAGENT2_PG_DSN is not configured."
+        )
+    if require_backend_services and backend != "auto":
+        raise RuntimeError("Postgres working store is required but CORPUSAGENT2_PG_DSN is not configured.")
+    store = InMemoryWorkingSetStore()
+    if doc_lookup:
+        store.document_lookup.update(doc_lookup)
+    return store
+
 TOOL_USAGE_CATEGORIES: tuple[tuple[str, set[str]], ...] = (
     ("Retrieval and working sets", {"db_search", "sql_query_search", "fetch_documents", "create_working_set", "filter_working_set"}),
     ("Temporal and structured series", {"time_series_aggregate", "change_point_detect", "burst_detect", "join_external_series"}),
@@ -5104,17 +5146,10 @@ class AgentRuntime:
         )
 
     def _build_working_store(self) -> WorkingSetStore:
-        try:
-            dsn = pg_dsn_from_env(required=False)
-        except Exception:
-            dsn = ""
-        if dsn:
-            return PostgresWorkingSetStore(dsn=dsn, documents_table=pg_table_from_env(default="article_corpus"))
-        if self.require_backend_services:
-            raise RuntimeError("Postgres working store is required but CORPUSAGENT2_PG_DSN is not configured.")
-        store = InMemoryWorkingSetStore()
-        store.document_lookup.update(self.runtime.doc_lookup())
-        return store
+        return resolve_working_store(
+            doc_lookup=self.runtime.doc_lookup(),
+            require_backend_services=self.require_backend_services,
+        )
 
     def _corpus_date_bounds(self) -> tuple[str, str] | None:
         if self._corpus_date_bounds_cache is not None:
