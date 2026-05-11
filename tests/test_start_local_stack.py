@@ -125,11 +125,16 @@ def test_dockerized_api_and_mcp_share_runtime_image_and_sandbox_mounts() -> None
     assert "ARG CORPUSAGENT2_DOCKER_INSTALL_NLP_PROVIDERS=false" in dockerfile_text
     assert "ARG CORPUSAGENT2_DOCKER_DOWNLOAD_PROVIDER_ASSETS=false" in dockerfile_text
     assert "deploy/requirements.docker-cpu.txt" in dockerfile_text
+    assert "deploy/requirements.docker-torch-cpu.txt" in dockerfile_text
     assert "deploy/requirements.docker-nlp-providers.txt" in dockerfile_text
     assert "RUN set -eu;" in dockerfile_text
+    assert "uv --system-certs pip install" in dockerfile_text
+    assert "uv --system-certs sync --frozen" in dockerfile_text
+    assert "--allow-insecure-host download.pytorch.org" in dockerfile_text
+    assert "--allow-insecure-host download-r2.pytorch.org" in dockerfile_text
+    assert "--index-url https://download.pytorch.org/whl/cpu" in dockerfile_text
     assert "--index-url https://pypi.org/simple" in dockerfile_text
     assert "--torch-backend cpu" not in dockerfile_text
-    assert "https://download.pytorch.org/whl/cpu" not in dockerfile_text
     assert "Unsupported CORPUSAGENT2_DOCKER_TORCH_PROFILE" in dockerfile_text
     assert "PYTHONPATH=/app/src" in dockerfile_text
     assert "CMD [\"python\", \"/app/scripts/12_run_agent_api.py\"]" in dockerfile_text
@@ -155,12 +160,14 @@ def test_dockerized_api_and_mcp_share_runtime_image_and_sandbox_mounts() -> None
 def test_docker_cpu_requirements_use_cpu_torch_and_real_provider_stack() -> None:
     project_root = Path(__file__).resolve().parents[1]
     cpu_requirements = (project_root / "deploy" / "requirements.docker-cpu.txt").read_text(encoding="utf-8")
+    torch_cpu_requirements = (project_root / "deploy" / "requirements.docker-torch-cpu.txt").read_text(encoding="utf-8")
     provider_requirements = (project_root / "deploy" / "requirements.docker-nlp-providers.txt").read_text(encoding="utf-8")
     gpu_compose = (project_root / "deploy" / "docker-compose.mcp.gpu.yml").read_text(encoding="utf-8")
 
-    assert "torch==2.3.1" in cpu_requirements
-    assert "torchvision==0.18.1" in cpu_requirements
-    assert "torchaudio==2.3.1" in cpu_requirements
+    assert "torch==" not in cpu_requirements
+    assert "torch==2.3.1+cpu" in torch_cpu_requirements
+    assert "torchvision==0.18.1+cpu" in torch_cpu_requirements
+    assert "torchaudio==2.3.1+cpu" in torch_cpu_requirements
     assert "torch==2.3.1+cpu" not in cpu_requirements
     assert "cu118" not in cpu_requirements
     assert "cu118" not in provider_requirements

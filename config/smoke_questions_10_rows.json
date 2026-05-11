@@ -1,0 +1,16 @@
+{
+  "name": "smoke_10_rows",
+  "description": "Two API smoke questions for the local 10-row smoke corpus.",
+  "questions": [
+    {
+      "id": "ukraine_energy_articles",
+      "question": "Which smoke test corpus articles mention Ukraine and energy?",
+      "expected_terms": ["smoke", "Ukraine", "energy"]
+    },
+    {
+      "id": "markets_public_policy",
+      "question": "What does the smoke test corpus say about markets and public policy?",
+      "expected_terms": ["markets", "public policy", "smoke"]
+    }
+  ]
+}
