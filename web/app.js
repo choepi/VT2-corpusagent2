@@ -2604,3 +2604,72 @@ loadRuntimeInfo().then(async () => {
     }
   }
 });
+
+// ----- Phase 4 modernization: scroll-reveal + live API status pill -----
+
+(function initScrollReveal() {
+  if (typeof IntersectionObserver === "undefined") {
+    return;
+  }
+  const cards = document.querySelectorAll(".shell .card");
+  if (!cards.length) {
+    return;
+  }
+  cards.forEach((card) => card.classList.add("reveal"));
+  const observer = new IntersectionObserver(
+    (entries) => {
+      entries.forEach((entry) => {
+        if (entry.isIntersecting) {
+          entry.target.classList.add("in-view");
+          observer.unobserve(entry.target);
+        }
+      });
+    },
+    { threshold: 0.08, rootMargin: "0px 0px -8% 0px" }
+  );
+  cards.forEach((card) => observer.observe(card));
+})();
+
+(function initApiStatusPill() {
+  const hero = document.querySelector(".shell .hero .hero-badges");
+  if (!hero) {
+    return;
+  }
+  const pill = document.createElement("span");
+  pill.className = "status-pill status-unknown";
+  pill.id = "apiStatusPill";
+  pill.textContent = "API: checking";
+  pill.setAttribute("role", "status");
+  pill.setAttribute("aria-live", "polite");
+  hero.insertBefore(pill, hero.firstChild);
+
+  async function probe() {
+    try {
+      const base = (typeof apiBaseInput !== "undefined" && apiBaseInput && apiBaseInput.value)
+        ? apiBaseInput.value.replace(/\/$/, "")
+        : "";
+      if (!base) {
+        pill.className = "status-pill status-unknown";
+        pill.textContent = "API: not set";
+        return;
+      }
+      const response = await fetch(`${base}/health`, { method: "GET", cache: "no-store" });
+      if (response.ok) {
+        pill.className = "status-pill";
+        pill.textContent = "API: healthy";
+      } else {
+        pill.className = "status-pill status-down";
+        pill.textContent = `API: ${response.status}`;
+      }
+    } catch (_error) {
+      pill.className = "status-pill status-down";
+      pill.textContent = "API: unreachable";
+    }
+  }
+
+  probe();
+  setInterval(probe, 15000);
+  if (typeof apiBaseInput !== "undefined" && apiBaseInput) {
+    apiBaseInput.addEventListener("change", probe);
+  }
+})();
