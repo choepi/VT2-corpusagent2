@@ -5600,7 +5600,29 @@ class AgentRuntime:
             cached_at, cached_payload = self._retrieval_health_cache
             if now - cached_at <= self._runtime_info_health_ttl_s:
                 return dict(cached_payload)
-        payload = dict(self.runtime.retrieval_health())
+        try:
+            payload = dict(self.runtime.retrieval_health())
+        except Exception as exc:
+            payload = {
+                "document_count": 0,
+                "backend": getattr(self.runtime, "retrieval_backend", "unknown"),
+                "local_lexical": {"ready": False, "path": ""},
+                "local_dense": {"ready": False, "error": str(exc)},
+                "pgvector": {
+                    "configured": False,
+                    "table": "",
+                    "ready": False,
+                    "total_rows": 0,
+                    "dense_rows": 0,
+                    "indices": [],
+                    "error": "",
+                },
+                "dense_strategy": "unavailable",
+                "full_corpus_dense_ready": False,
+                "dense_candidate_fallback_ready": False,
+                "metadata_error": f"{type(exc).__name__}: {exc}",
+                "health_check_error": str(exc),
+            }
         self._retrieval_health_cache = (now, payload)
         return dict(payload)
 
@@ -5667,7 +5689,14 @@ class AgentRuntime:
             if capability.startswith("CORPUSAGENT2_PROVIDER_ORDER_")
         }
         retrieval_health = self._cached_retrieval_health()
-        corpus_info = _runtime_corpus_info(self.config.project_root, retrieval_health)
+        try:
+            corpus_info = _runtime_corpus_info(self.config.project_root, retrieval_health)
+        except Exception as exc:
+            corpus_info = {
+                "name": "unknown",
+                "display_name": "unknown",
+                "error": f"{type(exc).__name__}: {exc}",
+            }
         configured_default_mode = os.getenv("CORPUSAGENT2_DEFAULT_RETRIEVAL_MODE", "").strip().lower()
         if not configured_default_mode:
             configured_default_mode = (
@@ -5749,6 +5778,11 @@ class AgentRuntime:
                     else "Full-corpus dense retrieval is ready."
                     if retrieval_health["full_corpus_dense_ready"]
                     else "Dense retrieval is unavailable until corpus metadata is loaded."
+                ),
+                *(
+                    [f"doc_metadata.parquet is missing on this host: {retrieval_health['metadata_error']}. Local lexical/dense assets and corpus row counts will read as 0 until the file is restored or re-built."]
+                    if retrieval_health.get("metadata_error")
+                    else []
                 ),
             ],
             "active_run_ids": self._active_run_ids(),
