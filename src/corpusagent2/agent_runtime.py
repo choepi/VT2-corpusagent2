@@ -256,6 +256,80 @@ def _candidate_payload_rows(snapshot: AgentExecutionSnapshot) -> list[dict[str, 
     return [dict(item) for item in snapshot.selected_docs[:50] if isinstance(item, dict)]
 
 
+def _diagnostic_text(value: Any, *, max_chars: int = 600) -> str:
+    text = str(value or "").strip()
+    if len(text) <= max_chars:
+        return text
+    return text[: max_chars - 3].rstrip() + "..."
+
+
+def _diagnostic_list(value: Any, *, max_items: int = 6) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    items: list[str] = []
+    for item in value:
+        text = _diagnostic_text(item, max_chars=240)
+        if text:
+            items.append(text)
+        if len(items) >= max_items:
+            break
+    return items
+
+
+def _diagnostic_node_payload(record: Any) -> dict[str, Any]:
+    payload = {
+        "node_id": str(getattr(record, "node_id", "") or ""),
+        "capability": str(getattr(record, "capability", "") or ""),
+        "status": str(getattr(record, "status", "") or ""),
+        "tool_name": str(getattr(record, "tool_name", "") or ""),
+        "provider": str(getattr(record, "provider", "") or ""),
+        "attempts": int(getattr(record, "attempts", 0) or 0),
+        "error": _diagnostic_text(getattr(record, "error", "")),
+        "caveats": _diagnostic_list(getattr(record, "caveats", [])),
+        "unsupported_parts": _diagnostic_list(getattr(record, "unsupported_parts", [])),
+    }
+    return {key: value for key, value in payload.items() if value not in ("", [], 0)}
+
+
+def _diagnostic_failure_payload(failure: AgentFailure) -> dict[str, Any]:
+    return {
+        "node_id": failure.node_id,
+        "capability": failure.capability,
+        "error_type": failure.error_type,
+        "message": _diagnostic_text(failure.message),
+        "retriable": bool(failure.retriable),
+        "details": failure.details,
+    }
+
+
+def _execution_issue_records(snapshot: AgentExecutionSnapshot) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    for record in snapshot.node_records:
+        status = str(record.status or "").strip().lower()
+        error = str(record.error or "").strip()
+        if status == "failed" or (status == "skipped" and error):
+            records.append(_diagnostic_node_payload(record))
+    return records[:20]
+
+
+def _execution_needs_diagnostics(snapshot: AgentExecutionSnapshot) -> bool:
+    if snapshot.status in {"failed", "partial", "aborted"}:
+        return True
+    if snapshot.failures:
+        return True
+    return any(str(record.status or "").strip().lower() == "failed" for record in snapshot.node_records)
+
+
+def _coerce_diagnostic_string_list(value: Any, *, max_items: int = 6) -> list[str]:
+    if isinstance(value, list):
+        items = [_diagnostic_text(item, max_chars=300) for item in value]
+    elif isinstance(value, str):
+        items = [_diagnostic_text(value, max_chars=300)]
+    else:
+        items = []
+    return [item for item in items if item][:max_items]
+
+
 def _merge_execution_snapshots(
     primary: AgentExecutionSnapshot,
     fallback: AgentExecutionSnapshot,
@@ -5886,6 +5960,196 @@ class AgentRuntime:
             },
         )
 
+    def _fallback_execution_diagnostics(
+        self,
+        *,
+        question: str,
+        snapshot: AgentExecutionSnapshot,
+        plan_dags: list[dict[str, Any]] | None,
+    ) -> dict[str, Any]:
+        issue_records = _execution_issue_records(snapshot)
+        failures = [_diagnostic_failure_payload(item) for item in snapshot.failures[:10]]
+        failed_nodes = [item for item in issue_records if item.get("status") == "failed"]
+        skipped_nodes = [item for item in issue_records if item.get("status") == "skipped"]
+        failure_types = {str(item.get("error_type", "")) for item in failures}
+        failure_messages = [str(item.get("message", "")).strip() for item in failures if str(item.get("message", "")).strip()]
+        node_messages = [str(item.get("error", "")).strip() for item in issue_records if str(item.get("error", "")).strip()]
+        likely_root_causes: list[str] = []
+        if "core_no_data" in failure_types:
+            likely_root_causes.append(
+                "A required corpus node returned no data, so downstream nodes could not safely run."
+            )
+        if "dependency_no_data" in failure_types:
+            likely_root_causes.append(
+                "A required dependency was skipped or empty, and a downstream required node was stopped."
+            )
+        if "execution_failed" in failure_types:
+            likely_root_causes.append(
+                "At least one selected tool raised an execution error instead of returning a structured no-data result."
+            )
+        if any("No tool available" in message or "unavailable" in message for message in failure_messages + node_messages):
+            likely_root_causes.append(
+                "The planner selected a capability whose implementation was unavailable in the current runtime."
+            )
+        if any("Plot input dependencies did not produce rows" in message for message in failure_messages + node_messages):
+            likely_root_causes.append(
+                "A plot node was requested, but its upstream analysis did not produce table rows to plot."
+            )
+        if not likely_root_causes:
+            likely_root_causes.append(
+                "Execution produced failed or skipped nodes; inspect the failed_nodes, skipped_nodes, and failures entries for the first concrete cause."
+            )
+
+        next_fix_trials = [
+            "Check /runtime-info first, especially retrieval.health, dense model readiness, Postgres row counts, and OpenSearch count.",
+            "Inspect the first failed node's capability, tool_name, error, inputs, and dependency nodes in the manifest/tool_calls.",
+            "If the failure is no-data, rerun with a broader retrieval query or exhaustive retrieval; if it is an unavailable tool, enable/install that provider or force a supported fallback.",
+        ]
+        if snapshot.status == "partial":
+            user_message = (
+                "The run completed only partially. Some evidence may be usable, but at least one required or recovery path failed; "
+                "use execution_diagnostics before trusting the answer scope."
+            )
+        elif snapshot.status == "failed":
+            user_message = (
+                "The run failed before a grounded answer could be completed. "
+                "The first failed node and its upstream dependency chain are recorded in execution_diagnostics."
+            )
+        else:
+            user_message = (
+                "The run contains failed or skipped execution records. "
+                "The manifest now includes structured diagnostics for the affected nodes."
+            )
+        return {
+            "status": "generated",
+            "consulted_llm": False,
+            "question": question,
+            "run_status": snapshot.status,
+            "summary": (
+                f"Execution status={snapshot.status}; "
+                f"failed_nodes={len(failed_nodes)}; skipped_nodes={len(skipped_nodes)}; failures={len(failures)}."
+            ),
+            "user_facing_message": user_message,
+            "likely_root_causes": list(dict.fromkeys(likely_root_causes)),
+            "next_fix_trials": next_fix_trials,
+            "failed_nodes": failed_nodes,
+            "skipped_nodes": skipped_nodes,
+            "failures": failures,
+            "planned_dag_count": len(plan_dags or []),
+            "llm_consult": {"status": "not_attempted"},
+        }
+
+    def _build_execution_diagnostics(
+        self,
+        *,
+        state: AgentRunState | None,
+        question: str,
+        snapshot: AgentExecutionSnapshot,
+        plan_dags: list[dict[str, Any]] | None,
+    ) -> dict[str, Any]:
+        if not _execution_needs_diagnostics(snapshot):
+            return {}
+        diagnostic = self._fallback_execution_diagnostics(
+            question=question,
+            snapshot=snapshot,
+            plan_dags=plan_dags,
+        )
+        if not _env_flag("CORPUSAGENT2_LLM_CONSULT_ON_ERROR", True):
+            diagnostic["llm_consult"] = {"status": "disabled_by_env"}
+            return diagnostic
+        if self.llm_client is None:
+            diagnostic["llm_consult"] = {"status": "skipped", "reason": "llm_client_not_configured"}
+            return diagnostic
+
+        runtime_summary: dict[str, Any] = {}
+        try:
+            info = self.runtime_info()
+            runtime_summary = {
+                "retrieval": info.get("retrieval", {}),
+                "device": info.get("device", {}),
+                "providers_installed": info.get("providers_installed", {}),
+            }
+        except Exception as exc:
+            runtime_summary = {"error": _diagnostic_text(exc)}
+
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "You diagnose failed or skipped CorpusAgent2 execution nodes. "
+                    "Return JSON only with keys summary, likely_root_causes, next_fix_trials, user_facing_message. "
+                    "Use only the supplied execution data. Do not invent corpus facts or claim the answer is supported. "
+                    "Prefer concrete next checks over generic advice."
+                ),
+            },
+            {
+                "role": "user",
+                "content": json.dumps(
+                    {
+                        "question": question,
+                        "rewritten_question": state.rewritten_question if state is not None else question,
+                        "run_status": snapshot.status,
+                        "deterministic_diagnostic": diagnostic,
+                        "plan_dag_count": len(plan_dags or []),
+                        "runtime_summary": runtime_summary,
+                    },
+                    ensure_ascii=True,
+                ),
+            },
+        ]
+        try:
+            trace = self.llm_client.complete_json_trace(
+                messages,
+                model=self.llm_config.planner_model,
+                temperature=0.0,
+            )
+            if state is not None:
+                self.orchestrator._record_llm_trace(state, stage="execution_diagnostics", trace=trace)
+            payload = dict(trace.get("parsed_json", {}))
+            diagnostic["consulted_llm"] = True
+            diagnostic["llm_consult"] = {
+                "status": "completed",
+                "provider_name": trace.get("provider_name", self.llm_config.provider_name),
+                "model": trace.get("model", self.llm_config.planner_model),
+            }
+            for key in ("summary", "user_facing_message"):
+                value = _diagnostic_text(payload.get(key, ""))
+                if value:
+                    diagnostic[key] = value
+            for key in ("likely_root_causes", "next_fix_trials"):
+                value = _coerce_diagnostic_string_list(payload.get(key, []), max_items=8)
+                if value:
+                    diagnostic[key] = value
+            return diagnostic
+        except Exception as exc:
+            if state is not None:
+                self.orchestrator._record_llm_trace(
+                    state,
+                    stage="execution_diagnostics",
+                    used_fallback=True,
+                    error=str(exc),
+                    note="LLM execution diagnostic failed; deterministic diagnostic retained.",
+                )
+            diagnostic["llm_consult"] = {
+                "status": "failed",
+                "error": _diagnostic_text(exc),
+            }
+            return diagnostic
+
+    @staticmethod
+    def _attach_execution_diagnostic_to_answer(
+        final_answer: FinalAnswerPayload,
+        diagnostic: dict[str, Any],
+    ) -> None:
+        if not diagnostic:
+            return
+        message = _diagnostic_text(diagnostic.get("user_facing_message") or diagnostic.get("summary"), max_chars=400)
+        if not message:
+            return
+        caveat = f"Execution diagnostics: {message}"
+        if caveat not in final_answer.caveats:
+            final_answer.caveats.append(caveat)
+
     def _failed_manifest(
         self,
         *,
@@ -5904,9 +6168,30 @@ class AgentRuntime:
             message=str(error),
             retriable=False,
         )
+        snapshot = AgentExecutionSnapshot(
+            node_records=[],
+            node_results={},
+            failures=[failure],
+            provenance_records=[],
+            selected_docs=[],
+            status="failed",
+        )
+        plan_dags = [state.last_plan] if state is not None and state.last_plan else []
+        execution_diagnostics = self._build_execution_diagnostics(
+            state=state,
+            question=question,
+            snapshot=snapshot,
+            plan_dags=plan_dags,
+        )
         llm_traces = list(state.llm_traces) if state is not None else []
         planner_actions = list(state.planner_actions) if state is not None else []
         clarification_history = list(state.clarification_history) if state is not None else []
+        final_answer = FinalAnswerPayload(
+            answer_text="The run failed before a grounded answer could be completed.",
+            unsupported_parts=[str(error)],
+            caveats=["Review the runtime failure details and LLM traces in the manifest."],
+        )
+        self._attach_execution_diagnostic_to_answer(final_answer, execution_diagnostics)
         return AgentRunManifest(
             run_id=run_id,
             question=question,
@@ -5915,17 +6200,13 @@ class AgentRuntime:
             clarification_questions=[],
             assumptions=list(assumptions),
             planner_actions=planner_actions,
-            plan_dags=[state.last_plan] if state is not None and state.last_plan else [],
+            plan_dags=plan_dags,
             tool_calls=self._current_tool_calls(run_id),
             selected_docs=[],
             node_records=[],
             provenance_records=[],
             evidence_table=[],
-            final_answer=FinalAnswerPayload(
-                answer_text="The run failed before a grounded answer could be completed.",
-                unsupported_parts=[str(error)],
-                caveats=["Review the runtime failure details and LLM traces in the manifest."],
-            ),
+            final_answer=final_answer,
             artifacts_dir=str(artifacts_dir),
             failures=[failure],
             metadata={
@@ -5938,6 +6219,7 @@ class AgentRuntime:
                     "type": type(error).__name__,
                     "message": str(error),
                 },
+                "execution_diagnostics": execution_diagnostics,
             },
         )
 
@@ -6265,6 +6547,13 @@ class AgentRuntime:
         if maybe_aborted is not None:
             return maybe_aborted
         final_answer = self.orchestrator.synthesize(state, snapshot)
+        execution_diagnostics = self._build_execution_diagnostics(
+            state=state,
+            question=question,
+            snapshot=snapshot,
+            plan_dags=plan_dags,
+        )
+        self._attach_execution_diagnostic_to_answer(final_answer, execution_diagnostics)
         manifest = AgentRunManifest(
             run_id=run_id,
             question=question,
@@ -6289,6 +6578,7 @@ class AgentRuntime:
                 "clarification_history": list(state.clarification_history),
                 "llm_traces": list(state.llm_traces),
                 "runtime_info": self.runtime_info(),
+                "execution_diagnostics": execution_diagnostics,
             },
         )
         self._persist_manifest(manifest)

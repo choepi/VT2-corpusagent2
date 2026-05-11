@@ -3454,6 +3454,12 @@ def test_failed_typed_tool_revises_to_structured_python_fallback(tmp_path: Path)
                 "evidence_items": [],
                 "artifacts_used": [],
             },
+            {
+                "summary": "The custom_fail node raised a synthetic error and the run recovered with python_runner.",
+                "likely_root_causes": ["The selected custom_fail capability raised an execution error."],
+                "next_fix_trials": ["Inspect the failing tool adapter before trusting the fallback scope."],
+                "user_facing_message": "A typed tool failed, so the answer uses a bounded fallback and should be treated as partial.",
+            },
         ]
     )
     fake_runner = _ArtifactPythonRunner()
@@ -3485,6 +3491,11 @@ def test_failed_typed_tool_revises_to_structured_python_fallback(tmp_path: Path)
     assert manifest.evidence_table
     assert manifest.evidence_table[0]["doc_id"] == "seed-1"
     assert any(failure.capability == "custom_fail" for failure in manifest.failures)
+    diagnostics = manifest.metadata["execution_diagnostics"]
+    assert diagnostics["consulted_llm"] is True
+    assert diagnostics["llm_consult"]["status"] == "completed"
+    assert diagnostics["summary"].startswith("The custom_fail node raised")
+    assert any("bounded fallback" in caveat for caveat in manifest.final_answer.caveats)
 
 
 def test_api_runtime_info_reports_provider_and_device(tmp_path: Path) -> None:
