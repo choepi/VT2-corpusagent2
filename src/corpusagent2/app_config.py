@@ -16,15 +16,15 @@ def _read_toml(path: Path) -> dict[str, Any]:
 @dataclass(slots=True)
 class FrontendConfig:
     api_base_url: str = "http://127.0.0.1:8001"
-    title: str = "CorpusAgent2 Prototype"
+    title: str = "Corpusagent v2 Prototype"
 
 
 @dataclass(slots=True)
 class LLMAppConfig:
     use_openai: bool = False
     openai_base_url: str = "https://api.openai.com/v1"
-    openai_planner_model: str = "gpt-4.1-mini"
-    openai_synthesis_model: str = "gpt-4.1-mini"
+    openai_planner_model: str = "gpt-5.4-2026-03-05"
+    openai_synthesis_model: str = "gpt-5.4-2026-03-05"
     unclose_base_url: str = "https://hermes.ai.unturf.com/v1"
     unclose_planner_model: str = "adamo1139/Hermes-3-Llama-3.1-8B-FP8-Dynamic"
     unclose_synthesis_model: str = "adamo1139/Hermes-3-Llama-3.1-8B-FP8-Dynamic"
@@ -40,10 +40,22 @@ class ServerConfig:
 
 
 @dataclass(slots=True)
+class AnalysisConfig:
+    strict_mode: bool = False
+    allow_silent_fallbacks: bool = True
+    allow_provider_fallback: bool = True
+    fail_on_required_node_empty: bool = False
+    fail_on_metric_source_empty: bool = False
+    plot_require_valid_y: bool = False
+    require_series_assignment: bool = False
+
+
+@dataclass(slots=True)
 class AppConfig:
     server: ServerConfig = field(default_factory=ServerConfig)
     frontend: FrontendConfig = field(default_factory=FrontendConfig)
     llm: LLMAppConfig = field(default_factory=LLMAppConfig)
+    analysis: AnalysisConfig = field(default_factory=AnalysisConfig)
     env_map: dict[str, str] = field(default_factory=dict)
     source_path: str = ""
 
@@ -54,7 +66,13 @@ class AppConfig:
         server_payload = raw.get("server", {})
         frontend_payload = raw.get("frontend", {})
         llm_payload = raw.get("llm", {})
+        analysis_payload = raw.get("analysis", {})
         env_map = cls._env_map_from_payload(raw)
+
+        def _bool(value: Any, default: bool) -> bool:
+            if value is None:
+                return default
+            return str(value).strip().lower() in {"1", "true", "yes", "on"}
         return cls(
             server=ServerConfig(
                 host=str(server_payload.get("host", "127.0.0.1")),
@@ -68,13 +86,13 @@ class AppConfig:
             ),
             frontend=FrontendConfig(
                 api_base_url=str(frontend_payload.get("api_base_url", "http://127.0.0.1:8001")),
-                title=str(frontend_payload.get("title", "CorpusAgent2 Prototype")),
+                title=str(frontend_payload.get("title", "Corpusagent v2 Prototype")),
             ),
             llm=LLMAppConfig(
                 use_openai=str(llm_payload.get("use_openai", "false")).strip().lower() in {"1", "true", "yes", "on"},
                 openai_base_url=str(llm_payload.get("openai_base_url", "https://api.openai.com/v1")),
-                openai_planner_model=str(llm_payload.get("openai_planner_model", "gpt-4.1-mini")),
-                openai_synthesis_model=str(llm_payload.get("openai_synthesis_model", "gpt-4.1-mini")),
+                openai_planner_model=str(llm_payload.get("openai_planner_model", "gpt-5.4-2026-03-05")),
+                openai_synthesis_model=str(llm_payload.get("openai_synthesis_model", "gpt-5.4-2026-03-05")),
                 unclose_base_url=str(llm_payload.get("unclose_base_url", "https://hermes.ai.unturf.com/v1")),
                 unclose_planner_model=str(
                     llm_payload.get(
@@ -91,6 +109,15 @@ class AppConfig:
                 timeout_s=float(llm_payload.get("timeout_s", 60)),
                 verify_ssl=str(llm_payload.get("verify_ssl", "true")).strip().lower()
                 not in {"0", "false", "no", "off"},
+            ),
+            analysis=AnalysisConfig(
+                strict_mode=_bool(analysis_payload.get("strict_mode"), False),
+                allow_silent_fallbacks=_bool(analysis_payload.get("allow_silent_fallbacks"), True),
+                allow_provider_fallback=_bool(analysis_payload.get("allow_provider_fallback"), True),
+                fail_on_required_node_empty=_bool(analysis_payload.get("fail_on_required_node_empty"), False),
+                fail_on_metric_source_empty=_bool(analysis_payload.get("fail_on_metric_source_empty"), False),
+                plot_require_valid_y=_bool(analysis_payload.get("plot_require_valid_y"), False),
+                require_series_assignment=_bool(analysis_payload.get("require_series_assignment"), False),
             ),
             env_map=env_map,
             source_path=str(config_path),
@@ -121,6 +148,13 @@ class AppConfig:
             ("retrieval", "require_backend_services", "CORPUSAGENT2_REQUIRE_BACKEND_SERVICES"),
             ("retrieval", "allow_local_fallback", "CORPUSAGENT2_ALLOW_LOCAL_FALLBACK"),
             ("retrieval", "default_time_granularity", "CORPUSAGENT2_TIME_GRANULARITY"),
+            ("analysis", "strict_mode", "CORPUSAGENT2_ANALYSIS_STRICT_MODE"),
+            ("analysis", "allow_silent_fallbacks", "CORPUSAGENT2_ALLOW_SILENT_FALLBACKS"),
+            ("analysis", "allow_provider_fallback", "CORPUSAGENT2_ALLOW_PROVIDER_FALLBACK"),
+            ("analysis", "fail_on_required_node_empty", "CORPUSAGENT2_FAIL_ON_REQUIRED_NODE_EMPTY"),
+            ("analysis", "fail_on_metric_source_empty", "CORPUSAGENT2_FAIL_ON_METRIC_SOURCE_EMPTY"),
+            ("analysis", "plot_require_valid_y", "CORPUSAGENT2_PLOT_REQUIRE_VALID_Y"),
+            ("analysis", "require_series_assignment", "CORPUSAGENT2_REQUIRE_SERIES_ASSIGNMENT"),
             ("runtime", "device", "CORPUSAGENT2_DEVICE"),
             ("postgres", "dsn", "CORPUSAGENT2_PG_DSN"),
             ("postgres", "table", "CORPUSAGENT2_PG_TABLE"),
@@ -187,6 +221,34 @@ def load_project_configuration(project_root: Path) -> AppConfig:
     config.llm.unclose_synthesis_model = os.getenv("CORPUSAGENT2_UNCLOSE_SYNTHESIS_MODEL", config.llm.unclose_synthesis_model).strip() or config.llm.unclose_synthesis_model
     config.llm.timeout_s = float(os.getenv("CORPUSAGENT2_LLM_TIMEOUT_S", str(config.llm.timeout_s)).strip() or str(config.llm.timeout_s))
     config.llm.verify_ssl = os.getenv("CORPUSAGENT2_LLM_VERIFY_SSL", str(config.llm.verify_ssl)).strip().lower() not in {"0", "false", "no", "off"}
+
+    def _env_bool(name: str, default: bool) -> bool:
+        raw = os.getenv(name)
+        if raw is None:
+            return default
+        return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+    config.analysis.strict_mode = _env_bool("CORPUSAGENT2_ANALYSIS_STRICT_MODE", config.analysis.strict_mode)
+    config.analysis.allow_silent_fallbacks = _env_bool("CORPUSAGENT2_ALLOW_SILENT_FALLBACKS", config.analysis.allow_silent_fallbacks)
+    config.analysis.allow_provider_fallback = _env_bool("CORPUSAGENT2_ALLOW_PROVIDER_FALLBACK", config.analysis.allow_provider_fallback)
+    config.analysis.fail_on_required_node_empty = _env_bool("CORPUSAGENT2_FAIL_ON_REQUIRED_NODE_EMPTY", config.analysis.fail_on_required_node_empty)
+    config.analysis.fail_on_metric_source_empty = _env_bool("CORPUSAGENT2_FAIL_ON_METRIC_SOURCE_EMPTY", config.analysis.fail_on_metric_source_empty)
+    config.analysis.plot_require_valid_y = _env_bool("CORPUSAGENT2_PLOT_REQUIRE_VALID_Y", config.analysis.plot_require_valid_y)
+    config.analysis.require_series_assignment = _env_bool("CORPUSAGENT2_REQUIRE_SERIES_ASSIGNMENT", config.analysis.require_series_assignment)
+
+    # Strict mode tightens the defaults of the related flags unless the user explicitly opted out.
+    if config.analysis.strict_mode:
+        if os.getenv("CORPUSAGENT2_ALLOW_SILENT_FALLBACKS") is None:
+            config.analysis.allow_silent_fallbacks = False
+        if os.getenv("CORPUSAGENT2_ALLOW_PROVIDER_FALLBACK") is None:
+            config.analysis.allow_provider_fallback = False
+        if os.getenv("CORPUSAGENT2_FAIL_ON_REQUIRED_NODE_EMPTY") is None:
+            config.analysis.fail_on_required_node_empty = True
+        if os.getenv("CORPUSAGENT2_PLOT_REQUIRE_VALID_Y") is None:
+            config.analysis.plot_require_valid_y = True
+        if os.getenv("CORPUSAGENT2_REQUIRE_SERIES_ASSIGNMENT") is None:
+            config.analysis.require_series_assignment = True
+
     return config
 
 

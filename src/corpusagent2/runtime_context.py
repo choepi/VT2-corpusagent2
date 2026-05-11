@@ -160,7 +160,14 @@ class CorpusRuntime:
         return runtime_device_report()
 
     def retrieval_health(self) -> dict[str, Any]:
-        metadata_rows = int(self.load_metadata().shape[0])
+        metadata_rows = 0
+        metadata_error = ""
+        try:
+            metadata_rows = int(self.load_metadata().shape[0])
+        except FileNotFoundError as exc:
+            metadata_error = str(exc)
+        except Exception as exc:
+            metadata_error = f"{type(exc).__name__}: {exc}"
         lexical_dir = self.paths.index_root / "lexical"
         local_lexical = {
             "ready": all(
@@ -216,6 +223,11 @@ class CorpusRuntime:
         elif not metadata_rows:
             dense_strategy = "unavailable"
 
+        if not metadata_rows and pgvector.get("ready"):
+            dense_candidate_fallback_ready = True
+        else:
+            dense_candidate_fallback_ready = bool(metadata_rows > 0)
+
         return {
             "document_count": metadata_rows,
             "backend": self.retrieval_backend,
@@ -224,5 +236,6 @@ class CorpusRuntime:
             "pgvector": pgvector,
             "dense_strategy": dense_strategy,
             "full_corpus_dense_ready": full_corpus_dense_ready,
-            "dense_candidate_fallback_ready": bool(metadata_rows > 0),
+            "dense_candidate_fallback_ready": dense_candidate_fallback_ready,
+            "metadata_error": metadata_error,
         }

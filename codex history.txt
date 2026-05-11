@@ -1,0 +1,288 @@
+codex history
+
+Datei
+Bearbeiten
+Anzeigen
+Fenster
+Hilfe
+Continue CorpusAgent2 work
+
+
+
+VS Code
+
+
+
+why do i want to start again from outside of docker? you see this inferring structure? retard
+Samstag, 18:06
+
+You don’t want to start the API outside Docker if your current target is the Docker stack. My last command was wrong for that context.
+
+Use PowerShell to kill only old host processes, then start Docker:
+
+# Kill old host API on 8001
+Get-NetTCPConnection -LocalPort 8001 -State Listen -ErrorAction SilentlyContinue |
+  ForEach-Object { Stop-Process -Id $_.OwningProcess -Force }
+
+# Kill old host frontend on 5500 if needed
+Get-NetTCPConnection -LocalPort 5500 -State Listen -ErrorAction SilentlyContinue |
+  ForEach-Object { Stop-Process -Id $_.OwningProcess -Force }
+
+# Verify 8001 is free
+Get-NetTCPConnection -LocalPort 8001 -State Listen -ErrorAction SilentlyContinue
+Then start the Docker stack from deploy:
+
+cd "D:\Programmieren\GitHub\VT2-corpusagent2\deploy"
+
+$env:CORPUSAGENT2_DOCKER_TORCH_PROFILE="cpu"
+$env:CORPUSAGENT2_DOCKER_INSTALL_NLP_PROVIDERS="true"
+$env:CORPUSAGENT2_DOCKER_DOWNLOAD_PROVIDER_ASSETS="true"
+
+docker compose -f docker-compose.yml -f docker-compose.mcp.yml up -d --build
+If you are on GPU Docker host, add the GPU overlay and set profile to cuda:
+
+cd "D:\Programmieren\GitHub\VT2-corpusagent2\deploy"
+
+$env:CORPUSAGENT2_DOCKER_TORCH_PROFILE="cuda"
+$env:CORPUSAGENT2_DOCKER_INSTALL_NLP_PROVIDERS="true"
+$env:CORPUSAGENT2_DOCKER_DOWNLOAD_PROVIDER_ASSETS="true"
+
+docker compose -f docker-compose.yml -f docker-compose.mcp.yml -f docker-compose.mcp.gpu.yml up -d --build
+Do not run scripts\15_start_local_stack.py if Docker is supposed to own the API.
+
+
+
+
+
+Samstag, 18:06
+docker api doesnt locally host gui?
+Samstag, 18:19
+
+Correct: the current Docker stack hosts the API and MCP, not the static GUI.
+
+From the compose files:
+
+corpusagent2-api exposes backend API on http://127.0.0.1:8001
+corpusagent2-mcp exposes MCP on http://127.0.0.1:8765/mcp
+No Docker service serves web/ on port 5500
+So for GUI you currently still need one of these:
+
+cd "D:\Programmieren\GitHub\VT2-corpusagent2"
+.\.venv\Scripts\python.exe scripts\14_run_static_frontend.py
+or any static file server pointed at web/.
+
+That does not start the API. It only serves the frontend. The frontend then talks to Docker API at http://127.0.0.1:8001.
+
+The clean future fix would be adding a small frontend service to Docker, so the whole app is Docker-owned.
+
+
+
+
+
+Samstag, 18:19
+can you answer rejected (out of corpus) questions with a big offlinemodel flag as for answerring the question oneshot with provided planner model but excplicitly mention that the agent has no data available in corpus?
+Samstag, 18:22
+
+
+7m 31s lang gearbeitet
+Implemented.
+
+Out-of-corpus/date-window rejected runs now:
+
+Keep status rejected.
+Add a model-only one-shot answer using the configured planner model.
+Start the answer with MODEL-ONLY / OUT-OF-CORPUS ANSWER (NOT CORPUS-GROUNDED).
+Explicitly state no corpus data was available.
+Add metadata: answer_grounding: model_only_out_of_corpus, out_of_corpus_model_answer: true.
+Skip all tools, retrieval, and plots as before.
+Changed:
+
+agent_runtime.py (line 5088)
+app.js (line 1939)
+index.html (line 208)
+styles.css (line 507)
+test_agent_runtime.py (line 1085)
+Tests:
+
+.\.venv\Scripts\python.exe -m pytest tests\test_agent_runtime.py -k "out_of_corpus or outside_loaded_corpus" passed.
+.\.venv\Scripts\python.exe -m pytest tests\test_frontend_state_guards.py passed.
+.\.venv\Scripts\python.exe -m pytest passed: 312 passed, 1 skipped.
+
+CorpusAgent2 Prototype
+Website
+Öffnen
+5 Dateien geändert
++215
+-15
+Rückgängig machen
+
+Überprüfen
+
+src/corpusagent2/agent_runtime.py
+tests/test_agent_runtime.py
+web/index.html
+web/app.js
+web/styles.css
+
+
+
+
+Samstag, 18:30
+in this paper file:///D:/OneDrive%20-%20ZHAW/MSE_school_files/Sem4/Papers/PA25_ciel_Feuchter_Veseli_Large_Doc_Sets_Explorer.pdf
+
+am i using the same lllccnews slice? and is the corpus really only 2016-2019?
+Samstag, 18:30
+
+
+2m 21s lang gearbeitet
+No, your current repo is not using the same CC-News slice described in that paper.
+
+The paper says it used:
+
+Hugging Face dataset: Geralt-Targaryen/CC-News
+Full dataset: about 134M articles, 2016-2021
+Working slice: about 10%, roughly 13M articles
+Mostly year-level metadata
+Your current local CorpusAgent2 data says:
+
+Download script uses vblagoje/cc_news, split train: scripts/00_1_downlaod.py (line 15)
+Processed/indexed rows: 624,095
+Actual valid date range in local parquet: 2017-01-01 to 2019-08-25
+Year counts:
+2017: 330,422
+2018: 229,956
+2019: 2
+missing/invalid date: 63,715
+2016: 0
+2020+: 0
+So the honest wording is:
+
+This CorpusAgent2 instance currently runs on the vblagoje/cc_news train split, not the 10% Geralt-Targaryen/CC-News 2016-2021 slice described in the paper. The local indexed corpus contains 624,095 documents and, among rows with valid dates, covers mainly 2017-2018, with only two dated 2019 rows and no 2016 or 2020-2021 coverage.
+
+Also: saying “only 2016-2019” would be wrong for your current local corpus. The real local range is effectively 2017-2018, technically 2017-01-01 to 2019-08-25 because of two 2019 rows.
+
+
+
+
+
+Samstag, 18:32
+update ci/cd, tests start to fail-> check if current tests hold up
+Samstag, 18:32
+
+
+6m 29s lang gearbeitet
+Result
+Root cause was twofold: CI was under-specified, and the local suite exposed a real MCP job race.
+
+CI now installs the CPU runtime dependency set plus NLP provider extras instead of plain pip install -e ., which avoids accidental GPU/CUDA dependency behavior and matches the test contract: .github/workflows/ci.yml (line 29).
+
+I also fixed the MCP job heartbeat race where stale progress updates could regress a completed job back to running. The guard is now enforced in the store layer for SQLite and Postgres: mcp_jobs.py (line 370).
+
+Tests
+Added regression coverage:
+
+test_ci_workflows.py (line 6)
+test_mcp_jobs.py (line 196)
+Verification:
+
+pytest tests/test_ci_workflows.py tests/test_start_local_stack.py passed.
+Failing MCP job test passed 5 consecutive runs.
+Full suite passed: 314 passed, 1 skipped.
+Remote GitHub Actions was not run locally, but the workflow YAML parses and the local test contract now holds.
+
+4 Dateien geändert
++111
+-31
+Rückgängig machen
+
+Überprüfen
+
+.github/workflows/ci.yml
+tests/test_ci_workflows.py
+src/corpusagent2/mcp_jobs.py
+tests/test_mcp_jobs.py
+
+
+
+
+Samstag, 18:39
+instructions on how to get the corpus used in paper, together with params that fit a rtx 3080, move current corpus into archive
+Samstag, 19:01
+
+
+I’ll handle this as two parts: archive the current local vblagoje/cc_news corpus artifacts without deleting them, then give a concrete rebuild recipe for the paper corpus (Geralt-Targaryen/CC-News, 10%, 2016-2021) with RTX 3080-safe parameters. First I’m checking the current data layout and available build scripts so the commands match this repo.
+
+I found the current corpus artifacts: raw incoming/staged gzip, processed parquet, and dense/lexical index files. I’m archiving only those data artifacts under data/archive/... and adding that archive folder to .gitignore so the moved multi-GB files do not become accidental git candidates.
+
+1 Datei bearbeitet
+The archive move started, but Windows blocked data/processed/documents.parquet because another process has it open. That is most likely a running backend/API or Python process holding the corpus parquet. I’ll identify the process, stop only the CorpusAgent2 local Python services, then continue the archive move.
+
+There are stale/active corpus build processes still running: scripts/02_build_retrieval_assets.py and scripts/10_ingest_parquet_to_postgres.py. They are exactly the kind of processes that keep parquet/index files locked, so I’m stopping those two and leaving unrelated/editor Python processes alone.
+
+One important gap: the existing bundle script can stream a Hugging Face dataset or cap rows, but it cannot reproduce the paper-style “10% sampled slice” without taking the first N rows. I’m adding deterministic streaming sampling support so the instructions are defensible rather than biased by dataset order.
+
+
+2 Dateien erstellt,1 Datei bearbeitet
+4 Dateien geändert
++228
+-2
+Rückgängig machen
+
+Überprüfen
+
+.gitignore
+scripts/27_build_prebuilt_bundle.py
+tests/test_prebuilt_bundle.py
+docs/paper_corpus_setup.md
+
+paper_corpus_setup.md
+Dokument · MD
+Öffnen
+
+
+Du hast das Limit an Codex-Nachrichten erreicht
+Dein Ratenlimit wird am 12.05.2026, 10:21 zurückgesetzt. Um Codex weiter zu nutzen, füge Credits hinzu oder hol dir heute noch ein Upgrade auf Pro.
+Upgrade
+Credits hinzufügen
+
+
+
+
+Vollzugriff
+
+5.5
+Extra hoch
+
+
+
+Lokal arbeiten
+
+master
+
+
+Branch-Details
+
+Änderungen
++3
+-2
+
+Git-Aktionen
+GitHub-CLI nicht verfügbar
+
+Artefakte
+
+paper_corpus_setup.md
+
+/D:/Programmieren/GitHub/VT2-corpusagent2/web/index.html
+
+README.md
+
+127.0.0.1:8001
+
+127.0.0.1:5500
+
+mcp_job_server.md
+6 weitere anzeigen
+
+Quellen
+Internetsuche

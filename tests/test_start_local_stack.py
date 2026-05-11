@@ -102,8 +102,11 @@ def test_dockerized_api_and_mcp_share_runtime_image_and_sandbox_mounts() -> None
     assert "image: corpusagent2-runtime:latest" in mcp_compose
     assert "CORPUSAGENT2_DOCKER_TORCH_PROFILE: ${CORPUSAGENT2_DOCKER_TORCH_PROFILE:-cpu}" in base_compose
     assert "CORPUSAGENT2_DOCKER_TORCH_PROFILE: ${CORPUSAGENT2_DOCKER_TORCH_PROFILE:-cpu}" in mcp_compose
-    assert "CORPUSAGENT2_DOCKER_INSTALL_NLP_PROVIDERS: ${CORPUSAGENT2_DOCKER_INSTALL_NLP_PROVIDERS:-false}" in base_compose
-    assert "CORPUSAGENT2_DOCKER_INSTALL_NLP_PROVIDERS: ${CORPUSAGENT2_DOCKER_INSTALL_NLP_PROVIDERS:-false}" in mcp_compose
+    # Default flipped to true: stanza/flair/textacy run fine on CPU; there's
+    # no reason to deactivate the optional NLP providers by default. Users who
+    # want a leaner image can still set CORPUSAGENT2_DOCKER_INSTALL_NLP_PROVIDERS=false.
+    assert "CORPUSAGENT2_DOCKER_INSTALL_NLP_PROVIDERS: ${CORPUSAGENT2_DOCKER_INSTALL_NLP_PROVIDERS:-true}" in base_compose
+    assert "CORPUSAGENT2_DOCKER_INSTALL_NLP_PROVIDERS: ${CORPUSAGENT2_DOCKER_INSTALL_NLP_PROVIDERS:-true}" in mcp_compose
     assert "CORPUSAGENT2_API_CPUS" in base_compose
     assert "CORPUSAGENT2_MCP_CPUS" in mcp_compose
     assert "CORPUSAGENT2_OPENSEARCH_MEM_LIMIT" not in base_compose

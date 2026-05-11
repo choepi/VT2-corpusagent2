@@ -3,7 +3,7 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>CorpusAgent2 Prototype</title>
+    <title>Corpusagent v2 Prototype</title>
     <link rel="stylesheet" href="./styles.css" />
   </head>
   <body>
@@ -25,13 +25,20 @@
     </div>
 
     <main class="shell">
+      <nav class="shell-nav" aria-label="Page sections">
+        <a href="#run-status" class="shell-nav-link">Status</a>
+        <a href="#answer" class="shell-nav-link">Answer</a>
+        <a href="#evidence" class="shell-nav-link">Evidence</a>
+        <a href="#advanced" class="shell-nav-link">Advanced</a>
+      </nav>
+
       <section class="card hero">
         <div class="hero-copy">
-          <p class="eyebrow">CorpusAgent2 Prototype</p>
-          <h1>Watch the magic box reason, plan, run tools, and ground the answer.</h1>
+          <p class="eyebrow">Successor to CorpusAgent v1 &middot; Moritz Feuchter &amp; Shpetim Veseli</p>
+          <h1>Corpusagent v2 Prototype</h1>
           <p class="lede">
-            This frontend keeps the planner traces, executor state, evidence, artifacts, and plots visible while the
-            backend works.
+            VT2 prototype (MSE, ZHAW). Tool based Agent for retrieval, NLP, and
+            evidence-grounded analysis over a CC-News corpus.
           </p>
         </div>
         <div class="hero-badges">
@@ -74,11 +81,11 @@
             </div>
             <div>
               <label for="plannerModelInput">Planner model</label>
-              <input id="plannerModelInput" type="text" placeholder="gpt-4.1-mini" />
+              <input id="plannerModelInput" type="text" placeholder="gpt-5.4-2026-03-05" />
             </div>
             <div>
               <label for="synthesisModelInput">Synthesis model</label>
-              <input id="synthesisModelInput" type="text" placeholder="gpt-4.1-mini" />
+              <input id="synthesisModelInput" type="text" placeholder="gpt-5.4-2026-03-05" />
             </div>
           </div>
           <div class="controls llm-settings-controls">
@@ -125,7 +132,7 @@
         <ul id="clarificationHistory"></ul>
       </section>
 
-      <section class="run-top-grid">
+      <section class="run-top-grid" id="run-status">
         <article class="card status-card">
           <div class="section-head">
             <h2>Run Status</h2>
@@ -177,29 +184,7 @@
         </article>
       </section>
 
-      <section class="card plan-tool-card">
-        <div class="section-head">
-          <h2>Plan Nodes And Tool Catalog</h2>
-          <span class="pill subtle">Full planner/tool list</span>
-        </div>
-        <p class="muted">
-          Plan nodes like n1, n2, and n18 are generated per run. The table below lists every planned node once the
-          planner emits a DAG. A tool function is a concrete backend implementation; a capability is the abstract task
-          the planner requests. In this build most capabilities map one-to-one to functions, so the table is the source
-          of truth.
-        </p>
-        <h3>Current Plan Node Table</h3>
-        <div id="toolNodeTable" class="table-scroll tool-node-table"></div>
-        <details class="tool-catalog-details" open>
-          <summary>
-            <span>All Registered Backend Tool Functions</span>
-            <small id="toolCatalogSummary">Loading tool catalog...</small>
-          </summary>
-          <div id="toolCatalog" class="tool-catalog"></div>
-        </details>
-      </section>
-
-      <section class="main-grid output-grid">
+      <section class="main-grid output-grid" id="answer">
         <article class="card answer-card">
           <div class="section-head">
             <h2>Grounded Answer</h2>
@@ -235,7 +220,7 @@
         </article>
       </section>
 
-      <section class="card evidence-card">
+      <section class="card evidence-card" id="evidence">
         <div class="section-head">
           <h2>Evidence Panel</h2>
           <span class="pill subtle">Visible on every run</span>
@@ -243,10 +228,10 @@
         <div id="evidenceTable" class="table-scroll"></div>
       </section>
 
-      <details class="advanced-details">
+      <details class="advanced-details" id="advanced">
         <summary>
           <span>Advanced Stats And Provenance</span>
-          <small>Runtime profile, exact tool calls, planner DAG, and raw LLM traces</small>
+          <small>Runtime profile, exact tool calls, planner DAG, plan node table, full tool catalog, and raw LLM traces</small>
         </summary>
 
         <section class="top-grid advanced-grid">
@@ -309,6 +294,28 @@
           <div id="planNodes" class="stack-panel scroll-panel compact-scroll"></div>
           <h3>Raw LLM Outputs</h3>
           <div id="llmTraces" class="stack-panel scroll-panel tall-scroll"></div>
+        </section>
+
+        <section class="card plan-tool-card">
+          <div class="section-head">
+            <h2>Plan Nodes And Tool Catalog</h2>
+            <span class="pill subtle">Full planner/tool list</span>
+          </div>
+          <p class="muted">
+            Plan nodes like n1, n2, and n18 are generated per run. The table below lists every planned node once the
+            planner emits a DAG. A tool function is a concrete backend implementation; a capability is the abstract task
+            the planner requests. In this build most capabilities map one-to-one to functions, so the table is the source
+            of truth.
+          </p>
+          <h3>Current Plan Node Table</h3>
+          <div id="toolNodeTable" class="table-scroll tool-node-table"></div>
+          <details class="tool-catalog-details">
+            <summary>
+              <span>All Registered Backend Tool Functions</span>
+              <small id="toolCatalogSummary">Loading tool catalog...</small>
+            </summary>
+            <div id="toolCatalog" class="tool-catalog"></div>
+          </details>
         </section>
       </details>
     </main>
