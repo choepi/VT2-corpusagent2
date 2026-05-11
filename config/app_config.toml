@@ -5,7 +5,7 @@ cors_origins = ["*"]
 
 [frontend]
 api_base_url = "https://api.dongtse.com"
-title = "CorpusAgent2 Prototype"
+title = "Corpusagent v2 Prototype"
 
 [llm]
 use_openai = true

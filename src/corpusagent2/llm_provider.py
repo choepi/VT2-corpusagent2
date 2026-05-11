@@ -188,7 +188,7 @@ class LLMProviderConfig:
 
     @staticmethod
     def openai_fallback_planner_model() -> str:
-        return "gpt-4.1-mini"
+        return "gpt-5.4-2026-03-05"
 
     @staticmethod
     def unclose_fallback_base_url() -> str:

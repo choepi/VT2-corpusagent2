@@ -579,11 +579,16 @@ def test_executor_records_successful_ready_siblings_and_skips_pending_after_core
     snapshot = asyncio.run(executor.execute(dag, context))
     statuses = {record.node_id: record.status for record in snapshot.node_records}
 
-    assert snapshot.status == "failed"
+    # New partial-failure semantics: a localized core_no_data failure on one
+    # node no longer halts the entire run. Independent branches (sibling and
+    # its descendant `pending`) must still execute — only the failing node's
+    # actual transitive children should be skipped. Here `pending` depends on
+    # `sibling`, not on `failing`, so it runs successfully.
+    assert snapshot.status == "partial"
     assert statuses["seed"] == "completed"
     assert statuses["failing"] == "failed"
     assert statuses["sibling"] == "completed"
-    assert statuses["pending"] == "skipped"
+    assert statuses["pending"] == "completed"
 
 
 def test_executor_rejects_malformed_declared_tool_input(tmp_path: Path) -> None:
@@ -3291,7 +3296,7 @@ def test_planner_can_route_fetched_documents_into_python_runner(tmp_path: Path) 
         [
             {
                 "action": "accept_with_assumptions",
-                "rewritten_question": "Inspect the fetched documents with a Python script.",
+                "rewritten_question": "Inspect the fetched Ukraine documents with a Python script.",
                 "assumptions": [],
                 "clarification_question": "",
                 "rejection_reason": "",
@@ -3299,7 +3304,7 @@ def test_planner_can_route_fetched_documents_into_python_runner(tmp_path: Path) 
             },
             {
                 "action": "emit_plan_dag",
-                "rewritten_question": "Inspect the fetched documents with a Python script.",
+                "rewritten_question": "Inspect the fetched Ukraine documents with a Python script.",
                 "plan_dag": {
                     "nodes": [
                         {"node_id": "search", "capability": "db_search", "inputs": {"query": "Ukraine", "top_k": 5}},

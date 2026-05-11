@@ -527,7 +527,8 @@ function formatStepRow(row, { allowLiveElapsed = false } = {}) {
   const base = `${escapeHtml(row.capability || "")} (${escapeHtml(row.node_id || "")})`;
   const duration = stepDurationLabel(row, { allowLiveElapsed });
   const suffix = duration ? ` - ${escapeHtml(duration)}` : "";
-  const error = row.error ? ` - ${escapeHtml(row.error)}` : "";
+  const errorText = row.short_message || row.error || "";
+  const error = errorText ? ` - ${escapeHtml(errorText)}` : "";
   return `${base}${suffix}${error}`;
 }
 
