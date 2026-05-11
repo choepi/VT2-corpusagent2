@@ -2423,6 +2423,37 @@ def _doc_rows(dependency_results: dict[str, ToolExecutionResult]) -> list[dict[s
     return []
 
 
+def _resolved_doc_rows(
+    dependency_results: dict[str, ToolExecutionResult],
+    context: "AgentExecutionContext",
+    *,
+    max_documents: int | None = None,
+) -> list[dict[str, Any]]:
+    """Get text-bearing document rows, dereferencing working_set_ref when needed.
+
+    This is the working-set-aware replacement for the bare `_doc_rows(deps)`
+    pattern that caused every text-consuming capability (tokenize, pos_morph,
+    lemmatize, dependency_parse, etc.) to silently return 0 rows when the
+    upstream node only provided preview rows + a working_set_ref. Use this
+    in any tool that takes a `context` argument; reserve plain `_doc_rows`
+    for legacy paths and pure data-only views.
+    """
+    from corpusagent2.node_resolution import resolve_documents_from_node
+
+    docs, _diag = resolve_documents_from_node(
+        dependency_results,
+        context,
+        text_field="text",
+        max_documents=max_documents,
+    )
+    if docs:
+        return [_coerce_text_document_row(dict(doc)) for doc in docs]
+    # Fall through to the legacy resolver so the existing data-only flows
+    # (where rows have no text but are still legitimate to consume) still
+    # produce something.
+    return _doc_rows(dependency_results)
+
+
 def _search_rows(dependency_results: dict[str, ToolExecutionResult]) -> list[dict[str, Any]]:
     for result in dependency_results.values():
         payload = result.payload
@@ -3940,7 +3971,7 @@ def _clean_normalize(params: dict[str, Any], deps: dict[str, ToolExecutionResult
 
 
 def _tokenize_docs(params: dict[str, Any], deps: dict[str, ToolExecutionResult], context: AgentExecutionContext) -> ToolExecutionResult:
-    rows = _doc_rows(deps)
+    rows = _resolved_doc_rows(deps, context)
     if not rows:
         return _no_input_documents_result("tokenize")
     providers = _provider_order("tokenize", ["spacy", "stanza", "nltk", "regex"])
@@ -3981,8 +4012,32 @@ def _tokenize_docs(params: dict[str, Any], deps: dict[str, ToolExecutionResult],
 
 
 def _sentence_split_docs(params: dict[str, Any], deps: dict[str, ToolExecutionResult], context: AgentExecutionContext) -> ToolExecutionResult:
-    rows = _doc_rows(deps)
+    # Dereference working_set_ref to actual full documents; before this fix
+    # _doc_rows alone returned [] when upstream only had preview rows, causing
+    # the "50 input docs, rows: [], no_input_documents" pattern observed in
+    # the Ronaldo vs Messi run.
+    from corpusagent2.node_resolution import resolve_documents_from_node
+    from corpusagent2 import strict_mode as _strict
+
+    max_documents = _working_set_analysis_max_documents()
+    rows, deref_diag = resolve_documents_from_node(
+        deps, context, text_field="text", max_documents=max_documents
+    )
     if not rows:
+        # In strict mode, return degraded with explicit reason instead of the
+        # opaque no_input_documents path.
+        if _strict.is_strict_mode():
+            return ToolExecutionResult(
+                payload={"rows": [], "diagnostics": deref_diag, "warnings": ["could_not_resolve_documents"]},
+                caveats=["sentence_split could not resolve any documents from upstream or working_set_ref"],
+                metadata={
+                    "degraded": True,
+                    "no_data": True,
+                    "no_data_reason": "could_not_resolve_documents",
+                    "status": "degraded",
+                    "diagnostics": deref_diag,
+                },
+            )
         return _no_input_documents_result("sentence_split")
     providers = _provider_order("sentence_split", ["spacy", "stanza", "nltk"])
     output = []
@@ -4027,19 +4082,44 @@ def _sentence_split_docs(params: dict[str, Any], deps: dict[str, ToolExecutionRe
             for key in ("doc_id", "title", "date", "published_at", "outlet", "source", "rank", "score")
             if key in row
         }
+        # Emit one structured sentence row per sentence so downstream tools
+        # (sentiment, claim_span_extract) have stable per-sentence inputs.
         output_row["sentences"] = sentence_rows
+        output_row["sentence_count"] = len(sentence_rows)
         output_row["text"] = " ".join(sentence_rows)
         output.append(output_row)
+    sentence_row_rows: list[dict[str, Any]] = []
+    for doc_row in output:
+        for idx, sentence_text in enumerate(doc_row.get("sentences", []) or []):
+            sentence_row_rows.append(
+                {
+                    "doc_id": doc_row.get("doc_id"),
+                    "sentence_id": f"{doc_row.get('doc_id', '')}::{idx}",
+                    "sentence_index": idx,
+                    "text": sentence_text,
+                    "published_at": doc_row.get("published_at") or doc_row.get("date"),
+                    "title": doc_row.get("title"),
+                    "source": doc_row.get("source") or doc_row.get("outlet"),
+                }
+            )
     if not any(row.get("sentences") for row in output):
         return _provider_unavailable_result("sentence_split")
+    metadata = _metadata(used_provider, f"{used_provider}_sentence_split")
+    metadata["diagnostics"] = deref_diag
+    metadata["input_document_count"] = deref_diag.get("input_document_count", len(rows))
+    metadata["output_document_count"] = len(output)
     return ToolExecutionResult(
-        payload={"rows": output},
-        metadata=_metadata(used_provider, f"{used_provider}_sentence_split"),
+        payload={
+            "rows": output,
+            "sentence_rows": sentence_row_rows,
+            "diagnostics": deref_diag,
+        },
+        metadata=metadata,
     )
 
 
 def _pos_morph(params: dict[str, Any], deps: dict[str, ToolExecutionResult], context: AgentExecutionContext) -> ToolExecutionResult:
-    rows = _doc_rows(deps)
+    rows = _resolved_doc_rows(deps, context)
     if not rows:
         return _no_input_documents_result("pos_morph")
     output: list[dict[str, Any]] = []
@@ -4165,7 +4245,7 @@ def _pos_morph(params: dict[str, Any], deps: dict[str, ToolExecutionResult], con
 
 
 def _lemmatize_docs(params: dict[str, Any], deps: dict[str, ToolExecutionResult], context: AgentExecutionContext) -> ToolExecutionResult:
-    rows = _doc_rows(deps)
+    rows = _resolved_doc_rows(deps, context)
     if not rows:
         return _no_input_documents_result("lemmatize")
     providers = _provider_order("lemmatize", ["spacy", "stanza", "textblob"])
@@ -4236,7 +4316,7 @@ def _lemmatize_docs(params: dict[str, Any], deps: dict[str, ToolExecutionResult]
 
 
 def _dependency_parse(params: dict[str, Any], deps: dict[str, ToolExecutionResult], context: AgentExecutionContext) -> ToolExecutionResult:
-    rows = _doc_rows(deps)
+    rows = _resolved_doc_rows(deps, context)
     if not rows:
         return _no_input_documents_result("dependency_parse")
     providers = _provider_order("dependency_parse", ["spacy", "stanza"])
@@ -4310,7 +4390,7 @@ def _dependency_parse(params: dict[str, Any], deps: dict[str, ToolExecutionResul
 
 
 def _noun_chunks(params: dict[str, Any], deps: dict[str, ToolExecutionResult], context: AgentExecutionContext) -> ToolExecutionResult:
-    doc_rows = _doc_rows(deps)
+    doc_rows = _resolved_doc_rows(deps, context)
     has_any_input_rows = bool(doc_rows)
     providers = _provider_order("noun_chunks", ["spacy"])
     chunks_by_doc: defaultdict[str, list[str]] = defaultdict(list)
@@ -5187,7 +5267,7 @@ def _topic_model(params: dict[str, Any], deps: dict[str, ToolExecutionResult], c
 
 def _readability_stats(params: dict[str, Any], deps: dict[str, ToolExecutionResult], context: AgentExecutionContext) -> ToolExecutionResult:
     rows = []
-    for doc in _doc_rows(deps):
+    for doc in _resolved_doc_rows(deps, context):
         text = _row_analysis_text(doc)
         sentences = simple_sentence_split(text)
         tokens = _tokenize(text)
@@ -5199,7 +5279,7 @@ def _readability_stats(params: dict[str, Any], deps: dict[str, ToolExecutionResu
 
 def _lexical_diversity(params: dict[str, Any], deps: dict[str, ToolExecutionResult], context: AgentExecutionContext) -> ToolExecutionResult:
     rows = []
-    for doc in _doc_rows(deps):
+    for doc in _resolved_doc_rows(deps, context):
         tokens = [token.lower() for token in _tokenize(_row_analysis_text(doc))]
         rows.append({"doc_id": doc["doc_id"], "type_token_ratio": len(set(tokens)) / max(len(tokens), 1)})
     return ToolExecutionResult(payload={"rows": rows})
@@ -5221,7 +5301,7 @@ def _extract_ngrams(params: dict[str, Any], deps: dict[str, ToolExecutionResult]
         n_values = [2]
     n_values = list(dict.fromkeys(n_values))[:4]
     counts: Counter = Counter()
-    for doc in _doc_rows(deps):
+    for doc in _resolved_doc_rows(deps, context):
         tokens = [token.lower() for token in _tokenize(_row_analysis_text(doc)) if token.lower() not in STOPWORDS]
         for n in n_values:
             for idx in range(len(tokens) - n + 1):
@@ -5239,7 +5319,7 @@ def _extract_ngrams(params: dict[str, Any], deps: dict[str, ToolExecutionResult]
 def _extract_acronyms(params: dict[str, Any], deps: dict[str, ToolExecutionResult], context: AgentExecutionContext) -> ToolExecutionResult:
     pattern = re.compile(r"\b[A-Z]{2,8}\b")
     counts: Counter = Counter()
-    for doc in _doc_rows(deps):
+    for doc in _resolved_doc_rows(deps, context):
         counts.update(match.group(0) for match in pattern.finditer(_row_analysis_text(doc)))
     return ToolExecutionResult(
         payload={"rows": [{"acronym": item, "count": int(count)} for item, count in counts.most_common(20)]}
@@ -5525,7 +5605,7 @@ def _text_classify(params: dict[str, Any], deps: dict[str, ToolExecutionResult],
         candidate_labels = [item.strip() for item in re.split(r"[,|]", candidate_labels) if item.strip()]
     candidate_labels = [str(label).strip() for label in candidate_labels if str(label).strip()]
     if candidate_labels:
-        docs = _doc_rows(deps)
+        docs = _resolved_doc_rows(deps, context)
         texts = [_row_analysis_text(doc) for doc in docs]
         if not docs or not texts:
             return ToolExecutionResult(payload={"rows": []}, metadata={"no_data": True, "no_data_reason": "no_documents"})
@@ -5577,7 +5657,7 @@ def _word_embeddings(params: dict[str, Any], deps: dict[str, ToolExecutionResult
     vocab = sorted(
         {
             token.lower()
-            for doc in _doc_rows(deps)
+            for doc in _resolved_doc_rows(deps, context)
             for token in _tokenize(_row_analysis_text(doc))
             if token.lower() not in STOPWORDS
         }
@@ -5604,9 +5684,23 @@ def _word_embeddings(params: dict[str, Any], deps: dict[str, ToolExecutionResult
 
 
 def _doc_embeddings(params: dict[str, Any], deps: dict[str, ToolExecutionResult], context: AgentExecutionContext) -> ToolExecutionResult:
-    docs = _doc_rows(deps)
+    from corpusagent2.node_resolution import resolve_documents_from_node
+    from corpusagent2 import strict_mode as _strict
+
+    max_documents = _working_set_analysis_max_documents()
+    docs, deref_diag = resolve_documents_from_node(deps, context, text_field="text", max_documents=max_documents)
     if not docs:
-        return ToolExecutionResult(payload={"rows": []})
+        return ToolExecutionResult(
+            payload={"rows": [], "diagnostics": deref_diag, "warnings": ["could_not_resolve_documents"]},
+            caveats=["doc_embeddings could not resolve any documents from upstream or working_set_ref"],
+            metadata={
+                "no_data": True,
+                "no_data_reason": "could_not_resolve_documents",
+                "status": "no_data" if _strict.is_strict_mode() else "degraded",
+                "degraded": True,
+                "diagnostics": deref_diag,
+            },
+        )
     texts = [_row_analysis_text(doc) for doc in docs]
     model_id = _sentence_embedding_model_id(context, params)
     embeddings, resolved_device = _encode_texts(texts, model_id=model_id, normalize=True)
@@ -5618,18 +5712,40 @@ def _doc_embeddings(params: dict[str, Any], deps: dict[str, ToolExecutionResult]
                 "vector_ref": f"embed:{sha256(str(doc.get('doc_id', '')).encode()).hexdigest()[:12]}",
                 "vector_preview": [round(float(value), 6) for value in vector[:8]],
                 "embedding_dim": int(len(vector)),
+                "model_id": model_id,
+                "provider": "sentence-transformers",
+                "normalized": True,
             }
         )
+    metadata = _metadata("sentence-transformers", "sentence_transformer_doc_embeddings", model_id=model_id, device=resolved_device)
+    metadata["diagnostics"] = deref_diag
+    metadata["input_document_count"] = deref_diag.get("input_document_count", len(docs))
+    metadata["output_document_count"] = len(rows)
     return ToolExecutionResult(
-        payload={"rows": rows},
-        metadata=_metadata("sentence-transformers", "sentence_transformer_doc_embeddings", model_id=model_id, device=resolved_device),
+        payload={"rows": rows, "diagnostics": deref_diag},
+        metadata=metadata,
     )
 
 
 def _similarity_index(params: dict[str, Any], deps: dict[str, ToolExecutionResult], context: AgentExecutionContext) -> ToolExecutionResult:
-    docs = _doc_rows(deps)
+    from corpusagent2.node_resolution import resolve_documents_from_node
+    from corpusagent2 import strict_mode as _strict
+
+    max_documents = _working_set_analysis_max_documents()
+    docs, deref_diag = resolve_documents_from_node(deps, context, text_field="text", max_documents=max_documents)
     if len(docs) < 2:
-        return ToolExecutionResult(payload={"rows": []})
+        reason = "no_embeddings" if not docs else "insufficient_documents_for_similarity"
+        return ToolExecutionResult(
+            payload={"rows": [], "diagnostics": deref_diag, "warnings": [reason]},
+            caveats=[f"similarity_index: {reason}"],
+            metadata={
+                "no_data": True,
+                "no_data_reason": reason,
+                "status": "no_data" if _strict.is_strict_mode() else "degraded",
+                "degraded": True,
+                "diagnostics": deref_diag,
+            },
+        )
     model_id = _sentence_embedding_model_id(context, params)
     texts = [_row_analysis_text(doc) for doc in docs]
     embeddings, resolved_device = _encode_texts(texts, model_id=model_id, normalize=True)
@@ -5643,17 +5759,21 @@ def _similarity_index(params: dict[str, Any], deps: dict[str, ToolExecutionResul
                     "left_doc_id": str(left_doc["doc_id"]),
                     "right_doc_id": str(docs[right_idx]["doc_id"]),
                     "score": round(score, 4),
+                    "similarity_score": round(score, 4),
+                    "model_id": model_id,
                 }
             )
     rows.sort(key=lambda item: float(item["score"]), reverse=True)
+    metadata = _metadata("sentence-transformers", "sentence_transformer_similarity_index", model_id=model_id, device=resolved_device)
+    metadata["diagnostics"] = deref_diag
     return ToolExecutionResult(
-        payload={"rows": rows[:25]},
-        metadata=_metadata("sentence-transformers", "sentence_transformer_similarity_index", model_id=model_id, device=resolved_device),
+        payload={"rows": rows[:25], "diagnostics": deref_diag},
+        metadata=metadata,
     )
 
 
 def _similarity_pairwise(params: dict[str, Any], deps: dict[str, ToolExecutionResult], context: AgentExecutionContext) -> ToolExecutionResult:
-    docs = _doc_rows(deps)
+    docs = _resolved_doc_rows(deps, context)
     query = str(params.get("query", getattr(context.state, "rewritten_question", "") or getattr(context.state, "question", ""))).strip()
     rows = []
     model_id = _sentence_embedding_model_id(context, params)
@@ -6045,11 +6165,41 @@ def _time_series_aggregate(params: dict[str, Any], deps: dict[str, ToolExecution
     ).strip().lower() or "month"
     metric_series = _time_series_rows_from_metric_specs(params, deps, context, granularity=granularity)
     if metric_series is not None:
-        rows, skipped_rows = metric_series
-        caveats = []
+        rows, skipped_rows, ts_warnings, metric_diagnostics = metric_series
+        caveats: list[str] = list(ts_warnings)
         if skipped_rows:
             caveats.append(f"Skipped {skipped_rows} metric rows that could not be assigned to a requested series or numeric metric.")
-        return ToolExecutionResult(payload={"rows": rows, "skipped_row_count": skipped_rows}, caveats=caveats)
+        from corpusagent2 import strict_mode as _strict
+        empty_metric_sources = [
+            name for name, diag in metric_diagnostics.items() if diag.get("empty_source")
+        ]
+        no_data_flag = False
+        no_data_reason = ""
+        if _strict.fail_on_metric_source_empty() and empty_metric_sources:
+            no_data_flag = True
+            no_data_reason = "metric_source_empty:" + ",".join(empty_metric_sources)
+        if not rows and metric_diagnostics:
+            no_data_flag = True
+            no_data_reason = no_data_reason or "no_metric_rows"
+        metadata: dict[str, Any] = {
+            "metric_diagnostics": metric_diagnostics,
+            "warnings": ts_warnings,
+            "empty_metric_sources": empty_metric_sources,
+            "strict_mode": _strict.snapshot(),
+        }
+        if no_data_flag:
+            metadata["no_data"] = True
+            metadata["no_data_reason"] = no_data_reason
+        return ToolExecutionResult(
+            payload={
+                "rows": rows,
+                "skipped_row_count": skipped_rows,
+                "warnings": ts_warnings,
+                "metric_diagnostics": metric_diagnostics,
+            },
+            caveats=caveats,
+            metadata=metadata,
+        )
     document_series = _time_series_rows_from_document_series(params, deps, context, granularity=granularity)
     if document_series is not None:
         rows, skipped_rows = document_series
@@ -6101,8 +6251,12 @@ def _time_series_aggregate(params: dict[str, Any], deps: dict[str, ToolExecution
     grouped_value_counts: defaultdict[tuple[str, str], int] = defaultdict(int)
     period_docs: defaultdict[str, set[str]] = defaultdict(set)
     skipped_rows = 0
+    skipped_no_series = 0
+    skipped_no_value = 0
     top_n = _int_param(params, "top_n", "top_k", "limit", default=100, maximum=5000)
     aggregation = str(params.get("aggregation", params.get("agg", "")) or "").strip().lower()
+    from corpusagent2 import strict_mode as _strict
+    require_series = _strict.require_series_assignment()
     for row in source_rows:
         label = str(row.get("label", row.get("entity_type", "")) or "").upper()
         if allowed_labels and label and label not in allowed_labels:
@@ -6115,6 +6269,13 @@ def _time_series_aggregate(params: dict[str, Any], deps: dict[str, ToolExecution
         if not entity and row.get("topic_id") is not None:
             entity = f"topic_{row.get('topic_id')}"
         if not entity:
+            if require_series:
+                # Strict mode forbids collapsing to a synthetic __all__ bucket
+                # — that masquerades an unassignable row as if it belonged to
+                # a requested series.
+                skipped_no_series += 1
+                skipped_rows += 1
+                continue
             entity = str(row.get("doc_id") or "__all__")
         entity = _canonical_entity(entity)
         if entity not in {"__all__"} and not entity.startswith("topic_") and not _valid_series_surface(entity):
@@ -6124,12 +6285,22 @@ def _time_series_aggregate(params: dict[str, Any], deps: dict[str, ToolExecution
         if not timestamp.strip() and fallback_timestamp:
             timestamp = fallback_timestamp
         time_bin = _time_bin(timestamp, granularity)
-        value = row.get(value_field) if value_field else None
-        if value in (None, ""):
+        if value_field:
+            # When the caller explicitly named a value field, missing values
+            # must NOT be silently promoted to 1.0 — that's how unrelated
+            # rows get accepted as the metric. Skip and count the row.
+            raw_value = row.get(value_field)
+            numeric_value = _plot_float(raw_value)
+            if numeric_value is None:
+                skipped_no_value += 1
+                skipped_rows += 1
+                continue
+        else:
+            # Count-based mode: a row IS a mention; 1.0 per row is correct.
             value = row.get("count", row.get("mention_count", row.get("document_frequency", row.get("weight", row.get("score", 1)))))
-        numeric_value = _plot_float(value)
-        if numeric_value is None:
-            numeric_value = 1.0
+            numeric_value = _plot_float(value)
+            if numeric_value is None:
+                numeric_value = 1.0
         grouped[(entity, time_bin)] += float(numeric_value)
         grouped_value_counts[(entity, time_bin)] += 1
         doc_id = str(row.get("doc_id", "")).strip()
@@ -6172,9 +6343,23 @@ def _time_series_aggregate(params: dict[str, Any], deps: dict[str, ToolExecution
         rows.append(row)
     rows.sort(key=lambda row: (str(row.get("time_bin", "")), -float(row.get("count", 0.0)), str(row.get("entity", ""))))
     caveats = []
+    warnings: list[str] = []
     if skipped_rows:
         caveats.append(f"Skipped {skipped_rows} time-series rows with unsupported entity labels or unusable series names.")
-    return ToolExecutionResult(payload={"rows": rows, "skipped_row_count": skipped_rows}, caveats=caveats)
+    if skipped_no_series:
+        warnings.append(f"{skipped_no_series} rows not assignable to a requested series (strict-mode require_series_assignment)")
+    if skipped_no_value and value_field:
+        warnings.append(f"{skipped_no_value} rows skipped because value_field '{value_field}' was missing or non-numeric")
+    metadata: dict[str, Any] = {"warnings": warnings, "strict_mode": _strict.snapshot()}
+    return ToolExecutionResult(
+        payload={
+            "rows": rows,
+            "skipped_row_count": skipped_rows,
+            "warnings": warnings,
+        },
+        caveats=caveats,
+        metadata=metadata,
+    )
 
 
 def _change_point_detect(params: dict[str, Any], deps: dict[str, ToolExecutionResult], context: AgentExecutionContext) -> ToolExecutionResult:
@@ -6250,11 +6435,28 @@ def _burst_detect(params: dict[str, Any], deps: dict[str, ToolExecutionResult], 
 
 
 def _claim_span_extract(params: dict[str, Any], deps: dict[str, ToolExecutionResult], context: AgentExecutionContext) -> ToolExecutionResult:
+    from corpusagent2.node_resolution import resolve_documents_from_node
+    from corpusagent2 import strict_mode as _strict
+
     target_groups = _target_alias_groups(params, context)
     focus_terms = _focus_terms(params)
     fallback_keywords = sorted(CLAIM_KEYWORDS)
     rows = []
-    for doc in _doc_rows(deps):
+    max_documents = _working_set_analysis_max_documents()
+    documents, deref_diag = resolve_documents_from_node(deps, context, text_field="text", max_documents=max_documents)
+    if not documents:
+        return ToolExecutionResult(
+            payload={"rows": [], "diagnostics": deref_diag, "warnings": ["no_sentence_rows"]},
+            caveats=["claim_span_extract found no upstream documents or sentence rows"],
+            metadata={
+                "no_data": True,
+                "no_data_reason": "no_sentence_rows",
+                "status": "degraded",
+                "degraded": True,
+                "diagnostics": deref_diag,
+            },
+        )
+    for doc in documents:
         raw_sentences = doc.get("sentences")
         if isinstance(raw_sentences, list) and raw_sentences:
             sentences = [str(sentence).strip() for sentence in raw_sentences if str(sentence).strip()]
@@ -6290,16 +6492,41 @@ def _claim_span_extract(params: dict[str, Any], deps: dict[str, ToolExecutionRes
                     "matched_focus_terms": matched_focus_terms,
                 }
             )
-    return ToolExecutionResult(payload={"rows": rows})
+    if not rows:
+        return ToolExecutionResult(
+            payload={"rows": [], "diagnostics": deref_diag, "warnings": ["no_claim_spans_found"]},
+            caveats=["claim_span_extract scanned documents but found no claim spans"],
+            metadata={
+                "no_data": True,
+                "no_data_reason": "no_claim_spans_found",
+                "status": "no_data" if _strict.is_strict_mode() else "degraded",
+                "degraded": True,
+                "diagnostics": deref_diag,
+            },
+        )
+    return ToolExecutionResult(payload={"rows": rows, "diagnostics": deref_diag})
 
 
 def _claim_strength_score(params: dict[str, Any], deps: dict[str, ToolExecutionResult], context: AgentExecutionContext) -> ToolExecutionResult:
+    from corpusagent2 import strict_mode as _strict
+
     spans = []
     for result in deps.values():
         payload = result.payload
         if isinstance(payload, dict) and "rows" in payload:
             spans = list(payload["rows"])
             break
+    if not spans:
+        return ToolExecutionResult(
+            payload={"rows": [], "warnings": ["no_claim_spans"]},
+            caveats=["claim_strength_score received no claim spans from upstream"],
+            metadata={
+                "no_data": True,
+                "no_data_reason": "no_claim_spans",
+                "status": "no_data",
+                "degraded": True,
+            },
+        )
     scored = []
     for row in spans:
         excerpt = str(row.get("claim_span", row.get("excerpt", ""))).lower()
@@ -6324,8 +6551,9 @@ def _claim_strength_score(params: dict[str, Any], deps: dict[str, ToolExecutionR
 
 def _quote_extract(params: dict[str, Any], deps: dict[str, ToolExecutionResult], context: AgentExecutionContext) -> ToolExecutionResult:
     rows = []
-    document_lookup = {str(doc.get("doc_id", "")): doc for doc in _doc_rows(deps) if str(doc.get("doc_id", ""))}
-    for doc in _doc_rows(deps):
+    resolved = _resolved_doc_rows(deps, context)
+    document_lookup = {str(doc.get("doc_id", "")): doc for doc in resolved if str(doc.get("doc_id", ""))}
+    for doc in resolved:
         text = _row_analysis_text(doc)
         for match in QUOTE_PATTERN.finditer(text):
             doc_id = str(doc.get("doc_id", ""))
@@ -6678,7 +6906,20 @@ def _time_series_source_rows(
     context: AgentExecutionContext,
     source: str = "",
 ) -> list[dict[str, Any]]:
-    rows = _dependency_rows_for_source(deps, source) if source else _payload_rows_from_all_dependencies(deps)
+    # When a metric explicitly names a source node, the contract is strict:
+    # the rows MUST come from that node's payload. Falling back to "all deps"
+    # or to the raw working-set documents is what produced cross-metric value
+    # contamination (avg_sentiment getting filled with document `count` fields
+    # when the sentiment node returned no rows). Honor source isolation.
+    if source:
+        if source in deps:
+            payload = deps[source].payload if isinstance(deps[source].payload, dict) else {}
+            for key in ("rows", "documents", "results"):
+                value = payload.get(key)
+                if isinstance(value, list):
+                    return [dict(item) for item in value if isinstance(item, dict)]
+        return []
+    rows = _payload_rows_from_all_dependencies(deps)
     if rows:
         return rows
     working_set_ref = _resolve_working_set_ref(params, deps)
@@ -6770,7 +7011,13 @@ def _metric_value(row: dict[str, Any], metric: dict[str, Any]) -> float | None:
     if aggregation == "count":
         return 1.0
     metric_name = str(metric.get("name") or metric.get("as") or metric.get("output_field") or "").strip()
-    field_candidates = [
+    # Generic fields like "score" or "value" are legitimate only because
+    # _time_series_source_rows now enforces source isolation: a metric never
+    # sees rows from a different node than the one it declared. Before that
+    # fix, this fallback was the second half of the cross-metric copy bug —
+    # generic field name + unrelated rows = fake values. Source isolation is
+    # the load-bearing defense; do NOT relax it.
+    declared_fields = [
         str(metric.get("field", "") or "").strip(),
         str(metric.get("value_field", "") or "").strip(),
         str(metric.get("metric", "") or "").strip(),
@@ -6782,7 +7029,10 @@ def _metric_value(row: dict[str, Any], metric: dict[str, Any]) -> float | None:
         "document_frequency",
         "weight",
     ]
-    for field in field_candidates:
+    extra = metric.get("fallback_fields")
+    if isinstance(extra, list):
+        declared_fields.extend(str(item).strip() for item in extra if str(item).strip())
+    for field in declared_fields:
         if not field:
             continue
         value = _plot_float(row.get(field))
@@ -6797,7 +7047,14 @@ def _time_series_rows_from_metric_specs(
     context: AgentExecutionContext,
     *,
     granularity: str,
-) -> tuple[list[dict[str, Any]], int] | None:
+) -> tuple[list[dict[str, Any]], int, list[str], dict[str, dict[str, Any]]] | None:
+    """Return (rows, skipped, warnings, metric_diagnostics) or None if no metric specs.
+
+    metric_diagnostics maps each requested metric name to:
+      {"source": str, "rows_seen": int, "values_extracted": int, "empty_source": bool}
+    Callers can use it to render the metric column as explicit null instead of
+    silently omitting it — and to refuse plots/synthesis when fail_on_metric_source_empty.
+    """
     raw_metrics = params.get("metrics")
     if not isinstance(raw_metrics, list) or not raw_metrics:
         return None
@@ -6809,33 +7066,70 @@ def _time_series_rows_from_metric_specs(
     ]
     if not metrics:
         return None
+    from corpusagent2 import strict_mode as _strict
+
+    strict = _strict.is_strict_mode()
+    require_series = _strict.require_series_assignment()
     groups = _series_definitions(params)
     values: defaultdict[tuple[str, str, str], list[float]] = defaultdict(list)
     aggregations: dict[str, str] = {}
     doc_sets: defaultdict[tuple[str, str], set[str]] = defaultdict(set)
+    metric_diagnostics: dict[str, dict[str, Any]] = {}
+    warnings: list[str] = []
     skipped = 0
+    skipped_no_series = 0
+    skipped_no_value = 0
+    skipped_no_time = 0
     for metric in metrics:
         metric_name = str(metric.get("name") or metric.get("as") or metric.get("output_field") or metric.get("field") or "").strip()
         aggregations[metric_name] = str(metric.get("aggregation", metric.get("agg", "sum")) or "sum").strip().lower()
         source = str(metric.get("source", metric.get("source_node", metric.get("source_node_id", ""))) or "").strip()
-        for row in _time_series_source_rows(params, deps, context, source):
-            series = _row_series_name(row, groups) if groups else "__all__"
+        source_rows = _time_series_source_rows(params, deps, context, source)
+        diag = {
+            "source": source,
+            "rows_seen": len(source_rows),
+            "values_extracted": 0,
+            "empty_source": False,
+        }
+        if source and not source_rows:
+            diag["empty_source"] = True
+            warnings.append(
+                f"metric '{metric_name}' source node '{source}' returned 0 rows — metric set to null"
+            )
+        if not source and not source_rows:
+            warnings.append(f"metric '{metric_name}' has no declared source and no upstream rows")
+        for row in source_rows:
+            series = _row_series_name(row, groups) if groups else ("__all__" if not require_series else "")
             if not series:
+                skipped_no_series += 1
                 skipped += 1
                 continue
             timestamp = str(_first_nonempty_field(row, ["published_at", "date", "time_bin", "month", "period", "time_period"]))
             time_bin = _time_bin(timestamp, granularity)
-            value = _metric_value(row, metric)
-            if value is None:
+            if not str(time_bin).strip() or str(time_bin).lower() in {"unknown", "n/a", "none"}:
+                skipped_no_time += 1
                 skipped += 1
                 continue
+            value = _metric_value(row, metric)
+            if value is None:
+                skipped_no_value += 1
+                skipped += 1
+                continue
+            diag["values_extracted"] += 1
             values[(series, time_bin, metric_name)].append(value)
             doc_id = str(row.get("doc_id", "") or "").strip()
             if doc_id:
                 doc_sets[(series, time_bin)].add(doc_id)
-    if not values:
-        return [], skipped
+        metric_diagnostics[metric_name] = diag
+    if skipped_no_series:
+        warnings.append(f"{skipped_no_series} rows could not be assigned to a requested series")
+    if skipped_no_time:
+        warnings.append(f"{skipped_no_time} rows skipped because of missing or unparseable timestamps")
+    if skipped_no_value:
+        warnings.append(f"{skipped_no_value} rows skipped because of missing numeric values")
     rows_by_key: dict[tuple[str, str], dict[str, Any]] = {}
+    if not values and not metric_diagnostics:
+        return [], skipped, warnings, metric_diagnostics
     for (series, time_bin, metric_name), metric_values in values.items():
         target = rows_by_key.setdefault(
             (series, time_bin),
@@ -6859,11 +7153,26 @@ def _time_series_rows_from_metric_specs(
             target[metric_name] = int(total) if float(total).is_integer() else round(total, 6)
         target["document_frequency"] = len(doc_sets.get((series, time_bin), set()))
     rows = list(rows_by_key.values())
+    # Ensure every requested metric appears as an explicit key on every row,
+    # set to None when its source produced 0 usable values for that series/bin.
+    # This is the single biggest scientific-integrity fix: a missing metric is
+    # null, never a copy of another metric.
+    all_metric_names = list(metric_diagnostics.keys())
+    for row in rows:
+        for metric_name in all_metric_names:
+            if metric_name not in row:
+                row[metric_name] = None
     for row in rows:
         if "mention_count" in row:
             row["count"] = row["mention_count"]
     rows.sort(key=lambda row: (str(row.get("time_bin", "")), str(row.get("series_name", ""))))
-    return rows, skipped
+    if strict and require_series and groups:
+        leaked_collapse = [r for r in rows if r.get("series_name") == "__all__"]
+        if leaked_collapse:
+            warnings.append(
+                f"strict-mode violation: {len(leaked_collapse)} rows collapsed to '__all__' despite explicit series definitions"
+            )
+    return rows, skipped, warnings, metric_diagnostics
 
 
 def _entity_frequency_rows(params: dict[str, Any], deps: dict[str, ToolExecutionResult], *, task: str) -> tuple[list[dict[str, Any]], dict[str, Any], list[str]]:
@@ -8233,6 +8542,8 @@ def _image_has_visual_content(path: Path) -> bool:
 
 
 def _plot_artifact(params: dict[str, Any], deps: dict[str, ToolExecutionResult], context: AgentExecutionContext) -> ToolExecutionResult:
+    from corpusagent2 import strict_mode as _strict
+
     rows = []
     for result in deps.values():
         payload = result.payload
@@ -8254,6 +8565,89 @@ def _plot_artifact(params: dict[str, Any], deps: dict[str, ToolExecutionResult],
             caveats=["No structured rows available for plotting."],
             metadata={"no_data": True, "no_data_reason": "No structured rows available for plotting."},
         )
+
+    # ---- strict-mode pre-plot validation ----------------------------------
+    # Refuse to render charts whose y metric is null/missing for every row.
+    # This is the single biggest visual-deception vector: a chart with bars
+    # drawn from another column when the requested metric was actually empty.
+    requested_x_strict = str(params.get("x", "")).strip()
+    requested_y_strict = str(params.get("y", "")).strip()
+    requested_series_strict = str(params.get("series", params.get("series_key", "")) or "").strip()
+    strict_warnings: list[str] = []
+    null_value_count = 0
+    if requested_y_strict and _strict.plot_require_valid_y():
+        y_values_seen = 0
+        y_values_numeric = 0
+        for row in structured_rows:
+            if requested_y_strict in row:
+                y_values_seen += 1
+                raw = row.get(requested_y_strict)
+                if raw is None:
+                    null_value_count += 1
+                    continue
+                if _plot_float(raw) is not None:
+                    y_values_numeric += 1
+        if y_values_seen and y_values_numeric == 0:
+            return ToolExecutionResult(
+                payload={
+                    "rows": [],
+                    "resolved_x": requested_x_strict,
+                    "resolved_y": requested_y_strict,
+                    "resolved_series": requested_series_strict,
+                    "plotted_row_count": 0,
+                    "skipped_row_count": len(structured_rows),
+                    "null_value_count": null_value_count,
+                    "warnings": [f"plot refused: y='{requested_y_strict}' is null/non-numeric for all {y_values_seen} rows"],
+                },
+                caveats=[
+                    f"plot_artifact refused to render: requested y='{requested_y_strict}' "
+                    f"has null or non-numeric values for all {y_values_seen} upstream rows. "
+                    "Strict mode forbids charts that would visually substitute another column."
+                ],
+                metadata={
+                    "no_data": True,
+                    "no_data_reason": f"plot_y_all_null:{requested_y_strict}",
+                    "status": "no_data",
+                    "degraded": True,
+                    "resolved_x": requested_x_strict,
+                    "resolved_y": requested_y_strict,
+                    "resolved_series": requested_series_strict,
+                    "null_value_count": null_value_count,
+                    "strict_mode": _strict.snapshot(),
+                },
+            )
+    # Refuse comparative-series collapse to __all__ when the planner asked
+    # for explicit series.
+    if _strict.require_series_assignment() and isinstance(params.get("series_definitions"), list) and params["series_definitions"]:
+        series_present = {str(row.get("series_name", "") or "").strip() for row in structured_rows}
+        meaningful = series_present - {"", "__all__"}
+        if not meaningful:
+            return ToolExecutionResult(
+                payload={
+                    "rows": [],
+                    "resolved_x": requested_x_strict,
+                    "resolved_y": requested_y_strict,
+                    "resolved_series": requested_series_strict,
+                    "plotted_row_count": 0,
+                    "skipped_row_count": len(structured_rows),
+                    "warnings": ["plot refused: comparative series collapsed to __all__ despite explicit series_definitions"],
+                },
+                caveats=[
+                    "plot_artifact refused to render: rows collapsed to '__all__' even though "
+                    "explicit series_definitions were provided. Strict mode forbids comparative "
+                    "plots that hide which series the values came from."
+                ],
+                metadata={
+                    "no_data": True,
+                    "no_data_reason": "comparative_series_collapsed",
+                    "status": "no_data",
+                    "degraded": True,
+                    "resolved_x": requested_x_strict,
+                    "resolved_y": requested_y_strict,
+                    "resolved_series": requested_series_strict,
+                    "strict_mode": _strict.snapshot(),
+                },
+            )
     requested_x_key = str(params.get("x", "")).strip()
     requested_y_key = str(params.get("y", "")).strip()
     x_key, x_caveat = _resolve_plot_field(

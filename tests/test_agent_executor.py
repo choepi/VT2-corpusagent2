@@ -158,6 +158,9 @@ def test_async_executor_skipped_nodes_include_failed_dependency_reason(tmp_path:
     snapshot = asyncio.run(AsyncPlanExecutor(registry).execute(plan, context))
 
     records = {record.node_id: record for record in snapshot.node_records}
+    # Two-node plan where the only producer fails: nothing succeeded, so the
+    # overall status is "failed". (Multi-branch plans with at least one
+    # successful node would be "partial" under the new cascade semantics.)
     assert snapshot.status == "failed"
     assert records["series"].status == "failed"
     assert records["plot"].status == "skipped"
