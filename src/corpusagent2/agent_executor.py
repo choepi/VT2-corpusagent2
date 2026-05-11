@@ -15,6 +15,8 @@ from .agent_capabilities import AgentExecutionContext
 from .agent_models import AgentFailure, AgentNodeExecutionRecord, AgentPlanDAG, AgentPlanNode
 from .io_utils import write_json
 from .provenance import make_provenance_record
+from . import recovery_advisor as _recovery_advisor
+from .retry import RetryPolicy
 from .tool_registry import ToolExecutionResult, ToolRegistry
 
 
@@ -396,6 +398,46 @@ class AsyncPlanExecutor:
         )
         return str(target)
 
+    def _write_run_state(
+        self,
+        artifacts_dir: Path,
+        node_records: list[AgentNodeExecutionRecord],
+        failures: list[AgentFailure],
+        *,
+        plan_dag: AgentPlanDAG | None = None,
+    ) -> None:
+        """Write a single-file progress snapshot to artifacts_dir/run_state.json.
+
+        Updated after every node so a killed run leaves a self-describing
+        breadcrumb: which nodes finished, which are still pending, which
+        failed, and the most recent timestamp.
+        """
+        total = len(plan_dag.nodes) if plan_dag is not None else len({r.node_id for r in node_records})
+        finished_ids = {r.node_id for r in node_records}
+        by_status: dict[str, list[str]] = {}
+        for record in node_records:
+            by_status.setdefault(record.status, []).append(record.node_id)
+        pending_ids: list[str] = []
+        if plan_dag is not None:
+            pending_ids = [n.node_id for n in plan_dag.nodes if n.node_id not in finished_ids]
+        try:
+            write_json(
+                artifacts_dir / "run_state.json",
+                {
+                    "updated_at_utc": _utc_now(),
+                    "total_nodes": total,
+                    "finished_nodes": len(finished_ids),
+                    "pending_node_ids": pending_ids,
+                    "completed_node_ids": by_status.get("completed", []),
+                    "skipped_node_ids": by_status.get("skipped", []),
+                    "failed_node_ids": by_status.get("failed", []),
+                    "failure_count": len(failures),
+                },
+            )
+        except Exception:
+            # Never let state writes break the run loop.
+            pass
+
     def _emit_event(self, context: AgentExecutionContext, payload: dict[str, Any]) -> None:
         if context.event_callback is None:
             return
@@ -774,13 +816,22 @@ class AsyncPlanExecutor:
                 provenance,
             )
 
-        while attempts < 2:
+        retry_policy = RetryPolicy.from_env()
+        while attempts < retry_policy.max_attempts:
             if self._is_cancelled(context):
                 return cancelled_response(
                     "Skipped because run abort was requested before this tool attempt started.",
                     tool_name=resolution.spec.tool_name,
                     provider=resolution.spec.provider,
                 )
+            if attempts >= 1:
+                # Only retry transient errors. Permanent failures should not
+                # consume more attempts.
+                if not retry_policy.is_retriable(last_category):
+                    break
+                delay_s = retry_policy.compute_delay_s(attempts + 1)
+                if delay_s > 0:
+                    time.sleep(delay_s)
             attempts += 1
             try:
                 context.working_store.record_tool_call(
@@ -956,6 +1007,30 @@ class AsyncPlanExecutor:
             category=last_category,
         )
         status = "skipped" if node.optional else "failed"
+        # Optional LLM recovery advisor: when CORPUSAGENT2_USE_LLM_RECOVERY=true
+        # is set, log the advisor's suggestion to the failure metadata.
+        # The advisor never mutates the plan; it surfaces a recommended
+        # next step that a human can inspect from the node JSON. Applying
+        # the action automatically is left as an opt-in follow-up.
+        if _recovery_advisor.is_enabled() and getattr(self, "_recovery_advisor_factory", None) is not None:
+            try:
+                advisor = self._recovery_advisor_factory()  # type: ignore[attr-defined]
+                if advisor is not None:
+                    action = advisor.advise(
+                        node_id=node.node_id,
+                        capability=node.capability,
+                        tool_name=resolution.spec.tool_name,
+                        inputs=dict(node.inputs),
+                        traceback=last_traceback,
+                        failure_category=last_category,
+                        upstream_summary={k: True for k in dependency_results},
+                        candidate_capabilities=self.registry.list_capabilities_in_same_category(node.capability)
+                        if hasattr(self.registry, "list_capabilities_in_same_category")
+                        else [],
+                    )
+                    failure.details["recovery_advisor"] = action.to_dict()
+            except Exception as exc:
+                failure.details["recovery_advisor_error"] = str(exc)
         try:
             self._write_failure_artifact(
                 context.artifacts_dir,
@@ -1147,6 +1222,7 @@ class AsyncPlanExecutor:
                         selected_docs = list(payload.get("documents", []))
                 if effective_failure is not None:
                     failures.append(effective_failure)
+                self._write_run_state(context.artifacts_dir, node_records, failures, plan_dag=plan_dag)
             failed_ready_ids = [
                 item.node_id
                 for item in node_records
