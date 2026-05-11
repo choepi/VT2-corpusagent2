@@ -1165,3 +1165,122 @@ th {
     grid-template-columns: 1fr;
   }
 }
+
+/* ----- Phase 4 modernization: scroll-reveal + status pill + micro-interactions ----- */
+
+@media (prefers-reduced-motion: no-preference) {
+  .reveal {
+    opacity: 0;
+    transform: translateY(18px);
+    transition: opacity 0.55s cubic-bezier(0.22, 1, 0.36, 1), transform 0.55s cubic-bezier(0.22, 1, 0.36, 1);
+    will-change: opacity, transform;
+  }
+  .reveal.in-view {
+    opacity: 1;
+    transform: translateY(0);
+  }
+  .card {
+    transition: box-shadow 0.35s ease, transform 0.35s ease;
+  }
+  .card:hover {
+    box-shadow: 0 26px 80px rgba(0, 0, 0, 0.10);
+  }
+}
+
+/* Live API health pill (green when /health is reachable, red when not). */
+.status-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 14px;
+  border-radius: 999px;
+  font-size: 12.5px;
+  font-weight: 500;
+  letter-spacing: 0.01em;
+  background: rgba(52, 199, 89, 0.12);
+  color: #1f7a3a;
+  border: 1px solid rgba(52, 199, 89, 0.32);
+  transition: background 0.3s ease, color 0.3s ease, border-color 0.3s ease;
+}
+.status-pill::before {
+  content: "";
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #34c759;
+  box-shadow: 0 0 0 0 rgba(52, 199, 89, 0.4);
+  animation: status-pulse 2.2s ease-in-out infinite;
+}
+.status-pill.status-down {
+  background: rgba(217, 45, 32, 0.10);
+  color: #b42318;
+  border-color: rgba(217, 45, 32, 0.30);
+}
+.status-pill.status-down::before {
+  background: #d92d20;
+  animation: none;
+  box-shadow: none;
+}
+.status-pill.status-unknown {
+  background: rgba(110, 110, 115, 0.10);
+  color: #4b5563;
+  border-color: rgba(110, 110, 115, 0.25);
+}
+.status-pill.status-unknown::before {
+  background: #6e6e73;
+  animation: none;
+  box-shadow: none;
+}
+
+@keyframes status-pulse {
+  0% {
+    box-shadow: 0 0 0 0 rgba(52, 199, 89, 0.50);
+  }
+  70% {
+    box-shadow: 0 0 0 10px rgba(52, 199, 89, 0);
+  }
+  100% {
+    box-shadow: 0 0 0 0 rgba(52, 199, 89, 0);
+  }
+}
+
+/* Subtle gradient drift on the hero for a hint of life. */
+.hero {
+  position: relative;
+  overflow: hidden;
+}
+.hero::after {
+  content: "";
+  position: absolute;
+  inset: -40% -10% auto auto;
+  width: 60%;
+  height: 200%;
+  background: radial-gradient(circle at 30% 30%, rgba(0, 113, 227, 0.10), transparent 55%);
+  pointer-events: none;
+  animation: hero-drift 18s ease-in-out infinite alternate;
+  z-index: 0;
+}
+.hero > * {
+  position: relative;
+  z-index: 1;
+}
+@keyframes hero-drift {
+  0% {
+    transform: translate3d(0, 0, 0) scale(1);
+  }
+  100% {
+    transform: translate3d(-6%, 4%, 0) scale(1.06);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .reveal {
+    opacity: 1;
+    transform: none;
+  }
+  .hero::after,
+  .status-pill::before {
+    animation: none;
+  }
+}

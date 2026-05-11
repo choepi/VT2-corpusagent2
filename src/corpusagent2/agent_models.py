@@ -216,6 +216,10 @@ class AgentFailure:
     message: str
     retriable: bool = False
     details: dict[str, Any] = field(default_factory=dict)
+    traceback: str = ""
+    input_snapshot: dict[str, Any] = field(default_factory=dict)
+    retry_count: int = 0
+    category: str = "unknown"
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

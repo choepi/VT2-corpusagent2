@@ -101,7 +101,24 @@ const ACCESS_GATE_SESSION_KEY = "corpusagent2-access-gate-ok";
 const TERMINAL_RUN_STATUSES = ["completed", "partial", "failed", "rejected", "needs_clarification", "aborted"];
 const DEFAULT_API_BASE = "https://api.dongtse.com";
 const LOCAL_API_BASE = "http://127.0.0.1:8001";
+const SAME_ORIGIN_BASE = (() => {
+  try {
+    const origin = String(window.location.origin || "").trim().replace(/\/$/, "");
+    if (!origin || origin === "null" || origin.startsWith("file:")) {
+      return "";
+    }
+    if (origin === "http://127.0.0.1:5500" || origin === "http://localhost:5500") {
+      return "";
+    }
+    return origin;
+  } catch (_error) {
+    return "";
+  }
+})();
 const API_BASE_OPTIONS = [DEFAULT_API_BASE, LOCAL_API_BASE];
+if (SAME_ORIGIN_BASE && !API_BASE_OPTIONS.includes(SAME_ORIGIN_BASE)) {
+  API_BASE_OPTIONS.push(SAME_ORIGIN_BASE);
+}
 let clarificationBaseQuestion = "";
 
 const runtimeConfig = window.CORPUSAGENT2_CONFIG || {};
@@ -114,7 +131,7 @@ providerBadge.textContent = "LLM: loading...";
 function normalizeApiBase(value) {
   const normalized = String(value || "").trim().replace(/\/$/, "");
   if (normalized === "http://127.0.0.1:5500" || normalized === "http://localhost:5500") {
-    return LOCAL_API_BASE;
+    return SAME_ORIGIN_BASE || LOCAL_API_BASE;
   }
   try {
     const parsedUrl = new URL(normalized);
@@ -125,6 +142,9 @@ function normalizeApiBase(value) {
   } catch (_error) {
     return DEFAULT_API_BASE;
   }
+  if (SAME_ORIGIN_BASE && normalized === SAME_ORIGIN_BASE) {
+    return SAME_ORIGIN_BASE;
+  }
   return API_BASE_OPTIONS.includes(normalized) ? normalized : DEFAULT_API_BASE;
 }
 
@@ -134,6 +154,16 @@ function initialApiBase(savedValue = "") {
     return runtimeBase;
   }
   return normalizeApiBase(savedValue || runtimeConfig.apiBaseUrl || DEFAULT_API_BASE);
+}
+
+if (SAME_ORIGIN_BASE) {
+  const hasOption = Array.from(apiBaseInput.options || []).some((opt) => opt.value === SAME_ORIGIN_BASE);
+  if (!hasOption) {
+    const option = document.createElement("option");
+    option.value = SAME_ORIGIN_BASE;
+    option.textContent = `Same origin - ${SAME_ORIGIN_BASE}`;
+    apiBaseInput.insertBefore(option, apiBaseInput.firstChild);
+  }
 }
 
 function questionStateKey(value) {
@@ -2574,3 +2604,72 @@ loadRuntimeInfo().then(async () => {
     }
   }
 });
+
+// ----- Phase 4 modernization: scroll-reveal + live API status pill -----
+
+(function initScrollReveal() {
+  if (typeof IntersectionObserver === "undefined") {
+    return;
+  }
+  const cards = document.querySelectorAll(".shell .card");
+  if (!cards.length) {
+    return;
+  }
+  cards.forEach((card) => card.classList.add("reveal"));
+  const observer = new IntersectionObserver(
+    (entries) => {
+      entries.forEach((entry) => {
+        if (entry.isIntersecting) {
+          entry.target.classList.add("in-view");
+          observer.unobserve(entry.target);
+        }
+      });
+    },
+    { threshold: 0.08, rootMargin: "0px 0px -8% 0px" }
+  );
+  cards.forEach((card) => observer.observe(card));
+})();
+
+(function initApiStatusPill() {
+  const hero = document.querySelector(".shell .hero .hero-badges");
+  if (!hero) {
+    return;
+  }
+  const pill = document.createElement("span");
+  pill.className = "status-pill status-unknown";
+  pill.id = "apiStatusPill";
+  pill.textContent = "API: checking";
+  pill.setAttribute("role", "status");
+  pill.setAttribute("aria-live", "polite");
+  hero.insertBefore(pill, hero.firstChild);
+
+  async function probe() {
+    try {
+      const base = (typeof apiBaseInput !== "undefined" && apiBaseInput && apiBaseInput.value)
+        ? apiBaseInput.value.replace(/\/$/, "")
+        : "";
+      if (!base) {
+        pill.className = "status-pill status-unknown";
+        pill.textContent = "API: not set";
+        return;
+      }
+      const response = await fetch(`${base}/health`, { method: "GET", cache: "no-store" });
+      if (response.ok) {
+        pill.className = "status-pill";
+        pill.textContent = "API: healthy";
+      } else {
+        pill.className = "status-pill status-down";
+        pill.textContent = `API: ${response.status}`;
+      }
+    } catch (_error) {
+      pill.className = "status-pill status-down";
+      pill.textContent = "API: unreachable";
+    }
+  }
+
+  probe();
+  setInterval(probe, 15000);
+  if (typeof apiBaseInput !== "undefined" && apiBaseInput) {
+    apiBaseInput.addEventListener("change", probe);
+  }
+})();

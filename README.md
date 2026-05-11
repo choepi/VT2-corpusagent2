@@ -27,6 +27,20 @@ repo, so some parts are cleaner than others.
 - an OpenAI-compatible API key, unless you are only testing non-LLM pieces
 - corpus data, if you are building the index from scratch
 
+## One-shot setup (recommended)
+
+```powershell
+python scripts/setup.py     # auto-detects CUDA, writes .env, runs uv sync
+python scripts/run.py up    # docker compose, picks CPU/GPU profile automatically
+```
+
+Then open `http://127.0.0.1:8001` — the FastAPI app serves both the UI and the
+API on the same port. `scripts/run.py` exposes `up / up-nodb / build / down /
+stop / logs / status / local / api / mcp` and always uses the same commands
+whether you are on CPU or GPU.
+
+Manual flow below is still supported if you want fine-grained control.
+
 ## Quick start on Windows
 
 From PowerShell:
