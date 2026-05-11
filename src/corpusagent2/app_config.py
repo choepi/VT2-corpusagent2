@@ -23,8 +23,8 @@ class FrontendConfig:
 class LLMAppConfig:
     use_openai: bool = False
     openai_base_url: str = "https://api.openai.com/v1"
-    openai_planner_model: str = "gpt-4.1-mini"
-    openai_synthesis_model: str = "gpt-4.1-mini"
+    openai_planner_model: str = "gpt-5.4-2026-03-05"
+    openai_synthesis_model: str = "gpt-5.4-2026-03-05"
     unclose_base_url: str = "https://hermes.ai.unturf.com/v1"
     unclose_planner_model: str = "adamo1139/Hermes-3-Llama-3.1-8B-FP8-Dynamic"
     unclose_synthesis_model: str = "adamo1139/Hermes-3-Llama-3.1-8B-FP8-Dynamic"
@@ -73,8 +73,8 @@ class AppConfig:
             llm=LLMAppConfig(
                 use_openai=str(llm_payload.get("use_openai", "false")).strip().lower() in {"1", "true", "yes", "on"},
                 openai_base_url=str(llm_payload.get("openai_base_url", "https://api.openai.com/v1")),
-                openai_planner_model=str(llm_payload.get("openai_planner_model", "gpt-4.1-mini")),
-                openai_synthesis_model=str(llm_payload.get("openai_synthesis_model", "gpt-4.1-mini")),
+                openai_planner_model=str(llm_payload.get("openai_planner_model", "gpt-5.4-2026-03-05")),
+                openai_synthesis_model=str(llm_payload.get("openai_synthesis_model", "gpt-5.4-2026-03-05")),
                 unclose_base_url=str(llm_payload.get("unclose_base_url", "https://hermes.ai.unturf.com/v1")),
                 unclose_planner_model=str(
                     llm_payload.get(
