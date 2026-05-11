@@ -17,7 +17,6 @@ COPY --from=docker:27-cli /usr/local/bin/docker /usr/local/bin/docker
 
 COPY pyproject.toml uv.lock README.md ./
 COPY deploy/requirements.docker-cpu.txt ./deploy/requirements.docker-cpu.txt
-COPY deploy/requirements.docker-torch-cpu.txt ./deploy/requirements.docker-torch-cpu.txt
 COPY deploy/requirements.docker-nlp-providers.txt ./deploy/requirements.docker-nlp-providers.txt
 COPY scripts/17_download_provider_assets.py ./scripts/17_download_provider_assets.py
 
@@ -27,27 +26,27 @@ RUN set -eu; \
     case "$CORPUSAGENT2_DOCKER_TORCH_PROFILE" in \
       cuda) \
         if [ "$CORPUSAGENT2_DOCKER_INSTALL_NLP_PROVIDERS" = "true" ]; then \
-          uv --system-certs sync --frozen --extra nlp-providers --no-install-project; \
+          uv sync --frozen --extra nlp-providers --no-install-project; \
         else \
-          uv --system-certs sync --frozen --no-install-project; \
+          uv sync --frozen --no-install-project; \
         fi; \
         ;; \
       cpu) \
         uv venv; \
-        uv --system-certs \
-          --allow-insecure-host download.pytorch.org \
-          --allow-insecure-host download-r2.pytorch.org \
-          pip install \
-          --index-url https://download.pytorch.org/whl/cpu \
-          -r deploy/requirements.docker-torch-cpu.txt; \
         if [ "$CORPUSAGENT2_DOCKER_INSTALL_NLP_PROVIDERS" = "true" ]; then \
-          uv --system-certs pip install \
+          uv pip install \
+            --torch-backend cpu \
+            --index-strategy unsafe-best-match \
             --index-url https://pypi.org/simple \
+            --extra-index-url https://download.pytorch.org/whl/cpu \
             -r deploy/requirements.docker-cpu.txt \
             -r deploy/requirements.docker-nlp-providers.txt; \
         else \
-          uv --system-certs pip install \
+          uv pip install \
+            --torch-backend cpu \
+            --index-strategy unsafe-best-match \
             --index-url https://pypi.org/simple \
+            --extra-index-url https://download.pytorch.org/whl/cpu \
             -r deploy/requirements.docker-cpu.txt; \
         fi; \
         ;; \
@@ -65,14 +64,15 @@ RUN if [ "$CORPUSAGENT2_DOCKER_DOWNLOAD_PROVIDER_ASSETS" = "true" ]; then \
 COPY config ./config
 COPY scripts ./scripts
 COPY src ./src
+COPY web ./web
 
 RUN set -eu; \
     case "$CORPUSAGENT2_DOCKER_TORCH_PROFILE" in \
       cuda) \
         if [ "$CORPUSAGENT2_DOCKER_INSTALL_NLP_PROVIDERS" = "true" ]; then \
-          uv --system-certs sync --frozen --extra nlp-providers --inexact; \
+          uv sync --frozen --extra nlp-providers --inexact; \
         else \
-          uv --system-certs sync --frozen --inexact; \
+          uv sync --frozen --inexact; \
         fi; \
         ;; \
       cpu) \

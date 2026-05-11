@@ -101,7 +101,24 @@ const ACCESS_GATE_SESSION_KEY = "corpusagent2-access-gate-ok";
 const TERMINAL_RUN_STATUSES = ["completed", "partial", "failed", "rejected", "needs_clarification", "aborted"];
 const DEFAULT_API_BASE = "https://api.dongtse.com";
 const LOCAL_API_BASE = "http://127.0.0.1:8001";
+const SAME_ORIGIN_BASE = (() => {
+  try {
+    const origin = String(window.location.origin || "").trim().replace(/\/$/, "");
+    if (!origin || origin === "null" || origin.startsWith("file:")) {
+      return "";
+    }
+    if (origin === "http://127.0.0.1:5500" || origin === "http://localhost:5500") {
+      return "";
+    }
+    return origin;
+  } catch (_error) {
+    return "";
+  }
+})();
 const API_BASE_OPTIONS = [DEFAULT_API_BASE, LOCAL_API_BASE];
+if (SAME_ORIGIN_BASE && !API_BASE_OPTIONS.includes(SAME_ORIGIN_BASE)) {
+  API_BASE_OPTIONS.push(SAME_ORIGIN_BASE);
+}
 let clarificationBaseQuestion = "";
 
 const runtimeConfig = window.CORPUSAGENT2_CONFIG || {};
@@ -114,7 +131,7 @@ providerBadge.textContent = "LLM: loading...";
 function normalizeApiBase(value) {
   const normalized = String(value || "").trim().replace(/\/$/, "");
   if (normalized === "http://127.0.0.1:5500" || normalized === "http://localhost:5500") {
-    return LOCAL_API_BASE;
+    return SAME_ORIGIN_BASE || LOCAL_API_BASE;
   }
   try {
     const parsedUrl = new URL(normalized);
@@ -125,6 +142,9 @@ function normalizeApiBase(value) {
   } catch (_error) {
     return DEFAULT_API_BASE;
   }
+  if (SAME_ORIGIN_BASE && normalized === SAME_ORIGIN_BASE) {
+    return SAME_ORIGIN_BASE;
+  }
   return API_BASE_OPTIONS.includes(normalized) ? normalized : DEFAULT_API_BASE;
 }
 
@@ -134,6 +154,16 @@ function initialApiBase(savedValue = "") {
     return runtimeBase;
   }
   return normalizeApiBase(savedValue || runtimeConfig.apiBaseUrl || DEFAULT_API_BASE);
+}
+
+if (SAME_ORIGIN_BASE) {
+  const hasOption = Array.from(apiBaseInput.options || []).some((opt) => opt.value === SAME_ORIGIN_BASE);
+  if (!hasOption) {
+    const option = document.createElement("option");
+    option.value = SAME_ORIGIN_BASE;
+    option.textContent = `Same origin - ${SAME_ORIGIN_BASE}`;
+    apiBaseInput.insertBefore(option, apiBaseInput.firstChild);
+  }
 }
 
 function questionStateKey(value) {
