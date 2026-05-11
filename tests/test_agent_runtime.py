@@ -579,11 +579,16 @@ def test_executor_records_successful_ready_siblings_and_skips_pending_after_core
     snapshot = asyncio.run(executor.execute(dag, context))
     statuses = {record.node_id: record.status for record in snapshot.node_records}
 
-    assert snapshot.status == "failed"
+    # New partial-failure semantics: a localized core_no_data failure on one
+    # node no longer halts the entire run. Independent branches (sibling and
+    # its descendant `pending`) must still execute — only the failing node's
+    # actual transitive children should be skipped. Here `pending` depends on
+    # `sibling`, not on `failing`, so it runs successfully.
+    assert snapshot.status == "partial"
     assert statuses["seed"] == "completed"
     assert statuses["failing"] == "failed"
     assert statuses["sibling"] == "completed"
-    assert statuses["pending"] == "skipped"
+    assert statuses["pending"] == "completed"
 
 
 def test_executor_rejects_malformed_declared_tool_input(tmp_path: Path) -> None:
