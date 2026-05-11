@@ -150,6 +150,43 @@ SERIES_SURFACE_STOPWORDS = (
     STOPWORDS | STRUCTURAL_TERM_STOPWORDS | FUNCTION_WORD_STOPWORDS | TEMPLATE_TERM_STOPWORDS | ENTITY_SURFACE_STOPWORDS
 )
 
+# Stopword set used by the *display layer* to scrub topic / frame labels
+# before they reach plots or the answer. The vectorizers in _topic_model
+# already pass stop_words="english", but the heuristic fallback skips that,
+# and gensim/textacy occasionally still surface function words. This is
+# the final safety net so charts never show labels like "in of league is".
+TOPIC_LABEL_STOPWORDS = (
+    STOPWORDS | FUNCTION_WORD_STOPWORDS | STRUCTURAL_TERM_STOPWORDS | ENTITY_SURFACE_STOPWORDS
+)
+
+
+def clean_topic_terms(top_terms: Any, *, max_count: int = 4, min_length: int = 3) -> list[str]:
+    """Return display-safe topic terms.
+
+    Drops English function words, structural article-template tokens, and
+    very short fragments (<3 chars). Preserves order so the strongest
+    remaining terms surface first. Lower-cases for stopword matching but
+    returns the original casing.
+    """
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    for term in top_terms or []:
+        text = str(term or "").strip()
+        if not text:
+            continue
+        normalized = text.lower()
+        if len(normalized) < min_length:
+            continue
+        if normalized in TOPIC_LABEL_STOPWORDS:
+            continue
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        cleaned.append(text)
+        if len(cleaned) >= max_count:
+            break
+    return cleaned
+
 
 def _is_placeholder_axis_label(value: Any) -> bool:
     return str(value or "").strip().lower() in NULL_AXIS_LABELS
@@ -5057,12 +5094,14 @@ def _topic_model(params: dict[str, Any], deps: dict[str, ToolExecutionResult], c
                     weights = model.fit_transform(matrix)
                     vocab = vectorizer.get_feature_names_out()
                     for idx, component in enumerate(model.components_, start=1):
-                        top_indices = component.argsort()[::-1][:10]
+                        top_indices = component.argsort()[::-1][:20]
+                        raw_terms = [str(vocab[item]) for item in top_indices]
+                        cleaned_terms = clean_topic_terms(raw_terms, max_count=10, min_length=3)
                         payload.append(
                             {
                                 "topic_id": topic_counter,
                                 "time_bin": time_bin,
-                                "top_terms": [str(vocab[item]) for item in top_indices],
+                                "top_terms": cleaned_terms,
                                 "weight": float(weights[:, idx - 1].sum()),
                             }
                         )
@@ -5076,7 +5115,11 @@ def _topic_model(params: dict[str, Any], deps: dict[str, ToolExecutionResult], c
                 topic_counter = 1
                 for time_bin, bucket in sorted(bucket_rows.items()):
                     tokenized = [
-                        [token.lower() for token in _tokenize(_row_analysis_text(item)) if token.lower() not in STOPWORDS]
+                        [
+                            token.lower()
+                            for token in _tokenize(_row_analysis_text(item))
+                            if token.lower() not in TOPIC_LABEL_STOPWORDS and len(token) >= 3
+                        ]
                         for item in bucket
                     ]
                     dictionary = corpora.Dictionary(tokenized)
@@ -5093,11 +5136,13 @@ def _topic_model(params: dict[str, Any], deps: dict[str, ToolExecutionResult], c
                         passes=5,
                     )
                     for topic_id in range(model.num_topics):
+                        raw_terms = [term for term, _ in model.show_topic(topic_id, topn=20)]
+                        cleaned_terms = clean_topic_terms(raw_terms, max_count=10, min_length=3)
                         payload.append(
                             {
                                 "topic_id": topic_counter,
                                 "time_bin": time_bin,
-                                "top_terms": [term for term, _ in model.show_topic(topic_id, topn=10)],
+                                "top_terms": cleaned_terms,
                                 "weight": float(sum(weight for _, weight in model.get_topic_terms(topic_id, topn=20))),
                             }
                         )
@@ -5113,15 +5158,19 @@ def _topic_model(params: dict[str, Any], deps: dict[str, ToolExecutionResult], c
         for row in rows:
             time_bin = _time_bin(_row_timestamp(row), granularity)
             for token in _tokenize(_row_analysis_text(row).lower()):
-                if token in STOPWORDS:
+                if token in TOPIC_LABEL_STOPWORDS or len(token) < 3:
                     continue
                 grouped[time_bin][token] += 1
         for idx, (time_bin, counts) in enumerate(sorted(grouped.items()), start=1):
+            raw_terms = [term for term, _ in counts.most_common(20)]
+            cleaned = clean_topic_terms(raw_terms, max_count=10, min_length=3)
+            if not cleaned:
+                continue
             payload.append(
                 {
                     "topic_id": idx,
                     "time_bin": time_bin,
-                    "top_terms": [term for term, _ in counts.most_common(10)],
+                    "top_terms": cleaned,
                     "weight": float(sum(counts.values())),
                 }
             )
@@ -8414,7 +8463,7 @@ def _plot_artifact(params: dict[str, Any], deps: dict[str, ToolExecutionResult],
         labels = []
         values = []
         for index, item in enumerate(first):
-            top_terms = [str(term) for term in item.get("top_terms", [])[:4] if str(term).strip()]
+            top_terms = clean_topic_terms(item.get("top_terms", []), max_count=4)
             label = f"Topic {item.get('topic_id', index + 1)}"
             if top_terms:
                 label = f"{label}: {', '.join(top_terms)}"

@@ -5969,6 +5969,10 @@ class AgentRuntime:
                 entry["duration_ms"] = float(payload["duration_ms"])
             if payload.get("error"):
                 entry["error"] = str(payload["error"])
+            if payload.get("short_message"):
+                entry["short_message"] = str(payload["short_message"])
+            if payload.get("degraded") is True:
+                entry["degraded"] = True
             status.tool_calls = _merge_tool_call_rows(status.tool_calls, payload)
             tool_name = str(payload.get("tool_name", "")).strip()
             call_signature = _tool_call_signature(tool_name, dict(payload.get("inputs", {})))
