@@ -24,7 +24,7 @@ def test_frontend_runtime_payload_uses_app_config() -> None:
     payload = frontend_runtime_payload(project_root)
 
     assert payload["apiBaseUrl"] == "https://api.dongtse.com"
-    assert "CorpusAgent2" in payload["title"]
+    assert "Corpusagent v2" in payload["title"]
     assert payload["useOpenAI"] is True
 
 

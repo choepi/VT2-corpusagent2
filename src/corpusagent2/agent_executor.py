@@ -87,6 +87,14 @@ _HEURISTIC_FALLBACK_DEGRADES_CAPABILITY: frozenset[str] = frozenset(
         "keyphrase_extract",
         "readability_stats",
         "lemmatize",
+        # Plumbing capabilities whose empty output silently breaks every
+        # downstream thesis-core tool. Reporting them as "completed" with 0
+        # rows is the exact "fake completion" pattern this list exists to
+        # prevent.
+        "sentence_split",
+        "doc_embeddings",
+        "similarity_index",
+        "claim_span_extract",
     }
 )
 
@@ -335,6 +343,28 @@ def _node_record_brief(record: AgentNodeExecutionRecord) -> str:
     if not reason:
         reason = record.status
     return f"{record.node_id} ({record.capability}{tool}): {reason}"
+
+
+def _transitive_dependents(failed_ids: set[str], node_map: dict[str, Any]) -> set[str]:
+    """Return every node that transitively depends on any node in failed_ids.
+
+    Used to skip only the unreachable subtree when a node fails, rather than
+    halting every remaining pending node. Independent DAG branches must keep
+    executing so a single localized failure (e.g. doc_embeddings hitting a
+    PyTorch meta-tensor bug) doesn't take out sentiment/topic/keyterms paths
+    that have no relationship to it.
+    """
+    blocked = set(failed_ids)
+    changed = True
+    while changed:
+        changed = False
+        for nid, node in node_map.items():
+            if nid in blocked:
+                continue
+            if any(dep in blocked for dep in node.depends_on):
+                blocked.add(nid)
+                changed = True
+    return blocked - set(failed_ids)
 
 
 def _dependency_skip_reason(
@@ -1465,21 +1495,62 @@ class AsyncPlanExecutor:
                 if item.node_id in ready_ids and item.status == "failed" and not node_map[item.node_id].optional
             ]
             if failed_ready_ids:
-                mark_pending_skipped(
-                    _dependency_skip_reason(
-                        prefix="Skipped because the run stopped after a required node failed",
+                # Two cases:
+                #   1. A retrieval-bailout capability failed (db_search /
+                #      sql_query_search produced no docs at all) — the entire
+                #      run has nothing left to do, halt every remaining node.
+                #   2. Any other capability failed — only that node's
+                #      transitive children are unreachable. Independent DAG
+                #      branches MUST keep executing. Previously a doc_embeddings
+                #      failure would skip sentiment/topic/keyterms branches
+                #      that had no dependency relationship to it; that was the
+                #      observed "n18 failed -> 14 unrelated nodes skipped" bug.
+                retrieval_bailout_failed = any(
+                    node_map[nid].capability in _RETRIEVAL_BAILOUT_CAPABILITIES
+                    for nid in failed_ready_ids
+                )
+                if retrieval_bailout_failed:
+                    mark_pending_skipped(
+                        _dependency_skip_reason(
+                            prefix="Skipped because retrieval produced no documents; downstream analysis cannot run",
+                            dependency_ids=failed_ready_ids,
+                            node_records=node_records,
+                        )
+                    )
+                    return AgentExecutionSnapshot(
+                        node_records=node_records,
+                        node_results=completed,
+                        failures=failures,
+                        provenance_records=provenance_rows,
+                        selected_docs=selected_docs,
+                        status="failed",
+                    )
+                # Partial-failure path: skip only descendants, continue with
+                # the rest of the DAG.
+                descendants = _transitive_dependents(set(failed_ready_ids), node_map) & pending
+                if descendants:
+                    skip_reason = _dependency_skip_reason(
+                        prefix="Skipped because a required upstream node failed",
                         dependency_ids=failed_ready_ids,
                         node_records=node_records,
                     )
-                )
-                return AgentExecutionSnapshot(
-                    node_records=node_records,
-                    node_results=completed,
-                    failures=failures,
-                    provenance_records=provenance_rows,
-                    selected_docs=selected_docs,
-                    status="failed",
-                )
+                    now = _utc_now()
+                    for descendant_id in sorted(descendants):
+                        descendant_node = node_map[descendant_id]
+                        node_records.append(
+                            AgentNodeExecutionRecord(
+                                node_id=descendant_node.node_id,
+                                capability=descendant_node.capability,
+                                status="skipped",
+                                tool_name=descendant_node.tool_name,
+                                started_at_utc=now,
+                                finished_at_utc=now,
+                                duration_ms=0.0,
+                                attempts=0,
+                                error=skip_reason,
+                            )
+                        )
+                    pending -= descendants
             if self._is_cancelled(context):
                 mark_pending_skipped("Skipped because run abort was requested.")
                 return AgentExecutionSnapshot(
@@ -1491,7 +1562,15 @@ class AsyncPlanExecutor:
                     status="aborted",
                 )
 
-        status = "completed" if not failures else "partial"
+        # Final status:
+        #   completed = no failures
+        #   failed    = nothing succeeded (every executed node failed/skipped)
+        #   partial   = at least one node succeeded but at least one failed
+        if not failures:
+            status = "completed"
+        else:
+            completed_count = sum(1 for record in node_records if record.status == "completed")
+            status = "partial" if completed_count > 0 else "failed"
         return AgentExecutionSnapshot(
             node_records=node_records,
             node_results=completed,

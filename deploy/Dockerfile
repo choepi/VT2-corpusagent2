@@ -61,6 +61,23 @@ RUN if [ "$CORPUSAGENT2_DOCKER_DOWNLOAD_PROVIDER_ASSETS" = "true" ]; then \
       .venv/bin/python scripts/17_download_provider_assets.py; \
     fi
 
+# Bake the dense-retrieval model into the image so the runtime container is
+# self-contained. The host bind mount in docker-compose.yml still wins at
+# runtime when the host path is present — this only matters when the bind
+# mount source is empty or missing. Default ON; opt out for slimmer images
+# with --build-arg CORPUSAGENT2_DOCKER_BAKE_DENSE_MODEL=false.
+ARG CORPUSAGENT2_DOCKER_BAKE_DENSE_MODEL=true
+ARG CORPUSAGENT2_DOCKER_DENSE_MODEL_ID=intfloat/e5-base-v2
+ARG CORPUSAGENT2_DOCKER_DENSE_MODEL_TARGET=/models/e5-base-v2
+COPY deploy/bake_dense_model.py ./deploy/bake_dense_model.py
+RUN if [ "$CORPUSAGENT2_DOCKER_BAKE_DENSE_MODEL" = "true" ]; then \
+      mkdir -p "$CORPUSAGENT2_DOCKER_DENSE_MODEL_TARGET" && \
+      HF_REPO="$CORPUSAGENT2_DOCKER_DENSE_MODEL_ID" \
+      HF_TARGET="$CORPUSAGENT2_DOCKER_DENSE_MODEL_TARGET" \
+      .venv/bin/python deploy/bake_dense_model.py \
+      || (echo "Dense model bake failed for $CORPUSAGENT2_DOCKER_DENSE_MODEL_ID" >&2 && exit 1); \
+    fi
+
 COPY config ./config
 COPY scripts ./scripts
 COPY src ./src

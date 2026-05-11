@@ -5,6 +5,7 @@ from dataclasses import dataclass
 import math
 import os
 from pathlib import Path
+import threading
 from typing import Any
 from urllib.parse import quote
 
@@ -17,6 +18,13 @@ from sklearn.metrics.pairwise import cosine_similarity
 from .seed import resolve_device
 
 _ALLOWED_RETRIEVAL_BACKENDS = {"local", "pgvector"}
+
+# Serializes SentenceTransformer / CrossEncoder model loading across threads.
+# Without this, parallel plan nodes (e.g. two `doc_embeddings` siblings) can
+# both miss the cache for the same (model_id, device) key, both start loading,
+# and the second loader trips over the first's partially-initialized
+# meta-device tensors with "Cannot copy out of meta tensor; no data!".
+_MODEL_LOAD_LOCK = threading.Lock()
 
 
 class _BoundedLRU(dict):
@@ -250,26 +258,48 @@ def _vector_literal(vector: np.ndarray) -> str:
     return "[" + ",".join(f"{value:.8f}" for value in values) + "]"
 
 
+def _is_meta_tensor_error(exc: BaseException) -> bool:
+    text = str(exc).lower()
+    return "meta tensor" in text or "to_empty" in text
+
+
 def _load_sentence_transformer(model_id: str, device: str | None = None):
     from sentence_transformers import SentenceTransformer
 
     resolved_device = resolve_device(device)
     cache_key = (model_id, resolved_device)
+    # Fast path outside the lock: most calls hit a warm cache.
     if cache_key in _SENTENCE_TRANSFORMER_CACHE:
         return _SENTENCE_TRANSFORMER_CACHE[cache_key], resolved_device
-    try:
-        model = SentenceTransformer(model_id, device=resolved_device)
-        _SENTENCE_TRANSFORMER_CACHE[cache_key] = model
-        return model, resolved_device
-    except Exception:
-        if resolved_device != "cpu":
-            cpu_key = (model_id, "cpu")
-            if cpu_key in _SENTENCE_TRANSFORMER_CACHE:
-                return _SENTENCE_TRANSFORMER_CACHE[cpu_key], "cpu"
-            model = SentenceTransformer(model_id, device="cpu")
-            _SENTENCE_TRANSFORMER_CACHE[cpu_key] = model
-            return model, "cpu"
-        raise
+    with _MODEL_LOAD_LOCK:
+        # Re-check inside the lock — a sibling thread may have populated
+        # the cache between our cache miss above and acquiring the lock.
+        if cache_key in _SENTENCE_TRANSFORMER_CACHE:
+            return _SENTENCE_TRANSFORMER_CACHE[cache_key], resolved_device
+        try:
+            model = SentenceTransformer(model_id, device=resolved_device)
+            _SENTENCE_TRANSFORMER_CACHE[cache_key] = model
+            return model, resolved_device
+        except Exception as exc:
+            # Specific recovery: a meta-tensor error means a previous half-
+            # initialized load left garbage in the SentenceTransformer
+            # internals. Drop the cache entry and retry once cleanly.
+            if _is_meta_tensor_error(exc):
+                _SENTENCE_TRANSFORMER_CACHE.pop(cache_key, None)
+                try:
+                    model = SentenceTransformer(model_id, device=resolved_device)
+                    _SENTENCE_TRANSFORMER_CACHE[cache_key] = model
+                    return model, resolved_device
+                except Exception:
+                    pass  # fall through to the CPU fallback below
+            if resolved_device != "cpu":
+                cpu_key = (model_id, "cpu")
+                if cpu_key in _SENTENCE_TRANSFORMER_CACHE:
+                    return _SENTENCE_TRANSFORMER_CACHE[cpu_key], "cpu"
+                model = SentenceTransformer(model_id, device="cpu")
+                _SENTENCE_TRANSFORMER_CACHE[cpu_key] = model
+                return model, "cpu"
+            raise
 
 
 def _load_cross_encoder(model_id: str, device: str | None = None):
@@ -279,19 +309,30 @@ def _load_cross_encoder(model_id: str, device: str | None = None):
     cache_key = (model_id, resolved_device)
     if cache_key in _CROSS_ENCODER_CACHE:
         return _CROSS_ENCODER_CACHE[cache_key], resolved_device
-    try:
-        model = CrossEncoder(model_id, device=resolved_device)
-        _CROSS_ENCODER_CACHE[cache_key] = model
-        return model, resolved_device
-    except Exception:
-        if resolved_device != "cpu":
-            cpu_key = (model_id, "cpu")
-            if cpu_key in _CROSS_ENCODER_CACHE:
-                return _CROSS_ENCODER_CACHE[cpu_key], "cpu"
-            model = CrossEncoder(model_id, device="cpu")
-            _CROSS_ENCODER_CACHE[cpu_key] = model
-            return model, "cpu"
-        raise
+    with _MODEL_LOAD_LOCK:
+        if cache_key in _CROSS_ENCODER_CACHE:
+            return _CROSS_ENCODER_CACHE[cache_key], resolved_device
+        try:
+            model = CrossEncoder(model_id, device=resolved_device)
+            _CROSS_ENCODER_CACHE[cache_key] = model
+            return model, resolved_device
+        except Exception as exc:
+            if _is_meta_tensor_error(exc):
+                _CROSS_ENCODER_CACHE.pop(cache_key, None)
+                try:
+                    model = CrossEncoder(model_id, device=resolved_device)
+                    _CROSS_ENCODER_CACHE[cache_key] = model
+                    return model, resolved_device
+                except Exception:
+                    pass
+            if resolved_device != "cpu":
+                cpu_key = (model_id, "cpu")
+                if cpu_key in _CROSS_ENCODER_CACHE:
+                    return _CROSS_ENCODER_CACHE[cpu_key], "cpu"
+                model = CrossEncoder(model_id, device="cpu")
+                _CROSS_ENCODER_CACHE[cpu_key] = model
+                return model, "cpu"
+            raise
 
 
 def build_lexical_assets(df: pd.DataFrame, max_features: int = 250_000) -> tuple[TfidfVectorizer, object, list[str]]:

@@ -4365,6 +4365,7 @@ class MagicBoxOrchestrator:
     def synthesize(self, state: AgentRunState, snapshot: AgentExecutionSnapshot) -> FinalAnswerPayload:
         evidence_rows = self._extract_evidence(snapshot)
         summary = self._derive_summary(snapshot)
+        strict_signals = self._derive_strict_signals(snapshot)
         if self.llm_client is None:
             self._record_llm_trace(
                 state,
@@ -4387,7 +4388,15 @@ class MagicBoxOrchestrator:
                     "Do not claim direct correspondence to stock-price moves or external market behavior unless an external series was explicitly attached. "
                     "When has_external_series is true and summary.external_series is present, use that compact external-series summary and do not say the external series is missing. "
                     "When summary contains entity_trend_time_series or time_series_summaries, treat those as valid temporal analysis rows; do not say a time breakdown is missing solely because evidence_rows are only examples. "
-                    "Use summary.run_diagnostics to qualify answer scope: for aggregate questions, do not generalize beyond a small ranked slice, preview rows, or noisy/no-data analytical outputs."
+                    "Use summary.run_diagnostics to qualify answer scope: for aggregate questions, do not generalize beyond a small ranked slice, preview rows, or noisy/no-data analytical outputs. "
+                    "STRICT SCIENTIFIC MODE: The user-message contains a `strict_signals` block with valid_signals, degraded_signals, unavailable_methods, null_metrics_by_node, and warnings. "
+                    "Do NOT make claims that depend on metrics listed in null_metrics_by_node — those metrics are null because their source tool produced no rows. "
+                    "Do NOT describe degraded_signals or unavailable_methods as if they had succeeded. "
+                    "Structure answer_text into clearly labeled sections: 'Valid findings:' (only from valid_signals), 'Degraded analyses:' (from degraded_signals, with the reason), and 'Unavailable methods:' (from unavailable_methods, with the reason). "
+                    "If a comparative question (e.g. A vs B) lacks data for one side, say so explicitly — do not paper over the gap by summarizing only the side that has data. "
+                    "Put every entry from strict_signals.warnings into caveats. "
+                    "Put every node in unavailable_methods into unsupported_parts. "
+                    "Honest partial analysis beats fake complete analysis."
                 ),
             },
             {
@@ -4399,6 +4408,7 @@ class MagicBoxOrchestrator:
                         "assumptions": list(state.assumptions),
                         "summary": summary,
                         "evidence_rows": evidence_rows,
+                        "strict_signals": strict_signals,
                         "tool_caveats": self._snapshot_caveats(snapshot),
                         "failures": [item.to_dict() for item in snapshot.failures],
                         "has_external_series": self._has_external_series(snapshot),
@@ -4553,6 +4563,69 @@ class MagicBoxOrchestrator:
                 "Some supporting tool outputs were empty; affected plots or comparisons were omitted or marked unsupported."
             )
         return list(dict.fromkeys(caveats))
+
+    def _derive_strict_signals(self, snapshot: AgentExecutionSnapshot) -> dict[str, Any]:
+        """Partition node outputs into valid / degraded / unavailable.
+
+        The synthesis prompt uses this to keep the LLM from generating claims
+        about metrics whose source nodes produced 0 rows or were marked
+        no_data — the exact "fake analysis from null metrics" pattern this
+        whole strict-mode pass exists to prevent.
+        """
+        valid_signals: list[dict[str, Any]] = []
+        degraded_signals: list[dict[str, Any]] = []
+        unavailable_methods: list[dict[str, Any]] = []
+        warnings: list[str] = []
+        null_metrics_by_node: dict[str, list[str]] = {}
+
+        for node_id, result in snapshot.node_results.items():
+            metadata = result.metadata if isinstance(result.metadata, dict) else {}
+            payload = result.payload if isinstance(result.payload, dict) else {}
+            capability = ""
+            for record in snapshot.node_records:
+                if getattr(record, "node_id", "") == node_id:
+                    capability = str(getattr(record, "capability", "") or getattr(record, "tool", "") or "")
+                    break
+            rows = payload.get("rows") if isinstance(payload.get("rows"), list) else []
+            no_data = bool(metadata.get("no_data") or payload.get("no_data"))
+            degraded = bool(metadata.get("degraded"))
+            reason = str(metadata.get("no_data_reason") or metadata.get("reason") or payload.get("no_data_reason") or "").strip()
+
+            entry = {
+                "node_id": node_id,
+                "capability": capability,
+                "row_count": len(rows),
+                "reason": reason,
+            }
+
+            metric_diag = metadata.get("metric_diagnostics") or payload.get("metric_diagnostics")
+            if isinstance(metric_diag, dict):
+                empty_metrics = [name for name, info in metric_diag.items() if isinstance(info, dict) and info.get("empty_source")]
+                if empty_metrics:
+                    null_metrics_by_node[node_id] = empty_metrics
+                    for name in empty_metrics:
+                        warnings.append(f"metric '{name}' (node {node_id}) is null — its source produced no rows")
+
+            payload_warnings = payload.get("warnings") if isinstance(payload.get("warnings"), list) else []
+            for w in payload_warnings:
+                warning_text = str(w).strip()
+                if warning_text:
+                    warnings.append(warning_text)
+
+            if no_data and not rows:
+                unavailable_methods.append(entry)
+            elif degraded or no_data:
+                degraded_signals.append(entry)
+            elif rows:
+                valid_signals.append(entry)
+
+        return {
+            "valid_signals": valid_signals,
+            "degraded_signals": degraded_signals,
+            "unavailable_methods": unavailable_methods,
+            "null_metrics_by_node": null_metrics_by_node,
+            "warnings": list(dict.fromkeys(warnings)),
+        }
 
     @staticmethod
     def _summary_float(value: Any) -> float | None:
@@ -5025,6 +5098,29 @@ class MagicBoxOrchestrator:
         for caveat in self._snapshot_caveats(snapshot):
             if caveat not in answer.caveats:
                 answer.caveats.append(caveat)
+        # Strict-mode guardrail: force unavailable methods into unsupported_parts
+        # and surface metric-source warnings as caveats so the final answer
+        # cannot quietly omit them even when the LLM forgets the prompt section.
+        strict_signals = self._derive_strict_signals(snapshot)
+        for entry in strict_signals.get("unavailable_methods", []) or []:
+            cap = str(entry.get("capability", "") or "").strip()
+            reason = str(entry.get("reason", "") or "").strip()
+            if not cap:
+                continue
+            sentence = f"{cap} produced no usable output ({reason})." if reason else f"{cap} produced no usable output."
+            if sentence not in answer.unsupported_parts:
+                answer.unsupported_parts.append(sentence)
+        for entry in strict_signals.get("degraded_signals", []) or []:
+            cap = str(entry.get("capability", "") or "").strip()
+            reason = str(entry.get("reason", "") or "").strip()
+            if cap and reason:
+                note = f"{cap} ran in degraded mode: {reason}"
+                if note not in answer.caveats:
+                    answer.caveats.append(note)
+        for warning in strict_signals.get("warnings", []) or []:
+            text = str(warning).strip()
+            if text and text not in answer.caveats:
+                answer.caveats.append(text)
         return answer
 
     def _fallback_synthesis(
