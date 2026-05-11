@@ -12,7 +12,13 @@ import traceback as _tb
 from typing import Any
 
 from .agent_capabilities import AgentExecutionContext
-from .agent_models import AgentFailure, AgentNodeExecutionRecord, AgentPlanDAG, AgentPlanNode
+from .agent_models import (
+    AgentFailure,
+    AgentNodeExecutionRecord,
+    AgentPlanDAG,
+    AgentPlanNode,
+    short_failure_message as _short_failure_message,
+)
 from .io_utils import write_json
 from .provenance import make_provenance_record
 from . import recovery_advisor as _recovery_advisor
@@ -575,6 +581,7 @@ class AsyncPlanExecutor:
                     "capability": node.capability,
                     "status": status,
                     "error": message,
+                    "short_message": _short_failure_message("data_empty", message),
                     "inputs": _safe_json(node.inputs),
                     "dependency_nodes": sorted(dependency_results.keys()),
                     "started_at_utc": started_at,
@@ -627,6 +634,7 @@ class AsyncPlanExecutor:
                     "capability": node.capability,
                     "status": "failed",
                     "error": str(exc),
+                    "short_message": _short_failure_message(category, str(exc)),
                     "error_category": category,
                     "started_at_utc": started_at,
                     "finished_at_utc": finished_at,
@@ -708,6 +716,7 @@ class AsyncPlanExecutor:
                     "capability": node.capability,
                     "status": status,
                     "error": message,
+                    "short_message": _short_failure_message("missing_input", message),
                     "tool_name": resolution.spec.tool_name,
                     "provider": resolution.spec.provider,
                     "inputs": _safe_json(node.inputs),
@@ -1197,6 +1206,7 @@ class AsyncPlanExecutor:
 
         finished_at = _utc_now()
         duration_ms = (time.perf_counter() - started_perf) * 1000.0
+        short_message = _short_failure_message(last_category, last_error)
         self._emit_event(
             context,
             {
@@ -1205,6 +1215,7 @@ class AsyncPlanExecutor:
                 "capability": node.capability,
                 "status": "failed",
                 "error": last_error,
+                "short_message": short_message,
                 "tool_name": resolution.spec.tool_name,
                 "provider": resolution.spec.provider,
                 "tool_version": resolution.spec.tool_version,
