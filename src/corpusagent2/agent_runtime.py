@@ -53,9 +53,15 @@ TERMINAL_RUN_STATUSES = {"completed", "partial", "failed", "rejected", "needs_cl
 def resolve_working_store(
     *,
     doc_lookup: dict[str, Any] | None = None,
+    doc_lookup_factory: "Callable[[], dict[str, Any]] | None" = None,
     require_backend_services: bool = False,
 ) -> WorkingSetStore:
     """Pick a WorkingSetStore based on env vars.
+
+    The ``doc_lookup`` table is only consulted when we actually build an
+    ``InMemoryWorkingSetStore``. Pass ``doc_lookup_factory`` instead of
+    ``doc_lookup`` if loading the table is expensive (e.g. reads parquet
+    from disk) so the cost is paid only when needed.
 
     CORPUSAGENT2_WORKINGSET_BACKEND:
       - ``memory``   force InMemoryWorkingSetStore (archive mode)
@@ -64,11 +70,22 @@ def resolve_working_store(
       - unset (default) keep historical behaviour: use Postgres if DSN
         present, else memory (unless ``require_backend_services`` is set).
     """
+    def _materialize_doc_lookup() -> dict[str, Any]:
+        if doc_lookup is not None:
+            return doc_lookup
+        if doc_lookup_factory is not None:
+            try:
+                return doc_lookup_factory() or {}
+            except Exception:
+                return {}
+        return {}
+
     backend = os.getenv("CORPUSAGENT2_WORKINGSET_BACKEND", "").strip().lower()
     if backend == "memory":
         store = InMemoryWorkingSetStore()
-        if doc_lookup:
-            store.document_lookup.update(doc_lookup)
+        materialized = _materialize_doc_lookup()
+        if materialized:
+            store.document_lookup.update(materialized)
         return store
     if backend not in {"", "postgres", "auto"}:
         raise ValueError(
@@ -87,8 +104,9 @@ def resolve_working_store(
     if require_backend_services and backend != "auto":
         raise RuntimeError("Postgres working store is required but CORPUSAGENT2_PG_DSN is not configured.")
     store = InMemoryWorkingSetStore()
-    if doc_lookup:
-        store.document_lookup.update(doc_lookup)
+    materialized = _materialize_doc_lookup()
+    if materialized:
+        store.document_lookup.update(materialized)
     return store
 
 TOOL_USAGE_CATEGORIES: tuple[tuple[str, set[str]], ...] = (
@@ -5147,7 +5165,7 @@ class AgentRuntime:
 
     def _build_working_store(self) -> WorkingSetStore:
         return resolve_working_store(
-            doc_lookup=self.runtime.doc_lookup(),
+            doc_lookup_factory=self.runtime.doc_lookup,
             require_backend_services=self.require_backend_services,
         )
 
