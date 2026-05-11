@@ -6109,7 +6109,24 @@ class AgentRuntime:
             "Inspect the first failed node's capability, tool_name, error, inputs, and dependency nodes in the manifest/tool_calls.",
             "If the failure is no-data, rerun with a broader retrieval query or exhaustive retrieval; if it is an unavailable tool, enable/install that provider or force a supported fallback.",
         ]
-        if snapshot.status == "partial":
+        retrieval_no_data = any(
+            str(item.get("error_type", "")) == "core_no_data"
+            and str(item.get("capability", "")) in {"db_search", "sql_query_search"}
+            for item in failures
+        )
+        if retrieval_no_data:
+            user_message = (
+                "No corpus documents matched the planner's retrieval query, so the run was stopped before any "
+                "downstream analysis. Inspect the first node's `query` and `source` filters in the manifest "
+                "and rerun with different keywords or a less restrictive filter."
+            )
+            likely_root_causes.insert(
+                0,
+                "The first retrieval node returned 0 documents, so every downstream node would be operating "
+                "on an empty corpus. Common causes: keywords too narrow, source: filter referencing outlets "
+                "that do not exist in this corpus, or malformed Lucene/SQL syntax in the planner output.",
+            )
+        elif snapshot.status == "partial":
             user_message = (
                 "The run completed only partially. Some evidence may be usable, but at least one required or recovery path failed; "
                 "use execution_diagnostics before trusting the answer scope."
