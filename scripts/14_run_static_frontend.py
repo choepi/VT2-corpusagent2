@@ -2,8 +2,8 @@ from __future__ import annotations
 
 from functools import partial
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
-import json
 import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -12,7 +12,7 @@ SRC_ROOT = REPO_ROOT / "src"
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
-from corpusagent2.app_config import AppConfig, frontend_runtime_payload
+from corpusagent2.app_config import AppConfig
 
 
 def local_api_base_url() -> str:
@@ -21,13 +21,6 @@ def local_api_base_url() -> str:
     port = int(os.getenv("CORPUSAGENT2_SERVER_PORT", str(config.server.port)).strip() or str(config.server.port))
     browser_host = "127.0.0.1" if host in {"0.0.0.0", "::", "[::]"} else host.strip("[]")
     return f"http://{browser_host}:{port}"
-
-
-def static_frontend_runtime_payload() -> dict:
-    os.environ.setdefault("CORPUSAGENT2_FRONTEND_API_BASE_URL", local_api_base_url())
-    payload = frontend_runtime_payload(REPO_ROOT)
-    payload["preferRuntimeApiBase"] = True
-    return payload
 
 
 class NoCacheStaticHandler(SimpleHTTPRequestHandler):
@@ -39,11 +32,15 @@ class NoCacheStaticHandler(SimpleHTTPRequestHandler):
 
 
 if __name__ == "__main__":
-    web_root = REPO_ROOT / "web"
-    (web_root / "config.js").write_text(
-        "window.CORPUSAGENT2_CONFIG = " + json.dumps(static_frontend_runtime_payload(), indent=2) + ";\n",
-        encoding="utf-8",
+    os.environ.setdefault("CORPUSAGENT2_FRONTEND_API_BASE_URL", local_api_base_url())
+    os.environ.setdefault("CORPUSAGENT2_PREFER_RUNTIME_API_BASE", "1")
+    subprocess.run(
+        [sys.executable, str(REPO_ROOT / "scripts" / "13_write_frontend_config.py")],
+        cwd=REPO_ROOT,
+        check=True,
     )
+
+    web_root = REPO_ROOT / "web"
     host = "127.0.0.1"
     port = 5500
     handler = partial(NoCacheStaticHandler, directory=str(web_root))
