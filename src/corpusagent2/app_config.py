@@ -192,7 +192,8 @@ def load_project_configuration(project_root: Path) -> AppConfig:
 
 def frontend_runtime_payload(project_root: Path) -> dict[str, Any]:
     config = load_project_configuration(project_root)
-    return {
+    prefer_runtime = os.getenv("CORPUSAGENT2_PREFER_RUNTIME_API_BASE", "").strip().lower() in {"1", "true", "yes", "on"}
+    payload: dict[str, Any] = {
         "apiBaseUrl": config.frontend.api_base_url,
         "title": config.frontend.title,
         "useOpenAI": config.llm.use_openai,
@@ -207,3 +208,6 @@ def frontend_runtime_payload(project_root: Path) -> dict[str, Any]:
             "passwordSha256": os.getenv("CORPUSAGENT2_FRONTEND_ACCESS_PASSWORD_SHA256", "").strip().lower(),
         },
     }
+    if prefer_runtime:
+        payload["preferRuntimeApiBase"] = True
+    return payload

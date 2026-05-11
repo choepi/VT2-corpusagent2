@@ -49,6 +49,66 @@ from .python_runner_service import DockerPythonRunnerService
 
 TERMINAL_RUN_STATUSES = {"completed", "partial", "failed", "rejected", "needs_clarification", "aborted"}
 
+
+def resolve_working_store(
+    *,
+    doc_lookup: dict[str, Any] | None = None,
+    doc_lookup_factory: "Callable[[], dict[str, Any]] | None" = None,
+    require_backend_services: bool = False,
+) -> WorkingSetStore:
+    """Pick a WorkingSetStore based on env vars.
+
+    The ``doc_lookup`` table is only consulted when we actually build an
+    ``InMemoryWorkingSetStore``. Pass ``doc_lookup_factory`` instead of
+    ``doc_lookup`` if loading the table is expensive (e.g. reads parquet
+    from disk) so the cost is paid only when needed.
+
+    CORPUSAGENT2_WORKINGSET_BACKEND:
+      - ``memory``   force InMemoryWorkingSetStore (archive mode)
+      - ``postgres`` require a configured DSN; raise if missing
+      - ``auto``     try Postgres if DSN present, else fall back to memory
+      - unset (default) keep historical behaviour: use Postgres if DSN
+        present, else memory (unless ``require_backend_services`` is set).
+    """
+    def _materialize_doc_lookup() -> dict[str, Any]:
+        if doc_lookup is not None:
+            return doc_lookup
+        if doc_lookup_factory is not None:
+            try:
+                return doc_lookup_factory() or {}
+            except Exception:
+                return {}
+        return {}
+
+    backend = os.getenv("CORPUSAGENT2_WORKINGSET_BACKEND", "").strip().lower()
+    if backend == "memory":
+        store = InMemoryWorkingSetStore()
+        materialized = _materialize_doc_lookup()
+        if materialized:
+            store.document_lookup.update(materialized)
+        return store
+    if backend not in {"", "postgres", "auto"}:
+        raise ValueError(
+            f"Unknown CORPUSAGENT2_WORKINGSET_BACKEND={backend!r}; expected 'postgres', 'memory', or 'auto'."
+        )
+    try:
+        dsn = pg_dsn_from_env(required=False)
+    except Exception:
+        dsn = ""
+    if dsn:
+        return PostgresWorkingSetStore(dsn=dsn, documents_table=pg_table_from_env(default="article_corpus"))
+    if backend == "postgres":
+        raise RuntimeError(
+            "CORPUSAGENT2_WORKINGSET_BACKEND=postgres but CORPUSAGENT2_PG_DSN is not configured."
+        )
+    if require_backend_services and backend != "auto":
+        raise RuntimeError("Postgres working store is required but CORPUSAGENT2_PG_DSN is not configured.")
+    store = InMemoryWorkingSetStore()
+    materialized = _materialize_doc_lookup()
+    if materialized:
+        store.document_lookup.update(materialized)
+    return store
+
 TOOL_USAGE_CATEGORIES: tuple[tuple[str, set[str]], ...] = (
     ("Retrieval and working sets", {"db_search", "sql_query_search", "fetch_documents", "create_working_set", "filter_working_set"}),
     ("Temporal and structured series", {"time_series_aggregate", "change_point_detect", "burst_detect", "join_external_series"}),
@@ -5104,17 +5164,10 @@ class AgentRuntime:
         )
 
     def _build_working_store(self) -> WorkingSetStore:
-        try:
-            dsn = pg_dsn_from_env(required=False)
-        except Exception:
-            dsn = ""
-        if dsn:
-            return PostgresWorkingSetStore(dsn=dsn, documents_table=pg_table_from_env(default="article_corpus"))
-        if self.require_backend_services:
-            raise RuntimeError("Postgres working store is required but CORPUSAGENT2_PG_DSN is not configured.")
-        store = InMemoryWorkingSetStore()
-        store.document_lookup.update(self.runtime.doc_lookup())
-        return store
+        return resolve_working_store(
+            doc_lookup_factory=self.runtime.doc_lookup,
+            require_backend_services=self.require_backend_services,
+        )
 
     def _corpus_date_bounds(self) -> tuple[str, str] | None:
         if self._corpus_date_bounds_cache is not None:
