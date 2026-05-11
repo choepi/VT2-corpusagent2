@@ -8555,6 +8555,51 @@ def _plot_artifact(params: dict[str, Any], deps: dict[str, ToolExecutionResult],
     )
 
 
+def _plot_artifact_safe(params: dict[str, Any], deps: dict[str, ToolExecutionResult], context: AgentExecutionContext) -> ToolExecutionResult:
+    """Wrap _plot_artifact so rendering failures degrade gracefully.
+
+    Plot generation is the most failure-prone step in many runs (matplotlib
+    state, weird input distributions, Windows path quirks). Instead of letting
+    a renderer exception kill the node and cascade to downstream consumers,
+    we catch it and return the upstream rows with plot_skipped=True so
+    non-plot downstream nodes can still process the data.
+    """
+    fallback_rows: list[dict[str, Any]] = []
+    try:
+        for result in deps.values():
+            payload = result.payload
+            if isinstance(payload, dict) and isinstance(payload.get("rows"), list):
+                candidate = [dict(item) for item in payload["rows"] if isinstance(item, dict)]
+                if candidate:
+                    fallback_rows = candidate
+                    break
+    except Exception:
+        fallback_rows = []
+
+    try:
+        return _plot_artifact(params, deps, context)
+    except Exception as exc:
+        import traceback as _plot_tb
+
+        reason = f"{exc.__class__.__name__}: {exc}"
+        return ToolExecutionResult(
+            payload={
+                "rows": fallback_rows,
+                "plot_skipped": True,
+                "plot_reason": reason,
+            },
+            caveats=[f"plot_artifact rendering failed: {reason}. Downstream rows preserved."],
+            metadata={
+                "no_data": False,
+                "plot_skipped": True,
+                "plot_reason": reason,
+                "plot_traceback": _plot_tb.format_exc(),
+                "fallback": "rows_only",
+                "degraded": True,
+            },
+        )
+
+
 def _looks_like_python_code(code: str) -> bool:
     text = str(code or "").strip()
     if not text:
@@ -8805,7 +8850,7 @@ def build_agent_registry() -> ToolRegistry:
         ("quote_attribute", "quote_attribute", "analytics", 61, _quote_attribute),
         ("build_evidence_table", "build_evidence_table", "analytics", 60, _build_evidence_table),
         ("join_external_series", "join_external_series", "analytics", 59, _join_external_series),
-        ("plot_artifact", "plot_artifact", "matplotlib", 58, _plot_artifact),
+        ("plot_artifact", "plot_artifact", "matplotlib", 58, _plot_artifact_safe),
         ("python_runner", "python_runner", "sandbox", 57, _python_runner),
     ]
     for tool_name, capability, provider, priority, fn in entries:
