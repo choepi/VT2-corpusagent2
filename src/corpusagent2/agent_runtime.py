@@ -46,6 +46,7 @@ from .runtime_context import CorpusRuntime
 from .seed import runtime_device_report
 from .tool_registry import ToolRegistry
 from .python_runner_service import DockerPythonRunnerService
+from . import recovery_advisor as _llm_recovery_advisor
 
 TERMINAL_RUN_STATUSES = {"completed", "partial", "failed", "rejected", "needs_clarification", "aborted"}
 
@@ -5129,6 +5130,18 @@ class AgentRuntime:
         self.python_runner = python_runner or DockerPythonRunnerService()
         self.orchestrator = MagicBoxOrchestrator(self.llm_client, self.llm_config)
         self.executor = AsyncPlanExecutor(self.registry)
+        # Wire the optional LLM recovery advisor. The executor checks
+        # CORPUSAGENT2_USE_LLM_RECOVERY at runtime; when off, the factory
+        # is never invoked. When on, each failed node consults the advisor
+        # for a bounded action that operates only on that node — PlanDAG
+        # topology stays the source of truth.
+        def _build_recovery_advisor() -> _llm_recovery_advisor.LLMRecoveryAdvisor:
+            return _llm_recovery_advisor.LLMRecoveryAdvisor(
+                self.llm_client,
+                model=self.llm_config.planner_model or self.llm_config.synthesis_model,
+            )
+
+        self.executor._recovery_advisor_factory = _build_recovery_advisor  # type: ignore[attr-defined]
         self._live_runs: dict[str, LiveRunStatus] = {}
         self._run_cancel_events: dict[str, threading.Event] = {}
         self._run_threads: dict[str, threading.Thread] = {}
