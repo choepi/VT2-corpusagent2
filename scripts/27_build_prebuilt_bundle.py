@@ -14,6 +14,12 @@ import zipfile
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+SRC_ROOT = REPO_ROOT / "src"
+if str(SRC_ROOT) not in sys.path:
+    sys.path.insert(0, str(SRC_ROOT))
+
+from corpusagent2.model_config import dense_model_id_from_env
+
 PREBUILT_ROOT = REPO_ROOT / "outputs" / "prebuilt"
 DEFAULT_BUNDLE_PATH = PREBUILT_ROOT / "corpusagent2_prebuilt_bundle.zip"
 DEFAULT_FIELD_CANDIDATES: dict[str, tuple[str, ...]] = {
@@ -363,6 +369,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--mode", choices=["debug", "full"], default=os.getenv("CORPUSAGENT2_MODE", "full").strip().lower() or "full")
     parser.add_argument("--dense-batch-size", type=int, default=128, help="Dense embedding batch size for cluster preprocessing.")
     parser.add_argument("--dense-chunk-size", type=int, default=2048, help="Dense embedding chunk size for streaming writes.")
+    parser.add_argument(
+        "--dense-model-id",
+        default="",
+        help="Dense SentenceTransformer model id or local model directory. Defaults to CORPUSAGENT2_DENSE_MODEL_ID or intfloat/e5-base-v2.",
+    )
     parser.add_argument("--sentiment-device", default="auto", help="Preferred sentiment device for NLP outputs, e.g. auto/cuda/mps/cpu.")
     parser.add_argument("--skip-dense", action="store_true", help="Skip dense embedding assets; useful for offline CPU smoke builds.")
     parser.add_argument("--skip-nlp", action="store_true", help="Skip building outputs/nlp_tools artifacts.")
@@ -418,6 +429,7 @@ def main(argv: list[str] | None = None) -> None:
     env["CORPUSAGENT2_STREAM_DENSE_ASSETS"] = "true"
     env["CORPUSAGENT2_DENSE_BATCH_SIZE"] = str(max(args.dense_batch_size, 1))
     env["CORPUSAGENT2_DENSE_CHUNK_SIZE"] = str(max(args.dense_chunk_size, 1))
+    env["CORPUSAGENT2_DENSE_MODEL_ID"] = str(args.dense_model_id).strip() or dense_model_id_from_env()
     env["CORPUSAGENT2_SENTIMENT_DEVICE"] = args.sentiment_device.strip().lower() or "auto"
 
     python_exe = Path(sys.executable).resolve()
@@ -440,6 +452,7 @@ def main(argv: list[str] | None = None) -> None:
         "time_granularity": args.granularity,
         "dense_batch_size": int(env["CORPUSAGENT2_DENSE_BATCH_SIZE"]),
         "dense_chunk_size": int(env["CORPUSAGENT2_DENSE_CHUNK_SIZE"]),
+        "dense_model_id": env["CORPUSAGENT2_DENSE_MODEL_ID"],
         "sentiment_device": env["CORPUSAGENT2_SENTIMENT_DEVICE"],
         "include_dense_assets": not args.skip_dense,
         "hf_streaming": bool(args.hf_streaming),

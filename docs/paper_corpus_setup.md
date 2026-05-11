@@ -37,6 +37,7 @@ cd "D:\Programmieren\GitHub\VT2-corpusagent2"
 
 $env:CORPUSAGENT2_TFIDF_MAX_FEATURES = "250000"
 $env:CORPUSAGENT2_RESUME_DENSE_ASSETS = "true"
+$env:CORPUSAGENT2_DENSE_MODEL_ID = "D:\Programmieren\GitHub\e5-base-v2"  # optional local clone
 
 .\.venv\Scripts\python.exe scripts\27_build_prebuilt_bundle.py `
   --hf-dataset Geralt-Targaryen/CC-News `
@@ -46,6 +47,7 @@ $env:CORPUSAGENT2_RESUME_DENSE_ASSETS = "true"
   --sample-seed 42 `
   --granularity year `
   --mode full `
+  --dense-model-id $env:CORPUSAGENT2_DENSE_MODEL_ID `
   --dense-batch-size 64 `
   --dense-chunk-size 4096 `
   --sentiment-device cuda `
@@ -119,6 +121,10 @@ Set these in `.env` or your shell before starting the API:
 ```dotenv
 CORPUSAGENT2_PG_TABLE=article_corpus_paper_ccnews_10pct
 CORPUSAGENT2_OPENSEARCH_INDEX=article-corpus-paper-ccnews-10pct
+CORPUSAGENT2_DENSE_MODEL_ID=intfloat/e5-base-v2
+# For Dockerized API/MCP with a manual model clone next to the repo:
+CORPUSAGENT2_DENSE_MODEL_HOST_PATH=../../e5-base-v2
+CORPUSAGENT2_DOCKER_DENSE_MODEL_ID=/models/e5-base-v2
 CORPUSAGENT2_DEVICE=cuda
 ```
 

@@ -104,6 +104,8 @@ def test_mcp_compose_defaults_to_cpu_and_keeps_gpu_override_separate() -> None:
     assert "dockerfile: deploy/Dockerfile" in mcp_compose
     assert "Dockerfile.mcp" not in mcp_compose
     assert "CORPUSAGENT2_DEVICE: ${CORPUSAGENT2_DEVICE:-cpu}" in mcp_compose
+    assert "CORPUSAGENT2_DENSE_MODEL_ID: ${CORPUSAGENT2_DOCKER_DENSE_MODEL_ID:-/models/e5-base-v2}" in mcp_compose
+    assert "source: ${CORPUSAGENT2_DENSE_MODEL_HOST_PATH:-../../e5-base-v2}" in mcp_compose
     assert "gpus: all" not in mcp_compose
     assert "corpusagent2-api:" in gpu_compose
     assert "CORPUSAGENT2_DEVICE: ${CORPUSAGENT2_DEVICE:-cuda}" in gpu_compose
@@ -137,6 +139,9 @@ def test_dockerized_api_and_mcp_share_runtime_image_and_sandbox_mounts() -> None
     assert "CORPUSAGENT2_DOCKER_TORCH_PROFILE: ${CORPUSAGENT2_DOCKER_TORCH_PROFILE:-cpu}" in mcp_compose
     assert "CORPUSAGENT2_DOCKER_INSTALL_NLP_PROVIDERS: ${CORPUSAGENT2_DOCKER_INSTALL_NLP_PROVIDERS:-false}" in base_compose
     assert "CORPUSAGENT2_DOCKER_INSTALL_NLP_PROVIDERS: ${CORPUSAGENT2_DOCKER_INSTALL_NLP_PROVIDERS:-false}" in mcp_compose
+    assert "CORPUSAGENT2_DENSE_MODEL_ID: ${CORPUSAGENT2_DOCKER_DENSE_MODEL_ID:-/models/e5-base-v2}" in base_compose
+    assert "source: ${CORPUSAGENT2_DENSE_MODEL_HOST_PATH:-../../e5-base-v2}" in base_compose
+    assert "target: ${CORPUSAGENT2_DOCKER_DENSE_MODEL_ID:-/models/e5-base-v2}" in base_compose
     assert "CORPUSAGENT2_API_CPUS" in base_compose
     assert "CORPUSAGENT2_MCP_CPUS" in mcp_compose
     assert "CORPUSAGENT2_OPENSEARCH_MEM_LIMIT" not in base_compose

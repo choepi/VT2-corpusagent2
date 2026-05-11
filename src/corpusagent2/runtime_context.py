@@ -9,6 +9,7 @@ import pandas as pd
 
 from .faithfulness import NLIVerifier
 from .io_utils import ensure_exists
+from .model_config import DEFAULT_DENSE_MODEL_ID, dense_model_id_from_env
 from .retrieval import (
     dense_asset_health,
     load_dense_assets,
@@ -21,7 +22,6 @@ from .retrieval import (
 from .seed import runtime_device_report
 
 
-DEFAULT_DENSE_MODEL_ID = "intfloat/e5-base-v2"
 DEFAULT_RERANK_MODEL_ID = "cross-encoder/ms-marco-MiniLM-L-6-v2"
 DEFAULT_NLI_MODEL_ID = "FacebookAI/roberta-large-mnli"
 
@@ -65,6 +65,7 @@ class CorpusRuntime:
                 outputs_root=(project_root / "outputs").resolve(),
             ),
             retrieval_backend=retrieval_backend,
+            dense_model_id=dense_model_id_from_env(),
             pg_dsn=pg_dsn,
             pg_table=pg_table,
         )
