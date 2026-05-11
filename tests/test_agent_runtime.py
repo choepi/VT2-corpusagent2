@@ -3291,7 +3291,7 @@ def test_planner_can_route_fetched_documents_into_python_runner(tmp_path: Path) 
         [
             {
                 "action": "accept_with_assumptions",
-                "rewritten_question": "Inspect the fetched documents with a Python script.",
+                "rewritten_question": "Inspect the fetched Ukraine documents with a Python script.",
                 "assumptions": [],
                 "clarification_question": "",
                 "rejection_reason": "",
@@ -3299,7 +3299,7 @@ def test_planner_can_route_fetched_documents_into_python_runner(tmp_path: Path) 
             },
             {
                 "action": "emit_plan_dag",
-                "rewritten_question": "Inspect the fetched documents with a Python script.",
+                "rewritten_question": "Inspect the fetched Ukraine documents with a Python script.",
                 "plan_dag": {
                     "nodes": [
                         {"node_id": "search", "capability": "db_search", "inputs": {"query": "Ukraine", "top_k": 5}},

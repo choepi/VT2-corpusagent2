@@ -96,10 +96,22 @@ def _node_status_from_result(capability: str, result: ToolExecutionResult) -> st
     if metadata.get("degraded") is True:
         return "degraded"
     provider = str(metadata.get("provider", "")).strip().lower()
-    if provider == "heuristic" and capability in _HEURISTIC_FALLBACK_DEGRADES_CAPABILITY:
-        return "degraded"
-    if metadata.get("provider_fallback_reason") and capability in _HEURISTIC_FALLBACK_DEGRADES_CAPABILITY:
-        return "degraded"
+    if capability in _HEURISTIC_FALLBACK_DEGRADES_CAPABILITY:
+        if provider == "heuristic":
+            return "degraded"
+        if metadata.get("provider_fallback_reason"):
+            return "degraded"
+        if metadata.get("no_data") is True:
+            # NLP tool ran on empty input — not real work, not a clean
+            # completion. Avoids 'fake completion' on capabilities the
+            # thesis claims about.
+            return "degraded"
+        payload = result.payload
+        if isinstance(payload, dict):
+            for key in ("rows", "documents", "results"):
+                value = payload.get(key)
+                if isinstance(value, list) and len(value) == 0:
+                    return "degraded"
     return "completed"
 
 
@@ -264,11 +276,18 @@ def _summarize_tool_result(result: ToolExecutionResult, *, dependency_results: d
 
 
 _CORE_NO_DATA_FAILURE_CAPABILITIES = {
+    "db_search",
     "join_external_series",
     "plot_artifact",
     "python_runner",
+    "sql_query_search",
     "time_series_aggregate",
 }
+
+# Capabilities where an empty retrieval result means there is nothing for
+# the entire downstream plan to work on. The orchestrator uses this to
+# bail out early instead of grinding 20 NLP nodes against zero rows.
+_RETRIEVAL_BAILOUT_CAPABILITIES = {"db_search", "sql_query_search"}
 
 
 def _result_no_data_reason(result: ToolExecutionResult) -> str:
