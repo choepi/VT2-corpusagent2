@@ -17,9 +17,52 @@ from sklearn.metrics.pairwise import cosine_similarity
 from .seed import resolve_device
 
 _ALLOWED_RETRIEVAL_BACKENDS = {"local", "pgvector"}
-_SENTENCE_TRANSFORMER_CACHE: dict[tuple[str, str], Any] = {}
-_CROSS_ENCODER_CACHE: dict[tuple[str, str], Any] = {}
-_TORCH_DENSE_CACHE: dict[tuple[int, str], Any] = {}
+
+
+class _BoundedLRU(dict):
+    """Tiny LRU-ish dict for model/tensor caches.
+
+    Eviction order is insertion order — we move-to-end on hits and pop
+    the oldest entry when ``maxsize`` is exceeded. Good enough to keep
+    multi-hour runs from accumulating unlimited sentence-transformer
+    models in memory across many queries.
+    """
+
+    def __init__(self, maxsize: int) -> None:
+        super().__init__()
+        self._maxsize = max(1, int(maxsize))
+
+    def __getitem__(self, key):  # type: ignore[override]
+        value = super().__getitem__(key)
+        try:
+            super().__delitem__(key)
+            super().__setitem__(key, value)
+        except KeyError:
+            pass
+        return value
+
+    def __setitem__(self, key, value):  # type: ignore[override]
+        if key in self:
+            super().__delitem__(key)
+        super().__setitem__(key, value)
+        while len(self) > self._maxsize:
+            oldest = next(iter(self))
+            super().__delitem__(oldest)
+
+
+def _cache_size(env_name: str, default: int) -> int:
+    raw = os.getenv(env_name, "").strip()
+    if not raw:
+        return default
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return default
+
+
+_SENTENCE_TRANSFORMER_CACHE: dict[tuple[str, str], Any] = _BoundedLRU(_cache_size("CORPUSAGENT2_SENTENCE_TRANSFORMER_CACHE_SIZE", 2))
+_CROSS_ENCODER_CACHE: dict[tuple[str, str], Any] = _BoundedLRU(_cache_size("CORPUSAGENT2_CROSS_ENCODER_CACHE_SIZE", 2))
+_TORCH_DENSE_CACHE: dict[tuple[int, str], Any] = _BoundedLRU(_cache_size("CORPUSAGENT2_TORCH_DENSE_CACHE_SIZE", 2))
 
 
 def pg_connect_kwargs() -> dict[str, Any]:
