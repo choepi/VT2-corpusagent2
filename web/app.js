@@ -1981,7 +1981,7 @@ function renderAnswerPayload(finalAnswer, metadata = {}) {
       ? "MODEL-ONLY OUT-OF-CORPUS ANSWER: no corpus-grounded evidence was available; this uses the configured planner model's prior knowledge."
       : "";
   }
-  answerText.textContent = finalAnswer?.answer_text || "No answer text returned.";
+  renderAnswerText(finalAnswer?.answer_text || "");
   const verdicts = finalAnswer?.claim_verdicts || [];
   if (!verdicts.length) {
     claimVerdicts.innerHTML = '<p class="muted">Claim verdicts will appear when verification outputs are available.</p>';
@@ -2578,6 +2578,9 @@ renderToolCalls([]);
 updateEtaDisplay();
 updateControlState();
 renderAccessGate();
+initTabs();
+initRunHistory();
+maybeEnterReviewMode();
 
 accessGateButton.addEventListener("click", async () => {
   try {
@@ -2718,3 +2721,161 @@ loadRuntimeInfo().then(async () => {
     apiBaseInput.addEventListener("change", () => void probe());
   }
 })();
+
+
+// ----- Markdown rendering helper ---------------------------------------
+// Replaces plain-text answer rendering. Uses marked from CDN when loaded;
+// falls back to textContent otherwise so the UI never goes blank if the
+// CDN is unreachable.
+function renderAnswerText(value) {
+  const text = String(value ?? "").trim();
+  if (!text) {
+    answerText.textContent = "No answer text returned.";
+    return;
+  }
+  if (typeof window !== "undefined" && window.marked && typeof window.marked.parse === "function") {
+    try {
+      answerText.innerHTML = window.marked.parse(text, { breaks: true, gfm: true });
+      return;
+    } catch (_err) {
+      // fall through to plain text
+    }
+  }
+  answerText.textContent = text;
+}
+
+
+// ----- Tab switching ---------------------------------------------------
+function activateTab(target) {
+  document.querySelectorAll("[data-tab]").forEach((panel) => {
+    const isActive = panel.getAttribute("data-tab") === target;
+    panel.classList.toggle("tab-active", isActive);
+  });
+  document.querySelectorAll(".tab-button").forEach((button) => {
+    const isActive = button.getAttribute("data-tab-target") === target;
+    button.classList.toggle("tab-active", isActive);
+    button.setAttribute("aria-selected", isActive ? "true" : "false");
+  });
+  if (target === "history") {
+    void loadRunHistory();
+  }
+}
+
+function initTabs() {
+  document.querySelectorAll(".tab-button").forEach((button) => {
+    button.addEventListener("click", () => activateTab(button.getAttribute("data-tab-target")));
+  });
+}
+
+
+// ----- Run history -----------------------------------------------------
+async function loadRunHistory() {
+  const listEl = document.getElementById("runHistoryList");
+  const statusEl = document.getElementById("runHistoryStatus");
+  if (!listEl || !statusEl) {
+    return;
+  }
+  statusEl.textContent = "Loading...";
+  try {
+    const base = apiBaseInput.value.replace(/\/$/, "");
+    const response = await fetch(`${base}/runs?limit=100`, { cache: "no-store" });
+    if (!response.ok) {
+      statusEl.textContent = `Failed to load: HTTP ${response.status}`;
+      listEl.innerHTML = "";
+      return;
+    }
+    const payload = await response.json();
+    const runs = Array.isArray(payload.runs) ? payload.runs : [];
+    if (!runs.length) {
+      statusEl.textContent = "No runs recorded yet. Postgres run history fills in as you submit queries.";
+      listEl.innerHTML = "";
+      return;
+    }
+    statusEl.textContent = `Showing ${runs.length} run${runs.length === 1 ? "" : "s"}.`;
+    listEl.innerHTML = runs.map(renderRunHistoryRow).join("");
+  } catch (error) {
+    statusEl.textContent = `Failed to load: ${error.message}`;
+    listEl.innerHTML = "";
+  }
+}
+
+function renderRunHistoryRow(run) {
+  const runId = String(run.run_id || "");
+  const question = String(run.question || "");
+  const status = String(run.status || "unknown");
+  const created = run.created_at_utc ? new Date(run.created_at_utc).toLocaleString() : "—";
+  const duration = (run.duration_ms != null) ? formatDurationMs(run.duration_ms) || "" : "";
+  const reviewUrl = `${window.location.pathname}?run=${encodeURIComponent(runId)}`;
+  const statusClass = status.replace(/[^a-z0-9_-]/gi, "_");
+  return `
+    <a class="run-history-row" href="${reviewUrl}" target="_blank" rel="noopener noreferrer" title="${escapeHtml(question)}">
+      <span class="status-chip status-${escapeHtml(statusClass)}">${escapeHtml(status)}</span>
+      <span class="run-history-time muted">${escapeHtml(created)}</span>
+      <span class="run-history-question">${escapeHtml(question || "(no question recorded)")}</span>
+      <span class="run-history-id muted">${escapeHtml(runId.slice(-12))}</span>
+      <span class="run-history-duration muted">${escapeHtml(duration)}</span>
+    </a>
+  `;
+}
+
+function initRunHistory() {
+  const refresh = document.getElementById("runHistoryRefreshButton");
+  if (refresh) {
+    refresh.addEventListener("click", () => void loadRunHistory());
+  }
+}
+
+
+// ----- Review mode (open past run in new tab) --------------------------
+// When the URL has ?run=<run_id>, we freeze the page on the saved manifest,
+// retitle the browser tab to the question, and disable mutating controls.
+// The active tab becomes Simple so the answer + evidence are the first
+// thing the reviewer sees.
+function maybeEnterReviewMode() {
+  let reviewRunId = "";
+  try {
+    const params = new URLSearchParams(window.location.search);
+    reviewRunId = (params.get("run") || "").trim();
+  } catch (_err) {
+    reviewRunId = "";
+  }
+  if (!reviewRunId) {
+    return;
+  }
+  activateTab("simple");
+  enterReviewMode(reviewRunId).catch((error) => {
+    detailText.textContent = `Failed to load run ${reviewRunId}: ${error.message}`;
+  });
+}
+
+async function enterReviewMode(runId) {
+  const base = apiBaseInput.value.replace(/\/$/, "");
+  detailText.textContent = `Loading run ${runId}...`;
+  const manifest = await fetchJson(`${base}/runs/${encodeURIComponent(runId)}`);
+  currentRunId = manifest.run_id || runId;
+  renderManifest(manifest);
+  const question = manifest.question || manifest.question_spec?.original_question || "";
+  if (question) {
+    questionInput.value = question;
+    const truncated = question.length > 80 ? `${question.slice(0, 77)}...` : question;
+    document.title = truncated;
+  }
+  // Freeze interactive controls — this is a read-only review window.
+  runButton.disabled = true;
+  runButton.textContent = "Review mode";
+  abortButton.disabled = true;
+  if (typeof abortAllButton !== "undefined" && abortAllButton) {
+    abortAllButton.disabled = true;
+  }
+  if (typeof continueButton !== "undefined" && continueButton) {
+    continueButton.disabled = true;
+  }
+  setStatus({
+    status: manifest.status || "completed",
+    detail: `Read-only review of run ${currentRunId}`,
+    assumptions: manifest.assumptions || [],
+    planner_actions: manifest.planner_actions || [],
+    llm_traces: manifest.metadata?.llm_traces || [],
+  });
+}
+

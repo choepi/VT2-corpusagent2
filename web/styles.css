@@ -1416,3 +1416,192 @@ th {
     animation: none;
   }
 }
+
+/* ---------- Tab bar ---------- */
+.tab-bar {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin: 18px 0 12px;
+  border-bottom: 1px solid var(--border);
+  padding-bottom: 6px;
+}
+.tab-button {
+  background: transparent;
+  border: 1px solid transparent;
+  padding: 10px 22px;
+  border-radius: 999px;
+  font: inherit;
+  font-weight: 600;
+  font-size: 0.95rem;
+  color: var(--muted);
+  cursor: pointer;
+  transition: background 0.15s ease, color 0.15s ease, border-color 0.15s ease;
+}
+.tab-button:hover {
+  background: var(--accent-soft);
+  color: var(--ink);
+}
+.tab-button.tab-active {
+  background: var(--ink);
+  color: #fff;
+  border-color: var(--ink);
+}
+
+.tab-panel {
+  display: none;
+}
+.tab-panel.tab-active {
+  display: block;
+  animation: tab-fade 0.18s ease;
+}
+@keyframes tab-fade {
+  from { opacity: 0; transform: translateY(4px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .tab-panel.tab-active { animation: none; }
+}
+
+/* ---------- Simple-view layout ---------- */
+.simple-controls {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+.simple-controls textarea {
+  width: 100%;
+  resize: vertical;
+  min-height: 80px;
+}
+.simple-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  align-items: center;
+}
+.simple-actions button {
+  font-weight: 600;
+}
+.simple-metrics {
+  border-top: 1px solid var(--hairline);
+  padding-top: 12px;
+}
+.simple-status-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+/* ---------- Markdown-rendered answer ---------- */
+.answer-rendered {
+  background: var(--paper);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  padding: 16px 20px;
+  line-height: 1.65;
+  font-size: 1rem;
+  color: var(--ink);
+}
+.answer-rendered h1,
+.answer-rendered h2 {
+  font-size: 1.15rem;
+  margin: 18px 0 8px;
+  font-weight: 700;
+}
+.answer-rendered h3 {
+  font-size: 1.02rem;
+  margin: 14px 0 6px;
+  font-weight: 600;
+}
+.answer-rendered h2:first-child,
+.answer-rendered h3:first-child,
+.answer-rendered p:first-child,
+.answer-rendered ul:first-child,
+.answer-rendered ol:first-child {
+  margin-top: 0;
+}
+.answer-rendered p {
+  margin: 8px 0;
+}
+.answer-rendered ul,
+.answer-rendered ol {
+  padding-left: 22px;
+  margin: 8px 0;
+}
+.answer-rendered li {
+  margin: 4px 0;
+}
+.answer-rendered strong {
+  font-weight: 700;
+  color: var(--ink);
+}
+.answer-rendered code {
+  background: var(--accent-soft);
+  padding: 1px 6px;
+  border-radius: 6px;
+  font-size: 0.92em;
+}
+.answer-rendered a {
+  color: var(--accent);
+  text-decoration: none;
+  border-bottom: 1px solid currentColor;
+}
+
+/* ---------- Run history ---------- */
+.run-history-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 12px;
+}
+.run-history-row {
+  display: grid;
+  grid-template-columns: 110px 180px 1fr 130px 70px;
+  gap: 14px;
+  align-items: center;
+  padding: 12px 16px;
+  border-radius: 12px;
+  border: 1px solid var(--border);
+  background: var(--paper);
+  text-decoration: none;
+  color: inherit;
+  font-size: 0.92rem;
+  transition: background 0.12s ease, transform 0.12s ease;
+}
+.run-history-row:hover {
+  background: var(--paper-strong);
+  transform: translateY(-1px);
+}
+.run-history-row .status-chip {
+  font-weight: 700;
+  text-transform: lowercase;
+  font-size: 0.85rem;
+  padding: 3px 9px;
+  border-radius: 999px;
+  background: rgba(0, 0, 0, 0.04);
+  text-align: center;
+}
+.run-history-row .status-chip.status-completed { background: rgba(52, 199, 89, 0.16); color: #1d6e3a; }
+.run-history-row .status-chip.status-partial   { background: rgba(255, 159, 10, 0.16); color: #8a5a06; }
+.run-history-row .status-chip.status-failed    { background: var(--danger-soft); color: var(--danger); }
+.run-history-row .status-chip.status-aborted   { background: rgba(0, 0, 0, 0.06); color: var(--muted); }
+.run-history-row .status-chip.status-rejected  { background: rgba(0, 0, 0, 0.06); color: var(--muted); }
+.run-history-row .run-history-question {
+  font-weight: 500;
+  color: var(--ink);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.run-history-row .run-history-id {
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 0.85rem;
+}
+@media (max-width: 720px) {
+  .run-history-row {
+    grid-template-columns: 1fr;
+    gap: 4px;
+  }
+}
