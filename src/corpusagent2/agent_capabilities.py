@@ -6762,6 +6762,213 @@ def _claim_strength_score(params: dict[str, Any], deps: dict[str, ToolExecutionR
     return ToolExecutionResult(payload={"rows": scored})
 
 
+def _nli_verify_claims(
+    params: dict[str, Any],
+    deps: dict[str, ToolExecutionResult],
+    context: AgentExecutionContext,
+) -> ToolExecutionResult:
+    """Verify claims against source-document sentences using a real NLI model.
+
+    Replaces the heuristic claim_strength_score with cross-encoder entailment
+    probabilities. For each claim span the verifier picks the top-K most
+    lexically-relevant non-self sentences from the source document and runs
+    NLI(premise=sentence, hypothesis=claim). The best entailment across the
+    candidate premises yields the verdict.
+
+    This is the implementation behind RQ3 (does NLI-based verification
+    reduce hallucinated final answers?). When this capability runs, the
+    manifest carries metadata.nli_verifier_ran=True so the UI can show
+    the real verdicts instead of the heuristic scores.
+    """
+    from corpusagent2.retrieval import _load_cross_encoder
+    from corpusagent2.node_resolution import resolve_documents_from_node
+    import numpy as np
+
+    params = _payload_or_params(params) if "_payload_or_params" in globals() else params
+
+    claim_rows: list[dict[str, Any]] = []
+    for result in deps.values():
+        payload = result.payload
+        if not isinstance(payload, dict):
+            continue
+        rows = payload.get("rows")
+        if not isinstance(rows, list):
+            continue
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            claim_text = str(
+                row.get("claim_span") or row.get("excerpt") or row.get("claim") or row.get("text") or ""
+            ).strip()
+            if not claim_text:
+                continue
+            claim_rows.append(
+                {
+                    "claim": claim_text,
+                    "doc_id": str(row.get("doc_id", "")),
+                    "outlet": str(row.get("outlet", row.get("source", ""))),
+                    "published_at": str(row.get("published_at", row.get("date", ""))),
+                }
+            )
+        if claim_rows:
+            break
+
+    if not claim_rows:
+        return ToolExecutionResult(
+            payload={"rows": [], "warnings": ["no_claims_to_verify"]},
+            caveats=["nli_verify_claims received no claim spans from upstream."],
+            metadata={"no_data": True, "no_data_reason": "no_claims_to_verify"},
+        )
+
+    max_claims = _int_param(params, "max_claims", default=50, maximum=200)
+    if len(claim_rows) > max_claims:
+        claim_rows = claim_rows[:max_claims]
+
+    documents, _diag = resolve_documents_from_node(deps, context, text_field="text")
+    doc_lookup = {str(doc.get("doc_id", "")): doc for doc in documents if str(doc.get("doc_id", ""))}
+
+    model_id = str(params.get("model_id") or "cross-encoder/nli-deberta-v3-base").strip()
+    device = (os.getenv("CORPUSAGENT2_DEVICE", "cpu").strip().lower() or "cpu")
+
+    try:
+        model, _resolved_device = _load_cross_encoder(model_id, device=device)
+    except Exception as exc:
+        return ToolExecutionResult(
+            payload={"rows": [], "warnings": [f"nli_model_load_failed:{type(exc).__name__}"]},
+            caveats=[f"NLI model {model_id} could not be loaded: {type(exc).__name__}: {exc}"],
+            metadata={
+                "no_data": True,
+                "no_data_reason": "nli_model_load_failed",
+                "nli_model": model_id,
+                "nli_model_load_error": f"{type(exc).__name__}: {exc}",
+            },
+        )
+
+    label_index = {"contradiction": 0, "entailment": 1, "neutral": 2}
+    label2id = getattr(getattr(getattr(model, "model", None), "config", None), "label2id", None)
+    if isinstance(label2id, dict) and label2id:
+        try:
+            label_index = {str(k).lower(): int(v) for k, v in label2id.items()}
+        except Exception:
+            pass
+    contradiction_idx = label_index.get("contradiction", 0)
+    entailment_idx = label_index.get("entailment", 1)
+    neutral_idx = label_index.get("neutral", 2)
+
+    per_claim_premise_count = _int_param(params, "premises_per_claim", default=3, maximum=10)
+    raw_threshold = params.get("verdict_threshold")
+    try:
+        verdict_threshold = float(raw_threshold) if raw_threshold not in (None, "") else 0.7
+    except (TypeError, ValueError):
+        verdict_threshold = 0.7
+    verdict_threshold = max(0.5, min(0.95, verdict_threshold))
+
+    verdicts: list[dict[str, Any]] = []
+    supported_count = 0
+    contradicted_count = 0
+    neutral_count = 0
+
+    for claim_row in claim_rows:
+        claim_text = claim_row["claim"]
+        doc_id = claim_row["doc_id"]
+        source_doc = doc_lookup.get(doc_id)
+        if source_doc is None:
+            verdicts.append(
+                {
+                    **claim_row,
+                    "verdict": "no_evidence_doc",
+                    "entailment_prob": 0.0,
+                    "contradiction_prob": 0.0,
+                    "neutral_prob": 1.0,
+                    "premise": "",
+                    "premise_doc_id": "",
+                }
+            )
+            neutral_count += 1
+            continue
+        doc_text = _row_analysis_text(source_doc)
+        sentences = simple_sentence_split(doc_text)
+        claim_normalised = " ".join(claim_text.lower().split())
+        premise_candidates = [
+            sentence.strip()
+            for sentence in sentences
+            if sentence.strip() and " ".join(sentence.lower().split()) != claim_normalised
+        ]
+        claim_tokens = set(re.findall(r"[A-Za-z0-9]+", claim_text.lower()))
+
+        def _overlap(sentence: str) -> int:
+            return sum(1 for token in re.findall(r"[A-Za-z0-9]+", sentence.lower()) if token in claim_tokens)
+
+        scored_premises = sorted(premise_candidates, key=lambda sentence: -_overlap(sentence))
+        top_premises = scored_premises[:per_claim_premise_count]
+        if not top_premises:
+            verdicts.append(
+                {
+                    **claim_row,
+                    "verdict": "no_other_sentences",
+                    "entailment_prob": 0.0,
+                    "contradiction_prob": 0.0,
+                    "neutral_prob": 1.0,
+                    "premise": "",
+                    "premise_doc_id": doc_id,
+                }
+            )
+            neutral_count += 1
+            continue
+
+        pairs = [(premise, claim_text) for premise in top_premises]
+        try:
+            scores = model.predict(pairs, apply_softmax=True)
+        except TypeError:
+            raw_scores = np.asarray(model.predict(pairs))
+            exp_scores = np.exp(raw_scores - raw_scores.max(axis=1, keepdims=True))
+            scores = exp_scores / exp_scores.sum(axis=1, keepdims=True)
+        scores = np.asarray(scores)
+        if scores.ndim == 1:
+            scores = scores.reshape(1, -1)
+        best_idx = int(np.argmax(scores[:, entailment_idx]))
+        ent_prob = float(scores[best_idx, entailment_idx])
+        con_prob = float(scores[best_idx, contradiction_idx])
+        neu_prob = float(scores[best_idx, neutral_idx])
+        if ent_prob >= verdict_threshold:
+            verdict = "supported"
+            supported_count += 1
+        elif con_prob >= verdict_threshold:
+            verdict = "contradicted"
+            contradicted_count += 1
+        else:
+            verdict = "neutral"
+            neutral_count += 1
+        verdicts.append(
+            {
+                **claim_row,
+                "verdict": verdict,
+                "entailment_prob": round(ent_prob, 4),
+                "contradiction_prob": round(con_prob, 4),
+                "neutral_prob": round(neu_prob, 4),
+                "premise": top_premises[best_idx][:320],
+                "premise_doc_id": doc_id,
+            }
+        )
+
+    return ToolExecutionResult(
+        payload={"rows": verdicts},
+        caveats=[
+            f"NLI claim verification ran on {len(verdicts)} claim(s) using {model_id}.",
+        ],
+        metadata={
+            "nli_verifier_ran": True,
+            "nli_model": model_id,
+            "claims_evaluated": len(verdicts),
+            "claims_supported": supported_count,
+            "claims_contradicted": contradicted_count,
+            "claims_neutral": neutral_count,
+            "verdict_threshold": verdict_threshold,
+            "premises_per_claim": per_claim_premise_count,
+        },
+    )
+
+
 def _quote_extract(params: dict[str, Any], deps: dict[str, ToolExecutionResult], context: AgentExecutionContext) -> ToolExecutionResult:
     rows = []
     resolved = _resolved_doc_rows(deps, context)
@@ -9502,6 +9709,7 @@ def build_agent_registry() -> ToolRegistry:
         ("burst_detect", "burst_detect", "analytics", 65, _burst_detect),
         ("claim_span_extract", "claim_span_extract", "analytics", 64, _claim_span_extract),
         ("claim_strength_score", "claim_strength_score", "analytics", 63, _claim_strength_score),
+        ("nli_verify_claims", "nli_verify_claims", "transformers", 64, _nli_verify_claims),
         ("quote_extract", "quote_extract", "analytics", 62, _quote_extract),
         ("quote_attribute", "quote_attribute", "analytics", 61, _quote_attribute),
         ("build_evidence_table", "build_evidence_table", "analytics", 60, _build_evidence_table),
