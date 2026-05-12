@@ -34,7 +34,6 @@
 
       <section class="card hero">
         <div class="hero-copy">
-          <p class="eyebrow">Successor to CorpusAgent v1 &middot; Moritz Feuchter &amp; Shpetim Veseli</p>
           <h1>Corpusagent v2 Prototype</h1>
           <p class="lede">
             VT2 prototype (MSE, ZHAW). Tool based Agent for retrieval, NLP, and
@@ -99,7 +98,7 @@
 
         <div class="controls">
           <label><input id="forceAnswer" type="checkbox" /> Force answer</label>
-          <label><input id="noCache" type="checkbox" /> No cache</label>
+          <label hidden><input id="noCache" type="checkbox" /> No cache</label>
           <label><input id="notifyOnFinish" type="checkbox" checked /> Browser notification</label>
           <button id="runButton" type="button">Run Query</button>
           <button id="abortButton" type="button" class="ghost-button">Abort Current</button>
@@ -187,7 +186,7 @@
       <section class="main-grid output-grid" id="answer">
         <article class="card answer-card">
           <div class="section-head">
-            <h2>Grounded Answer</h2>
+            <h2>Answer</h2>
             <span class="pill subtle">Always visible</span>
           </div>
           <div id="answerModeBanner" class="answer-mode-banner hidden"></div>
@@ -210,13 +209,10 @@
 
         <article class="card artifact-card">
           <div class="section-head">
-            <h2>Artifacts And Plots</h2>
+            <h2>Plots</h2>
             <span class="pill subtle">Inspector</span>
           </div>
-          <h3>Plots</h3>
           <div id="plotGallery" class="plot-grid scroll-panel medium-scroll"></div>
-          <h3>Artifacts</h3>
-          <div id="artifactList" class="stack-panel scroll-panel compact-scroll"></div>
         </article>
       </section>
 
