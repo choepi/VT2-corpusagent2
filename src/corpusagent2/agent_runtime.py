@@ -5291,6 +5291,37 @@ class MagicBoxOrchestrator:
         )
 
 
+_RUNTIME_LIMITER_ENV_VARS = (
+    # Retrieval-side caps
+    "CORPUSAGENT2_RETRIEVAL_RERANK_TOP_K",
+    "CORPUSAGENT2_RETRIEVAL_FUSION_K",
+    # Analysis-side per-capability caps
+    "CORPUSAGENT2_WORKING_SET_ANALYSIS_MAX_DOCS",
+    "CORPUSAGENT2_NOUN_SPACY_MAX_DOCS",
+    "CORPUSAGENT2_ENTITY_ANALYSIS_MAX_DOCS",
+    "CORPUSAGENT2_ENTITY_PROVIDER_MAX_DOCS",
+    "CORPUSAGENT2_TOPIC_MODEL_ANALYSIS_MAX_DOCS",
+    "CORPUSAGENT2_SENTIMENT_ANALYSIS_MAX_DOCS",
+    # Python-runner sandbox bounds
+    "CORPUSAGENT2_PYTHON_RUNNER_TIMEOUT_S",
+    "CORPUSAGENT2_PYTHON_RUNNER_CPUS",
+    "CORPUSAGENT2_PYTHON_RUNNER_MEMORY",
+    # Executor scheduling bounds
+    "CORPUSAGENT2_NODE_DEFAULT_TIMEOUT_S",
+    "CORPUSAGENT2_NODE_MAX_ATTEMPTS",
+)
+
+
+def _collect_runtime_limiters() -> dict[str, Any]:
+    """Surface every numeric/text cap that can silently truncate analysis.
+
+    The user explicitly asked for visibility on hidden choke points. Values
+    are reported exactly as the environment provides them (empty string =
+    unset, in which case the capability's internal default applies).
+    """
+    return {name: os.getenv(name, "") for name in _RUNTIME_LIMITER_ENV_VARS}
+
+
 class AgentRuntime:
     def __init__(
         self,
@@ -6036,6 +6067,7 @@ class AgentRuntime:
             "provider_order": provider_orders,
             "corpus": corpus_info,
             "capability_count": len(self.registry.list_tools()),
+            "limiters": _collect_runtime_limiters(),
             "retrieval": {
                 "backend": self.runtime.retrieval_backend,
                 "configured_default_mode": configured_default_mode,
