@@ -6152,7 +6152,220 @@ def _time_series_rows_from_named_metrics(
     return rows, skipped
 
 
-def _time_series_aggregate(params: dict[str, Any], deps: dict[str, ToolExecutionResult], context: AgentExecutionContext) -> ToolExecutionResult:
+def _time_series_aggregate(
+    params: dict[str, Any], deps: dict[str, ToolExecutionResult], context: AgentExecutionContext
+) -> ToolExecutionResult:
+    """Public capability. Wraps the real implementation in an LLM-managed
+    python_runner fallback so a shape-mismatch / pandas exception does not
+    halt the run. See _time_series_python_llm_fallback for the recovery path.
+    """
+    try:
+        return _time_series_aggregate_impl(params, deps, context)
+    except Exception as exc:
+        return _time_series_python_llm_fallback(params, deps, context, exc)
+
+
+def _time_series_python_llm_fallback(
+    params: dict[str, Any],
+    deps: dict[str, ToolExecutionResult],
+    context: AgentExecutionContext,
+    original_error: Exception,
+) -> ToolExecutionResult:
+    """Recover from time_series_aggregate exception with an LLM-written python_runner script.
+
+    The LLM sees the original params, a sample of upstream rows, and the
+    exception. It produces a pandas script that adapts the row shape and
+    emits TSA-shape rows. The script runs in the sandbox; output is
+    validated minimally (period + value present) before returning. On any
+    sub-failure the node returns no_data honestly with the captured script,
+    error, and stdout/stderr for debugging.
+    """
+    error_label = f"{type(original_error).__name__}: {original_error}"
+
+    if context.llm_client is None or context.python_runner is None:
+        return ToolExecutionResult(
+            payload={"rows": [], "skipped_row_count": 0},
+            caveats=[f"time_series_aggregate failed and the python fallback path is unavailable: {error_label}"],
+            metadata={
+                "no_data": True,
+                "no_data_reason": "tsa_failed_no_fallback",
+                "tsa_original_error": error_label,
+            },
+        )
+
+    upstream_rows: list[dict[str, Any]] = []
+    upstream_source: str = ""
+    for dep_name, dep_result in deps.items():
+        if not isinstance(dep_result.payload, dict):
+            continue
+        rows = dep_result.payload.get("rows")
+        if isinstance(rows, list) and rows:
+            upstream_rows = [row for row in rows if isinstance(row, dict)]
+            upstream_source = dep_name
+            break
+
+    sample_for_prompt = upstream_rows[:5]
+    granularity = (
+        params.get("granularity")
+        or params.get("frequency")
+        or params.get("time_granularity")
+        or params.get("interval")
+        or _default_time_granularity()
+    )
+
+    llm_messages = [
+        {
+            "role": "system",
+            "content": (
+                "You are repairing a failed time_series_aggregate call. Read INPUTS_JSON['rows'] "
+                "and produce a JSON file at Path(OUTPUT_DIR, 'result.json') containing a key 'rows' "
+                "whose value is a list of dicts with at least keys 'period' and 'value'. Use the "
+                "string 'period' format that matches INPUTS_JSON['granularity']: month -> 'YYYY-MM', "
+                "year -> 'YYYY', day -> 'YYYY-MM-DD'. Add a 'group' field when the data has an "
+                "entity/series label. Use pandas. Do not raise — if a row cannot be parsed, skip it. "
+                "Return strict JSON with keys: code (the full python script), explanation (one sentence "
+                "describing what you adapted)."
+            ),
+        },
+        {
+            "role": "user",
+            "content": json.dumps(
+                {
+                    "tsa_params": {k: v for k, v in params.items() if not isinstance(v, (dict, list)) or len(str(v)) < 1000},
+                    "tsa_exception": error_label,
+                    "upstream_source": upstream_source,
+                    "upstream_rows_sample": sample_for_prompt,
+                    "upstream_row_count": len(upstream_rows),
+                    "granularity": granularity,
+                },
+                ensure_ascii=False,
+                default=str,
+            ),
+        },
+    ]
+
+    model = getattr(getattr(context.llm_client, "config", None), "planner_model", "") or getattr(
+        getattr(context.llm_client, "config", None), "synthesis_model", ""
+    )
+    llm_response: dict[str, Any] = {}
+    script_code = ""
+    try:
+        llm_response = context.llm_client.complete_json(llm_messages, model=model or "", temperature=0.0)
+        script_code = str(llm_response.get("code", "")).strip()
+        if not script_code:
+            raise ValueError("LLM returned empty 'code'")
+    except Exception as exc:
+        return ToolExecutionResult(
+            payload={"rows": [], "skipped_row_count": 0},
+            caveats=[f"time_series_aggregate failed; LLM fallback also failed: {type(exc).__name__}: {exc}"],
+            metadata={
+                "no_data": True,
+                "no_data_reason": "tsa_failed_llm_fallback_failed",
+                "tsa_original_error": error_label,
+                "tsa_llm_fallback_error": f"{type(exc).__name__}: {exc}",
+            },
+        )
+
+    try:
+        runner_result = context.python_runner.run(
+            code=script_code,
+            inputs_json={"rows": upstream_rows, "granularity": granularity, "tsa_params": params},
+        )
+    except Exception as exc:
+        return ToolExecutionResult(
+            payload={"rows": [], "skipped_row_count": 0},
+            caveats=[f"time_series_aggregate fallback runner crashed: {type(exc).__name__}: {exc}"],
+            metadata={
+                "no_data": True,
+                "no_data_reason": "tsa_failed_runner_crashed",
+                "tsa_original_error": error_label,
+                "tsa_llm_fallback_code": script_code,
+            },
+        )
+
+    if runner_result.exit_code != 0:
+        return ToolExecutionResult(
+            payload={"rows": [], "skipped_row_count": 0},
+            caveats=[
+                f"time_series_aggregate fallback script exit code {runner_result.exit_code}",
+                f"stderr tail: {(runner_result.stderr or '')[-400:]}",
+            ],
+            metadata={
+                "no_data": True,
+                "no_data_reason": "tsa_failed_runner_nonzero_exit",
+                "tsa_original_error": error_label,
+                "tsa_llm_fallback_code": script_code,
+                "tsa_runner_stdout": (runner_result.stdout or "")[-2000:],
+                "tsa_runner_stderr": (runner_result.stderr or "")[-2000:],
+            },
+        )
+
+    result_rows: list[dict[str, Any]] = []
+    for artifact in runner_result.artifacts:
+        if artifact.name != "result.json":
+            continue
+        try:
+            decoded = json.loads(base64.b64decode(artifact.bytes_b64.encode("ascii")).decode("utf-8"))
+        except Exception:
+            continue
+        rows = decoded.get("rows") if isinstance(decoded, dict) else decoded
+        if isinstance(rows, list):
+            result_rows = [row for row in rows if isinstance(row, dict)]
+        break
+
+    valid_rows: list[dict[str, Any]] = []
+    for row in result_rows:
+        period = row.get("period") or row.get("date") or row.get("time")
+        value = row.get("value")
+        if period is None or value is None:
+            continue
+        normalised: dict[str, Any] = {
+            "period": str(period),
+            "value": value,
+            "group": str(row.get("group", row.get("entity", row.get("label", "")))),
+        }
+        for key, val in row.items():
+            if key not in {"period", "value", "group", "date", "time", "entity", "label"}:
+                normalised[key] = val
+        valid_rows.append(normalised)
+
+    if not valid_rows:
+        return ToolExecutionResult(
+            payload={"rows": [], "skipped_row_count": 0},
+            caveats=[
+                "time_series_aggregate fallback produced no usable rows.",
+                f"Original error: {error_label}",
+            ],
+            metadata={
+                "no_data": True,
+                "no_data_reason": "tsa_failed_fallback_shape_invalid",
+                "tsa_original_error": error_label,
+                "tsa_llm_fallback_code": script_code,
+                "tsa_runner_stdout": (runner_result.stdout or "")[-2000:],
+            },
+        )
+
+    return ToolExecutionResult(
+        payload={
+            "rows": valid_rows,
+            "skipped_row_count": max(0, len(result_rows) - len(valid_rows)),
+        },
+        caveats=[
+            "time_series_aggregate failed; recovered with an LLM-written python_runner script.",
+            f"Original error: {error_label}",
+        ],
+        metadata={
+            "degraded": True,
+            "recovery": "llm_python_fallback",
+            "tsa_original_error": error_label,
+            "tsa_llm_fallback_code": script_code,
+            "tsa_llm_fallback_explanation": str(llm_response.get("explanation", "")),
+            "tsa_runner_stdout_tail": (runner_result.stdout or "")[-400:],
+        },
+    )
+
+
+def _time_series_aggregate_impl(params: dict[str, Any], deps: dict[str, ToolExecutionResult], context: AgentExecutionContext) -> ToolExecutionResult:
     params = _payload_or_params(params)
     granularity = str(
         params.get(
