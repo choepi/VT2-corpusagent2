@@ -196,7 +196,7 @@
           </div>
           <div class="metric-strip">
             <div><span class="metric-label">Corpus</span><strong id="corpusNameText">unknown</strong></div>
-            <div><span class="metric-label">Saved</span><strong id="runSavedText">no manifest yet</strong></div>
+            <div><span class="metric-label">Saved</span><strong id="runSavedText">not saved yet</strong></div>
           </div>
           <h3>Active Steps</h3>
           <ul id="activeSteps"></ul>
@@ -255,7 +255,7 @@
             <span class="pill subtle">All saved runs</span>
           </div>
           <p class="muted">
-            Aggregated from saved run manifests and backend tool-call history. Completed node count is the main usage
+            Aggregated from saved run outputs and backend tool-call history. Completed node count is the main usage
             metric because one node can emit multiple running/completed call events.
           </p>
           <div id="toolUsageSummary" class="tool-usage-summary"></div>
@@ -310,7 +310,7 @@
             <span class="pill subtle">From Postgres</span>
           </div>
           <p class="muted">
-            Click a row to open the run in a new browser tab. The tab loads the saved manifest and renders it as if the run had just completed.
+            Click a row to open the run in a new browser tab. The tab loads the saved run output and renders it as if the run had just completed.
           </p>
           <div class="controls">
             <button id="runHistoryRefreshButton" type="button" class="ghost-button">Refresh</button>

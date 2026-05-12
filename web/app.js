@@ -313,7 +313,7 @@ function updateRunSaveDisplay() {
     corpus.pg_table ? `Table: ${corpus.pg_table}` : "",
   ].filter(Boolean).join(" | ");
   const saved = Boolean(latestManifest || currentManifestSavedPath);
-  runSavedText.textContent = saved ? "manifest saved" : currentRunId ? "running" : "no manifest yet";
+  runSavedText.textContent = saved ? "output saved" : currentRunId ? "running" : "not saved yet";
   runSavedText.title = currentManifestSavedPath || "";
 }
 
@@ -913,7 +913,7 @@ function renderToolUsageSummary(payload) {
       <div><span class="metric-label">Used historically</span><strong>${formatCount(payload.used_tool_count || usedTools.length)}</strong></div>
       <div><span class="metric-label">Never completed</span><strong>${formatCount(payload.never_used_tool_count || neverUsed.length)}</strong></div>
     </div>
-    <p class="muted">${escapeHtml((payload.notes || [])[0] || "Counts are derived from saved run manifests and backend tool-call history.")}</p>
+    <p class="muted">${escapeHtml((payload.notes || [])[0] || "Counts are derived from saved run outputs and backend tool-call history.")}</p>
   `;
 
   const categoryMax = Math.max(1, ...categories.map((row) => Number(row.completed_node_count || 0)));
@@ -1564,7 +1564,7 @@ function buildPrintableReportHtml(manifest) {
       </section>
 
       <section class="appendix">
-        <h2>Full Manifest JSON</h2>
+        <h2>Full Run Output JSON</h2>
         ${reportPre(manifest)}
       </section>
     </main>
@@ -2171,7 +2171,7 @@ async function fetchManifestWithRetry(base, runId, attempts = MANIFEST_FETCH_MAX
       await new Promise((resolve) => window.setTimeout(resolve, MANIFEST_FETCH_RETRY_DELAY_MS));
     }
   }
-  throw lastError || new Error("Manifest fetch failed.");
+  throw lastError || new Error("Run output fetch failed.");
 }
 
 async function loadToolUsageSummary() {
