@@ -90,6 +90,8 @@ let providerDefaults = {};
 let submissionInFlight = false;
 let activePollSessionId = 0;
 let notificationPermissionRequested = false;
+let apiReady = true;
+let apiWarmingStages = [];
 const notifiedRunIds = new Set();
 const notificationEligibleRunIds = new Set();
 const notificationObservedActiveRunIds = new Set();
@@ -316,13 +318,20 @@ function updateRunSaveDisplay() {
 }
 
 function updateControlState() {
-  runButton.disabled = submissionInFlight || hasActiveRun();
+  const warming = !apiReady;
+  runButton.disabled = submissionInFlight || hasActiveRun() || warming;
   abortButton.disabled = !hasActiveRun();
-  continueButton.disabled = submissionInFlight || !pendingClarificationQuestion;
-  applyLlmSettingsButton.disabled = submissionInFlight || hasActiveRun();
-  resetLlmSettingsButton.disabled = submissionInFlight || hasActiveRun();
+  continueButton.disabled = submissionInFlight || !pendingClarificationQuestion || warming;
+  applyLlmSettingsButton.disabled = submissionInFlight || hasActiveRun() || warming;
+  resetLlmSettingsButton.disabled = submissionInFlight || hasActiveRun() || warming;
   printReportButton.disabled = !canPrintReport();
-  runButton.textContent = submissionInFlight ? "Submitting..." : hasActiveRun() ? "Run In Progress" : "Run Query";
+  runButton.textContent = warming
+    ? "API warming..."
+    : submissionInFlight
+    ? "Submitting..."
+    : hasActiveRun()
+    ? "Run In Progress"
+    : "Run Query";
   continueButton.textContent = submissionInFlight ? "Submitting..." : "Continue With Clarification";
   printReportButton.textContent = hasActiveRun() ? "PDF After Run" : "Print / Save PDF";
   updateRunSaveDisplay();
@@ -2342,6 +2351,9 @@ async function submitQuery({ preserveClarificationHistory = false } = {}) {
   }
 }
 
+const POLL_MAX_CONSECUTIVE_ERRORS = 5;
+const pollSessionErrorCounts = new Map();
+
 async function pollRun(runId, pollSessionId = activePollSessionId) {
   if (pollSessionId !== activePollSessionId) {
     return;
@@ -2352,6 +2364,7 @@ async function pollRun(runId, pollSessionId = activePollSessionId) {
     if (pollSessionId !== activePollSessionId) {
       return;
     }
+    pollSessionErrorCounts.delete(pollSessionId);
     currentRunId = runId;
     setStatus(statusPayload);
     if (!isTerminalStatus(statusPayload.status)) {
@@ -2404,16 +2417,26 @@ async function pollRun(runId, pollSessionId = activePollSessionId) {
     if (pollSessionId !== activePollSessionId) {
       return;
     }
-    clearInterval(pollTimer);
-    pollTimer = null;
     if (String(error.message || "").includes("404")) {
+      clearInterval(pollTimer);
+      pollTimer = null;
+      pollSessionErrorCounts.delete(pollSessionId);
       clearRestoredRunState();
       detailText.textContent = "Previous run could not be restored after restart, so the stale run state was cleared.";
       return;
     }
+    const consecutive = (pollSessionErrorCounts.get(pollSessionId) || 0) + 1;
+    pollSessionErrorCounts.set(pollSessionId, consecutive);
+    if (consecutive < POLL_MAX_CONSECUTIVE_ERRORS) {
+      detailText.textContent = `Polling hiccup (${consecutive}/${POLL_MAX_CONSECUTIVE_ERRORS}) — ${error.message}. Retrying.`;
+      return;
+    }
+    clearInterval(pollTimer);
+    pollTimer = null;
+    pollSessionErrorCounts.delete(pollSessionId);
     statusBox.textContent = "failed";
     statusBox.className = "status failed";
-    detailText.textContent = `Polling failed: ${error.message}`;
+    detailText.textContent = `Polling failed after ${POLL_MAX_CONSECUTIVE_ERRORS} consecutive errors: ${error.message}`;
   }
 }
 
@@ -2625,6 +2648,24 @@ loadRuntimeInfo().then(async () => {
   pill.setAttribute("aria-live", "polite");
   hero.insertBefore(pill, hero.firstChild);
 
+  let probeTimer = null;
+
+  function scheduleNextProbe(intervalMs) {
+    if (probeTimer) {
+      clearTimeout(probeTimer);
+    }
+    probeTimer = setTimeout(() => void probe(), intervalMs);
+  }
+
+  function setApiReady(ready, warmingStages) {
+    const changed = apiReady !== ready;
+    apiReady = ready;
+    apiWarmingStages = Array.isArray(warmingStages) ? warmingStages : [];
+    if (changed && typeof updateControlState === "function") {
+      updateControlState();
+    }
+  }
+
   async function probe() {
     try {
       const base = (typeof apiBaseInput !== "undefined" && apiBaseInput && apiBaseInput.value)
@@ -2633,25 +2674,47 @@ loadRuntimeInfo().then(async () => {
       if (!base) {
         pill.className = "status-pill status-unknown";
         pill.textContent = "API: not set";
+        setApiReady(true, []);
+        scheduleNextProbe(15000);
         return;
       }
       const response = await fetch(`${base}/health`, { method: "GET", cache: "no-store" });
-      if (response.ok) {
+      if (!response.ok) {
+        pill.className = "status-pill status-down";
+        pill.textContent = `API: ${response.status}`;
+        setApiReady(false, []);
+        scheduleNextProbe(5000);
+        return;
+      }
+      let payload = {};
+      try {
+        payload = await response.json();
+      } catch (_jsonError) {
+        payload = {};
+      }
+      const ready = payload.ready !== false;
+      const warming = Array.isArray(payload.warming) ? payload.warming : [];
+      if (ready) {
         pill.className = "status-pill";
         pill.textContent = "API: healthy";
       } else {
-        pill.className = "status-pill status-down";
-        pill.textContent = `API: ${response.status}`;
+        pill.className = "status-pill status-warming";
+        pill.textContent = warming.length
+          ? `API: warming (${warming.join(", ")})`
+          : "API: warming";
       }
+      setApiReady(ready, warming);
+      scheduleNextProbe(ready ? 15000 : 3000);
     } catch (_error) {
       pill.className = "status-pill status-down";
       pill.textContent = "API: unreachable";
+      setApiReady(false, []);
+      scheduleNextProbe(5000);
     }
   }
 
   probe();
-  setInterval(probe, 15000);
   if (typeof apiBaseInput !== "undefined" && apiBaseInput) {
-    apiBaseInput.addEventListener("change", probe);
+    apiBaseInput.addEventListener("change", () => void probe());
   }
 })();
