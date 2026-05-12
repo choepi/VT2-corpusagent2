@@ -1982,11 +1982,40 @@ function renderAnswerPayload(finalAnswer, metadata = {}) {
       : "";
   }
   renderAnswerText(finalAnswer?.answer_text || "");
-  const verdicts = finalAnswer?.claim_verdicts || [];
-  if (!verdicts.length) {
-    claimVerdicts.innerHTML = '<p class="muted">Claim verdicts will appear when verification outputs are available.</p>';
+  const nliRan = Boolean(metadata?.nli_verifier_ran);
+  const nliRows = Array.isArray(metadata?.nli_verdicts) ? metadata.nli_verdicts : [];
+  const nliStats = metadata?.nli_stats || null;
+  const heuristicVerdicts = finalAnswer?.claim_verdicts || [];
+  if (nliRan) {
+    if (!nliRows.length) {
+      claimVerdicts.innerHTML = '<p class="muted">NLI verifier ran but produced no claim verdicts.</p>';
+    } else {
+      const header = nliStats
+        ? `<p class="muted small">NLI verifier ${escapeHtml(String(nliStats.nli_model || ""))} — ${nliStats.claims_supported ?? 0} supported, ${nliStats.claims_contradicted ?? 0} contradicted, ${nliStats.claims_neutral ?? 0} neutral (threshold ${nliStats.verdict_threshold ?? "0.7"}).</p>`
+        : "";
+      const cards = nliRows
+        .map((row) => {
+          const verdict = String(row.verdict || "neutral").trim() || "neutral";
+          const safeClass = verdict.toLowerCase().replace(/[^a-z0-9_-]/g, "-");
+          const ent = (row.entailment_prob != null) ? Number(row.entailment_prob).toFixed(2) : "";
+          const con = (row.contradiction_prob != null) ? Number(row.contradiction_prob).toFixed(2) : "";
+          const probs = ent ? `<span class="muted small">entail ${ent}${con ? ` · contradict ${con}` : ""}</span>` : "";
+          return `
+            <article class="claim-card claim-card-${safeClass}">
+              <span class="claim-verdict-pill">${escapeHtml(verdict)}</span>
+              <p class="claim-text">${escapeHtml(row.claim || "")}</p>
+              ${row.premise ? `<p class="claim-evidence">${escapeHtml(row.premise)}</p>` : ""}
+              ${probs}
+            </article>
+          `;
+        })
+        .join("");
+      claimVerdicts.innerHTML = header + cards;
+    }
+  } else if (!heuristicVerdicts.length) {
+    claimVerdicts.innerHTML = '<p class="muted">Claim verdicts will appear when an NLI verification node runs. The heuristic claim_strength_score is shown when present but is not a real entailment check.</p>';
   } else {
-    claimVerdicts.innerHTML = verdicts
+    claimVerdicts.innerHTML = heuristicVerdicts
       .map((row) => {
         const verdict = String(row.verdict || row.label || "claim").trim() || "claim";
         const safeClass = verdict.toLowerCase().replace(/[^a-z0-9_-]/g, "-");
@@ -1995,6 +2024,7 @@ function renderAnswerPayload(finalAnswer, metadata = {}) {
             <span class="claim-verdict-pill">${escapeHtml(verdict)}</span>
             <p class="claim-text">${escapeHtml(row.claim || "")}</p>
             ${row.evidence ? `<p class="claim-evidence">${escapeHtml(row.evidence)}</p>` : ""}
+            <p class="muted small">Heuristic claim_strength_score — not a real NLI verdict.</p>
           </article>
         `;
       })

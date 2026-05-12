@@ -4184,6 +4184,9 @@ class MagicBoxOrchestrator:
                     time_series_aggregate, burst/change detection, keyterms, quote_extract, quote_attribute, claim_span_extract, claim_strength_score, NER/entity_linking, and an evidence table.
                     The plan must align corpus evidence windows with external time-series movement windows.
 
+                    For verification, fact-checking, "did source X say Y", "is the claim that Z true" questions:
+                    After claim_span_extract, add nli_verify_claims as a final analysis node. It returns per-claim verdicts of supported/contradicted/neutral grounded in cross-encoder NLI against the source-document sentences. Prefer nli_verify_claims over claim_strength_score for honest claim verification; claim_strength_score is a lexical heuristic.
+
                     For plots:
                     plot_artifact must depend on an analytical table node, not raw document evidence rows.
                     Pass x, y, limit or top_k, and title.
@@ -5289,6 +5292,41 @@ class MagicBoxOrchestrator:
             caveats=list(dict.fromkeys(item for item in caveats if item)),
             claim_verdicts=[],
         )
+
+
+def _extract_nli_summary(snapshot: AgentExecutionSnapshot) -> dict[str, Any] | None:
+    """Pull NLI verdicts off the execution snapshot for manifest metadata.
+
+    Returns None when no nli_verify_claims node ran. Returns the verdict
+    rows plus aggregated counts (supported / contradicted / neutral) when
+    the capability did run. The frontend uses presence of the resulting
+    metadata to decide whether to show real NLI verdicts vs the heuristic
+    claim_strength_score.
+    """
+    for node_id, result in snapshot.node_results.items():
+        record = next(
+            (rec for rec in snapshot.node_records if rec.node_id == node_id and rec.capability == "nli_verify_claims"),
+            None,
+        )
+        if record is None:
+            continue
+        payload = result.payload if hasattr(result, "payload") else {}
+        metadata = result.metadata if hasattr(result, "metadata") else {}
+        rows = payload.get("rows") if isinstance(payload, dict) else None
+        if not isinstance(rows, list):
+            rows = []
+        stats = {
+            "claims_evaluated": int(metadata.get("claims_evaluated", len(rows))) if isinstance(metadata, dict) else len(rows),
+            "claims_supported": int(metadata.get("claims_supported", 0)) if isinstance(metadata, dict) else 0,
+            "claims_contradicted": int(metadata.get("claims_contradicted", 0)) if isinstance(metadata, dict) else 0,
+            "claims_neutral": int(metadata.get("claims_neutral", 0)) if isinstance(metadata, dict) else 0,
+            "verdict_threshold": float(metadata.get("verdict_threshold", 0.7)) if isinstance(metadata, dict) else 0.7,
+            "premises_per_claim": int(metadata.get("premises_per_claim", 3)) if isinstance(metadata, dict) else 3,
+            "nli_model": str(metadata.get("nli_model", "")) if isinstance(metadata, dict) else "",
+            "node_id": record.node_id,
+        }
+        return {"rows": rows, "stats": stats}
+    return None
 
 
 _RUNTIME_LIMITER_ENV_VARS = (
@@ -7047,6 +7085,20 @@ class AgentRuntime:
             plan_dags=plan_dags,
         )
         self._attach_execution_diagnostic_to_answer(final_answer, execution_diagnostics)
+        nli_summary = _extract_nli_summary(snapshot)
+        manifest_metadata: dict[str, Any] = {
+            "force_answer": bool(state.force_answer),
+            "no_cache": bool(state.no_cache),
+            "planner_calls_used": state.planner_calls_used,
+            "clarification_history": list(state.clarification_history),
+            "llm_traces": list(state.llm_traces),
+            "runtime_info": self.runtime_info(),
+            "execution_diagnostics": execution_diagnostics,
+        }
+        if nli_summary is not None:
+            manifest_metadata["nli_verifier_ran"] = True
+            manifest_metadata["nli_verdicts"] = nli_summary["rows"]
+            manifest_metadata["nli_stats"] = nli_summary["stats"]
         manifest = AgentRunManifest(
             run_id=run_id,
             question=question,
@@ -7064,15 +7116,7 @@ class AgentRuntime:
             final_answer=final_answer,
             artifacts_dir=str(artifacts_dir),
             failures=list(snapshot.failures),
-            metadata={
-                "force_answer": bool(state.force_answer),
-                "no_cache": bool(state.no_cache),
-                "planner_calls_used": state.planner_calls_used,
-                "clarification_history": list(state.clarification_history),
-                "llm_traces": list(state.llm_traces),
-                "runtime_info": self.runtime_info(),
-                "execution_diagnostics": execution_diagnostics,
-            },
+            metadata=manifest_metadata,
         )
         self._persist_manifest(manifest)
         return manifest
