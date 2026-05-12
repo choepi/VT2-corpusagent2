@@ -1,4 +1,4 @@
-﻿<!doctype html>
+<!doctype html>
 <html lang="en">
   <head>
     <meta charset="utf-8" />
@@ -25,13 +25,6 @@
     </div>
 
     <main class="shell">
-      <nav class="shell-nav" aria-label="Page sections">
-        <a href="#run-status" class="shell-nav-link">Status</a>
-        <a href="#answer" class="shell-nav-link">Answer</a>
-        <a href="#evidence" class="shell-nav-link">Evidence</a>
-        <a href="#advanced" class="shell-nav-link">Advanced</a>
-      </nav>
-
       <section class="card hero">
         <div class="hero-copy">
           <h1>Corpusagent v2 Prototype</h1>
@@ -47,150 +40,49 @@
         </div>
       </section>
 
-      <section class="card controls-card">
-        <div class="controls-grid">
-          <div>
-            <label for="apiBase">API Base URL</label>
-            <select id="apiBase" class="button-select">
-              <option value="https://api.dongtse.com">Remote API - https://api.dongtse.com</option>
-              <option value="http://127.0.0.1:8001">Local API - http://127.0.0.1:8001</option>
-            </select>
+      <nav class="tab-bar" role="tablist" aria-label="View mode">
+        <button type="button" class="tab-button tab-active" data-tab-target="simple" role="tab" aria-selected="true">Simple</button>
+        <button type="button" class="tab-button" data-tab-target="advanced" role="tab" aria-selected="false">Advanced</button>
+        <button type="button" class="tab-button" data-tab-target="history" role="tab" aria-selected="false">Run history</button>
+      </nav>
+
+      <!-- ============================================================ -->
+      <!-- SIMPLE TAB — question, run controls, status pills, answer,    -->
+      <!-- evidence. Order: question → buttons → answer → evidence.      -->
+      <!-- ============================================================ -->
+      <div class="tab-panel tab-active" data-tab="simple" role="tabpanel" aria-label="Simple view">
+
+        <section class="card simple-controls">
+          <label for="question">Question</label>
+          <textarea id="question" rows="4">Which media predicted the outbreak of the Ukraine war in 2022?</textarea>
+
+          <div class="controls simple-actions">
+            <button id="runButton" type="button">Run Query</button>
+            <label><input id="forceAnswer" type="checkbox" /> Force answer</label>
+            <button id="abortButton" type="button" class="ghost-button">Abort</button>
+            <button id="printReportButton" type="button" class="ghost-button">Save / Print PDF</button>
           </div>
-          <div>
-            <label for="question">Question</label>
-            <textarea id="question" rows="5">Which media predicted the outbreak of the Ukraine war in 2022?</textarea>
+
+          <div class="metric-strip simple-metrics">
+            <div><span class="metric-label">Active</span><strong id="activeCount">0</strong></div>
+            <div><span class="metric-label">Completed</span><strong id="completedCount">0</strong></div>
+            <div><span class="metric-label">Failed</span><strong id="failedCount">0</strong></div>
+            <div><span class="metric-label">Total time</span><strong id="totalTimeCount">n/a</strong></div>
+            <div><span class="metric-label">ETA</span><strong id="etaText">unknown</strong></div>
+            <div><span class="metric-label">Run ID</span><strong id="runIdText">not saved yet</strong></div>
           </div>
-        </div>
-
-        <div class="llm-settings-panel main-llm-settings">
-          <div class="llm-settings-head">
-            <div>
-              <p class="eyebrow">Backend LLM</p>
-              <h3>Provider and Models</h3>
-            </div>
-            <span class="pill subtle">Applies to future runs</span>
-          </div>
-          <div class="llm-settings-grid">
-            <div>
-              <label for="llmProvider">Provider</label>
-              <select id="llmProvider" class="button-select">
-                <option value="uncloseai">UncloseAI / Hermes</option>
-                <option value="openai">OpenAI</option>
-              </select>
-            </div>
-            <div>
-              <label for="plannerModelInput">Planner model</label>
-              <input id="plannerModelInput" type="text" placeholder="gpt-5.4-2026-03-05" />
-            </div>
-            <div>
-              <label for="synthesisModelInput">Synthesis model</label>
-              <input id="synthesisModelInput" type="text" placeholder="gpt-5.4-2026-03-05" />
-            </div>
-          </div>
-          <div class="controls llm-settings-controls">
-            <button id="applyLlmSettingsButton" type="button">Apply LLM Settings</button>
-            <button id="resetLlmSettingsButton" type="button" class="ghost-button">Reset To Startup</button>
-            <span id="llmSettingsNote" class="muted inline-note">
-              Runtime overrides affect future runs only.
-            </span>
-          </div>
-        </div>
-
-        <div class="controls">
-          <label><input id="forceAnswer" type="checkbox" /> Force answer</label>
-          <label hidden><input id="noCache" type="checkbox" /> No cache</label>
-          <label><input id="notifyOnFinish" type="checkbox" checked /> Browser notification</label>
-          <button id="runButton" type="button">Run Query</button>
-          <button id="abortButton" type="button" class="ghost-button">Abort Current</button>
-          <button id="abortAllButton" type="button" class="ghost-button">Abort All</button>
-          <button id="printReportButton" type="button" class="ghost-button">Print / Save PDF</button>
-        </div>
-      </section>
-
-      <section id="clarificationPanel" class="card hidden">
-        <div class="section-head">
-          <h2>Clarification Needed</h2>
-          <span class="pill warn">Follow-up required</span>
-        </div>
-        <p id="clarificationPrompt" class="muted">
-          The backend has not requested a clarification yet.
-        </p>
-
-        <label for="clarificationInput">Your clarification</label>
-        <textarea
-          id="clarificationInput"
-          rows="4"
-          placeholder="Type the missing detail here, for example: compare NZZ and Tages-Anzeiger only."
-        ></textarea>
-
-        <div class="controls">
-          <button id="continueButton" type="button">Continue With Clarification</button>
-        </div>
-
-        <h3>Clarification History</h3>
-        <ul id="clarificationHistory"></ul>
-      </section>
-
-      <section class="run-top-grid" id="run-status">
-        <article class="card status-card">
-          <div class="section-head">
-            <h2>Run Status</h2>
+          <div class="simple-status-row">
             <div id="statusBox" class="status idle">Idle</div>
+            <p id="detailText" class="muted">No run started yet.</p>
           </div>
-          <p id="detailText" class="muted">No run started yet.</p>
-          <div class="metric-strip">
-            <div>
-              <span class="metric-label">Active</span>
-              <strong id="activeCount">0</strong>
-            </div>
-            <div>
-              <span class="metric-label">Completed</span>
-              <strong id="completedCount">0</strong>
-            </div>
-            <div>
-              <span class="metric-label">Failed</span>
-              <strong id="failedCount">0</strong>
-            </div>
-            <div>
-              <span class="metric-label">Total Time</span>
-              <strong id="totalTimeCount">n/a</strong>
-            </div>
-            <div>
-              <span class="metric-label">ETA</span>
-              <strong id="etaText">unknown</strong>
-            </div>
-            <div>
-              <span class="metric-label">Run ID</span>
-              <strong id="runIdText">not saved yet</strong>
-            </div>
-            <div>
-              <span class="metric-label">Corpus</span>
-              <strong id="corpusNameText">unknown</strong>
-            </div>
-            <div>
-              <span class="metric-label">Saved</span>
-              <strong id="runSavedText">no manifest yet</strong>
-            </div>
-          </div>
-          <h3>Active Steps</h3>
-          <ul id="activeSteps"></ul>
-          <h3>Completed Steps</h3>
-          <ul id="completedSteps"></ul>
-          <h3>Failed Steps</h3>
-          <ul id="failedSteps"></ul>
-          <h3>Assumptions</h3>
-          <ul id="assumptionsList"></ul>
-        </article>
-      </section>
+        </section>
 
-      <section class="main-grid output-grid" id="answer">
-        <article class="card answer-card">
+        <section class="card answer-card">
           <div class="section-head">
             <h2>Answer</h2>
-            <span class="pill subtle">Always visible</span>
           </div>
           <div id="answerModeBanner" class="answer-mode-banner hidden"></div>
-          <pre id="answerText" class="answer">Waiting for a run.</pre>
+          <div id="answerText" class="answer-rendered">Waiting for a run.</div>
 
           <h3>Claim Verdicts</h3>
           <div id="claimVerdicts" class="claim-verdict-grid"></div>
@@ -205,6 +97,115 @@
               <ul id="unsupportedList"></ul>
             </div>
           </div>
+        </section>
+
+        <section class="card evidence-card">
+          <div class="section-head">
+            <h2>Evidence</h2>
+          </div>
+          <div id="evidenceTable" class="table-scroll"></div>
+        </section>
+
+      </div>
+
+      <!-- ============================================================ -->
+      <!-- ADVANCED TAB — LLM settings, full status, plots, runtime      -->
+      <!-- profile, transcript, planner trace, tool catalog. Inspector.  -->
+      <!-- ============================================================ -->
+      <div class="tab-panel" data-tab="advanced" role="tabpanel" aria-label="Advanced view">
+
+        <section class="card controls-card">
+          <div class="controls-grid">
+            <div>
+              <label for="apiBase">API Base URL</label>
+              <select id="apiBase" class="button-select">
+                <option value="https://api.dongtse.com">Remote API - https://api.dongtse.com</option>
+                <option value="http://127.0.0.1:8001">Local API - http://127.0.0.1:8001</option>
+              </select>
+            </div>
+          </div>
+
+          <div class="llm-settings-panel main-llm-settings">
+            <div class="llm-settings-head">
+              <div>
+                <p class="eyebrow">Backend LLM</p>
+                <h3>Provider and Models</h3>
+              </div>
+              <span class="pill subtle">Applies to future runs</span>
+            </div>
+            <div class="llm-settings-grid">
+              <div>
+                <label for="llmProvider">Provider</label>
+                <select id="llmProvider" class="button-select">
+                  <option value="uncloseai">UncloseAI / Hermes</option>
+                  <option value="openai">OpenAI</option>
+                </select>
+              </div>
+              <div>
+                <label for="plannerModelInput">Planner model</label>
+                <input id="plannerModelInput" type="text" placeholder="gpt-4o-mini" />
+              </div>
+              <div>
+                <label for="synthesisModelInput">Synthesis model</label>
+                <input id="synthesisModelInput" type="text" placeholder="gpt-4o-mini" />
+              </div>
+            </div>
+            <div class="controls llm-settings-controls">
+              <button id="applyLlmSettingsButton" type="button">Apply LLM Settings</button>
+              <button id="resetLlmSettingsButton" type="button" class="ghost-button">Reset To Startup</button>
+              <span id="llmSettingsNote" class="muted inline-note">
+                Runtime overrides affect future runs only.
+              </span>
+            </div>
+          </div>
+
+          <div class="controls">
+            <label><input id="noCache" type="checkbox" /> No cache</label>
+            <label><input id="notifyOnFinish" type="checkbox" checked /> Browser notification</label>
+            <button id="abortAllButton" type="button" class="ghost-button">Abort All Runs</button>
+          </div>
+        </section>
+
+        <section id="clarificationPanel" class="card hidden">
+          <div class="section-head">
+            <h2>Clarification Needed</h2>
+            <span class="pill warn">Follow-up required</span>
+          </div>
+          <p id="clarificationPrompt" class="muted">
+            The backend has not requested a clarification yet.
+          </p>
+
+          <label for="clarificationInput">Your clarification</label>
+          <textarea
+            id="clarificationInput"
+            rows="4"
+            placeholder="Type the missing detail here, for example: compare NZZ and Tages-Anzeiger only."
+          ></textarea>
+
+          <div class="controls">
+            <button id="continueButton" type="button">Continue With Clarification</button>
+          </div>
+
+          <h3>Clarification History</h3>
+          <ul id="clarificationHistory"></ul>
+        </section>
+
+        <article class="card status-card">
+          <div class="section-head">
+            <h2>Step Inspector</h2>
+          </div>
+          <div class="metric-strip">
+            <div><span class="metric-label">Corpus</span><strong id="corpusNameText">unknown</strong></div>
+            <div><span class="metric-label">Saved</span><strong id="runSavedText">no manifest yet</strong></div>
+          </div>
+          <h3>Active Steps</h3>
+          <ul id="activeSteps"></ul>
+          <h3>Completed Steps</h3>
+          <ul id="completedSteps"></ul>
+          <h3>Failed Steps</h3>
+          <ul id="failedSteps"></ul>
+          <h3>Assumptions</h3>
+          <ul id="assumptionsList"></ul>
         </article>
 
         <article class="card artifact-card">
@@ -214,56 +215,39 @@
           </div>
           <div id="plotGallery" class="plot-grid scroll-panel medium-scroll"></div>
         </article>
-      </section>
 
-      <section class="card evidence-card" id="evidence">
-        <div class="section-head">
-          <h2>Evidence Panel</h2>
-          <span class="pill subtle">Visible on every run</span>
-        </div>
-        <div id="evidenceTable" class="table-scroll"></div>
-      </section>
-
-      <details class="advanced-details" id="advanced">
-        <summary>
-          <span>Advanced Stats And Provenance</span>
-          <small>Runtime profile, exact tool calls, planner DAG, plan node table, full tool catalog, and raw LLM traces</small>
-        </summary>
-
-        <section class="top-grid advanced-grid">
-          <article class="card runtime-card">
-            <div class="section-head">
-              <h2>Runtime Profile</h2>
-              <span id="runtimeModeBadge" class="pill subtle">Loading</span>
+        <article class="card runtime-card">
+          <div class="section-head">
+            <h2>Runtime Profile</h2>
+            <span id="runtimeModeBadge" class="pill subtle">Loading</span>
+          </div>
+          <div class="runtime-compact-grid">
+            <div>
+              <div id="runtimeSummary" class="metric-stack"></div>
             </div>
-            <div class="runtime-compact-grid">
-              <div>
-                <div id="runtimeSummary" class="metric-stack"></div>
-              </div>
-              <div>
-                <h3>Retrieval Health</h3>
-                <div id="retrievalHealth" class="metric-stack"></div>
-              </div>
+            <div>
+              <h3>Retrieval Health</h3>
+              <div id="retrievalHealth" class="metric-stack"></div>
             </div>
-            <details class="mini-details">
-              <summary>Provider imports and runtime notes</summary>
-              <h3>Provider Imports</h3>
-              <div id="providersInstalled" class="chip-wrap"></div>
-              <p class="muted">These chips show whether provider libraries import. Per-node provenance shows what actually executed.</p>
-              <h3>Execution Notes</h3>
-              <ul id="runtimeNotes"></ul>
-            </details>
-          </article>
+          </div>
+          <details class="mini-details">
+            <summary>Provider imports and runtime notes</summary>
+            <h3>Provider Imports</h3>
+            <div id="providersInstalled" class="chip-wrap"></div>
+            <p class="muted">These chips show whether provider libraries import. Per-node provenance shows what actually executed.</p>
+            <h3>Execution Notes</h3>
+            <ul id="runtimeNotes"></ul>
+          </details>
+        </article>
 
-          <article class="card transcript-card">
-            <div class="section-head">
-              <h2>Execution Transcript</h2>
-              <span class="pill subtle">Exact tool calls</span>
-            </div>
-            <div id="toolCallSummary" class="metric-strip transcript-strip"></div>
-            <div id="toolCalls" class="stack-panel scroll-panel medium-scroll"></div>
-          </article>
-        </section>
+        <article class="card transcript-card">
+          <div class="section-head">
+            <h2>Execution Transcript</h2>
+            <span class="pill subtle">Exact tool calls</span>
+          </div>
+          <div id="toolCallSummary" class="metric-strip transcript-strip"></div>
+          <div id="toolCalls" class="stack-panel scroll-panel medium-scroll"></div>
+        </article>
 
         <section class="card usage-card">
           <div class="section-head">
@@ -313,7 +297,29 @@
             <div id="toolCatalog" class="tool-catalog"></div>
           </details>
         </section>
-      </details>
+
+      </div>
+
+      <!-- ============================================================ -->
+      <!-- RUN HISTORY TAB — list past runs, click row to open new tab.  -->
+      <!-- ============================================================ -->
+      <div class="tab-panel" data-tab="history" role="tabpanel" aria-label="Run history">
+        <section class="card history-card">
+          <div class="section-head">
+            <h2>Run history</h2>
+            <span class="pill subtle">From Postgres</span>
+          </div>
+          <p class="muted">
+            Click a row to open the run in a new browser tab. The tab loads the saved manifest and renders it as if the run had just completed.
+          </p>
+          <div class="controls">
+            <button id="runHistoryRefreshButton" type="button" class="ghost-button">Refresh</button>
+            <span id="runHistoryStatus" class="muted inline-note">Not loaded yet.</span>
+          </div>
+          <div id="runHistoryList" class="run-history-list"></div>
+        </section>
+      </div>
+
     </main>
 
     <div id="plotModal" class="modal-overlay hidden" aria-hidden="true" hidden>
@@ -326,6 +332,7 @@
       </div>
     </div>
 
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js" defer></script>
     <script src="./config.js"></script>
     <script src="./app.js"></script>
   </body>
