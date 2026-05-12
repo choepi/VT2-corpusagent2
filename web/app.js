@@ -50,7 +50,7 @@ const assumptionsList = document.getElementById("assumptionsList");
 const answerModeBanner = document.getElementById("answerModeBanner");
 const answerText = document.getElementById("answerText");
 const caveatsList = document.getElementById("caveatsList");
-const unsupportedList = document.getElementById("unsupportedList");
+const unsupportedList = document.getElementById("unsupportedList"); // may be null after Simple-tab UI cleanup
 const claimVerdicts = document.getElementById("claimVerdicts");
 const plannerActions = document.getElementById("plannerActions");
 const planNodes = document.getElementById("planNodes");
@@ -1658,20 +1658,36 @@ function renderEvidence(rows) {
       </thead>
       <tbody>
         ${rows
-          .map(
-            (row) => `
-              <tr>
-                <td class="evidence-doc">${escapeHtml(row.doc_id ?? "")}</td>
+          .map((row) => {
+            const docId = String(row.doc_id ?? "");
+            const safeId = docId ? `id="doc-${escapeHtml(docId)}"` : "";
+            return `
+              <tr ${safeId}>
+                <td class="evidence-doc">${escapeHtml(docId)}</td>
                 <td class="evidence-outlet">${escapeHtml(row.outlet ?? "")}</td>
                 <td>${escapeHtml(row.date ?? "")}</td>
                 <td class="evidence-excerpt">${escapeHtml(row.excerpt ?? "")}</td>
                 <td class="evidence-score">${escapeHtml(row.score_display ?? formatScore(row.score ?? ""))}</td>
-              </tr>`
-          )
+              </tr>`;
+          })
           .join("")}
       </tbody>
     </table>
   `;
+}
+
+function handleAnswerDocLinkClick(event) {
+  const anchor = event.target.closest("a[href^='#doc-']");
+  if (!anchor) return;
+  const href = anchor.getAttribute("href") || "";
+  const target = document.getElementById(href.slice(1));
+  if (!target) return;
+  event.preventDefault();
+  target.scrollIntoView({ behavior: "smooth", block: "center" });
+  target.classList.remove("evidence-row-highlight");
+  // Force reflow so re-adding the class restarts the animation.
+  void target.offsetWidth;
+  target.classList.add("evidence-row-highlight");
 }
 
 function resetManifestPanels(answerMessage = "Waiting for result...") {
@@ -2031,7 +2047,9 @@ function renderAnswerPayload(finalAnswer, metadata = {}) {
       .join("");
   }
   renderList(caveatsList, finalAnswer?.caveats || [], (row) => escapeHtml(row));
-  renderList(unsupportedList, finalAnswer?.unsupported_parts || [], (row) => escapeHtml(row));
+  if (unsupportedList) {
+    renderList(unsupportedList, finalAnswer?.unsupported_parts || [], (row) => escapeHtml(row));
+  }
 }
 
 function renderManifest(manifest) {
@@ -2611,6 +2629,7 @@ renderAccessGate();
 initTabs();
 initRunHistory();
 maybeEnterReviewMode();
+answerText.addEventListener("click", handleAnswerDocLinkClick);
 
 accessGateButton.addEventListener("click", async () => {
   try {
