@@ -1164,27 +1164,10 @@ function reportTable(headers, rows, rowFormatter, emptyText = "No rows") {
   `;
 }
 
-function reportArtifactLink(runId, path) {
-  const fileName = String(path || "").split(/[/\\]/).pop() || path;
-  return `<a href="${artifactUrl(runId, path)}">${escapeHtml(fileName)}</a><br><span class="muted">${escapeHtml(path)}</span>`;
-}
-
-function reportArtifacts(manifest) {
-  const artifacts = collectArtifacts(manifest);
-  if (!artifacts.length) {
-    return '<p class="muted">No artifacts were recorded for this run.</p>';
-  }
-  return `
-    <ul>
-      ${artifacts.map((path) => `<li>${reportArtifactLink(manifest.run_id, path)}</li>`).join("")}
-    </ul>
-  `;
-}
-
 function reportPlots(manifest) {
   const plots = collectArtifacts(manifest).filter((path) => /\.(png|jpg|jpeg|svg)$/i.test(path));
   if (!plots.length) {
-    return '<p class="muted">No plot artifacts were generated for this run.</p>';
+    return '<p class="muted">No plots were generated for this run.</p>';
   }
   return `
     <div class="report-plots">
@@ -1213,7 +1196,9 @@ function buildPrintableReportHtml(manifest) {
   const retrieval = runtimeInfo.retrieval || {};
   const toolTotals = collectToolCallTotals(manifest.tool_calls || []);
   const nodeDuration = formatDurationMs(totalNodeDurationMs(manifest.node_records || [])) || "n/a";
-  const title = `CorpusAgent2 analysis - ${manifest.run_id || "run"}`;
+  const questionForTitle = (manifest.question || manifest.question_spec?.original_question || "").trim();
+  const truncatedQuestion = questionForTitle.length > 80 ? `${questionForTitle.slice(0, 77)}...` : questionForTitle;
+  const title = truncatedQuestion || `Run ${manifest.run_id || ""}`;
   const generatedAt = new Date().toLocaleString();
   const plotCount = collectArtifacts(manifest).filter((path) => /\.(png|jpg|jpeg|svg)$/i.test(path)).length;
 
@@ -1475,7 +1460,7 @@ function buildPrintableReportHtml(manifest) {
       </header>
 
       <section>
-        <h2>Grounded Answer</h2>
+        <h2>Answer</h2>
         ${reportTextBlock(finalAnswer.answer_text || "")}
         <h3>Caveats</h3>
         ${reportList(finalAnswer.caveats || [])}
@@ -1512,11 +1497,6 @@ function buildPrintableReportHtml(manifest) {
       <section>
         <h2>Plots</h2>
         ${reportPlots(manifest)}
-      </section>
-
-      <section>
-        <h2>Artifacts</h2>
-        ${reportArtifacts(manifest)}
       </section>
 
       <section>
@@ -1952,20 +1932,21 @@ function renderArtifacts(manifest) {
   const artifacts = collectArtifacts(manifest);
   const runId = manifest.run_id;
   const plots = artifacts.filter((path) => /\.(png|jpg|jpeg|svg)$/i.test(path));
-  const others = artifacts.filter((path) => !/\.(png|jpg|jpeg|svg)$/i.test(path));
 
-  const artifactBlocks = others.map((path) => `
-    <div class="trace-head">
-      <span class="pill subtle">artifact</span>
-      <a href="${artifactUrl(runId, path)}" target="_blank" rel="noreferrer">${escapeHtml(path.split(/[/\\]/).pop() || path)}</a>
-    </div>
-    <p class="muted artifact-path">${escapeHtml(path)}</p>
-  `);
-  renderStackPanel(artifactList, artifactBlocks, "Artifacts created by the executor will appear here.");
+  if (artifactList) {
+    const others = artifacts.filter((path) => !/\.(png|jpg|jpeg|svg)$/i.test(path));
+    const artifactBlocks = others.map((path) => `
+      <div class="trace-head">
+        <a href="${artifactUrl(runId, path)}" target="_blank" rel="noreferrer">${escapeHtml(path.split(/[/\\]/).pop() || path)}</a>
+      </div>
+      <p class="muted artifact-path">${escapeHtml(path)}</p>
+    `);
+    renderStackPanel(artifactList, artifactBlocks, "");
+  }
 
   plotGallery.innerHTML = "";
   if (plots.length === 0) {
-    plotGallery.innerHTML = '<p class="muted">No plot artifacts were generated for this run.</p>';
+    plotGallery.innerHTML = '<p class="muted">No plots were generated for this run.</p>';
     return;
   }
   plots.forEach((path) => {
