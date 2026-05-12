@@ -26,7 +26,11 @@ from .agent_backends import (
     save_agent_manifest,
 )
 from .agent_capabilities import AgentExecutionContext, _infer_market_ticker_from_text, build_agent_registry
-from .agent_executor import AgentExecutionSnapshot, AsyncPlanExecutor
+from .agent_executor import (
+    _RETRIEVAL_BAILOUT_CAPABILITIES,
+    AgentExecutionSnapshot,
+    AsyncPlanExecutor,
+)
 from .agent_models import (
     AgentFailure,
     AgentPlanDAG,
@@ -6928,6 +6932,68 @@ class AgentRuntime:
                 )
                 if maybe_aborted is not None:
                     return maybe_aborted
+
+        retrieval_bailout_failures = [
+            failure
+            for failure in snapshot.failures
+            if failure.capability in _RETRIEVAL_BAILOUT_CAPABILITIES
+        ]
+        if retrieval_bailout_failures and snapshot.status == "failed":
+            bailout_reason = "; ".join(
+                failure.message for failure in retrieval_bailout_failures if failure.message
+            ) or "Retrieval returned no documents matching the requested scope."
+            self._set_live_status(
+                run_id,
+                current_phase="empty_retrieval_one_shot",
+                detail=f"Retrieval returned no documents; producing model-only answer. {bailout_reason}",
+                planner_actions=list(state.planner_actions),
+                llm_traces=list(state.llm_traces),
+            )
+            one_shot_answer = self._out_of_corpus_model_answer(
+                state=state,
+                unsupported_reason=f"No documents matched: {bailout_reason}",
+            )
+            manifest = AgentRunManifest(
+                run_id=run_id,
+                question=question,
+                rewritten_question=state.rewritten_question,
+                status="rejected",
+                clarification_questions=[],
+                assumptions=list(state.assumptions),
+                planner_actions=list(state.planner_actions),
+                plan_dags=plan_dags,
+                tool_calls=self._current_tool_calls(run_id),
+                selected_docs=list(snapshot.selected_docs),
+                node_records=list(snapshot.node_records),
+                provenance_records=list(snapshot.provenance_records),
+                evidence_table=[],
+                final_answer=one_shot_answer,
+                artifacts_dir=str(artifacts_dir),
+                failures=list(snapshot.failures),
+                metadata={
+                    "force_answer": bool(state.force_answer),
+                    "no_cache": bool(state.no_cache),
+                    "planner_calls_used": state.planner_calls_used,
+                    "clarification_history": list(state.clarification_history),
+                    "llm_traces": list(state.llm_traces),
+                    "runtime_info": self.runtime_info(),
+                    "answer_grounding": "model_only_out_of_corpus",
+                    "out_of_corpus_model_answer": True,
+                    "corpus_unsupported_reason": bailout_reason,
+                    "out_of_corpus_model": self.llm_config.planner_model,
+                    "retrieval_bailout_one_shot": True,
+                },
+            )
+            self._set_live_status(
+                run_id,
+                status="rejected",
+                current_phase="empty_retrieval_one_shot",
+                detail=bailout_reason,
+                planner_actions=list(state.planner_actions),
+                llm_traces=list(state.llm_traces),
+            )
+            self._persist_manifest(manifest)
+            return manifest
 
         self._set_live_status(run_id, current_phase="final_synthesis", detail="Synthesizing grounded answer")
         maybe_aborted = self._maybe_abort(
