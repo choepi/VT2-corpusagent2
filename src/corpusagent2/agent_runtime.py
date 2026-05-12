@@ -5349,6 +5349,94 @@ class AgentRuntime:
         except Exception:
             self._startup_repaired_runs = 0
 
+        self._warmup_state: dict[str, Any] = {
+            "complete": False,
+            "started_at_utc": datetime.now(UTC).isoformat(),
+            "completed_at_utc": None,
+            "duration_ms": None,
+            "stages": {},
+            "errors": [],
+        }
+        self._warmup_thread = threading.Thread(
+            target=self._run_warmup, name="agent-warmup", daemon=True
+        )
+        self._warmup_thread.start()
+
+    _EXPECTED_WARMUP_STAGES = ("torch_init", "spacy_en_load", "llm_endpoint_reachable")
+
+    def _run_warmup(self) -> None:
+        started = time.monotonic()
+        self._warmup_stage("torch_init", self._warmup_probe_torch)
+        self._warmup_stage("spacy_en_load", self._warmup_probe_spacy_en)
+        self._warmup_stage("llm_endpoint_reachable", self._warmup_probe_llm)
+        if dense_retrieval_enabled(default=False):
+            self._warmup_stage("dense_embedder_load", self._warmup_probe_dense_embedder)
+        self._warmup_state["complete"] = True
+        self._warmup_state["completed_at_utc"] = datetime.now(UTC).isoformat()
+        self._warmup_state["duration_ms"] = round((time.monotonic() - started) * 1000, 1)
+
+    def _warmup_stage(self, name: str, fn: Callable[[], None]) -> None:
+        started = time.monotonic()
+        try:
+            fn()
+            self._warmup_state["stages"][name] = {
+                "ok": True,
+                "duration_ms": round((time.monotonic() - started) * 1000, 1),
+            }
+        except Exception as exc:
+            self._warmup_state["stages"][name] = {
+                "ok": False,
+                "duration_ms": round((time.monotonic() - started) * 1000, 1),
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+            self._warmup_state["errors"].append(f"{name}: {type(exc).__name__}: {exc}")
+
+    def _warmup_probe_torch(self) -> None:
+        import torch  # noqa: F401
+
+        _ = torch.cuda.is_available()
+
+    def _warmup_probe_spacy_en(self) -> None:
+        import spacy
+
+        _ = spacy.load("en_core_web_sm")
+
+    def _warmup_probe_llm(self) -> None:
+        import socket
+        from urllib.parse import urlparse
+
+        parsed = urlparse(self.llm_config.base_url or "")
+        host = parsed.hostname
+        if not host:
+            raise RuntimeError("LLM base_url has no host")
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        with socket.create_connection((host, port), timeout=5):
+            pass
+
+    def _warmup_probe_dense_embedder(self) -> None:
+        dense_id = self.runtime.dense_model_id
+        if not dense_id:
+            return
+        from sentence_transformers import SentenceTransformer
+
+        _ = SentenceTransformer(dense_id, device="cpu")
+
+    def warmup_info(self) -> dict[str, Any]:
+        """Snapshot of background warmup progress for /health and /runtime-info."""
+        state = {
+            "complete": bool(self._warmup_state.get("complete")),
+            "started_at_utc": self._warmup_state.get("started_at_utc"),
+            "completed_at_utc": self._warmup_state.get("completed_at_utc"),
+            "duration_ms": self._warmup_state.get("duration_ms"),
+            "stages": dict(self._warmup_state.get("stages", {})),
+            "errors": list(self._warmup_state.get("errors", [])),
+        }
+        expected = list(self._EXPECTED_WARMUP_STAGES)
+        if dense_retrieval_enabled(default=False):
+            expected.append("dense_embedder_load")
+        state["pending_stages"] = [name for name in expected if name not in state["stages"]]
+        return state
+
     def _build_search_backend(self):
         lexical_backend = None
         try:

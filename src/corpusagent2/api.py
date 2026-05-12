@@ -59,7 +59,14 @@ def build_app(runtime: AgentRuntime | None = None, project_root: Path | None = N
 
     @app.get("/health")
     def health() -> dict[str, Any]:
-        return {"status": "ok", "service": "corpusagent2-agent-runtime"}
+        warmup = resolved_runtime.warmup_info()
+        return {
+            "status": "ok",
+            "service": "corpusagent2-agent-runtime",
+            "ready": bool(warmup.get("complete")),
+            "warming": list(warmup.get("pending_stages", [])),
+            "warmup_errors": list(warmup.get("errors", [])),
+        }
 
     @app.get("/capabilities")
     def capabilities() -> dict[str, Any]:
@@ -67,7 +74,9 @@ def build_app(runtime: AgentRuntime | None = None, project_root: Path | None = N
 
     @app.get("/runtime-info")
     def runtime_info() -> dict[str, Any]:
-        return resolved_runtime.runtime_info()
+        info = resolved_runtime.runtime_info()
+        info["warmup"] = resolved_runtime.warmup_info()
+        return info
 
     @app.get("/tool-usage")
     def tool_usage() -> dict[str, Any]:
