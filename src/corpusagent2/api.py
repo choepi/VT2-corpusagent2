@@ -241,6 +241,18 @@ def build_app(runtime: AgentRuntime | None = None, project_root: Path | None = N
         )
         return status.to_dict()
 
+    @app.get("/runs")
+    def list_runs(limit: int = 50, offset: int = 0) -> dict[str, Any]:
+        """Return the most recent runs from the agent_run_history table.
+
+        Postgres-backed. Returns an empty list when Postgres is unreachable
+        or no runs have been recorded yet.
+        """
+        from . import run_history as _run_history
+
+        runs = _run_history.list_runs(limit=limit, offset=offset)
+        return {"runs": runs, "limit": int(limit), "offset": int(offset)}
+
     @app.get("/runs/{run_id}")
     def get_run(run_id: str) -> dict[str, Any]:
         try:
