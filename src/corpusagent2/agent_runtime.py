@@ -4081,126 +4081,64 @@ class MagicBoxOrchestrator:
                     Return strict JSON with keys:
                     action, rewritten_question, assumptions, clarification_question, rejection_reason, message, plan_dag.
 
-                    Allowed actions:
-                    ask_clarification, emit_plan_dag, grounded_rejection.
+                    Allowed actions: ask_clarification, emit_plan_dag, grounded_rejection.
 
                     The plan_dag is a compact directed acyclic graph. Each node must include:
                     node_id, capability, tool_name if a concrete tool is selected, inputs, depends_on.
 
-                    Core planning order:
-                    1. Rewrite the user question into a precise analytical task.
-                    2. Decide whether the task is:
-                    - precision evidence lookup,
-                    - exhaustive corpus analysis,
-                    - semantic/conceptual exploration,
-                    - linguistic/statistical analysis,
-                    - temporal/external-series alignment,
-                    - unsupported or underspecified.
-                    3. Choose the retrieval coverage policy.
-                    4. Select tools by required capability.
-                    5. Resolve each capability to a concrete typed repo tool from tool_catalog when available.
-                    6. If no typed repo tool fits the required capability, use python_runner as a bounded fallback.
-                    7. If a typed repo tool exists but cannot express the required operation or has failed according to prior context, use python_runner on the smallest already-materialized working set that is sufficient.
-
                     Do not assume the corpus is news unless the user question or corpus schema indicates that.
 
-                    Retrieval coverage policy:
-                    Use retrieval_strategy='precision_ranked' when the user needs a small set of best supporting documents, examples, quotes, or evidence snippets.
+                    Planning order:
+                    Step 1 — Rewrite the user question into a precise analytical task.
+                    Step 2 — Identify what the task requires to answer it (evidence snippets, corpus-wide aggregate, semantic similarity, linguistic structure, temporal alignment with external data, etc.). State this in rewritten_question and assumptions, not as a category label.
+                    Step 3 — Select capabilities directly from what the answer requires. For each capability:
+                      - If tool_catalog contains a typed repo tool that directly implements it, use that tool.
+                      - If multiple typed tools fit, choose the most specific.
+                      - If no typed tool fits, use python_runner with bounded inputs, an explicit expected_output_schema, and dependencies on already-materialized data.
+                      - Do not invent tool names or task names that are not documented in tool_catalog.
+                      - Prefer typed repo tools before python_runner, but do not force an ill-fitting typed tool when python_runner is the only way to correctly compute the requested analysis.
+                    Step 4 — For every retrieval node (db_search / sql_query_search), set retrieval_strategy to ONE of:
+                        precision_ranked     — small ranked set of best evidence (examples, quotes, supporting snippets);
+                        exhaustive_analytic  — population for aggregate/trend/compare/frequency/over-time/ranking questions;
+                        semantic_exploratory — similarity/themes/paraphrase/abbreviation coverage.
+                      Include retrieval_strategy_rationale: a one-sentence justification linking the choice to the rewritten question.
 
-                    Use retrieval_strategy='exhaustive_analytic' when the user asks for corpus-wide aggregates, distributions, trends, comparisons, frequencies, rankings, "all relevant records", "all documents about X", "how often", "over time", "compare X and Y", or any analytical result where missing relevant records would bias the conclusion.
+                    Hard rules:
 
-                    Use retrieval_strategy='semantic_exploratory' when the user asks about similarity, themes, recurring descriptions, vague concepts, paraphrases, abbreviations, or wording that may not match exact keywords.
+                    R1 — exhaustive_analytic ⇒ retrieve_all=true OR SQL/filter pagination materializes the working set BEFORE any analysis runs. top_k is NEVER the population size in this mode; it may only be a preview limit, batch size, or safety fallback.
 
-                    Critical rule for exhaustive_analytic:
-                    When retrieval_strategy='exhaustive_analytic', top_k must not define the analyzed population size. It may only be used as a safety fallback, preview limit, or batch/page size. The plan must materialize the candidate working set using retrieve_all=true, SQL/filter-based retrieval, pagination, or corpus metadata filters before running analysis.
+                    R2 — For exhaustive_analytic plans:
+                      - include an explicit topical query string for db_search or sql_query_search;
+                      - use source/time/entity filters when the user or schema supplies them;
+                      - prefer one broad materialized working set plus filter_working_set over multiple overlapping retrieve_all searches;
+                      - run aggregate/statistical tools only after the working set is materialized;
+                      - emit candidate_count / filtered_count / coverage_notes diagnostics when tools support them.
 
-                    For exhaustive_analytic tasks:
-                    - set retrieve_all=true when supported;
-                    - include explicit topical query strings for db_search or sql_query_search;
-                    - use source/time/entity filters when supplied by the user or schema;
-                    - avoid tiny default retrieval budgets;
-                    - prefer one broad materialized working set plus filter_working_set over multiple overlapping retrieve_all searches;
-                    - run aggregate/statistical tools only after the relevant working set is materialized;
-                    - include summary/count diagnostics such as candidate_count, filtered_count, and coverage_notes when tools support them.
+                    R3 — For precision_ranked plans:
+                      Use db_search plus fetch_documents. Set top_k, lexical_top_k, dense_top_k, rerank_top_k, and use_rerank to match the scope. Use reranking when the best evidence documents matter.
 
-                    For precision_ranked tasks:
-                    Use db_search plus fetch_documents. Set top_k, lexical_top_k, dense_top_k, rerank_top_k, and use_rerank according to the scope. Use reranking when the best evidence documents matter.
+                    R4 — For semantic_exploratory plans:
+                      Use embeddings/similarity capabilities when available — doc_embeddings, similarity_index, similarity_pairwise, word_embeddings, extract_acronyms. Combine with keyterms/entities and temporal summaries when the question asks over time.
 
-                    For semantic_exploratory tasks:
-                    Use embeddings/similarity capabilities when available:
-                    doc_embeddings, similarity_index, similarity_pairwise, word_embeddings, extract_acronyms.
-                    Combine with keyterms/entities and temporal summaries when the question asks over time.
+                    R5 — Every db_search or sql_query_search node has a non-empty query string derived from rewritten_question. No implicit query context.
 
-                    Tool selection policy:
-                    Always select by capability first, not by tool name first.
+                    R6 — Use sql_query_search when hybrid retrieval is sparse/off-target, exact metadata filtering is needed, entity/source/time coverage is poor, or exhaustive_analytic needs full candidate materialization and SQL expresses the slice better than ranked retrieval. Use db_search when natural-language/hybrid retrieval is appropriate, when ranked evidence is needed, or for broad topical candidate generation before filtering.
 
-                    For every required capability:
-                    - If tool_catalog contains a typed repo tool that directly implements the capability, use it.
-                    - If multiple typed tools fit, choose the most specific one.
-                    - If no typed tool fits, use python_runner with bounded inputs, explicit expected output schema, and dependencies on already-materialized data.
-                    - Do not invent tool names.
-                    - Do not invent task names that are not documented in tool_catalog.
-                    - Prefer typed repo tools before python_runner, but do not force an ill-fitting typed tool when python_runner is the only way to correctly compute the requested analysis.
+                    R7 — Every python_runner node lists input_artifacts (or upstream node references), operation_description, expected_output_schema, and resource_bounds (max_rows, max_runtime_seconds, batch_size where applicable). Use python_runner only when no typed tool exists, the typed tool failed in prior context, the user requested a custom statistic/transformation/visualization not covered by typed tools, or the computation is simple and bounded over an already-materialized working set.
 
-                    Python fallback policy:
-                    Use python_runner only when:
-                    - no typed repo tool exists for the required operation;
-                    - the typed tool is unavailable or failed in prior context;
-                    - the user requests a custom statistic, transformation, or visualization not covered by typed tools;
-                    - the required computation is simple and bounded over an already-materialized working set.
+                    R8 — plot_artifact depends on an analytical table node, never on raw document evidence rows. Pass x, y, limit or top_k, and title. When the user specifies a limit such as "top 20", pass it through to aggregation and plot nodes.
 
-                    Every python_runner node must include:
-                    - input_artifacts or upstream node references,
-                    - operation_description,
-                    - expected_output_schema,
-                    - resource_bounds such as max_rows, max_runtime_seconds, or batch_size when applicable.
+                    R9 — For verification, fact-checking, "did source X say Y", "is the claim Z true" questions: after claim_span_extract, add nli_verify_claims as a final analysis node. It returns per-claim supported/contradicted/neutral verdicts grounded in cross-encoder NLI against source-document sentences. Prefer nli_verify_claims over claim_strength_score for honest claim verification; claim_strength_score is a lexical heuristic.
 
-                    Query string rule:
-                    Every db_search or sql_query_search node must include a non-empty query string derived from rewritten_question. Do not rely on implicit query context.
+                    R10 — For linguistic questions about nouns, verbs, adjectives, grammatical roles, or subject-verb-object patterns: include sentence_split, tokenize, pos_morph, lemmatize, dependency_parse, extract_svo_triples, noun_chunks, named_entities, entity_linking. For noun frequency tables, use build_evidence_table with task_name='noun_frequency_distribution'. noun_frequency_distribution rows contain lemma, count, relative_frequency, document_frequency, rank. Plot noun distributions with x='lemma' and y='count'.
 
-                    Use sql_query_search when:
-                    - hybrid retrieval is sparse or off-target;
-                    - exact metadata filtering is needed;
-                    - entity/source/time coverage is poor;
-                    - exhaustive_analytic requires full candidate materialization and SQL can express the slice better than ranked retrieval.
+                    R11 — For price/external-series explanation questions: combine external price/time series with time_series_aggregate, burst/change detection, keyterms, quote_extract, quote_attribute, claim_span_extract, claim_strength_score, NER/entity_linking, and an evidence table. Align corpus evidence windows with external time-series movement windows.
 
-                    Use db_search when:
-                    - natural-language or hybrid retrieval is appropriate;
-                    - ranked evidence is needed;
-                    - broad topical candidate generation is needed before filtering.
+                    R12 — Source filters: only when the user names specific outlets or the corpus metadata clearly supplies source names. Do not invent backend alias lists for broad phrases such as "Swiss newspapers" or "American media". If outlet aliases may be needed, list them in assumptions and keep source terms separate from topical query terms.
 
-                    For outlet/source-scoped questions:
-                    Add source filters only when the user names specific outlets or the corpus metadata clearly supplies source names. Do not invent backend alias lists for broad phrases such as "Swiss newspapers" or "American media". If outlet aliases may be needed, list them in assumptions and keep source terms separate from topical query terms.
+                    R13 — Clarification policy: ask clarification only when the missing information would change the plan structure. If clarification_history resolves a term, use the resolved term as the retrieval anchor. If prior clarification resolved only part of an ambiguity, ask only for the remainder. When a clarification says one term means another, use the resolved term as the retrieval anchor and avoid broad synonym paraphrases that dilute retrieval.
 
-                    For linguistic questions:
-                    If the user asks about nouns, verbs, adjectives, grammatical roles, who acted, who was acted upon, or subject-verb-object patterns, include the relevant linguistic capabilities:
-                    sentence_split, tokenize, pos_morph, lemmatize, dependency_parse, extract_svo_triples, noun_chunks, named_entities, entity_linking.
-                    For noun frequency tables, use build_evidence_table with task_name='noun_frequency_distribution' exactly when supported.
-                    noun_frequency_distribution rows contain lemma, count, relative_frequency, document_frequency, and rank.
-                    Plot noun distributions with x='lemma' and y='count'.
-
-                    For price/external-series explanation questions:
-                    Combine external price/time series with:
-                    time_series_aggregate, burst/change detection, keyterms, quote_extract, quote_attribute, claim_span_extract, claim_strength_score, NER/entity_linking, and an evidence table.
-                    The plan must align corpus evidence windows with external time-series movement windows.
-
-                    For verification, fact-checking, "did source X say Y", "is the claim that Z true" questions:
-                    After claim_span_extract, add nli_verify_claims as a final analysis node. It returns per-claim verdicts of supported/contradicted/neutral grounded in cross-encoder NLI against the source-document sentences. Prefer nli_verify_claims over claim_strength_score for honest claim verification; claim_strength_score is a lexical heuristic.
-
-                    For plots:
-                    plot_artifact must depend on an analytical table node, not raw document evidence rows.
-                    Pass x, y, limit or top_k, and title.
-                    When the user specifies an output limit such as "top 20", pass it through to the aggregation and plot nodes.
-
-                    Clarification policy:
-                    Ask clarification only when the missing information changes the required analysis materially.
-                    If clarification_history resolves a term, use the resolved term as the retrieval anchor.
-                    If prior clarification resolved only part of an ambiguity, ask only for the missing remainder.
-                    When a clarification says one term means another, use the resolved term as the retrieval anchor and avoid broad synonym paraphrases that dilute retrieval.
-
-                    Rejection policy:
-                    Use grounded_rejection only when the question cannot be answered from the available corpus/tools, violates constraints, or requires unavailable external data.
-                    Explain the missing requirement precisely in rejection_reason."""
+                    R14 — Rejection policy: use grounded_rejection only when the question cannot be answered from the available corpus/tools, violates constraints, or requires unavailable external data. Explain the missing requirement precisely in rejection_reason."""
                 ),
             },
             {
