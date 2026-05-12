@@ -7181,6 +7181,12 @@ class AgentRuntime:
             self.working_store.finalize_run(manifest.run_id, manifest.status)
         except Exception:
             pass
+        try:
+            from . import run_history as _run_history
+
+            _run_history.record_run(manifest.to_dict(), manifest_path=str(manifest_path))
+        except Exception:
+            pass
         self._set_live_status(
             manifest.run_id,
             question=manifest.question,
