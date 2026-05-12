@@ -2628,19 +2628,59 @@ accessGatePassword.addEventListener("keydown", async (event) => {
   }
 });
 
+function startContinuousPollingForRun(runId, pollSessionId) {
+  if (pollTimer) {
+    clearInterval(pollTimer);
+    pollTimer = null;
+  }
+  pollTimer = setInterval(() => {
+    void pollRun(runId, pollSessionId);
+  }, POLL_INTERVAL_MS);
+}
+
 loadRuntimeInfo().then(async () => {
   if (currentRunId) {
+    detailText.textContent = `Reconnecting to run ${currentRunId}...`;
+    const reattachSessionId = ++activePollSessionId;
     try {
-      await pollRun(currentRunId);
+      await pollRun(currentRunId, reattachSessionId);
+      // If the run is still active server-side, keep polling so the user
+      // sees live updates after laptop wake / browser reload.
+      if (!isTerminalStatus(currentStatus) && currentRunId) {
+        startContinuousPollingForRun(currentRunId, reattachSessionId);
+      }
     } catch (error) {
       if (String(error.message || "").includes("404")) {
         clearRestoredRunState();
-        detailText.textContent = "Previous run was no longer available after restart, so the saved run reference was cleared.";
+        detailText.textContent =
+          "Previous run was no longer available after restart, so the saved run reference was cleared. Check the Run history tab to find it.";
       } else {
-        detailText.textContent = `Could not restore previous run: ${error.message}`;
+        detailText.textContent =
+          `Could not restore previous run: ${error.message}. The run may still be in progress on the server — check the Run history tab.`;
       }
     }
   }
+});
+
+// When the tab regains focus (e.g., laptop wake) and we have a saved
+// run id but polling has stopped, resume continuous polling. Prevents
+// the "I came back hours later and the UI is silent" failure mode.
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState !== "visible") {
+    return;
+  }
+  if (!currentRunId || pollTimer || isTerminalStatus(currentStatus)) {
+    return;
+  }
+  const resumeSessionId = ++activePollSessionId;
+  detailText.textContent = `Tab became visible — resuming polling for run ${currentRunId}.`;
+  pollRun(currentRunId, resumeSessionId).then(() => {
+    if (!isTerminalStatus(currentStatus) && currentRunId) {
+      startContinuousPollingForRun(currentRunId, resumeSessionId);
+    }
+  }).catch(() => {
+    // Errors are handled by pollRun's catch block; nothing extra here.
+  });
 });
 
 // ----- Phase 4 modernization: scroll-reveal + live API status pill -----
@@ -2829,6 +2869,14 @@ async function loadRunHistory() {
   }
 }
 
+const IN_PROGRESS_RUN_STATUSES = new Set([
+  "queued",
+  "running",
+  "aborting",
+  "cancel_requested",
+  "on_hold",
+]);
+
 function renderRunHistoryRow(run) {
   const runId = String(run.run_id || "");
   const question = String(run.question || "");
@@ -2837,9 +2885,12 @@ function renderRunHistoryRow(run) {
   const duration = (run.duration_ms != null) ? formatDurationMs(run.duration_ms) || "" : "";
   const reviewUrl = `${window.location.pathname}?run=${encodeURIComponent(runId)}`;
   const statusClass = status.replace(/[^a-z0-9_-]/gi, "_");
+  const inProgress = IN_PROGRESS_RUN_STATUSES.has(status.toLowerCase());
+  const rowClass = inProgress ? "run-history-row run-history-row-active" : "run-history-row";
+  const indicator = inProgress ? '<span class="run-history-active-dot" aria-hidden="true"></span>' : "";
   return `
-    <a class="run-history-row" href="${reviewUrl}" target="_blank" rel="noopener noreferrer" title="${escapeHtml(question)}">
-      <span class="status-chip status-${escapeHtml(statusClass)}">${escapeHtml(status)}</span>
+    <a class="${rowClass}" href="${reviewUrl}" target="_blank" rel="noopener noreferrer" title="${escapeHtml(question)}">
+      <span class="status-chip status-${escapeHtml(statusClass)}">${indicator}${escapeHtml(status)}</span>
       <span class="run-history-time muted">${escapeHtml(created)}</span>
       <span class="run-history-question">${escapeHtml(question || "(no question recorded)")}</span>
       <span class="run-history-id muted">${escapeHtml(runId.slice(-12))}</span>
