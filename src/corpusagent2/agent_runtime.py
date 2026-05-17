@@ -7166,6 +7166,8 @@ class AgentRuntime:
 
     def _persist_manifest(self, manifest: AgentRunManifest) -> None:
         manifest_path = Path(manifest.artifacts_dir) / "run_manifest.json"
+        if not manifest.finished_at_utc:
+            manifest.finished_at_utc = datetime.now(UTC).isoformat()
         save_agent_manifest(manifest_path, manifest.to_dict())
         try:
             self.working_store.record_output(manifest.run_id, "final_answer", manifest.final_answer.to_dict())
