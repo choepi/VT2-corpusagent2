@@ -1549,14 +1549,29 @@ th {
   border-bottom: 1px solid currentColor;
 }
 .answer-rendered a[href^="#doc-"] {
-  font-variant-numeric: tabular-nums;
-  font-size: 0.92em;
-  padding: 0 2px;
-  border-bottom-style: dashed;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  vertical-align: middle;
+  min-width: 1.2em;
+  min-height: 1.2em;
+  margin: 0 1px;
+  padding: 0 3px;
+  color: var(--accent);
+  font-size: 0.95em;
+  font-weight: 700;
+  line-height: 1;
+  border-bottom: 0;
+  border-radius: 4px;
+  text-decoration: none;
 }
 .answer-rendered a[href^="#doc-"]:hover {
   background: var(--accent-soft);
-  border-radius: 3px;
+  text-decoration: none;
+}
+.answer-rendered a[href^="#doc-"]:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
 }
 
 .evidence-row-highlight {

@@ -2041,23 +2041,35 @@ function renderArtifacts(manifest) {
     renderStackPanel(artifactList, artifactBlocks, "");
   }
 
+  const simplePlotsCard = document.getElementById("simplePlotsCard");
+  const simplePlotGallery = document.getElementById("simplePlotGallery");
   plotGallery.innerHTML = "";
+  if (simplePlotGallery) simplePlotGallery.innerHTML = "";
   if (plots.length === 0) {
     plotGallery.innerHTML = '<p class="muted">No plots were generated for this run.</p>';
+    if (simplePlotsCard) simplePlotsCard.classList.add("hidden");
     return;
   }
+  if (simplePlotsCard) simplePlotsCard.classList.remove("hidden");
   plots.forEach((path) => {
-    const figure = document.createElement("figure");
-    figure.className = "plot-card";
     const fileName = path.split(/[/\\]/).pop() || path;
     const src = artifactUrl(runId, path);
-    figure.innerHTML = `
+    const figureHtml = `
       <button class="plot-button" type="button" data-src="${src}" data-caption="${escapeHtml(fileName)}">
         <img src="${src}" alt="Plot artifact" />
         <figcaption>${escapeHtml(fileName)}</figcaption>
       </button>
     `;
-    plotGallery.appendChild(figure);
+    const advFigure = document.createElement("figure");
+    advFigure.className = "plot-card";
+    advFigure.innerHTML = figureHtml;
+    plotGallery.appendChild(advFigure);
+    if (simplePlotGallery) {
+      const simpleFigure = document.createElement("figure");
+      simpleFigure.className = "plot-card";
+      simpleFigure.innerHTML = figureHtml;
+      simplePlotGallery.appendChild(simpleFigure);
+    }
   });
 }
 
@@ -2665,6 +2677,15 @@ plotGallery.addEventListener("click", (event) => {
   openPlotModal(button.dataset.src || "", button.dataset.caption || "Plot preview");
 });
 
+const _simplePlotGallery = document.getElementById("simplePlotGallery");
+if (_simplePlotGallery) {
+  _simplePlotGallery.addEventListener("click", (event) => {
+    const button = event.target.closest(".plot-button");
+    if (!button) return;
+    openPlotModal(button.dataset.src || "", button.dataset.caption || "Plot preview");
+  });
+}
+
 plotModalClose.addEventListener("click", closePlotModal);
 plotModal.addEventListener("click", (event) => {
   if (event.target === plotModal) {
@@ -2904,12 +2925,27 @@ function renderAnswerText(value) {
   if (typeof window !== "undefined" && window.marked && typeof window.marked.parse === "function") {
     try {
       answerText.innerHTML = window.marked.parse(text, { breaks: true, gfm: true });
+      _replaceDocLinkLabelsWithIcons(answerText);
       return;
     } catch (_err) {
       // fall through to plain text
     }
   }
   answerText.textContent = text;
+}
+
+function _replaceDocLinkLabelsWithIcons(container) {
+  if (!container) return;
+  const anchors = container.querySelectorAll('a[href^="#doc-"]');
+  anchors.forEach((anchor) => {
+    const originalText = anchor.textContent.trim();
+    if (originalText && !anchor.getAttribute("title")) {
+      anchor.setAttribute("title", originalText);
+    }
+    anchor.setAttribute("aria-label", originalText || "Open evidence");
+    anchor.classList.add("doc-link-icon");
+    anchor.innerHTML = '<span aria-hidden="true">↗</span>';
+  });
 }
 
 
