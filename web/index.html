@@ -192,6 +192,9 @@
           <div class="metric-strip">
             <div><span class="metric-label">Corpus</span><strong id="corpusNameText">unknown</strong></div>
             <div><span class="metric-label">Saved</span><strong id="runSavedText">not saved yet</strong></div>
+            <div title="Time from when you pressed Run to when the run finished. Includes everything: tools, planner, answer, and waiting in between."><span class="metric-label">Total time</span><strong id="totalTimeBreakdown">n/a</strong></div>
+            <div title="Time spent inside the actual tool steps (search, NLP, plotting...)."><span class="metric-label">Tool execution</span><strong id="nodeSumTimeText">n/a</strong></div>
+            <div title="Total time minus tool execution. This is mostly the planner thinking, the final answer being written, and short waits between steps."><span class="metric-label">Planner + answer + waiting</span><strong id="overheadTimeText">n/a</strong></div>
           </div>
           <h3>Active Steps</h3>
           <ul id="activeSteps"></ul>
