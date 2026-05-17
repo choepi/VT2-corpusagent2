@@ -15,9 +15,21 @@ can apply uniform completed/no_data/degraded/failed semantics downstream.
 
 from __future__ import annotations
 
+import re
 from typing import Any, Iterable
 
 from corpusagent2.tool_registry import ToolExecutionResult
+
+
+def _looks_like_plan_node_ref(value: str) -> bool:
+    normalized = str(value or "").strip().lower()
+    return bool(re.fullmatch(r"n\d+", normalized)) or normalized in {
+        "search",
+        "fetch",
+        "documents",
+        "working_set",
+        "working-set",
+    }
 
 
 # ---------- payload-shape inspection ----------------------------------------
@@ -95,21 +107,29 @@ def resolve_working_set_ref(
     deps: dict[str, "ToolExecutionResult"],
     params: dict[str, Any] | None = None,
 ) -> str:
-    """Resolve a working_set_ref string from params or any upstream payload."""
+    """Resolve a working_set_ref string from params or any upstream payload.
+
+    Plan-node references like "n2" are dereferenced via deps[node_id].payload.
+    Plan-node strings that aren't in deps are skipped, never returned.
+    """
     if params:
         for key in ("working_set_ref", "working_set", "working_set_from"):
             raw = str(params.get(key, "") or "").strip()
-            if raw and raw not in deps:
-                return raw
-            if raw and raw in deps:
+            if not raw:
+                continue
+            if raw in deps:
                 payload = deps[raw].payload if isinstance(deps[raw].payload, dict) else {}
                 inner = str(payload.get("working_set_ref", "") or "").strip()
                 if inner:
                     return inner
+                continue
+            if _looks_like_plan_node_ref(raw):
+                continue
+            return raw
     for result in deps.values():
         payload = result.payload if isinstance(result.payload, dict) else {}
         ref = str(payload.get("working_set_ref", "") or "").strip()
-        if ref:
+        if ref and not _looks_like_plan_node_ref(ref):
             return ref
     return ""
 
@@ -125,6 +145,7 @@ def resolve_documents_from_node(
     node_id: str = "",
     text_field: str = "text",
     max_documents: int | None = None,
+    params: dict[str, Any] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Get full document rows, dereferencing working_set_ref when needed.
 
@@ -158,7 +179,7 @@ def resolve_documents_from_node(
         )
         for dep in deps.values()
     )
-    ws_ref = resolve_working_set_ref(deps)
+    ws_ref = resolve_working_set_ref(deps, params=params)
 
     inline_with_text = [row for row in inline if _row_has_text(row, text_field)]
     if inline_with_text and not (truncated_flag and ws_ref):

@@ -3299,7 +3299,7 @@ def _fetch_documents(params: dict[str, Any], deps: dict[str, ToolExecutionResult
 
 def _create_working_set(params: dict[str, Any], deps: dict[str, ToolExecutionResult], context: AgentExecutionContext) -> ToolExecutionResult:
     filters = dict(params.get("filter", {})) if isinstance(params.get("filter"), dict) else {}
-    upstream_ref = str(params.get("working_set_ref", "") or _working_set_ref(deps)).strip()
+    upstream_ref = _resolve_working_set_ref(params, deps).strip()
     if upstream_ref and not filters:
         count = _count_working_set(context, upstream_ref, 0)
         preview_ids = _fetch_working_set_ids(context, upstream_ref, limit=_result_preview_limit())
@@ -5688,7 +5688,7 @@ def _doc_embeddings(params: dict[str, Any], deps: dict[str, ToolExecutionResult]
     from corpusagent2 import strict_mode as _strict
 
     max_documents = _working_set_analysis_max_documents()
-    docs, deref_diag = resolve_documents_from_node(deps, context, text_field="text", max_documents=max_documents)
+    docs, deref_diag = resolve_documents_from_node(deps, context, text_field="text", max_documents=max_documents, params=params)
     if not docs:
         return ToolExecutionResult(
             payload={"rows": [], "diagnostics": deref_diag, "warnings": ["could_not_resolve_documents"]},
@@ -5732,7 +5732,7 @@ def _similarity_index(params: dict[str, Any], deps: dict[str, ToolExecutionResul
     from corpusagent2 import strict_mode as _strict
 
     max_documents = _working_set_analysis_max_documents()
-    docs, deref_diag = resolve_documents_from_node(deps, context, text_field="text", max_documents=max_documents)
+    docs, deref_diag = resolve_documents_from_node(deps, context, text_field="text", max_documents=max_documents, params=params)
     if len(docs) < 2:
         reason = "no_embeddings" if not docs else "insufficient_documents_for_similarity"
         return ToolExecutionResult(
@@ -6656,7 +6656,7 @@ def _claim_span_extract(params: dict[str, Any], deps: dict[str, ToolExecutionRes
     fallback_keywords = sorted(CLAIM_KEYWORDS)
     rows = []
     max_documents = _working_set_analysis_max_documents()
-    documents, deref_diag = resolve_documents_from_node(deps, context, text_field="text", max_documents=max_documents)
+    documents, deref_diag = resolve_documents_from_node(deps, context, text_field="text", max_documents=max_documents, params=params)
     if not documents:
         return ToolExecutionResult(
             payload={"rows": [], "diagnostics": deref_diag, "warnings": ["no_sentence_rows"]},
@@ -6824,7 +6824,7 @@ def _nli_verify_claims(
     if len(claim_rows) > max_claims:
         claim_rows = claim_rows[:max_claims]
 
-    documents, _diag = resolve_documents_from_node(deps, context, text_field="text")
+    documents, _diag = resolve_documents_from_node(deps, context, text_field="text", params=params)
     doc_lookup = {str(doc.get("doc_id", "")): doc for doc in documents if str(doc.get("doc_id", ""))}
 
     model_id = str(params.get("model_id") or "cross-encoder/nli-deberta-v3-base").strip()
