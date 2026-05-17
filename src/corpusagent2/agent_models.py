@@ -323,6 +323,7 @@ class AgentRunManifest:
     artifacts_dir: str
     failures: list[AgentFailure] = field(default_factory=list)
     created_at_utc: str = field(default_factory=lambda: datetime.now(UTC).isoformat())
+    finished_at_utc: str = ""
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -332,6 +333,7 @@ class AgentRunManifest:
             "rewritten_question": self.rewritten_question,
             "status": self.status,
             "created_at_utc": self.created_at_utc,
+            "finished_at_utc": self.finished_at_utc,
             "clarification_questions": list(self.clarification_questions),
             "assumptions": list(self.assumptions),
             "planner_actions": _serialize(self.planner_actions),
