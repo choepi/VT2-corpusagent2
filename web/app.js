@@ -1784,15 +1784,21 @@ function renderRuntimeInfo(payload) {
       <div class="metric-row"><span>Corpus</span><strong>${escapeHtml((payload.corpus || {}).display_name || (payload.corpus || {}).name || "unknown")}</strong></div>
     `;
 
+  const effectiveMode = String(retrieval.default_mode || "").toLowerCase();
+  const hideLocalAssets = effectiveMode === "hybrid";
   retrievalHealth.innerHTML = `
     <div class="metric-row"><span>Corpus docs</span><strong>${escapeHtml(formatCount(retrievalHealthPayload.document_count || 0))}</strong></div>
-    <div class="metric-row"><span>Local lexical assets</span><strong>${localLexical.ready ? "ready" : "missing"}</strong></div>
-    <div class="metric-row"><span>Local dense assets</span><strong>${localDense.ready ? "ready" : localDense.error ? "broken" : "missing"}</strong></div>
+    ${
+      hideLocalAssets
+        ? ""
+        : `<div class="metric-row"><span>Local lexical assets</span><strong>${localLexical.ready ? "ready" : "missing"}</strong></div>
+    <div class="metric-row"><span>Local dense assets</span><strong>${localDense.ready ? "ready" : localDense.error ? "broken" : "missing"}</strong></div>`
+    }
     <div class="metric-row"><span>pgvector dense rows</span><strong>${escapeHtml(`${formatCount(pgvector.dense_rows || 0)} / ${formatCount(pgvector.total_rows || 0)}`)}</strong></div>
     <div class="metric-row"><span>Full dense ready</span><strong>${retrievalHealthPayload.full_corpus_dense_ready ? "yes" : "no"}</strong></div>
     <div class="metric-row"><span>Dense fallback</span><strong>${retrievalHealthPayload.dense_candidate_fallback_ready ? "candidate rerank ready" : "not ready"}</strong></div>
     ${
-      localDense.error
+      !hideLocalAssets && localDense.error
         ? `<div class="metric-row"><span>Dense asset issue</span><strong>${escapeHtml(localDense.error)}</strong></div>`
         : ""
     }
