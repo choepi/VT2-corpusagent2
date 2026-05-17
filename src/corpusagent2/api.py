@@ -28,6 +28,15 @@ class QueryRequest(BaseModel):
     )
 
 
+class ReplanRequest(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    additional_instruction: str = Field(
+        default="",
+        validation_alias=AliasChoices("additional_instruction", "additionalInstruction"),
+    )
+
+
 class LLMSettingsRequest(BaseModel):
     use_openai: bool
     planner_model: str = Field(default="")
@@ -283,6 +292,19 @@ def build_app(runtime: AgentRuntime | None = None, project_root: Path | None = N
             return resolved_runtime.abort_run(run_id)
         except FileNotFoundError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.post("/runs/{run_id}/replan")
+    def replan_run(run_id: str, request: ReplanRequest | None = None) -> dict[str, Any]:
+        try:
+            status = resolved_runtime.replan_from_run(
+                run_id,
+                additional_instruction=(request.additional_instruction if request else ""),
+            )
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return status.to_dict()
 
     @app.post("/runs/abort-all")
     def abort_all_runs() -> dict[str, Any]:

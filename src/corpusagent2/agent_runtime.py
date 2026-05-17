@@ -7164,6 +7164,88 @@ class AgentRuntime:
         thread.start()
         return status
 
+    def replan_from_run(
+        self,
+        prior_run_id: str,
+        *,
+        additional_instruction: str = "",
+    ) -> LiveRunStatus:
+        """Submit a new run that inherits the prior run's question, assumptions,
+        and working-set context. The planner is told to reuse the existing
+        working_set_ref via filter_working_set instead of re-running db_search.
+        """
+        prior = self.get_run(prior_run_id)
+        question = str(prior.get("question") or prior.get("rewritten_question") or "").strip()
+        if not question:
+            raise ValueError(f"Prior run {prior_run_id} has no question text to replan from")
+
+        prior_assumptions = [
+            str(item).strip()
+            for item in (prior.get("assumptions") or [])
+            if str(item).strip()
+        ]
+        prior_failures = [
+            str(failure.get("capability") or failure.get("node_id") or "").strip()
+            for failure in (prior.get("failures") or [])
+            if isinstance(failure, dict)
+        ]
+        prior_failures = [name for name in prior_failures if name]
+
+        working_set_refs: list[tuple[str, int]] = []
+        seen_refs: set[str] = set()
+        for call in prior.get("tool_calls") or []:
+            if not isinstance(call, dict):
+                continue
+            summary = call.get("summary") or {}
+            payload_preview = summary.get("payload_preview") if isinstance(summary, dict) else None
+            if not isinstance(payload_preview, dict):
+                continue
+            ref = str(payload_preview.get("working_set_ref") or "").strip()
+            if not ref or ref in seen_refs:
+                continue
+            seen_refs.add(ref)
+            try:
+                count = int(payload_preview.get("document_count") or 0)
+            except (TypeError, ValueError):
+                count = 0
+            working_set_refs.append((ref, count))
+
+        synthetic_parts: list[str] = []
+        synthetic_parts.append(
+            f"REPLAN: This is a re-plan of prior run {prior_run_id}. "
+            f"Original question is unchanged. Build a new plan that improves on "
+            f"the prior plan."
+        )
+        if working_set_refs:
+            ref_lines = ", ".join(f"{ref} ({count} docs)" for ref, count in working_set_refs)
+            synthetic_parts.append(
+                f"Prior run produced working set(s): {ref_lines}. "
+                f"Reuse the largest of these via filter_working_set (working_set_ref=\"<ref>\") "
+                f"instead of running new db_search/fetch_documents, unless the prior retrieval is the "
+                f"root cause being investigated."
+            )
+        if prior_assumptions:
+            synthetic_parts.append("Prior assumptions to keep in mind: " + " | ".join(prior_assumptions))
+        if prior_failures:
+            synthetic_parts.append(
+                "Prior failed nodes/capabilities (avoid where possible, or substitute): "
+                + ", ".join(sorted(set(prior_failures)))
+            )
+        if additional_instruction.strip():
+            synthetic_parts.append("Additional user instruction: " + additional_instruction.strip())
+
+        synthetic_entry = " ".join(synthetic_parts)
+        clarification_history: list[str] = list(prior.get("clarification_questions") or [])
+        clarification_history.append(synthetic_entry)
+
+        force_answer = bool((prior.get("metadata") or {}).get("force_answer", False))
+        return self.submit_query(
+            question,
+            force_answer=force_answer,
+            no_cache=True,
+            clarification_history=clarification_history,
+        )
+
     def _persist_manifest(self, manifest: AgentRunManifest) -> None:
         manifest_path = Path(manifest.artifacts_dir) / "run_manifest.json"
         if not manifest.finished_at_utc:
