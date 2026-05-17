@@ -82,6 +82,7 @@ let currentRunStartedAtUtc = "";
 let currentRunFinishedAtUtc = "";
 let currentManifestSavedPath = "";
 let latestManifest = null;
+let latestLiveStatusPayload = null;
 let latestRuntimeInfo = null;
 let latestCapabilityCatalog = [];
 let latestToolCallRows = [];
@@ -597,15 +598,66 @@ function updateRunTotalTimeDisplay() {
   const startedAt = parseUtcTimestamp(currentRunStartedAtUtc);
   if (startedAt === null) {
     totalTimeCount.textContent = "n/a";
+    updateExecutionBreakdown(null, null);
     return;
   }
   const isTerminal = isTerminalStatus(currentStatus);
   const finishedAt = isTerminal ? parseUtcTimestamp(currentRunFinishedAtUtc || "") : Date.now();
   if (finishedAt === null || finishedAt < startedAt) {
     totalTimeCount.textContent = "n/a";
+    updateExecutionBreakdown(null, null);
     return;
   }
-  totalTimeCount.textContent = formatDurationMs(finishedAt - startedAt) || "n/a";
+  const totalMs = finishedAt - startedAt;
+  totalTimeCount.textContent = formatDurationMs(totalMs) || "n/a";
+  updateExecutionBreakdown(totalMs);
+}
+
+function _toolExecutionMs(source) {
+  if (!source) return null;
+  if (Array.isArray(source.node_records) && source.node_records.length) {
+    return totalNodeDurationMs(source.node_records);
+  }
+  const finished = [
+    ...(source.completed_steps || []),
+    ...(source.failed_steps || []),
+  ];
+  let total = finished.reduce((sum, row) => {
+    const v = Number(row?.duration_ms);
+    return Number.isFinite(v) && v >= 0 ? sum + v : sum;
+  }, 0);
+  for (const row of source.active_steps || []) {
+    const startedAt = parseUtcTimestamp(row?.started_at_utc);
+    if (startedAt !== null) {
+      total += Math.max(0, Date.now() - startedAt);
+    }
+  }
+  return total;
+}
+
+function updateExecutionBreakdown(totalMs) {
+  const sumEl = document.getElementById("nodeSumTimeText");
+  const overheadEl = document.getElementById("overheadTimeText");
+  const totalEl = document.getElementById("totalTimeBreakdown");
+  if (!sumEl || !overheadEl || !totalEl) return;
+  if (totalMs == null || !Number.isFinite(totalMs)) {
+    sumEl.textContent = "n/a";
+    overheadEl.textContent = "n/a";
+    totalEl.textContent = "n/a";
+    return;
+  }
+  const source = latestManifest || latestLiveStatusPayload;
+  const toolMs = _toolExecutionMs(source);
+  totalEl.textContent = formatDurationMs(totalMs) || "n/a";
+  if (toolMs == null) {
+    sumEl.textContent = "n/a";
+    overheadEl.textContent = "n/a";
+    return;
+  }
+  const cappedTool = Math.min(toolMs, totalMs);
+  const overhead = Math.max(totalMs - cappedTool, 0);
+  sumEl.textContent = formatDurationMs(cappedTool) || "n/a";
+  overheadEl.textContent = formatDurationMs(overhead) || "n/a";
 }
 
 function updateEtaDisplay(payload = {}) {
@@ -2086,6 +2138,7 @@ function renderManifest(manifest) {
 function setStatus(payload) {
   const status = payload.status || "unknown";
   currentStatus = status;
+  latestLiveStatusPayload = payload;
   if (payload.run_id) {
     currentRunId = String(payload.run_id);
   }
