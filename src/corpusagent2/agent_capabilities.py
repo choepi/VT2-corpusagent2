@@ -2779,7 +2779,7 @@ def _load_flair_object(kind: str) -> Any | None:
     return obj
 
 
-def _db_search(params: dict[str, Any], deps: dict[str, ToolExecutionResult], context: AgentExecutionContext) -> ToolExecutionResult:
+def _db_search_run(params: dict[str, Any], deps: dict[str, ToolExecutionResult], context: AgentExecutionContext) -> ToolExecutionResult:
     query = str(
         params.get("query")
         or getattr(context.state, "rewritten_question", "")
@@ -3051,6 +3051,125 @@ def _db_search(params: dict[str, Any], deps: dict[str, ToolExecutionResult], con
         rows=rows,
         caveats=caveats,
     )
+
+
+_AUTO_BROADEN_FLOOR = 30
+_AUTO_BROADEN_FRACTION = 0.5
+
+
+def _auto_broaden_enabled() -> bool:
+    return _env_flag("CORPUSAGENT2_AUTO_BROADEN_SEARCH", True)
+
+
+def _search_returned_count(result: ToolExecutionResult) -> int:
+    payload = result.payload if isinstance(result.payload, dict) else {}
+    for key in ("document_count", "result_count", "full_result_count"):
+        try:
+            value = int(payload.get(key) or 0)
+        except (TypeError, ValueError):
+            value = 0
+        if value:
+            return value
+    metadata = result.metadata if isinstance(result.metadata, dict) else {}
+    try:
+        return int(metadata.get("full_result_count") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _requested_top_k_value(params: dict[str, Any]) -> int:
+    for key in ("top_k", "lexical_top_k", "dense_top_k"):
+        try:
+            value = int(params.get(key) or 0)
+        except (TypeError, ValueError):
+            value = 0
+        if value > 0:
+            return value
+    return 0
+
+
+def _broadened_search_params(
+    params: dict[str, Any], step: int, original_top_k: int
+) -> tuple[dict[str, Any], str]:
+    broadened = dict(params)
+    notes: list[str] = []
+    bump = max(original_top_k * 3, 200)
+    for key in ("top_k", "lexical_top_k", "dense_top_k"):
+        try:
+            current = int(broadened.get(key) or 0)
+        except (TypeError, ValueError):
+            current = 0
+        if current and current < bump:
+            broadened[key] = bump
+            notes.append(f"{key}={bump}")
+    mode = str(broadened.get("retrieval_mode", "")).strip().lower()
+    upgrade = {"lexical": "hybrid", "tfidf": "hybrid", "hybrid": "dense"}
+    if mode in upgrade:
+        broadened["retrieval_mode"] = upgrade[mode]
+        notes.append(f"mode->{upgrade[mode]}")
+    if step >= 2:
+        if broadened.get("date_from") or broadened.get("date_to"):
+            broadened["date_from"] = ""
+            broadened["date_to"] = ""
+            notes.append("dropped date filter")
+        elif str(broadened.get("retrieval_strategy", "")).strip() not in ("", "semantic_exploratory"):
+            broadened["retrieval_strategy"] = "semantic_exploratory"
+            notes.append("strategy=semantic_exploratory")
+    return broadened, ", ".join(notes) if notes else "no-op"
+
+
+def _db_search(
+    params: dict[str, Any], deps: dict[str, ToolExecutionResult], context: AgentExecutionContext
+) -> ToolExecutionResult:
+    result = _db_search_run(params, deps, context)
+    if not _auto_broaden_enabled():
+        return result
+    if bool(params.get("retrieve_all")):
+        return result
+    requested = _requested_top_k_value(params)
+    if not requested:
+        return result
+    returned = _search_returned_count(result)
+    threshold = max(_AUTO_BROADEN_FLOOR, int(requested * _AUTO_BROADEN_FRACTION))
+    if returned >= _AUTO_BROADEN_FLOOR and returned >= int(requested * _AUTO_BROADEN_FRACTION):
+        return result
+    initial_returned = returned
+    current_params = dict(params)
+    notes_accum: list[str] = []
+    for step in (1, 2):
+        broadened_params, note = _broadened_search_params(current_params, step, requested)
+        if note == "no-op":
+            break
+        broadened_result = _db_search_run(broadened_params, deps, context)
+        broadened_returned = _search_returned_count(broadened_result)
+        if broadened_returned <= returned:
+            break
+        result = broadened_result
+        returned = broadened_returned
+        notes_accum.append(note)
+        current_params = broadened_params
+        if returned >= _AUTO_BROADEN_FLOOR and returned >= int(requested * _AUTO_BROADEN_FRACTION):
+            break
+    if notes_accum:
+        caveat = (
+            f"Initial search returned {initial_returned} docs (asked for {requested}); "
+            f"automatically broadened ({'; '.join(notes_accum)}) and got {returned}. "
+            f"Downstream analysis still filters the result set by date, entity, and quality."
+        )
+        meta = dict(result.metadata) if isinstance(result.metadata, dict) else {}
+        meta["auto_broadened"] = True
+        meta["auto_broaden_initial_count"] = initial_returned
+        meta["auto_broaden_final_count"] = returned
+        meta["auto_broaden_steps"] = notes_accum
+        result = ToolExecutionResult(
+            payload=result.payload,
+            evidence=result.evidence,
+            artifacts=result.artifacts,
+            caveats=list(result.caveats) + [caveat],
+            unsupported_parts=result.unsupported_parts,
+            metadata=meta,
+        )
+    return result
 
 
 def _sql_query_search(params: dict[str, Any], deps: dict[str, ToolExecutionResult], context: AgentExecutionContext) -> ToolExecutionResult:
