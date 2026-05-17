@@ -40,6 +40,30 @@
         </div>
       </section>
 
+      <section id="clarificationPanel" class="card hidden">
+        <div class="section-head">
+          <h2>Clarification Needed</h2>
+          <span class="pill warn">Follow-up required</span>
+        </div>
+        <p id="clarificationPrompt" class="muted">
+          The backend has not requested a clarification yet.
+        </p>
+
+        <label for="clarificationInput">Your clarification</label>
+        <textarea
+          id="clarificationInput"
+          rows="4"
+          placeholder="Type the missing detail here, for example: compare NZZ and Tages-Anzeiger only."
+        ></textarea>
+
+        <div class="controls">
+          <button id="continueButton" type="button">Continue With Clarification</button>
+        </div>
+
+        <h3>Clarification History</h3>
+        <ul id="clarificationHistory"></ul>
+      </section>
+
       <nav class="tab-bar" role="tablist" aria-label="View mode">
         <button type="button" class="tab-button tab-active" data-tab-target="simple" role="tab" aria-selected="true">Simple</button>
         <button type="button" class="tab-button" data-tab-target="advanced" role="tab" aria-selected="false">Advanced</button>
@@ -84,8 +108,10 @@
           <div id="answerModeBanner" class="answer-mode-banner hidden"></div>
           <div id="answerText" class="answer-rendered">Waiting for a run.</div>
 
-          <h3>Claim Verdicts</h3>
-          <div id="claimVerdicts" class="claim-verdict-grid"></div>
+          <div id="claimVerdictsSection" class="hidden">
+            <h3>Claim Verdicts</h3>
+            <div id="claimVerdicts" class="claim-verdict-grid"></div>
+          </div>
 
           <h3>Caveats</h3>
           <ul id="caveatsList"></ul>
@@ -156,30 +182,6 @@
             <label><input id="notifyOnFinish" type="checkbox" checked /> Browser notification</label>
             <button id="abortAllButton" type="button" class="ghost-button">Abort All Runs</button>
           </div>
-        </section>
-
-        <section id="clarificationPanel" class="card hidden">
-          <div class="section-head">
-            <h2>Clarification Needed</h2>
-            <span class="pill warn">Follow-up required</span>
-          </div>
-          <p id="clarificationPrompt" class="muted">
-            The backend has not requested a clarification yet.
-          </p>
-
-          <label for="clarificationInput">Your clarification</label>
-          <textarea
-            id="clarificationInput"
-            rows="4"
-            placeholder="Type the missing detail here, for example: compare NZZ and Tages-Anzeiger only."
-          ></textarea>
-
-          <div class="controls">
-            <button id="continueButton" type="button">Continue With Clarification</button>
-          </div>
-
-          <h3>Clarification History</h3>
-          <ul id="clarificationHistory"></ul>
         </section>
 
         <article class="card status-card">
