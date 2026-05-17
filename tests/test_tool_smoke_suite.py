@@ -20,6 +20,7 @@ if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
 from corpusagent2 import agent_capabilities
+from corpusagent2 import retrieval as _retrieval_module
 from corpusagent2.agent_backends import InMemoryWorkingSetStore
 from corpusagent2.agent_capabilities import AgentExecutionContext, build_agent_registry
 from corpusagent2.python_runner_service import PythonRunnerResult, SandboxArtifact
@@ -155,6 +156,29 @@ def _search_rows(documents: list[dict[str, str]]) -> list[dict[str, str | float]
     return rows
 
 
+class _FakeNliModel:
+    """Stand-in for sentence_transformers.CrossEncoder used in NLI smoke."""
+
+    def predict(self, pairs, apply_softmax: bool = True):
+        probs = np.zeros((len(pairs), 3), dtype=np.float32)
+        for i, (premise, claim) in enumerate(pairs):
+            p_tokens = {t for t in str(premise).lower().split() if t}
+            c_tokens = {t for t in str(claim).lower().split() if t}
+            overlap = len(p_tokens & c_tokens) / max(len(c_tokens), 1)
+            ent = 0.5 + 0.4 * overlap
+            con = max(0.05, 0.2 - 0.15 * overlap)
+            neu = max(1.0 - ent - con, 0.05)
+            total = ent + con + neu
+            probs[i, 0] = con / total
+            probs[i, 1] = ent / total
+            probs[i, 2] = neu / total
+        return probs
+
+
+def _fake_load_cross_encoder(model_id: str, device: str | None = None):
+    return _FakeNliModel(), "cpu"
+
+
 def _fake_encode_texts(texts: list[str], *, model_id: str, normalize: bool = True):
     vectors = []
     for index, text in enumerate(texts, start=1):
@@ -245,6 +269,7 @@ def _execute_smoke_suite(tmp_path: Path) -> tuple[dict[str, ToolExecutionResult]
         monkeypatch.setenv("CORPUSAGENT2_PROVIDER_ORDER_EXTRACT_SVO_TRIPLES", "spacy")
         monkeypatch.setattr(agent_capabilities, "_encode_texts", _fake_encode_texts)
         monkeypatch.setattr(agent_capabilities, "_fetch_yfinance_series_rows", _fake_yfinance_rows)
+        monkeypatch.setattr(_retrieval_module, "_load_cross_encoder", _fake_load_cross_encoder)
 
         documents = _smoke_documents()
         search_rows = _search_rows(documents)
@@ -396,6 +421,14 @@ def _execute_smoke_suite(tmp_path: Path) -> tuple[dict[str, ToolExecutionResult]
         execute("change_point_detect", "change_point_detect", deps={"series": synthetic_series})
         execute("burst_detect", "burst_detect", deps={"series": synthetic_series})
         execute("claim_strength_score", "claim_strength_score", deps={"spans": results["claim_span_extract"]})
+        execute(
+            "nli_verify_claims",
+            "nli_verify_claims",
+            deps={
+                "spans": results["claim_span_extract"],
+                "documents": fetch_result,
+            },
+        )
         execute("quote_attribute", "quote_attribute", deps={"quotes": results["quote_extract"]})
         execute(
             "build_evidence_table",
@@ -518,6 +551,7 @@ def test_smoke_suite_covers_all_registered_tools() -> None:
         "burst_detect",
         "claim_span_extract",
         "claim_strength_score",
+        "nli_verify_claims",
         "quote_extract",
         "quote_attribute",
         "build_evidence_table",

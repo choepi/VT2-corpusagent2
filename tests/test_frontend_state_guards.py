@@ -17,14 +17,14 @@ def test_frontend_layout_keeps_evidence_single_and_moves_usage_to_advanced() -> 
     project_root = Path(__file__).resolve().parents[1]
     index_html = (project_root / "web" / "index.html").read_text(encoding="utf-8")
 
-    evidence_index = index_html.index("<h2>Evidence Panel</h2>")
-    advanced_index = index_html.index("Advanced Stats And Provenance")
+    evidence_index = index_html.index("<h2>Evidence</h2>")
+    advanced_index = index_html.index('data-tab="advanced"')
     usage_index = index_html.index("<h2>Historical Tool Usage</h2>")
 
     assert "id=\"selectedDocs\"" not in index_html
     assert "<h3>Selected Documents</h3>" not in index_html
-    assert advanced_index < usage_index
     assert evidence_index < advanced_index
+    assert advanced_index < usage_index
     assert "class=\"claim-verdict-grid\"" in index_html
 
 
