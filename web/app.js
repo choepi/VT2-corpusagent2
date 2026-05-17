@@ -14,6 +14,7 @@ const runButton = document.getElementById("runButton");
 const abortButton = document.getElementById("abortButton");
 const abortAllButton = document.getElementById("abortAllButton");
 const printReportButton = document.getElementById("printReportButton");
+const replanButton = document.getElementById("replanButton");
 const continueButton = document.getElementById("continueButton");
 const clarificationPanel = document.getElementById("clarificationPanel");
 const clarificationPrompt = document.getElementById("clarificationPrompt");
@@ -325,6 +326,13 @@ function updateControlState() {
   applyLlmSettingsButton.disabled = submissionInFlight || hasActiveRun() || warming;
   resetLlmSettingsButton.disabled = submissionInFlight || hasActiveRun() || warming;
   printReportButton.disabled = !canPrintReport();
+  if (replanButton) {
+    replanButton.disabled =
+      submissionInFlight ||
+      warming ||
+      !currentRunId ||
+      !isTerminalStatus(currentStatus);
+  }
   runButton.textContent = warming
     ? "API warming..."
     : submissionInFlight
@@ -2312,7 +2320,7 @@ async function abortAllRuns() {
   return payload;
 }
 
-async function submitQuery({ preserveClarificationHistory = false } = {}) {
+async function submitQuery({ preserveClarificationHistory = false, replanFromRunId = "" } = {}) {
   if (submissionInFlight) {
     return;
   }
@@ -2364,15 +2372,20 @@ async function submitQuery({ preserveClarificationHistory = false } = {}) {
   const base = apiBaseInput.value.replace(/\/$/, "");
   void loadRuntimeInfo();
   try {
-    const payload = await fetchJson(`${base}/query/submit`, {
-      method: "POST",
-      body: JSON.stringify({
-        question: questionInput.value,
-        force_answer: forceAnswerInput.checked,
-        no_cache: noCacheInput.checked,
-        clarification_history: preserveClarificationHistory ? clarificationHistory : [],
-      }),
-    });
+    const payload = replanFromRunId
+      ? await fetchJson(`${base}/runs/${encodeURIComponent(replanFromRunId)}/replan`, {
+          method: "POST",
+          body: JSON.stringify({ additional_instruction: "" }),
+        })
+      : await fetchJson(`${base}/query/submit`, {
+          method: "POST",
+          body: JSON.stringify({
+            question: questionInput.value,
+            force_answer: forceAnswerInput.checked,
+            no_cache: noCacheInput.checked,
+            clarification_history: preserveClarificationHistory ? clarificationHistory : [],
+          }),
+        });
     if (pollSessionId !== activePollSessionId) {
       return;
     }
@@ -2521,6 +2534,22 @@ printReportButton.addEventListener("click", async () => {
     detailText.textContent = `PDF report failed: ${error.message}`;
   }
 });
+
+if (replanButton) {
+  replanButton.addEventListener("click", async () => {
+    if (!currentRunId || !isTerminalStatus(currentStatus) || submissionInFlight) {
+      return;
+    }
+    const priorRunId = currentRunId;
+    try {
+      await submitQuery({ preserveClarificationHistory: false, replanFromRunId: priorRunId });
+    } catch (error) {
+      statusBox.textContent = "failed";
+      statusBox.className = "status failed";
+      detailText.textContent = `Re-plan failed: ${error.message}`;
+    }
+  });
+}
 
 applyLlmSettingsButton.addEventListener("click", async () => {
   try {
