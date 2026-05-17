@@ -3639,7 +3639,7 @@ def _filter_working_set(params: dict[str, Any], deps: dict[str, ToolExecutionRes
     document_filters = {key: value for key, value in filters.items() if str(key) not in annotation_filter_keys}
     limit = _positive_int_param(params.get("limit", params.get("top_k", params.get("max_documents"))))
     sort_specs = _working_set_sort_specs(params)
-    upstream_ref = str(params.get("working_set_ref", "") or _resolve_working_set_ref(params, deps)).strip()
+    upstream_ref = _resolve_working_set_ref(params, deps).strip()
     if not upstream_ref:
         return ToolExecutionResult(
             payload={"results": [], "document_count": 0},
