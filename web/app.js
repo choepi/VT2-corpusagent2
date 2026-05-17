@@ -93,6 +93,7 @@ let submissionInFlight = false;
 let activePollSessionId = 0;
 let notificationPermissionRequested = false;
 let apiReady = true;
+let runtimeInfoLoaded = false;
 let apiWarmingStages = [];
 const notifiedRunIds = new Set();
 const notificationEligibleRunIds = new Set();
@@ -321,21 +322,26 @@ function updateRunSaveDisplay() {
 
 function updateControlState() {
   const warming = !apiReady;
-  runButton.disabled = submissionInFlight || hasActiveRun() || warming;
+  const runtimeBlocked = !runtimeInfoLoaded;
+  const submitBlocked = submissionInFlight || hasActiveRun() || warming || runtimeBlocked;
+  runButton.disabled = submitBlocked;
   abortButton.disabled = !hasActiveRun();
-  continueButton.disabled = submissionInFlight || !pendingClarificationQuestion || warming;
-  applyLlmSettingsButton.disabled = submissionInFlight || hasActiveRun() || warming;
-  resetLlmSettingsButton.disabled = submissionInFlight || hasActiveRun() || warming;
+  continueButton.disabled = submissionInFlight || !pendingClarificationQuestion || warming || runtimeBlocked;
+  applyLlmSettingsButton.disabled = submissionInFlight || hasActiveRun() || warming || runtimeBlocked;
+  resetLlmSettingsButton.disabled = submissionInFlight || hasActiveRun() || warming || runtimeBlocked;
   printReportButton.disabled = !canPrintReport();
   if (replanButton) {
     replanButton.disabled =
       submissionInFlight ||
       warming ||
+      runtimeBlocked ||
       !currentRunId ||
       !isTerminalStatus(currentStatus);
   }
   runButton.textContent = warming
     ? "API warming..."
+    : runtimeBlocked
+    ? "Loading model/device..."
     : submissionInFlight
     ? "Submitting..."
     : hasActiveRun()
@@ -1822,10 +1828,14 @@ function renderRuntimeInfo(payload) {
   const localDense = retrievalHealthPayload.local_dense || {};
   const pgvector = retrievalHealthPayload.pgvector || {};
   providerDefaults = llm.available_defaults || {};
-  providerBadge.textContent = `LLM: ${llm.provider_name || "unknown"}`;
+  const provider = String(llm.provider_name || "").trim();
+  const planner = String(llm.planner_model || "").trim();
+  const dev = String(device.recommended_device || "").trim();
+  runtimeInfoLoaded = Boolean(provider && planner && dev);
+  providerBadge.textContent = `LLM: ${provider || "unknown"}`;
   providerBadge.className = `pill ${llm.use_openai ? "openai" : "unclose"}`;
-  modelBadge.textContent = `Planner: ${llm.planner_model || "unknown"}`;
-  deviceBadge.textContent = `Device: ${device.recommended_device || "unknown"}`;
+  modelBadge.textContent = `Planner: ${planner || "unknown"}`;
+  deviceBadge.textContent = `Device: ${dev || "unknown"}`;
   runtimeModeBadge.textContent = llm.use_openai ? "OpenAI mode" : "UncloseAI mode";
   llmProviderSelect.value = llm.use_openai ? "openai" : "uncloseai";
   plannerModelInput.value = llm.planner_model || "";
