@@ -986,7 +986,8 @@ function renderToolUsageSummary(payload) {
   const toolMax = Math.max(1, ...topTools.map((row) => Number(row.completed_node_count || row.completed_event_count || 0)));
   toolUsagePlot.innerHTML = `
     <div class="usage-panel">
-      <h4>Usage By Tool Category</h4>
+      <h4>Calls per tool category</h4>
+      <p class="muted">Bar length = how many times tools in this category ran. Number on the right = how many distinct tools in the category were ever used.</p>
       ${categories.length
         ? categories
             .map((row) =>
@@ -994,7 +995,7 @@ function renderToolUsageSummary(payload) {
                 row.category || "Other",
                 row.completed_node_count || 0,
                 categoryMax,
-                `${formatCount(row.used_tool_count || 0)}/${formatCount(row.registered_tool_count || 0)} tools used`
+                `${formatCount(row.used_tool_count || 0)} of ${formatCount(row.registered_tool_count || 0)} distinct tools used`
               )
             )
             .join("")
@@ -1568,8 +1569,8 @@ function buildPrintableReportHtml(manifest) {
           ["Tool calls", toolTotals.totalCalls],
           ["Completed calls", toolTotals.completedCalls],
           ["Failed calls", toolTotals.failedCalls],
-          ["Input docs seen", toolTotals.inputDocumentsSeen],
-          ["Output items", toolTotals.outputItems],
+          ["Docs read by tools", toolTotals.inputDocumentsSeen],
+          ["Rows produced (entities, sentences, etc.)", toolTotals.outputItems],
         ])}
         <h3>Assumptions</h3>
         ${reportList(manifest.assumptions || [])}
@@ -1854,30 +1855,13 @@ function renderRuntimeInfo(payload) {
       <div class="metric-row"><span>GPU count</span><strong>${escapeHtml(device.cuda_device_count ?? 0)}</strong></div>
       <div class="metric-row"><span>Configured mode</span><strong>${escapeHtml(retrieval.configured_default_mode || retrieval.default_mode || "unknown")}</strong></div>
       <div class="metric-row"><span>Effective mode</span><strong>${escapeHtml(retrieval.default_mode || "unknown")}</strong></div>
-      <div class="metric-row"><span>Dense strategy</span><strong>${escapeHtml(retrievalHealthPayload.dense_strategy || "unknown")}</strong></div>
-      <div class="metric-row"><span>Re-rank</span><strong>${retrieval.rerank_enabled ? `on (top ${escapeHtml(retrieval.rerank_top_k ?? "")})` : "off"}</strong></div>
       <div class="metric-row"><span>Dense model</span><strong>${escapeHtml(retrieval.dense_model_id || "")}</strong></div>
       <div class="metric-row"><span>Corpus</span><strong>${escapeHtml((payload.corpus || {}).display_name || (payload.corpus || {}).name || "unknown")}</strong></div>
     `;
 
-  const effectiveMode = String(retrieval.default_mode || "").toLowerCase();
-  const hideLocalAssets = effectiveMode === "hybrid";
   retrievalHealth.innerHTML = `
     <div class="metric-row"><span>Corpus docs</span><strong>${escapeHtml(formatCount(retrievalHealthPayload.document_count || 0))}</strong></div>
-    ${
-      hideLocalAssets
-        ? ""
-        : `<div class="metric-row"><span>Local lexical assets</span><strong>${localLexical.ready ? "ready" : "missing"}</strong></div>
-    <div class="metric-row"><span>Local dense assets</span><strong>${localDense.ready ? "ready" : localDense.error ? "broken" : "missing"}</strong></div>`
-    }
-    <div class="metric-row"><span>pgvector dense rows</span><strong>${escapeHtml(`${formatCount(pgvector.dense_rows || 0)} / ${formatCount(pgvector.total_rows || 0)}`)}</strong></div>
-    <div class="metric-row"><span>Full dense ready</span><strong>${retrievalHealthPayload.full_corpus_dense_ready ? "yes" : "no"}</strong></div>
-    <div class="metric-row"><span>Dense fallback</span><strong>${retrievalHealthPayload.dense_candidate_fallback_ready ? "candidate rerank ready" : "not ready"}</strong></div>
-    ${
-      !hideLocalAssets && localDense.error
-        ? `<div class="metric-row"><span>Dense asset issue</span><strong>${escapeHtml(localDense.error)}</strong></div>`
-        : ""
-    }
+    <div class="metric-row"><span>Dense index rows</span><strong>${escapeHtml(`${formatCount(pgvector.dense_rows || 0)} / ${formatCount(pgvector.total_rows || 0)}`)}</strong></div>
   `;
 
   providersInstalled.innerHTML = "";
@@ -1974,8 +1958,8 @@ function renderToolCalls(rows) {
     { label: "Calls", value: formatCount(totals.totalCalls) },
     { label: "Completed", value: formatCount(totals.completedCalls) },
     { label: "Failed", value: formatCount(totals.failedCalls) },
-    { label: "Input docs seen", value: formatCount(totals.inputDocumentsSeen) },
-    { label: "Output items", value: formatCount(totals.outputItems) },
+    { label: "Docs read by tools", value: formatCount(totals.inputDocumentsSeen) },
+    { label: "Rows produced (entities, sentences, etc.)", value: formatCount(totals.outputItems) },
   ]);
   const blocks = ordered.map((row) => {
     const summary = row.summary || {};
@@ -2213,6 +2197,7 @@ function setStatus(payload) {
   renderLLMTraces(payload.llm_traces || []);
   updateRunTotalTimeDisplay();
   updateEtaDisplay(payload);
+  ensureLiveBreakdownTicker();
 
   const clarificationQuestions = payload.clarification_questions || [];
   if (status === "needs_clarification" && clarificationQuestions.length > 0) {
@@ -2972,6 +2957,27 @@ function activateTab(target) {
   });
   if (target === "history") {
     void loadRunHistory();
+  }
+  if (target === "advanced") {
+    updateRunTotalTimeDisplay();
+  }
+}
+
+let liveBreakdownTicker = null;
+function ensureLiveBreakdownTicker() {
+  const running = !isTerminalStatus(currentStatus) && Boolean(currentRunStartedAtUtc);
+  if (running && liveBreakdownTicker == null) {
+    liveBreakdownTicker = setInterval(() => {
+      if (isTerminalStatus(currentStatus) || !currentRunStartedAtUtc) {
+        clearInterval(liveBreakdownTicker);
+        liveBreakdownTicker = null;
+        return;
+      }
+      updateRunTotalTimeDisplay();
+    }, 1000);
+  } else if (!running && liveBreakdownTicker != null) {
+    clearInterval(liveBreakdownTicker);
+    liveBreakdownTicker = null;
   }
 }
 
