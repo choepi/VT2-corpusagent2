@@ -37,10 +37,12 @@ services:
     volumes:
       - ../data:/app/data:ro
       - ../outputs:/app/outputs
-      - type: bind
-        source: ${CORPUSAGENT2_DENSE_MODEL_HOST_PATH:-../../e5-base-v2}
-        target: ${CORPUSAGENT2_DOCKER_DENSE_MODEL_ID:-/models/e5-base-v2}
-        read_only: true
+      # Dense-retrieval model is baked into the image at /models/e5-base-v2
+      # (see Dockerfile bake step). To override with a host-side checkout for
+      # development, create a compose override that adds a bind mount at the
+      # same target — DO NOT add it here by default, because a missing/broken
+      # host path masks the baked model and produces opaque transformers
+      # "Unrecognized model" errors on container recreate.
       - /var/run/docker.sock:/var/run/docker.sock
       - ${CORPUSAGENT2_PYTHON_RUNNER_SHARED_TMP:-/tmp/corpusagent2_python_runner}:${CORPUSAGENT2_PYTHON_RUNNER_SHARED_TMP:-/tmp/corpusagent2_python_runner}
     cpus: "${CORPUSAGENT2_API_CPUS:-4}"

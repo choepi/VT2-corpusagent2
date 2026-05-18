@@ -619,26 +619,66 @@ function updateRunTotalTimeDisplay() {
   updateExecutionBreakdown(totalMs);
 }
 
+function _collectToolIntervals(source) {
+  const intervals = [];
+  if (!source) return intervals;
+  const records = Array.isArray(source.node_records) ? source.node_records : [];
+  for (const row of records) {
+    const start = parseUtcTimestamp(row?.started_at_utc);
+    const finish = parseUtcTimestamp(row?.finished_at_utc);
+    if (start !== null && finish !== null && finish >= start) {
+      intervals.push([start, finish]);
+    }
+  }
+  if (intervals.length === 0) {
+    const finished = [
+      ...(source.completed_steps || []),
+      ...(source.failed_steps || []),
+    ];
+    for (const row of finished) {
+      const start = parseUtcTimestamp(row?.started_at_utc);
+      const finish = parseUtcTimestamp(row?.finished_at_utc);
+      if (start !== null && finish !== null && finish >= start) {
+        intervals.push([start, finish]);
+      }
+    }
+  }
+  for (const row of source.active_steps || []) {
+    const start = parseUtcTimestamp(row?.started_at_utc);
+    if (start !== null) {
+      intervals.push([start, Date.now()]);
+    }
+  }
+  return intervals;
+}
+
+function _mergedIntervalDurationMs(intervals) {
+  if (!intervals.length) return 0;
+  const sorted = intervals.slice().sort((a, b) => a[0] - b[0]);
+  let total = 0;
+  let [mergeStart, mergeEnd] = sorted[0];
+  for (let i = 1; i < sorted.length; i += 1) {
+    const [start, end] = sorted[i];
+    if (start <= mergeEnd) {
+      mergeEnd = Math.max(mergeEnd, end);
+    } else {
+      total += mergeEnd - mergeStart;
+      mergeStart = start;
+      mergeEnd = end;
+    }
+  }
+  total += mergeEnd - mergeStart;
+  return total;
+}
+
 function _toolExecutionMs(source) {
   if (!source) return null;
+  const intervals = _collectToolIntervals(source);
+  if (intervals.length) return _mergedIntervalDurationMs(intervals);
   if (Array.isArray(source.node_records) && source.node_records.length) {
     return totalNodeDurationMs(source.node_records);
   }
-  const finished = [
-    ...(source.completed_steps || []),
-    ...(source.failed_steps || []),
-  ];
-  let total = finished.reduce((sum, row) => {
-    const v = Number(row?.duration_ms);
-    return Number.isFinite(v) && v >= 0 ? sum + v : sum;
-  }, 0);
-  for (const row of source.active_steps || []) {
-    const startedAt = parseUtcTimestamp(row?.started_at_utc);
-    if (startedAt !== null) {
-      total += Math.max(0, Date.now() - startedAt);
-    }
-  }
-  return total;
+  return null;
 }
 
 function updateExecutionBreakdown(totalMs) {
@@ -663,7 +703,11 @@ function updateExecutionBreakdown(totalMs) {
   const cappedTool = Math.min(toolMs, totalMs);
   const overhead = Math.max(totalMs - cappedTool, 0);
   sumEl.textContent = formatDurationMs(cappedTool) || "n/a";
-  overheadEl.textContent = formatDurationMs(overhead) || "n/a";
+  overheadEl.textContent = overhead > 0 ? (formatDurationMs(overhead) || "n/a") : "—";
+  sumEl.title = "Wall-clock time covered by tool execution (parallel tools merged, not double-counted).";
+  overheadEl.title = overhead > 0
+    ? "Total time minus tool execution. Covers planner, synthesis, and any idle gaps between tools."
+    : "No measurable gap between tool execution and total — tools covered the whole wall clock.";
 }
 
 function updateEtaDisplay(payload = {}) {

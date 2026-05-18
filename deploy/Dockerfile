@@ -62,10 +62,10 @@ RUN if [ "$CORPUSAGENT2_DOCKER_DOWNLOAD_PROVIDER_ASSETS" = "true" ]; then \
     fi
 
 # Bake the dense-retrieval model into the image so the runtime container is
-# self-contained. The host bind mount in docker-compose.yml still wins at
-# runtime when the host path is present — this only matters when the bind
-# mount source is empty or missing. Default ON; opt out for slimmer images
-# with --build-arg CORPUSAGENT2_DOCKER_BAKE_DENSE_MODEL=false.
+# self-contained. This is the authoritative source at runtime — the compose
+# files intentionally do not bind-mount a host path on top, because a
+# missing/broken host path silently masks the baked model. Default ON; opt
+# out for slimmer images with --build-arg CORPUSAGENT2_DOCKER_BAKE_DENSE_MODEL=false.
 ARG CORPUSAGENT2_DOCKER_BAKE_DENSE_MODEL=true
 ARG CORPUSAGENT2_DOCKER_DENSE_MODEL_ID=intfloat/e5-base-v2
 ARG CORPUSAGENT2_DOCKER_DENSE_MODEL_TARGET=/models/e5-base-v2
