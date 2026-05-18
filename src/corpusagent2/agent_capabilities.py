@@ -3996,7 +3996,7 @@ def _lang_id(params: dict[str, Any], deps: dict[str, ToolExecutionResult], conte
     if not rows:
         return _no_input_documents_result("lang_id")
     detected = []
-    providers = _provider_order("lang_id", ["langdetect"])
+    providers = _provider_order("lang_id", ["langdetect", "heuristic"])
     used_provider = ""
     for row in rows:
         text = _row_analysis_text(row)
@@ -5257,7 +5257,7 @@ def _topic_model(params: dict[str, Any], deps: dict[str, ToolExecutionResult], c
     )
     if not rows:
         return _no_input_documents_result("topic_model", caveats=source_caveats, **source_metadata)
-    providers = _provider_order("topic_model", ["textacy", "gensim"])
+    providers = _provider_order("topic_model", ["textacy", "gensim", "heuristic"])
     payload: list[dict[str, Any]] = []
     used_provider = ""
     texts = [_row_analysis_text(row) for row in rows]
