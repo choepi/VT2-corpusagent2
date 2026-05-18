@@ -1,5 +1,8 @@
-## Optional GPU override for deploy/docker-compose.yml + deploy/docker-compose.mcp.yml.
-## Use only on hosts where Docker can discover an NVIDIA/CDI GPU runtime.
+## Optional GPU overlay for deploy/docker-compose.yml + deploy/docker-compose.mcp.yml.
+## Use only on hosts with NVIDIA Container Toolkit installed and CDI configured.
+## If you see "failed to discover GPU vendor from CDI: no known GPU vendor found",
+## run:  sudo nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml
+## then restart the Docker daemon before using this overlay.
 services:
   corpusagent2-api:
     build:

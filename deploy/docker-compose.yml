@@ -30,7 +30,8 @@ services:
       CORPUSAGENT2_REQUIRE_BACKEND_SERVICES: "true"
       CORPUSAGENT2_ALLOW_LOCAL_FALLBACK: "false"
       CORPUSAGENT2_DEVICE: ${CORPUSAGENT2_DEVICE:-cpu}
-      CORPUSAGENT2_DENSE_MODEL_ID: ${CORPUSAGENT2_DOCKER_DENSE_MODEL_ID:-/models/e5-base-v2}
+      CORPUSAGENT2_DENSE_MODEL_ID: ${CORPUSAGENT2_DOCKER_DENSE_MODEL_ID:-intfloat/e5-base-v2}
+      HF_HOME: /hf-cache
       CORPUSAGENT2_PYTHON_RUNNER_SHARED_TMP: ${CORPUSAGENT2_PYTHON_RUNNER_SHARED_TMP:-/tmp/corpusagent2_python_runner}
     command: ["python", "/app/scripts/12_run_agent_api.py"]
     ports:
@@ -38,12 +39,12 @@ services:
     volumes:
       - ../data:/app/data:ro
       - ../outputs:/app/outputs
-      # Dense-retrieval model is baked into the image at /models/e5-base-v2
-      # (see Dockerfile bake step). To override with a host-side checkout for
-      # development, create a compose override that adds a bind mount at the
-      # same target — DO NOT add it here by default, because a missing/broken
-      # host path masks the baked model and produces opaque transformers
-      # "Unrecognized model" errors on container recreate.
+      # HF model cache: persists downloads across container recreations so the
+      # model is only fetched from HuggingFace Hub once.
+      # To use a local model checkout, add to .env:
+      #   CORPUSAGENT2_DOCKER_DENSE_MODEL_ID=/models/e5-base-v2
+      # and add a bind-mount override in compose.override.yml.
+      - hf-model-cache:/hf-cache
       - /var/run/docker.sock:/var/run/docker.sock
       - ${CORPUSAGENT2_PYTHON_RUNNER_SHARED_TMP:-/tmp/corpusagent2_python_runner}:${CORPUSAGENT2_PYTHON_RUNNER_SHARED_TMP:-/tmp/corpusagent2_python_runner}
     cpus: "${CORPUSAGENT2_API_CPUS:-4}"
@@ -113,3 +114,6 @@ services:
       OPENSEARCH_SSL_VERIFICATIONMODE: none
     ports:
       - "127.0.0.1:5601:5601"
+
+volumes:
+  hf-model-cache:

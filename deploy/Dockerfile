@@ -66,7 +66,7 @@ RUN if [ "$CORPUSAGENT2_DOCKER_DOWNLOAD_PROVIDER_ASSETS" = "true" ]; then \
 # files intentionally do not bind-mount a host path on top, because a
 # missing/broken host path silently masks the baked model. Default ON; opt
 # out for slimmer images with --build-arg CORPUSAGENT2_DOCKER_BAKE_DENSE_MODEL=false.
-ARG CORPUSAGENT2_DOCKER_BAKE_DENSE_MODEL=true
+ARG CORPUSAGENT2_DOCKER_BAKE_DENSE_MODEL=false
 ARG CORPUSAGENT2_DOCKER_DENSE_MODEL_ID=intfloat/e5-base-v2
 ARG CORPUSAGENT2_DOCKER_DENSE_MODEL_TARGET=/models/e5-base-v2
 COPY deploy/bake_dense_model.py ./deploy/bake_dense_model.py
