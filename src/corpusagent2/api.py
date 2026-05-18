@@ -252,15 +252,41 @@ def build_app(runtime: AgentRuntime | None = None, project_root: Path | None = N
 
     @app.get("/runs")
     def list_runs(limit: int = 50, offset: int = 0) -> dict[str, Any]:
-        """Return the most recent runs from the agent_run_history table.
+        """Return the most recent runs from the agent_run_history table,
+        plus any currently in-flight runs from the runtime's live registry.
 
-        Postgres-backed. Returns an empty list when Postgres is unreachable
-        or no runs have been recorded yet.
+        Live runs are merged at the top so the UI can show "running" rows
+        before they've been persisted to Postgres on completion.
         """
         from . import run_history as _run_history
 
-        runs = _run_history.list_runs(limit=limit, offset=offset)
-        return {"runs": runs, "limit": int(limit), "offset": int(offset)}
+        persisted = _run_history.list_runs(limit=limit, offset=offset)
+        persisted_ids = {str(r.get("run_id") or "") for r in persisted}
+
+        live_rows: list[dict[str, Any]] = []
+        try:
+            live_runs = resolved_runtime.list_live_runs()
+        except Exception:
+            live_runs = []
+        for live in live_runs:
+            run_id = str(live.get("run_id") or "")
+            if not run_id or run_id in persisted_ids:
+                continue
+            live_rows.append({
+                "run_id": run_id,
+                "question": live.get("question") or "",
+                "status": live.get("status") or "running",
+                "created_at_utc": live.get("started_at_utc") or "",
+                "completed_at_utc": None,
+                "duration_ms": None,
+                "node_count": len(live.get("completed_steps") or []),
+                "failure_count": len(live.get("failed_steps") or []),
+                "artifacts_dir": None,
+                "manifest_path": None,
+            })
+
+        merged = live_rows + persisted
+        return {"runs": merged, "limit": int(limit), "offset": int(offset)}
 
     @app.get("/runs/{run_id}")
     def get_run(run_id: str) -> dict[str, Any]:

@@ -5888,6 +5888,19 @@ class AgentRuntime:
                 if status.status not in TERMINAL_RUN_STATUSES
             ]
 
+    def list_live_runs(self) -> list[dict[str, Any]]:
+        """Snapshot of currently in-flight (non-terminal) live runs.
+
+        Returns dicts compatible with the agent_run_history row shape so the
+        /runs endpoint can prepend them to the persisted history list.
+        """
+        with self._run_lock:
+            return [
+                status.to_dict()
+                for status in self._live_runs.values()
+                if status.status not in TERMINAL_RUN_STATUSES
+            ]
+
     def _provider_modules_installed(self) -> dict[str, bool]:
         if self._provider_modules_cache is None:
             self._provider_modules_cache = {
@@ -6073,19 +6086,17 @@ class AgentRuntime:
                 "Classical spaCy/textacy/gensim analytics are usually CPU-bound even when CUDA is available.",
                 "GPU is mainly relevant for torch- or Flair-backed models and only when those providers are selected.",
                 "Per-node provider choice and artifacts are captured in the run manifest so you can verify what really ran.",
-                "Some analytics remain heuristic by design in the prototype, especially claim scoring, quote attribution, and burst detection; check provenance and caveats per node.",
-                "Provider chips are import checks only; per-node provenance shows which provider actually executed.",
                 (
                     f"Recovered {self._startup_repaired_runs} interrupted run(s) from 'started' to 'failed' on startup."
                     if self._startup_repaired_runs
                     else "No interrupted runs needed cleanup on startup."
                 ),
-                (
-                    f"Dense retrieval is using '{retrieval_health['dense_strategy']}' because full-corpus dense assets are not fully ready yet."
+                *(
+                    [f"Dense retrieval is using '{retrieval_health['dense_strategy']}' because full-corpus dense assets are not fully ready yet."]
                     if not retrieval_health["full_corpus_dense_ready"] and retrieval_health["dense_candidate_fallback_ready"]
-                    else "Full-corpus dense retrieval is ready."
+                    else []
                     if retrieval_health["full_corpus_dense_ready"]
-                    else "Dense retrieval is unavailable until corpus metadata is loaded."
+                    else ["Dense retrieval is unavailable until corpus metadata is loaded."]
                 ),
                 *(
                     [f"doc_metadata.parquet is missing on this host: {retrieval_health['metadata_error']}. Local lexical/dense assets and corpus row counts will read as 0 until the file is restored or re-built."]
