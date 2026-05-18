@@ -437,6 +437,7 @@ source = { editable = "." }
 dependencies = [
     { name = "bertopic" },
     { name = "datasets" },
+    { name = "en-core-web-sm" },
     { name = "fastapi" },
     { name = "httpx" },
     { name = "huggingface-hub" },
@@ -453,6 +454,8 @@ dependencies = [
     { name = "scipy" },
     { name = "sentence-transformers" },
     { name = "spacy" },
+    { name = "textacy" },
+    { name = "textblob" },
     { name = "torch", version = "2.3.1", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform != 'linux' and sys_platform != 'win32'" },
     { name = "torch", version = "2.3.1+cu118", source = { registry = "https://download.pytorch.org/whl/cu118" }, marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
     { name = "torchaudio", version = "2.3.1", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform != 'linux' and sys_platform != 'win32'" },
@@ -470,14 +473,13 @@ nlp-providers = [
     { name = "gensim" },
     { name = "nltk" },
     { name = "stanza" },
-    { name = "textacy" },
-    { name = "textblob" },
 ]
 
 [package.metadata]
 requires-dist = [
     { name = "bertopic", specifier = ">=0.17.4" },
     { name = "datasets", specifier = ">=4.7.0" },
+    { name = "en-core-web-sm", url = "https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl" },
     { name = "fastapi", specifier = ">=0.135.2" },
     { name = "flair", marker = "extra == 'nlp-providers'", specifier = ">=0.15.1" },
     { name = "gensim", marker = "extra == 'nlp-providers'", specifier = ">=4.3.3" },
@@ -498,8 +500,8 @@ requires-dist = [
     { name = "sentence-transformers", specifier = ">=5.2.3" },
     { name = "spacy", specifier = ">=3.8.11" },
     { name = "stanza", marker = "extra == 'nlp-providers'", specifier = ">=1.11.0" },
-    { name = "textacy", marker = "extra == 'nlp-providers'", specifier = ">=0.13.0" },
-    { name = "textblob", marker = "extra == 'nlp-providers'", specifier = ">=0.19.0" },
+    { name = "textacy", specifier = ">=0.13.0" },
+    { name = "textblob", specifier = ">=0.19.0" },
     { name = "torch", marker = "sys_platform != 'linux' and sys_platform != 'win32'", specifier = "==2.3.1" },
     { name = "torch", marker = "sys_platform == 'linux' or sys_platform == 'win32'", specifier = "==2.3.1", index = "https://download.pytorch.org/whl/cu118" },
     { name = "torchaudio", marker = "sys_platform != 'linux' and sys_platform != 'win32'", specifier = "==2.3.1" },
@@ -727,6 +729,14 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/a2/78/0d2db9382c92a163d7095fc08efff7800880f830a152cfced40161e7638d/emoji-2.15.0.tar.gz", hash = "sha256:eae4ab7d86456a70a00a985125a03263a5eac54cd55e51d7e184b1ed3b6757e4", size = 615483, upload-time = "2025-09-21T12:13:02.755Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/e1/5e/4b5aaaabddfacfe36ba7768817bd1f71a7a810a43705e531f3ae4c690767/emoji-2.15.0-py3-none-any.whl", hash = "sha256:205296793d66a89d88af4688fa57fd6496732eb48917a87175a023c8138995eb", size = 608433, upload-time = "2025-09-21T12:13:01.197Z" },
+]
+
+[[package]]
+name = "en-core-web-sm"
+version = "3.8.0"
+source = { url = "https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl" }
+wheels = [
+    { url = "https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl", hash = "sha256:1932429db727d4bff3deed6b34cfc05df17794f4a52eeb26cf8928f7c1a0fb85" },
 ]
 
 [[package]]
@@ -3006,10 +3016,10 @@ dependencies = [
     { name = "typing-extensions", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
 ]
 wheels = [
-    { url = "https://download-r2.pytorch.org/whl/cu118/torch-2.3.1%2Bcu118-cp311-cp311-linux_x86_64.whl", hash = "sha256:5b0d531814886573cbe8c8ca91d17676f96bbaa33b569dd37ea235f124314e97" },
-    { url = "https://download-r2.pytorch.org/whl/cu118/torch-2.3.1%2Bcu118-cp311-cp311-win_amd64.whl", hash = "sha256:a697df4337d6f18a204b7603c06bec9c81ed393ceae71432c4a4e2902bc20270" },
-    { url = "https://download-r2.pytorch.org/whl/cu118/torch-2.3.1%2Bcu118-cp312-cp312-linux_x86_64.whl", hash = "sha256:6c03ff41879674cbd661b598cec80fb5e6f7faa225624732a2a197b5471dbd38" },
-    { url = "https://download-r2.pytorch.org/whl/cu118/torch-2.3.1%2Bcu118-cp312-cp312-win_amd64.whl", hash = "sha256:f44c7b64d990a6b1a382d1cd63c359806153974e7db8d16f6780645a8a9c9fe0" },
+    { url = "https://download-r2.pytorch.org/whl/cu118/torch-2.3.1%2Bcu118-cp311-cp311-linux_x86_64.whl", hash = "sha256:5b0d531814886573cbe8c8ca91d17676f96bbaa33b569dd37ea235f124314e97", upload-time = "2024-06-05T21:16:12Z" },
+    { url = "https://download-r2.pytorch.org/whl/cu118/torch-2.3.1%2Bcu118-cp311-cp311-win_amd64.whl", hash = "sha256:a697df4337d6f18a204b7603c06bec9c81ed393ceae71432c4a4e2902bc20270", upload-time = "2024-06-05T21:16:44Z" },
+    { url = "https://download-r2.pytorch.org/whl/cu118/torch-2.3.1%2Bcu118-cp312-cp312-linux_x86_64.whl", hash = "sha256:6c03ff41879674cbd661b598cec80fb5e6f7faa225624732a2a197b5471dbd38", upload-time = "2024-06-05T21:18:25Z" },
+    { url = "https://download-r2.pytorch.org/whl/cu118/torch-2.3.1%2Bcu118-cp312-cp312-win_amd64.whl", hash = "sha256:f44c7b64d990a6b1a382d1cd63c359806153974e7db8d16f6780645a8a9c9fe0", upload-time = "2024-06-05T21:18:59Z" },
 ]
 
 [[package]]
@@ -3038,10 +3048,10 @@ dependencies = [
     { name = "torch", version = "2.3.1+cu118", source = { registry = "https://download.pytorch.org/whl/cu118" }, marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
 ]
 wheels = [
-    { url = "https://download-r2.pytorch.org/whl/cu118/torchaudio-2.3.1%2Bcu118-cp311-cp311-linux_x86_64.whl", hash = "sha256:358581564d0c46bc129ba8f6af7b099fe6e1e3a6d9b63472d5150d4af9da5b78" },
-    { url = "https://download-r2.pytorch.org/whl/cu118/torchaudio-2.3.1%2Bcu118-cp311-cp311-win_amd64.whl", hash = "sha256:2c757ff7ecbcbf56eb3d3a85220ea918e21868378ccf90f57effb98b74ad454c" },
-    { url = "https://download-r2.pytorch.org/whl/cu118/torchaudio-2.3.1%2Bcu118-cp312-cp312-linux_x86_64.whl", hash = "sha256:53125788f7ce6a3ce32679c2952e0033339461a379a618eed54447efe44bed97" },
-    { url = "https://download-r2.pytorch.org/whl/cu118/torchaudio-2.3.1%2Bcu118-cp312-cp312-win_amd64.whl", hash = "sha256:ac85969a84c08d7399ec6762839a00de3d4b13090334f9fb936d86167477582e" },
+    { url = "https://download-r2.pytorch.org/whl/cu118/torchaudio-2.3.1%2Bcu118-cp311-cp311-linux_x86_64.whl", hash = "sha256:358581564d0c46bc129ba8f6af7b099fe6e1e3a6d9b63472d5150d4af9da5b78", upload-time = "2024-06-05T21:25:19Z" },
+    { url = "https://download-r2.pytorch.org/whl/cu118/torchaudio-2.3.1%2Bcu118-cp311-cp311-win_amd64.whl", hash = "sha256:2c757ff7ecbcbf56eb3d3a85220ea918e21868378ccf90f57effb98b74ad454c", upload-time = "2024-06-05T21:25:20Z" },
+    { url = "https://download-r2.pytorch.org/whl/cu118/torchaudio-2.3.1%2Bcu118-cp312-cp312-linux_x86_64.whl", hash = "sha256:53125788f7ce6a3ce32679c2952e0033339461a379a618eed54447efe44bed97", upload-time = "2024-06-05T21:25:20Z" },
+    { url = "https://download-r2.pytorch.org/whl/cu118/torchaudio-2.3.1%2Bcu118-cp312-cp312-win_amd64.whl", hash = "sha256:ac85969a84c08d7399ec6762839a00de3d4b13090334f9fb936d86167477582e", upload-time = "2024-06-05T21:25:21Z" },
 ]
 
 [[package]]
@@ -3074,10 +3084,10 @@ dependencies = [
     { name = "torch", version = "2.3.1+cu118", source = { registry = "https://download.pytorch.org/whl/cu118" }, marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
 ]
 wheels = [
-    { url = "https://download-r2.pytorch.org/whl/cu118/torchvision-0.18.1%2Bcu118-cp311-cp311-linux_x86_64.whl", hash = "sha256:24e7b88e285913767ef7a5e8938bab2caddb9ebfd1059d274b9ab96693c7111c" },
-    { url = "https://download-r2.pytorch.org/whl/cu118/torchvision-0.18.1%2Bcu118-cp311-cp311-win_amd64.whl", hash = "sha256:d0d25efe3418462478594e799bca29ec84c7688cbe9926650929f440d72318b7" },
-    { url = "https://download-r2.pytorch.org/whl/cu118/torchvision-0.18.1%2Bcu118-cp312-cp312-linux_x86_64.whl", hash = "sha256:cb4dc3af2359dace3eebddb751850bd37857c11895b96acbee0bd37452b87800" },
-    { url = "https://download-r2.pytorch.org/whl/cu118/torchvision-0.18.1%2Bcu118-cp312-cp312-win_amd64.whl", hash = "sha256:8103c78f9ebfe51a6b049c8bfcb23c96c201c32b4fc509d6b6ed4350ed5c1ec1" },
+    { url = "https://download-r2.pytorch.org/whl/cu118/torchvision-0.18.1%2Bcu118-cp311-cp311-linux_x86_64.whl", hash = "sha256:24e7b88e285913767ef7a5e8938bab2caddb9ebfd1059d274b9ab96693c7111c", upload-time = "2024-06-05T21:25:24Z" },
+    { url = "https://download-r2.pytorch.org/whl/cu118/torchvision-0.18.1%2Bcu118-cp311-cp311-win_amd64.whl", hash = "sha256:d0d25efe3418462478594e799bca29ec84c7688cbe9926650929f440d72318b7", upload-time = "2024-06-05T21:25:24Z" },
+    { url = "https://download-r2.pytorch.org/whl/cu118/torchvision-0.18.1%2Bcu118-cp312-cp312-linux_x86_64.whl", hash = "sha256:cb4dc3af2359dace3eebddb751850bd37857c11895b96acbee0bd37452b87800", upload-time = "2024-06-05T21:25:25Z" },
+    { url = "https://download-r2.pytorch.org/whl/cu118/torchvision-0.18.1%2Bcu118-cp312-cp312-win_amd64.whl", hash = "sha256:8103c78f9ebfe51a6b049c8bfcb23c96c201c32b4fc509d6b6ed4350ed5c1ec1", upload-time = "2024-06-05T21:25:25Z" },
 ]
 
 [[package]]
