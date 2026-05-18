@@ -14,6 +14,7 @@ const runButton = document.getElementById("runButton");
 const abortButton = document.getElementById("abortButton");
 const abortAllButton = document.getElementById("abortAllButton");
 const printReportButton = document.getElementById("printReportButton");
+const replanButton = document.getElementById("replanButton");
 const continueButton = document.getElementById("continueButton");
 const clarificationPanel = document.getElementById("clarificationPanel");
 const clarificationPrompt = document.getElementById("clarificationPrompt");
@@ -50,7 +51,7 @@ const assumptionsList = document.getElementById("assumptionsList");
 const answerModeBanner = document.getElementById("answerModeBanner");
 const answerText = document.getElementById("answerText");
 const caveatsList = document.getElementById("caveatsList");
-const unsupportedList = document.getElementById("unsupportedList");
+const unsupportedList = document.getElementById("unsupportedList"); // may be null after Simple-tab UI cleanup
 const claimVerdicts = document.getElementById("claimVerdicts");
 const plannerActions = document.getElementById("plannerActions");
 const planNodes = document.getElementById("planNodes");
@@ -81,6 +82,7 @@ let currentRunStartedAtUtc = "";
 let currentRunFinishedAtUtc = "";
 let currentManifestSavedPath = "";
 let latestManifest = null;
+let latestLiveStatusPayload = null;
 let latestRuntimeInfo = null;
 let latestCapabilityCatalog = [];
 let latestToolCallRows = [];
@@ -90,6 +92,9 @@ let providerDefaults = {};
 let submissionInFlight = false;
 let activePollSessionId = 0;
 let notificationPermissionRequested = false;
+let apiReady = true;
+let runtimeInfoLoaded = false;
+let apiWarmingStages = [];
 const notifiedRunIds = new Set();
 const notificationEligibleRunIds = new Set();
 const notificationObservedActiveRunIds = new Set();
@@ -311,18 +316,37 @@ function updateRunSaveDisplay() {
     corpus.pg_table ? `Table: ${corpus.pg_table}` : "",
   ].filter(Boolean).join(" | ");
   const saved = Boolean(latestManifest || currentManifestSavedPath);
-  runSavedText.textContent = saved ? "manifest saved" : currentRunId ? "running" : "no manifest yet";
+  runSavedText.textContent = saved ? "output saved" : currentRunId ? "running" : "not saved yet";
   runSavedText.title = currentManifestSavedPath || "";
 }
 
 function updateControlState() {
-  runButton.disabled = submissionInFlight || hasActiveRun();
+  const warming = !apiReady;
+  const runtimeBlocked = !runtimeInfoLoaded;
+  const submitBlocked = submissionInFlight || hasActiveRun() || warming || runtimeBlocked;
+  runButton.disabled = submitBlocked;
   abortButton.disabled = !hasActiveRun();
-  continueButton.disabled = submissionInFlight || !pendingClarificationQuestion;
-  applyLlmSettingsButton.disabled = submissionInFlight || hasActiveRun();
-  resetLlmSettingsButton.disabled = submissionInFlight || hasActiveRun();
+  continueButton.disabled = submissionInFlight || !pendingClarificationQuestion || warming || runtimeBlocked;
+  applyLlmSettingsButton.disabled = submissionInFlight || hasActiveRun() || warming || runtimeBlocked;
+  resetLlmSettingsButton.disabled = submissionInFlight || hasActiveRun() || warming || runtimeBlocked;
   printReportButton.disabled = !canPrintReport();
-  runButton.textContent = submissionInFlight ? "Submitting..." : hasActiveRun() ? "Run In Progress" : "Run Query";
+  if (replanButton) {
+    replanButton.disabled =
+      submissionInFlight ||
+      warming ||
+      runtimeBlocked ||
+      !currentRunId ||
+      !isTerminalStatus(currentStatus);
+  }
+  runButton.textContent = warming
+    ? "API warming..."
+    : runtimeBlocked
+    ? "Loading model/device..."
+    : submissionInFlight
+    ? "Submitting..."
+    : hasActiveRun()
+    ? "Run In Progress"
+    : "Run Query";
   continueButton.textContent = submissionInFlight ? "Submitting..." : "Continue With Clarification";
   printReportButton.textContent = hasActiveRun() ? "PDF After Run" : "Print / Save PDF";
   updateRunSaveDisplay();
@@ -580,15 +604,66 @@ function updateRunTotalTimeDisplay() {
   const startedAt = parseUtcTimestamp(currentRunStartedAtUtc);
   if (startedAt === null) {
     totalTimeCount.textContent = "n/a";
+    updateExecutionBreakdown(null, null);
     return;
   }
   const isTerminal = isTerminalStatus(currentStatus);
   const finishedAt = isTerminal ? parseUtcTimestamp(currentRunFinishedAtUtc || "") : Date.now();
   if (finishedAt === null || finishedAt < startedAt) {
     totalTimeCount.textContent = "n/a";
+    updateExecutionBreakdown(null, null);
     return;
   }
-  totalTimeCount.textContent = formatDurationMs(finishedAt - startedAt) || "n/a";
+  const totalMs = finishedAt - startedAt;
+  totalTimeCount.textContent = formatDurationMs(totalMs) || "n/a";
+  updateExecutionBreakdown(totalMs);
+}
+
+function _toolExecutionMs(source) {
+  if (!source) return null;
+  if (Array.isArray(source.node_records) && source.node_records.length) {
+    return totalNodeDurationMs(source.node_records);
+  }
+  const finished = [
+    ...(source.completed_steps || []),
+    ...(source.failed_steps || []),
+  ];
+  let total = finished.reduce((sum, row) => {
+    const v = Number(row?.duration_ms);
+    return Number.isFinite(v) && v >= 0 ? sum + v : sum;
+  }, 0);
+  for (const row of source.active_steps || []) {
+    const startedAt = parseUtcTimestamp(row?.started_at_utc);
+    if (startedAt !== null) {
+      total += Math.max(0, Date.now() - startedAt);
+    }
+  }
+  return total;
+}
+
+function updateExecutionBreakdown(totalMs) {
+  const sumEl = document.getElementById("nodeSumTimeText");
+  const overheadEl = document.getElementById("overheadTimeText");
+  const totalEl = document.getElementById("totalTimeBreakdown");
+  if (!sumEl || !overheadEl || !totalEl) return;
+  if (totalMs == null || !Number.isFinite(totalMs)) {
+    sumEl.textContent = "n/a";
+    overheadEl.textContent = "n/a";
+    totalEl.textContent = "n/a";
+    return;
+  }
+  const source = latestManifest || latestLiveStatusPayload;
+  const toolMs = _toolExecutionMs(source);
+  totalEl.textContent = formatDurationMs(totalMs) || "n/a";
+  if (toolMs == null) {
+    sumEl.textContent = "n/a";
+    overheadEl.textContent = "n/a";
+    return;
+  }
+  const cappedTool = Math.min(toolMs, totalMs);
+  const overhead = Math.max(totalMs - cappedTool, 0);
+  sumEl.textContent = formatDurationMs(cappedTool) || "n/a";
+  overheadEl.textContent = formatDurationMs(overhead) || "n/a";
 }
 
 function updateEtaDisplay(payload = {}) {
@@ -904,14 +979,15 @@ function renderToolUsageSummary(payload) {
       <div><span class="metric-label">Used historically</span><strong>${formatCount(payload.used_tool_count || usedTools.length)}</strong></div>
       <div><span class="metric-label">Never completed</span><strong>${formatCount(payload.never_used_tool_count || neverUsed.length)}</strong></div>
     </div>
-    <p class="muted">${escapeHtml((payload.notes || [])[0] || "Counts are derived from saved run manifests and backend tool-call history.")}</p>
+    <p class="muted">${escapeHtml((payload.notes || [])[0] || "Counts are derived from saved run outputs and backend tool-call history.")}</p>
   `;
 
   const categoryMax = Math.max(1, ...categories.map((row) => Number(row.completed_node_count || 0)));
   const toolMax = Math.max(1, ...topTools.map((row) => Number(row.completed_node_count || row.completed_event_count || 0)));
   toolUsagePlot.innerHTML = `
     <div class="usage-panel">
-      <h4>Usage By Tool Category</h4>
+      <h4>Calls per tool category</h4>
+      <p class="muted">Bar length = how many times tools in this category ran. Number on the right = how many distinct tools in the category were ever used.</p>
       ${categories.length
         ? categories
             .map((row) =>
@@ -919,7 +995,7 @@ function renderToolUsageSummary(payload) {
                 row.category || "Other",
                 row.completed_node_count || 0,
                 categoryMax,
-                `${formatCount(row.used_tool_count || 0)}/${formatCount(row.registered_tool_count || 0)} tools used`
+                `${formatCount(row.used_tool_count || 0)} of ${formatCount(row.registered_tool_count || 0)} distinct tools used`
               )
             )
             .join("")
@@ -1164,27 +1240,10 @@ function reportTable(headers, rows, rowFormatter, emptyText = "No rows") {
   `;
 }
 
-function reportArtifactLink(runId, path) {
-  const fileName = String(path || "").split(/[/\\]/).pop() || path;
-  return `<a href="${artifactUrl(runId, path)}">${escapeHtml(fileName)}</a><br><span class="muted">${escapeHtml(path)}</span>`;
-}
-
-function reportArtifacts(manifest) {
-  const artifacts = collectArtifacts(manifest);
-  if (!artifacts.length) {
-    return '<p class="muted">No artifacts were recorded for this run.</p>';
-  }
-  return `
-    <ul>
-      ${artifacts.map((path) => `<li>${reportArtifactLink(manifest.run_id, path)}</li>`).join("")}
-    </ul>
-  `;
-}
-
 function reportPlots(manifest) {
   const plots = collectArtifacts(manifest).filter((path) => /\.(png|jpg|jpeg|svg)$/i.test(path));
   if (!plots.length) {
-    return '<p class="muted">No plot artifacts were generated for this run.</p>';
+    return '<p class="muted">No plots were generated for this run.</p>';
   }
   return `
     <div class="report-plots">
@@ -1213,7 +1272,9 @@ function buildPrintableReportHtml(manifest) {
   const retrieval = runtimeInfo.retrieval || {};
   const toolTotals = collectToolCallTotals(manifest.tool_calls || []);
   const nodeDuration = formatDurationMs(totalNodeDurationMs(manifest.node_records || [])) || "n/a";
-  const title = `CorpusAgent2 analysis - ${manifest.run_id || "run"}`;
+  const questionForTitle = (manifest.question || manifest.question_spec?.original_question || "").trim();
+  const truncatedQuestion = questionForTitle.length > 80 ? `${questionForTitle.slice(0, 77)}...` : questionForTitle;
+  const title = truncatedQuestion || `Run ${manifest.run_id || ""}`;
   const generatedAt = new Date().toLocaleString();
   const plotCount = collectArtifacts(manifest).filter((path) => /\.(png|jpg|jpeg|svg)$/i.test(path)).length;
 
@@ -1475,19 +1536,25 @@ function buildPrintableReportHtml(manifest) {
       </header>
 
       <section>
-        <h2>Grounded Answer</h2>
+        <h2>Answer</h2>
         ${reportTextBlock(finalAnswer.answer_text || "")}
         <h3>Caveats</h3>
         ${reportList(finalAnswer.caveats || [])}
-        <h3>Unsupported Parts</h3>
-        ${reportList(finalAnswer.unsupported_parts || [])}
-        <h3>Claim Verdicts</h3>
-        ${reportTable(
-          ["Verdict", "Claim", "Evidence"],
-          finalAnswer.claim_verdicts || [],
-          (row) => [row.verdict || row.label || "", row.claim || "", row.evidence || ""],
-          "No claim verdicts"
-        )}
+        ${
+          (finalAnswer.unsupported_parts || []).length
+            ? `<h3>Unsupported Parts</h3>${reportList(finalAnswer.unsupported_parts || [])}`
+            : ""
+        }
+        ${
+          metadata.nli_verifier_ran && Array.isArray(metadata.nli_verdicts) && metadata.nli_verdicts.length
+            ? `<h3>Claim Verdicts</h3>${reportTable(
+                ["Verdict", "Claim", "Evidence"],
+                metadata.nli_verdicts,
+                (row) => [row.verdict || "", row.claim || "", row.premise || ""],
+                "No claim verdicts"
+              )}`
+            : ""
+        }
       </section>
 
       <section>
@@ -1502,8 +1569,8 @@ function buildPrintableReportHtml(manifest) {
           ["Tool calls", toolTotals.totalCalls],
           ["Completed calls", toolTotals.completedCalls],
           ["Failed calls", toolTotals.failedCalls],
-          ["Input docs seen", toolTotals.inputDocumentsSeen],
-          ["Output items", toolTotals.outputItems],
+          ["Docs read by tools", toolTotals.inputDocumentsSeen],
+          ["Rows produced (entities, sentences, etc.)", toolTotals.outputItems],
         ])}
         <h3>Assumptions</h3>
         ${reportList(manifest.assumptions || [])}
@@ -1512,11 +1579,6 @@ function buildPrintableReportHtml(manifest) {
       <section>
         <h2>Plots</h2>
         ${reportPlots(manifest)}
-      </section>
-
-      <section>
-        <h2>Artifacts</h2>
-        ${reportArtifacts(manifest)}
       </section>
 
       <section>
@@ -1575,7 +1637,7 @@ function buildPrintableReportHtml(manifest) {
       </section>
 
       <section class="appendix">
-        <h2>Full Manifest JSON</h2>
+        <h2>Full Run Output JSON</h2>
         ${reportPre(manifest)}
       </section>
     </main>
@@ -1669,20 +1731,36 @@ function renderEvidence(rows) {
       </thead>
       <tbody>
         ${rows
-          .map(
-            (row) => `
-              <tr>
-                <td class="evidence-doc">${escapeHtml(row.doc_id ?? "")}</td>
+          .map((row) => {
+            const docId = String(row.doc_id ?? "");
+            const safeId = docId ? `id="doc-${escapeHtml(docId)}"` : "";
+            return `
+              <tr ${safeId}>
+                <td class="evidence-doc">${escapeHtml(docId)}</td>
                 <td class="evidence-outlet">${escapeHtml(row.outlet ?? "")}</td>
                 <td>${escapeHtml(row.date ?? "")}</td>
                 <td class="evidence-excerpt">${escapeHtml(row.excerpt ?? "")}</td>
                 <td class="evidence-score">${escapeHtml(row.score_display ?? formatScore(row.score ?? ""))}</td>
-              </tr>`
-          )
+              </tr>`;
+          })
           .join("")}
       </tbody>
     </table>
   `;
+}
+
+function handleAnswerDocLinkClick(event) {
+  const anchor = event.target.closest("a[href^='#doc-']");
+  if (!anchor) return;
+  const href = anchor.getAttribute("href") || "";
+  const target = document.getElementById(href.slice(1));
+  if (!target) return;
+  event.preventDefault();
+  target.scrollIntoView({ behavior: "smooth", block: "center" });
+  target.classList.remove("evidence-row-highlight");
+  // Force reflow so re-adding the class restarts the animation.
+  void target.offsetWidth;
+  target.classList.add("evidence-row-highlight");
 }
 
 function resetManifestPanels(answerMessage = "Waiting for result...") {
@@ -1751,10 +1829,14 @@ function renderRuntimeInfo(payload) {
   const localDense = retrievalHealthPayload.local_dense || {};
   const pgvector = retrievalHealthPayload.pgvector || {};
   providerDefaults = llm.available_defaults || {};
-  providerBadge.textContent = `LLM: ${llm.provider_name || "unknown"}`;
+  const provider = String(llm.provider_name || "").trim();
+  const planner = String(llm.planner_model || "").trim();
+  const dev = String(device.recommended_device || "").trim();
+  runtimeInfoLoaded = Boolean(provider && planner && dev);
+  providerBadge.textContent = `LLM: ${provider || "unknown"}`;
   providerBadge.className = `pill ${llm.use_openai ? "openai" : "unclose"}`;
-  modelBadge.textContent = `Planner: ${llm.planner_model || "unknown"}`;
-  deviceBadge.textContent = `Device: ${device.recommended_device || "unknown"}`;
+  modelBadge.textContent = `Planner: ${planner || "unknown"}`;
+  deviceBadge.textContent = `Device: ${dev || "unknown"}`;
   runtimeModeBadge.textContent = llm.use_openai ? "OpenAI mode" : "UncloseAI mode";
   llmProviderSelect.value = llm.use_openai ? "openai" : "uncloseai";
   plannerModelInput.value = llm.planner_model || "";
@@ -1773,24 +1855,13 @@ function renderRuntimeInfo(payload) {
       <div class="metric-row"><span>GPU count</span><strong>${escapeHtml(device.cuda_device_count ?? 0)}</strong></div>
       <div class="metric-row"><span>Configured mode</span><strong>${escapeHtml(retrieval.configured_default_mode || retrieval.default_mode || "unknown")}</strong></div>
       <div class="metric-row"><span>Effective mode</span><strong>${escapeHtml(retrieval.default_mode || "unknown")}</strong></div>
-      <div class="metric-row"><span>Dense strategy</span><strong>${escapeHtml(retrievalHealthPayload.dense_strategy || "unknown")}</strong></div>
-      <div class="metric-row"><span>Re-rank</span><strong>${retrieval.rerank_enabled ? `on (top ${escapeHtml(retrieval.rerank_top_k ?? "")})` : "off"}</strong></div>
       <div class="metric-row"><span>Dense model</span><strong>${escapeHtml(retrieval.dense_model_id || "")}</strong></div>
       <div class="metric-row"><span>Corpus</span><strong>${escapeHtml((payload.corpus || {}).display_name || (payload.corpus || {}).name || "unknown")}</strong></div>
     `;
 
   retrievalHealth.innerHTML = `
     <div class="metric-row"><span>Corpus docs</span><strong>${escapeHtml(formatCount(retrievalHealthPayload.document_count || 0))}</strong></div>
-    <div class="metric-row"><span>Local lexical assets</span><strong>${localLexical.ready ? "ready" : "missing"}</strong></div>
-    <div class="metric-row"><span>Local dense assets</span><strong>${localDense.ready ? "ready" : localDense.error ? "broken" : "missing"}</strong></div>
-    <div class="metric-row"><span>pgvector dense rows</span><strong>${escapeHtml(`${formatCount(pgvector.dense_rows || 0)} / ${formatCount(pgvector.total_rows || 0)}`)}</strong></div>
-    <div class="metric-row"><span>Full dense ready</span><strong>${retrievalHealthPayload.full_corpus_dense_ready ? "yes" : "no"}</strong></div>
-    <div class="metric-row"><span>Dense fallback</span><strong>${retrievalHealthPayload.dense_candidate_fallback_ready ? "candidate rerank ready" : "not ready"}</strong></div>
-    ${
-      localDense.error
-        ? `<div class="metric-row"><span>Dense asset issue</span><strong>${escapeHtml(localDense.error)}</strong></div>`
-        : ""
-    }
+    <div class="metric-row"><span>Dense index rows</span><strong>${escapeHtml(`${formatCount(pgvector.dense_rows || 0)} / ${formatCount(pgvector.total_rows || 0)}`)}</strong></div>
   `;
 
   providersInstalled.innerHTML = "";
@@ -1887,8 +1958,8 @@ function renderToolCalls(rows) {
     { label: "Calls", value: formatCount(totals.totalCalls) },
     { label: "Completed", value: formatCount(totals.completedCalls) },
     { label: "Failed", value: formatCount(totals.failedCalls) },
-    { label: "Input docs seen", value: formatCount(totals.inputDocumentsSeen) },
-    { label: "Output items", value: formatCount(totals.outputItems) },
+    { label: "Docs read by tools", value: formatCount(totals.inputDocumentsSeen) },
+    { label: "Rows produced (entities, sentences, etc.)", value: formatCount(totals.outputItems) },
   ]);
   const blocks = ordered.map((row) => {
     const summary = row.summary || {};
@@ -1952,34 +2023,47 @@ function renderArtifacts(manifest) {
   const artifacts = collectArtifacts(manifest);
   const runId = manifest.run_id;
   const plots = artifacts.filter((path) => /\.(png|jpg|jpeg|svg)$/i.test(path));
-  const others = artifacts.filter((path) => !/\.(png|jpg|jpeg|svg)$/i.test(path));
 
-  const artifactBlocks = others.map((path) => `
-    <div class="trace-head">
-      <span class="pill subtle">artifact</span>
-      <a href="${artifactUrl(runId, path)}" target="_blank" rel="noreferrer">${escapeHtml(path.split(/[/\\]/).pop() || path)}</a>
-    </div>
-    <p class="muted artifact-path">${escapeHtml(path)}</p>
-  `);
-  renderStackPanel(artifactList, artifactBlocks, "Artifacts created by the executor will appear here.");
+  if (artifactList) {
+    const others = artifacts.filter((path) => !/\.(png|jpg|jpeg|svg)$/i.test(path));
+    const artifactBlocks = others.map((path) => `
+      <div class="trace-head">
+        <a href="${artifactUrl(runId, path)}" target="_blank" rel="noreferrer">${escapeHtml(path.split(/[/\\]/).pop() || path)}</a>
+      </div>
+      <p class="muted artifact-path">${escapeHtml(path)}</p>
+    `);
+    renderStackPanel(artifactList, artifactBlocks, "");
+  }
 
+  const simplePlotsCard = document.getElementById("simplePlotsCard");
+  const simplePlotGallery = document.getElementById("simplePlotGallery");
   plotGallery.innerHTML = "";
+  if (simplePlotGallery) simplePlotGallery.innerHTML = "";
   if (plots.length === 0) {
-    plotGallery.innerHTML = '<p class="muted">No plot artifacts were generated for this run.</p>';
+    plotGallery.innerHTML = '<p class="muted">No plots were generated for this run.</p>';
+    if (simplePlotsCard) simplePlotsCard.classList.add("hidden");
     return;
   }
+  if (simplePlotsCard) simplePlotsCard.classList.remove("hidden");
   plots.forEach((path) => {
-    const figure = document.createElement("figure");
-    figure.className = "plot-card";
     const fileName = path.split(/[/\\]/).pop() || path;
     const src = artifactUrl(runId, path);
-    figure.innerHTML = `
+    const figureHtml = `
       <button class="plot-button" type="button" data-src="${src}" data-caption="${escapeHtml(fileName)}">
         <img src="${src}" alt="Plot artifact" />
         <figcaption>${escapeHtml(fileName)}</figcaption>
       </button>
     `;
-    plotGallery.appendChild(figure);
+    const advFigure = document.createElement("figure");
+    advFigure.className = "plot-card";
+    advFigure.innerHTML = figureHtml;
+    plotGallery.appendChild(advFigure);
+    if (simplePlotGallery) {
+      const simpleFigure = document.createElement("figure");
+      simpleFigure.className = "plot-card";
+      simpleFigure.innerHTML = figureHtml;
+      simplePlotGallery.appendChild(simpleFigure);
+    }
   });
 }
 
@@ -1991,27 +2075,44 @@ function renderAnswerPayload(finalAnswer, metadata = {}) {
       ? "MODEL-ONLY OUT-OF-CORPUS ANSWER: no corpus-grounded evidence was available; this uses the configured planner model's prior knowledge."
       : "";
   }
-  answerText.textContent = finalAnswer?.answer_text || "No answer text returned.";
-  const verdicts = finalAnswer?.claim_verdicts || [];
-  if (!verdicts.length) {
-    claimVerdicts.innerHTML = '<p class="muted">Claim verdicts will appear when verification outputs are available.</p>';
-  } else {
-    claimVerdicts.innerHTML = verdicts
+  renderAnswerText(finalAnswer?.answer_text || "");
+  const nliRan = Boolean(metadata?.nli_verifier_ran);
+  const nliRows = Array.isArray(metadata?.nli_verdicts) ? metadata.nli_verdicts : [];
+  const nliStats = metadata?.nli_stats || null;
+  const claimSection = document.getElementById("claimVerdictsSection");
+  const meaningful = nliRan && nliRows.length > 0;
+  if (claimSection) {
+    claimSection.classList.toggle("hidden", !meaningful);
+  }
+  if (meaningful) {
+    const header = nliStats
+      ? `<p class="muted small">NLI verifier ${escapeHtml(String(nliStats.nli_model || ""))} — ${nliStats.claims_supported ?? 0} supported, ${nliStats.claims_contradicted ?? 0} contradicted, ${nliStats.claims_neutral ?? 0} neutral (threshold ${nliStats.verdict_threshold ?? "0.7"}).</p>`
+      : "";
+    const cards = nliRows
       .map((row) => {
-        const verdict = String(row.verdict || row.label || "claim").trim() || "claim";
+        const verdict = String(row.verdict || "neutral").trim() || "neutral";
         const safeClass = verdict.toLowerCase().replace(/[^a-z0-9_-]/g, "-");
+        const ent = (row.entailment_prob != null) ? Number(row.entailment_prob).toFixed(2) : "";
+        const con = (row.contradiction_prob != null) ? Number(row.contradiction_prob).toFixed(2) : "";
+        const probs = ent ? `<span class="muted small">entail ${ent}${con ? ` · contradict ${con}` : ""}</span>` : "";
         return `
           <article class="claim-card claim-card-${safeClass}">
             <span class="claim-verdict-pill">${escapeHtml(verdict)}</span>
             <p class="claim-text">${escapeHtml(row.claim || "")}</p>
-            ${row.evidence ? `<p class="claim-evidence">${escapeHtml(row.evidence)}</p>` : ""}
+            ${row.premise ? `<p class="claim-evidence">${escapeHtml(row.premise)}</p>` : ""}
+            ${probs}
           </article>
         `;
       })
       .join("");
+    claimVerdicts.innerHTML = header + cards;
+  } else {
+    claimVerdicts.innerHTML = "";
   }
   renderList(caveatsList, finalAnswer?.caveats || [], (row) => escapeHtml(row));
-  renderList(unsupportedList, finalAnswer?.unsupported_parts || [], (row) => escapeHtml(row));
+  if (unsupportedList) {
+    renderList(unsupportedList, finalAnswer?.unsupported_parts || [], (row) => escapeHtml(row));
+  }
 }
 
 function renderManifest(manifest) {
@@ -2043,6 +2144,7 @@ function renderManifest(manifest) {
 function setStatus(payload) {
   const status = payload.status || "unknown";
   currentStatus = status;
+  latestLiveStatusPayload = payload;
   if (payload.run_id) {
     currentRunId = String(payload.run_id);
   }
@@ -2095,6 +2197,7 @@ function setStatus(payload) {
   renderLLMTraces(payload.llm_traces || []);
   updateRunTotalTimeDisplay();
   updateEtaDisplay(payload);
+  ensureLiveBreakdownTicker();
 
   const clarificationQuestions = payload.clarification_questions || [];
   if (status === "needs_clarification" && clarificationQuestions.length > 0) {
@@ -2151,7 +2254,7 @@ async function fetchManifestWithRetry(base, runId, attempts = MANIFEST_FETCH_MAX
       await new Promise((resolve) => window.setTimeout(resolve, MANIFEST_FETCH_RETRY_DELAY_MS));
     }
   }
-  throw lastError || new Error("Manifest fetch failed.");
+  throw lastError || new Error("Run output fetch failed.");
 }
 
 async function loadToolUsageSummary() {
@@ -2277,7 +2380,7 @@ async function abortAllRuns() {
   return payload;
 }
 
-async function submitQuery({ preserveClarificationHistory = false } = {}) {
+async function submitQuery({ preserveClarificationHistory = false, replanFromRunId = "" } = {}) {
   if (submissionInFlight) {
     return;
   }
@@ -2329,15 +2432,20 @@ async function submitQuery({ preserveClarificationHistory = false } = {}) {
   const base = apiBaseInput.value.replace(/\/$/, "");
   void loadRuntimeInfo();
   try {
-    const payload = await fetchJson(`${base}/query/submit`, {
-      method: "POST",
-      body: JSON.stringify({
-        question: questionInput.value,
-        force_answer: forceAnswerInput.checked,
-        no_cache: noCacheInput.checked,
-        clarification_history: preserveClarificationHistory ? clarificationHistory : [],
-      }),
-    });
+    const payload = replanFromRunId
+      ? await fetchJson(`${base}/runs/${encodeURIComponent(replanFromRunId)}/replan`, {
+          method: "POST",
+          body: JSON.stringify({ additional_instruction: "" }),
+        })
+      : await fetchJson(`${base}/query/submit`, {
+          method: "POST",
+          body: JSON.stringify({
+            question: questionInput.value,
+            force_answer: forceAnswerInput.checked,
+            no_cache: noCacheInput.checked,
+            clarification_history: preserveClarificationHistory ? clarificationHistory : [],
+          }),
+        });
     if (pollSessionId !== activePollSessionId) {
       return;
     }
@@ -2361,6 +2469,9 @@ async function submitQuery({ preserveClarificationHistory = false } = {}) {
   }
 }
 
+const POLL_MAX_CONSECUTIVE_ERRORS = 5;
+const pollSessionErrorCounts = new Map();
+
 async function pollRun(runId, pollSessionId = activePollSessionId) {
   if (pollSessionId !== activePollSessionId) {
     return;
@@ -2371,6 +2482,7 @@ async function pollRun(runId, pollSessionId = activePollSessionId) {
     if (pollSessionId !== activePollSessionId) {
       return;
     }
+    pollSessionErrorCounts.delete(pollSessionId);
     currentRunId = runId;
     setStatus(statusPayload);
     if (!isTerminalStatus(statusPayload.status)) {
@@ -2423,16 +2535,26 @@ async function pollRun(runId, pollSessionId = activePollSessionId) {
     if (pollSessionId !== activePollSessionId) {
       return;
     }
-    clearInterval(pollTimer);
-    pollTimer = null;
     if (String(error.message || "").includes("404")) {
+      clearInterval(pollTimer);
+      pollTimer = null;
+      pollSessionErrorCounts.delete(pollSessionId);
       clearRestoredRunState();
       detailText.textContent = "Previous run could not be restored after restart, so the stale run state was cleared.";
       return;
     }
+    const consecutive = (pollSessionErrorCounts.get(pollSessionId) || 0) + 1;
+    pollSessionErrorCounts.set(pollSessionId, consecutive);
+    if (consecutive < POLL_MAX_CONSECUTIVE_ERRORS) {
+      detailText.textContent = `Polling hiccup (${consecutive}/${POLL_MAX_CONSECUTIVE_ERRORS}) — ${error.message}. Retrying.`;
+      return;
+    }
+    clearInterval(pollTimer);
+    pollTimer = null;
+    pollSessionErrorCounts.delete(pollSessionId);
     statusBox.textContent = "failed";
     statusBox.className = "status failed";
-    detailText.textContent = `Polling failed: ${error.message}`;
+    detailText.textContent = `Polling failed after ${POLL_MAX_CONSECUTIVE_ERRORS} consecutive errors: ${error.message}`;
   }
 }
 
@@ -2472,6 +2594,22 @@ printReportButton.addEventListener("click", async () => {
     detailText.textContent = `PDF report failed: ${error.message}`;
   }
 });
+
+if (replanButton) {
+  replanButton.addEventListener("click", async () => {
+    if (!currentRunId || !isTerminalStatus(currentStatus) || submissionInFlight) {
+      return;
+    }
+    const priorRunId = currentRunId;
+    try {
+      await submitQuery({ preserveClarificationHistory: false, replanFromRunId: priorRunId });
+    } catch (error) {
+      statusBox.textContent = "failed";
+      statusBox.className = "status failed";
+      detailText.textContent = `Re-plan failed: ${error.message}`;
+    }
+  });
+}
 
 applyLlmSettingsButton.addEventListener("click", async () => {
   try {
@@ -2534,6 +2672,15 @@ plotGallery.addEventListener("click", (event) => {
   openPlotModal(button.dataset.src || "", button.dataset.caption || "Plot preview");
 });
 
+const _simplePlotGallery = document.getElementById("simplePlotGallery");
+if (_simplePlotGallery) {
+  _simplePlotGallery.addEventListener("click", (event) => {
+    const button = event.target.closest(".plot-button");
+    if (!button) return;
+    openPlotModal(button.dataset.src || "", button.dataset.caption || "Plot preview");
+  });
+}
+
 plotModalClose.addEventListener("click", closePlotModal);
 plotModal.addEventListener("click", (event) => {
   if (event.target === plotModal) {
@@ -2574,6 +2721,10 @@ renderToolCalls([]);
 updateEtaDisplay();
 updateControlState();
 renderAccessGate();
+initTabs();
+initRunHistory();
+maybeEnterReviewMode();
+answerText.addEventListener("click", handleAnswerDocLinkClick);
 
 accessGateButton.addEventListener("click", async () => {
   try {
@@ -2591,19 +2742,59 @@ accessGatePassword.addEventListener("keydown", async (event) => {
   }
 });
 
+function startContinuousPollingForRun(runId, pollSessionId) {
+  if (pollTimer) {
+    clearInterval(pollTimer);
+    pollTimer = null;
+  }
+  pollTimer = setInterval(() => {
+    void pollRun(runId, pollSessionId);
+  }, POLL_INTERVAL_MS);
+}
+
 loadRuntimeInfo().then(async () => {
   if (currentRunId) {
+    detailText.textContent = `Reconnecting to run ${currentRunId}...`;
+    const reattachSessionId = ++activePollSessionId;
     try {
-      await pollRun(currentRunId);
+      await pollRun(currentRunId, reattachSessionId);
+      // If the run is still active server-side, keep polling so the user
+      // sees live updates after laptop wake / browser reload.
+      if (!isTerminalStatus(currentStatus) && currentRunId) {
+        startContinuousPollingForRun(currentRunId, reattachSessionId);
+      }
     } catch (error) {
       if (String(error.message || "").includes("404")) {
         clearRestoredRunState();
-        detailText.textContent = "Previous run was no longer available after restart, so the saved run reference was cleared.";
+        detailText.textContent =
+          "Previous run was no longer available after restart, so the saved run reference was cleared. Check the Run history tab to find it.";
       } else {
-        detailText.textContent = `Could not restore previous run: ${error.message}`;
+        detailText.textContent =
+          `Could not restore previous run: ${error.message}. The run may still be in progress on the server — check the Run history tab.`;
       }
     }
   }
+});
+
+// When the tab regains focus (e.g., laptop wake) and we have a saved
+// run id but polling has stopped, resume continuous polling. Prevents
+// the "I came back hours later and the UI is silent" failure mode.
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState !== "visible") {
+    return;
+  }
+  if (!currentRunId || pollTimer || isTerminalStatus(currentStatus)) {
+    return;
+  }
+  const resumeSessionId = ++activePollSessionId;
+  detailText.textContent = `Tab became visible — resuming polling for run ${currentRunId}.`;
+  pollRun(currentRunId, resumeSessionId).then(() => {
+    if (!isTerminalStatus(currentStatus) && currentRunId) {
+      startContinuousPollingForRun(currentRunId, resumeSessionId);
+    }
+  }).catch(() => {
+    // Errors are handled by pollRun's catch block; nothing extra here.
+  });
 });
 
 // ----- Phase 4 modernization: scroll-reveal + live API status pill -----
@@ -2644,6 +2835,24 @@ loadRuntimeInfo().then(async () => {
   pill.setAttribute("aria-live", "polite");
   hero.insertBefore(pill, hero.firstChild);
 
+  let probeTimer = null;
+
+  function scheduleNextProbe(intervalMs) {
+    if (probeTimer) {
+      clearTimeout(probeTimer);
+    }
+    probeTimer = setTimeout(() => void probe(), intervalMs);
+  }
+
+  function setApiReady(ready, warmingStages) {
+    const changed = apiReady !== ready;
+    apiReady = ready;
+    apiWarmingStages = Array.isArray(warmingStages) ? warmingStages : [];
+    if (changed && typeof updateControlState === "function") {
+      updateControlState();
+    }
+  }
+
   async function probe() {
     try {
       const base = (typeof apiBaseInput !== "undefined" && apiBaseInput && apiBaseInput.value)
@@ -2652,25 +2861,252 @@ loadRuntimeInfo().then(async () => {
       if (!base) {
         pill.className = "status-pill status-unknown";
         pill.textContent = "API: not set";
+        setApiReady(true, []);
+        scheduleNextProbe(15000);
         return;
       }
       const response = await fetch(`${base}/health`, { method: "GET", cache: "no-store" });
-      if (response.ok) {
+      if (!response.ok) {
+        pill.className = "status-pill status-down";
+        pill.textContent = `API: ${response.status}`;
+        setApiReady(false, []);
+        scheduleNextProbe(5000);
+        return;
+      }
+      let payload = {};
+      try {
+        payload = await response.json();
+      } catch (_jsonError) {
+        payload = {};
+      }
+      const ready = payload.ready !== false;
+      const warming = Array.isArray(payload.warming) ? payload.warming : [];
+      if (ready) {
         pill.className = "status-pill";
         pill.textContent = "API: healthy";
       } else {
-        pill.className = "status-pill status-down";
-        pill.textContent = `API: ${response.status}`;
+        pill.className = "status-pill status-warming";
+        pill.textContent = warming.length
+          ? `API: warming (${warming.join(", ")})`
+          : "API: warming";
       }
+      setApiReady(ready, warming);
+      scheduleNextProbe(ready ? 15000 : 3000);
     } catch (_error) {
       pill.className = "status-pill status-down";
       pill.textContent = "API: unreachable";
+      setApiReady(false, []);
+      scheduleNextProbe(5000);
     }
   }
 
   probe();
-  setInterval(probe, 15000);
   if (typeof apiBaseInput !== "undefined" && apiBaseInput) {
-    apiBaseInput.addEventListener("change", probe);
+    apiBaseInput.addEventListener("change", () => void probe());
   }
 })();
+
+
+// ----- Markdown rendering helper ---------------------------------------
+// Replaces plain-text answer rendering. Uses marked from CDN when loaded;
+// falls back to textContent otherwise so the UI never goes blank if the
+// CDN is unreachable.
+function renderAnswerText(value) {
+  const text = String(value ?? "").trim();
+  if (!text) {
+    answerText.textContent = "No answer text returned.";
+    return;
+  }
+  if (typeof window !== "undefined" && window.marked && typeof window.marked.parse === "function") {
+    try {
+      answerText.innerHTML = window.marked.parse(text, { breaks: true, gfm: true });
+      _replaceDocLinkLabelsWithIcons(answerText);
+      return;
+    } catch (_err) {
+      // fall through to plain text
+    }
+  }
+  answerText.textContent = text;
+}
+
+function _replaceDocLinkLabelsWithIcons(container) {
+  if (!container) return;
+  const anchors = container.querySelectorAll('a[href^="#doc-"]');
+  anchors.forEach((anchor) => {
+    const originalText = anchor.textContent.trim();
+    if (originalText && !anchor.getAttribute("title")) {
+      anchor.setAttribute("title", originalText);
+    }
+    anchor.setAttribute("aria-label", originalText || "Open evidence");
+    anchor.classList.add("doc-link-icon");
+    anchor.innerHTML = '<span aria-hidden="true">↗</span>';
+  });
+}
+
+
+// ----- Tab switching ---------------------------------------------------
+function activateTab(target) {
+  document.querySelectorAll("[data-tab]").forEach((panel) => {
+    const isActive = panel.getAttribute("data-tab") === target;
+    panel.classList.toggle("tab-active", isActive);
+  });
+  document.querySelectorAll(".tab-button").forEach((button) => {
+    const isActive = button.getAttribute("data-tab-target") === target;
+    button.classList.toggle("tab-active", isActive);
+    button.setAttribute("aria-selected", isActive ? "true" : "false");
+  });
+  if (target === "history") {
+    void loadRunHistory();
+  }
+  if (target === "advanced") {
+    updateRunTotalTimeDisplay();
+  }
+}
+
+let liveBreakdownTicker = null;
+function ensureLiveBreakdownTicker() {
+  const running = !isTerminalStatus(currentStatus) && Boolean(currentRunStartedAtUtc);
+  if (running && liveBreakdownTicker == null) {
+    liveBreakdownTicker = setInterval(() => {
+      if (isTerminalStatus(currentStatus) || !currentRunStartedAtUtc) {
+        clearInterval(liveBreakdownTicker);
+        liveBreakdownTicker = null;
+        return;
+      }
+      updateRunTotalTimeDisplay();
+    }, 1000);
+  } else if (!running && liveBreakdownTicker != null) {
+    clearInterval(liveBreakdownTicker);
+    liveBreakdownTicker = null;
+  }
+}
+
+function initTabs() {
+  document.querySelectorAll(".tab-button").forEach((button) => {
+    button.addEventListener("click", () => activateTab(button.getAttribute("data-tab-target")));
+  });
+}
+
+
+// ----- Run history -----------------------------------------------------
+async function loadRunHistory() {
+  const listEl = document.getElementById("runHistoryList");
+  const statusEl = document.getElementById("runHistoryStatus");
+  if (!listEl || !statusEl) {
+    return;
+  }
+  statusEl.textContent = "Loading...";
+  try {
+    const base = apiBaseInput.value.replace(/\/$/, "");
+    const response = await fetch(`${base}/runs?limit=100`, { cache: "no-store" });
+    if (!response.ok) {
+      statusEl.textContent = `Failed to load: HTTP ${response.status}`;
+      listEl.innerHTML = "";
+      return;
+    }
+    const payload = await response.json();
+    const runs = Array.isArray(payload.runs) ? payload.runs : [];
+    if (!runs.length) {
+      statusEl.textContent = "No runs recorded yet. Postgres run history fills in as you submit queries.";
+      listEl.innerHTML = "";
+      return;
+    }
+    statusEl.textContent = `Showing ${runs.length} run${runs.length === 1 ? "" : "s"}.`;
+    listEl.innerHTML = runs.map(renderRunHistoryRow).join("");
+  } catch (error) {
+    statusEl.textContent = `Failed to load: ${error.message}`;
+    listEl.innerHTML = "";
+  }
+}
+
+const IN_PROGRESS_RUN_STATUSES = new Set([
+  "queued",
+  "running",
+  "aborting",
+  "cancel_requested",
+  "on_hold",
+]);
+
+function renderRunHistoryRow(run) {
+  const runId = String(run.run_id || "");
+  const question = String(run.question || "");
+  const status = String(run.status || "unknown");
+  const created = run.created_at_utc ? new Date(run.created_at_utc).toLocaleString() : "—";
+  const duration = (run.duration_ms != null) ? formatDurationMs(run.duration_ms) || "" : "";
+  const reviewUrl = `${window.location.pathname}?run=${encodeURIComponent(runId)}`;
+  const statusClass = status.replace(/[^a-z0-9_-]/gi, "_");
+  const inProgress = IN_PROGRESS_RUN_STATUSES.has(status.toLowerCase());
+  const rowClass = inProgress ? "run-history-row run-history-row-active" : "run-history-row";
+  const indicator = inProgress ? '<span class="run-history-active-dot" aria-hidden="true"></span>' : "";
+  return `
+    <a class="${rowClass}" href="${reviewUrl}" target="_blank" rel="noopener noreferrer" title="${escapeHtml(question)}">
+      <span class="status-chip status-${escapeHtml(statusClass)}">${indicator}${escapeHtml(status)}</span>
+      <span class="run-history-time muted">${escapeHtml(created)}</span>
+      <span class="run-history-question">${escapeHtml(question || "(no question recorded)")}</span>
+      <span class="run-history-id muted">${escapeHtml(runId.slice(-12))}</span>
+      <span class="run-history-duration muted">${escapeHtml(duration)}</span>
+    </a>
+  `;
+}
+
+function initRunHistory() {
+  const refresh = document.getElementById("runHistoryRefreshButton");
+  if (refresh) {
+    refresh.addEventListener("click", () => void loadRunHistory());
+  }
+}
+
+
+// ----- Review mode (open past run in new tab) --------------------------
+// When the URL has ?run=<run_id>, we freeze the page on the saved manifest,
+// retitle the browser tab to the question, and disable mutating controls.
+// The active tab becomes Simple so the answer + evidence are the first
+// thing the reviewer sees.
+function maybeEnterReviewMode() {
+  let reviewRunId = "";
+  try {
+    const params = new URLSearchParams(window.location.search);
+    reviewRunId = (params.get("run") || "").trim();
+  } catch (_err) {
+    reviewRunId = "";
+  }
+  if (!reviewRunId) {
+    return;
+  }
+  activateTab("simple");
+  enterReviewMode(reviewRunId).catch((error) => {
+    detailText.textContent = `Failed to load run ${reviewRunId}: ${error.message}`;
+  });
+}
+
+async function enterReviewMode(runId) {
+  const base = apiBaseInput.value.replace(/\/$/, "");
+  detailText.textContent = `Loading run ${runId}...`;
+  const manifest = await fetchJson(`${base}/runs/${encodeURIComponent(runId)}`);
+  currentRunId = manifest.run_id || runId;
+  renderManifest(manifest);
+  const question = manifest.question || manifest.question_spec?.original_question || "";
+  if (question) {
+    questionInput.value = question;
+    const truncated = question.length > 80 ? `${question.slice(0, 77)}...` : question;
+    document.title = truncated;
+  }
+  // Freeze interactive controls — this is a read-only review window.
+  runButton.disabled = true;
+  runButton.textContent = "Review mode";
+  abortButton.disabled = true;
+  if (typeof abortAllButton !== "undefined" && abortAllButton) {
+    abortAllButton.disabled = true;
+  }
+  if (typeof continueButton !== "undefined" && continueButton) {
+    continueButton.disabled = true;
+  }
+  setStatus({
+    status: manifest.status || "completed",
+    detail: `Read-only review of run ${currentRunId}`,
+    assumptions: manifest.assumptions || [],
+    planner_actions: manifest.planner_actions || [],
+    llm_traces: manifest.metadata?.llm_traces || [],
+  });
+}
+

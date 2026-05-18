@@ -26,7 +26,11 @@ from .agent_backends import (
     save_agent_manifest,
 )
 from .agent_capabilities import AgentExecutionContext, _infer_market_ticker_from_text, build_agent_registry
-from .agent_executor import AgentExecutionSnapshot, AsyncPlanExecutor
+from .agent_executor import (
+    _RETRIEVAL_BAILOUT_CAPABILITIES,
+    AgentExecutionSnapshot,
+    AsyncPlanExecutor,
+)
 from .agent_models import (
     AgentFailure,
     AgentPlanDAG,
@@ -4072,38 +4076,69 @@ class MagicBoxOrchestrator:
             {
                 "role": "system",
                 "content": (
-                    "You are the planning module for a corpus agent operating over a user-provided corpus. "
-                    "Return JSON with keys action, rewritten_question, assumptions, clarification_question, rejection_reason, message, plan_dag. "
-                    "Allowed actions: ask_clarification, emit_plan_dag, grounded_rejection. "
-                    "Keep plans compact and parallel where possible. "
-                    "Each plan node must include node_id, capability, optional tool_name, inputs, and depends_on. "
-                    "Use the provided tool_catalog to choose concrete repo tools when that improves control or fallback behavior. "
-                    "Prefer typed repo tools before python_runner. "
-                    "Use python_runner only as a bounded last-resort fallback when no typed tool fits or a typed tool has already failed. "
-                    "Prefer db_search plus fetch_documents for normal retrieval. "
-                    "Every db_search or sql_query_search node must include a non-empty query string derived from the rewritten question; do not rely on implicit query context. "
-                    "Use sql_query_search when hybrid retrieval is sparse, off-target, or entity coverage is poor. "
-                    "Choose an explicit retrieval_strategy when planning retrieval-backed work. "
-                    "Use retrieval_strategy='exhaustive_analytic' for corpus-wide aggregates, distributions, trends, comparisons, and questions that ask for all relevant records; in that mode the goal is to materialize the full candidate working set before analysis rather than relying on a tiny ranked slice. "
-                    "Use retrieval_strategy='precision_ranked' for targeted evidence lookups where the best supporting documents matter more than full-population coverage. "
-                    "Use retrieval_strategy='semantic_exploratory' for similarity, thematic, or concept-discovery questions where semantic closeness matters more than exact lexical overlap. "
-                    "For questions about descriptions that use different wording, semantic relatedness, recurring terms, or abbreviations, include embeddings/similarity tools: doc_embeddings, similarity_index, similarity_pairwise, word_embeddings, extract_acronyms, plus keyterms/entities and temporal summaries when the question asks over time. "
-                    "For questions asking who acted, who was acted upon, subject-verb-object patterns, or grammatical roles, include sentence_split, tokenize, pos_morph, lemmatize, dependency_parse, extract_svo_triples, noun_chunks, named entities/entity linking, and quote tools when political statements or attributed speech matter. "
-                    "For questions asking what explanations media gave for price movements/crashes/recoveries and who those explanations were attributed to, combine the external price series with time_series_aggregate, burst/change detection, keyterms, quote_extract, quote_attribute, claim_span_extract, claim_strength_score, NER/entity_link, and an evidence table. "
-                    "Size retrieval budgets to the question, and never use tiny default retrieval budgets for broad analytical questions. "
-                    "When using db_search for ranked retrieval, set top_k and, when helpful, lexical_top_k, dense_top_k, rerank_top_k, and use_rerank based on the scope needed to answer the question faithfully. "
-                    "When retrieve_all is true, top_k is only a fallback budget and must not be treated as the analyzed population size. "
-                    "Avoid parallel overlapping retrieve_all db_search branches. If a narrower corpus slice can be derived from a broader retrieved working set, use filter_working_set instead of launching another full-corpus db_search. "
-                    "For outlet/source-scoped questions, add source filters only when the user names specific outlets or the corpus metadata clearly supplies source names; do not invent backend alias lists for broad phrases like a country's newspapers. "
-                    "If outlet spellings or aliases may be needed, surface them in the plan assumptions and keep the source terms separate from the topical retrieval query. "
-                    "For analytical frequency tables, use build_evidence_table with supported task names exactly: noun_frequency_distribution for noun/POS lemma counts, and summary_stats for compact aggregate summaries. "
-                    "noun_frequency_distribution rows contain lemma, count, relative_frequency, document_frequency, and rank; plot them with x='lemma' and y='count'. "
-                    "Do not invent near-synonym task names such as aggregate_token_frequencies unless a tool catalog entry explicitly documents them. "
-                    "For plot_artifact, depend on the analytical table node and pass x, y, limit or top_k, and title; do not plot document evidence rows as if they were aggregate rows. "
-                    "When a clarification says one term means another, use the resolved term as the retrieval anchor; avoid hyphenated synonym paraphrases that introduce broad generic anchors. "
-                    "When the user specifies an output limit such as 'top 20', pass that through to the relevant aggregation or plot node instead of hardcoding your own. "
-                    "Treat clarification_history as authoritative user follow-up memory. If prior follow-up answers only resolve part of an ambiguity, ask only for the missing remainder instead of repeating the full earlier clarification prompt. "
-                    "Do not assume the corpus is news unless the question or corpus schema indicates that."
+                    """You are the planning module for a corpus agent operating over a user-provided corpus.
+
+                    Return strict JSON with keys:
+                    action, rewritten_question, assumptions, clarification_question, rejection_reason, message, plan_dag.
+
+                    Allowed actions: ask_clarification, emit_plan_dag, grounded_rejection.
+
+                    The plan_dag is a compact directed acyclic graph. Each node must include:
+                    node_id, capability, tool_name if a concrete tool is selected, inputs, depends_on.
+
+                    Do not assume the corpus is news unless the user question or corpus schema indicates that.
+
+                    Planning order:
+                    Step 1 — Rewrite the user question into a precise analytical task.
+                    Step 2 — Identify what the task requires to answer it (evidence snippets, corpus-wide aggregate, semantic similarity, linguistic structure, temporal alignment with external data, etc.). State this in rewritten_question and assumptions, not as a category label.
+                    Step 3 — Select capabilities directly from what the answer requires. For each capability:
+                      - If tool_catalog contains a typed repo tool that directly implements it, use that tool.
+                      - If multiple typed tools fit, choose the most specific.
+                      - If no typed tool fits, use python_runner with bounded inputs, an explicit expected_output_schema, and dependencies on already-materialized data.
+                      - Do not invent tool names or task names that are not documented in tool_catalog.
+                      - Prefer typed repo tools before python_runner, but do not force an ill-fitting typed tool when python_runner is the only way to correctly compute the requested analysis.
+                    Step 4 — For every retrieval node (db_search / sql_query_search), set retrieval_strategy to ONE of:
+                        precision_ranked     — small ranked set of best evidence (examples, quotes, supporting snippets);
+                        exhaustive_analytic  — population for aggregate/trend/compare/frequency/over-time/ranking questions;
+                        semantic_exploratory — similarity/themes/paraphrase/abbreviation coverage.
+                      Include retrieval_strategy_rationale: a one-sentence justification linking the choice to the rewritten question.
+
+                    Hard rules:
+
+                    R1 — exhaustive_analytic ⇒ retrieve_all=true OR SQL/filter pagination materializes the working set BEFORE any analysis runs. top_k is NEVER the population size in this mode; it may only be a preview limit, batch size, or safety fallback.
+
+                    R2 — For exhaustive_analytic plans:
+                      - include an explicit topical query string for db_search or sql_query_search;
+                      - use source/time/entity filters when the user or schema supplies them;
+                      - prefer one broad materialized working set plus filter_working_set over multiple overlapping retrieve_all searches;
+                      - run aggregate/statistical tools only after the working set is materialized;
+                      - emit candidate_count / filtered_count / coverage_notes diagnostics when tools support them.
+
+                    R3 — For precision_ranked plans:
+                      Use db_search plus fetch_documents. Set top_k, lexical_top_k, dense_top_k, rerank_top_k, and use_rerank to match the scope. Use reranking when the best evidence documents matter.
+
+                    R4 — For semantic_exploratory plans:
+                      Use embeddings/similarity capabilities when available — doc_embeddings, similarity_index, similarity_pairwise, word_embeddings, extract_acronyms. Combine with keyterms/entities and temporal summaries when the question asks over time.
+
+                    R5 — Every db_search or sql_query_search node has a non-empty query string derived from rewritten_question. No implicit query context.
+
+                    R6 — Use sql_query_search when hybrid retrieval is sparse/off-target, exact metadata filtering is needed, entity/source/time coverage is poor, or exhaustive_analytic needs full candidate materialization and SQL expresses the slice better than ranked retrieval. Use db_search when natural-language/hybrid retrieval is appropriate, when ranked evidence is needed, or for broad topical candidate generation before filtering.
+
+                    R7 — Every python_runner node lists input_artifacts (or upstream node references), operation_description, expected_output_schema, and resource_bounds (max_rows, max_runtime_seconds, batch_size where applicable). Use python_runner only when no typed tool exists, the typed tool failed in prior context, the user requested a custom statistic/transformation/visualization not covered by typed tools, or the computation is simple and bounded over an already-materialized working set.
+
+                    R8 — plot_artifact depends on an analytical table node, never on raw document evidence rows. Pass x, y, limit or top_k, and title. When the user specifies a limit such as "top 20", pass it through to aggregation and plot nodes.
+
+                    R9 — For verification, fact-checking, "did source X say Y", "is the claim Z true" questions: after claim_span_extract, add nli_verify_claims as a final analysis node. It returns per-claim supported/contradicted/neutral verdicts grounded in cross-encoder NLI against source-document sentences. Prefer nli_verify_claims over claim_strength_score for honest claim verification; claim_strength_score is a lexical heuristic.
+
+                    R10 — For linguistic questions about nouns, verbs, adjectives, grammatical roles, or subject-verb-object patterns: include sentence_split, tokenize, pos_morph, lemmatize, dependency_parse, extract_svo_triples, noun_chunks, named_entities, entity_linking. For noun frequency tables, use build_evidence_table with task_name='noun_frequency_distribution'. noun_frequency_distribution rows contain lemma, count, relative_frequency, document_frequency, rank. Plot noun distributions with x='lemma' and y='count'.
+
+                    R11 — For price/external-series explanation questions: combine external price/time series with time_series_aggregate, burst/change detection, keyterms, quote_extract, quote_attribute, claim_span_extract, claim_strength_score, NER/entity_linking, and an evidence table. Align corpus evidence windows with external time-series movement windows.
+
+                    R12 — Source filters: only when the user names specific outlets or the corpus metadata clearly supplies source names. Do not invent backend alias lists for broad phrases such as "Swiss newspapers" or "American media". If outlet aliases may be needed, list them in assumptions and keep source terms separate from topical query terms.
+
+                    R13 — Clarification policy: ask clarification only when the missing information would change the plan structure. If clarification_history resolves a term, use the resolved term as the retrieval anchor. If prior clarification resolved only part of an ambiguity, ask only for the remainder. When a clarification says one term means another, use the resolved term as the retrieval anchor and avoid broad synonym paraphrases that dilute retrieval.
+
+                    R14 — Rejection policy: use grounded_rejection only when the question cannot be answered from the available corpus/tools, violates constraints, or requires unavailable external data. Explain the missing requirement precisely in rejection_reason."""
                 ),
             },
             {
@@ -4385,15 +4420,24 @@ class MagicBoxOrchestrator:
                     "You are the grounded synthesis module for a corpus agent operating over a user-provided corpus. "
                     "Return JSON with keys answer_text, evidence_items, artifacts_used, unsupported_parts, caveats, claim_verdicts. "
                     "Use only the provided summaries, tool outputs, and evidence. "
+                    "\n\n"
+                    "answer_text is a markdown document with these conventions:\n"
+                    "- Open with an H2 (##) that restates the question as a thesis sentence.\n"
+                    "- Follow with prose that directly answers the question. Use H3 (###) subheadings ONLY if the answer has 3+ distinct dimensions (e.g. time period, entity, outlet); otherwise stay in flowing paragraphs.\n"
+                    "- Bullet lists only for genuine enumerations (e.g. ranked outlets).\n"
+                    "- Cite specific evidence with markdown links of the form [short label](#doc-<doc_id>). Use only doc_ids that appear in evidence_rows; pick the most representative snippet per claim. Multiple claims may link to the same doc_id.\n"
+                    "- DO NOT add a scope-limits paragraph or sentence at the end; scope, gaps, and limits live in the separate caveats / unsupported_parts JSON fields, not in answer_text.\n"
+                    "- DO NOT use the section labels 'Valid findings', 'Degraded analyses', 'Unavailable methods', or 'Unsupported parts' anywhere in answer_text.\n"
+                    "\n"
                     "Do not claim direct correspondence to stock-price moves or external market behavior unless an external series was explicitly attached. "
                     "When has_external_series is true and summary.external_series is present, use that compact external-series summary and do not say the external series is missing. "
                     "When summary contains entity_trend_time_series or time_series_summaries, treat those as valid temporal analysis rows; do not say a time breakdown is missing solely because evidence_rows are only examples. "
                     "Use summary.run_diagnostics to qualify answer scope: for aggregate questions, do not generalize beyond a small ranked slice, preview rows, or noisy/no-data analytical outputs. "
+                    "\n\n"
                     "STRICT SCIENTIFIC MODE: The user-message contains a `strict_signals` block with valid_signals, degraded_signals, unavailable_methods, null_metrics_by_node, and warnings. "
                     "Do NOT make claims that depend on metrics listed in null_metrics_by_node — those metrics are null because their source tool produced no rows. "
                     "Do NOT describe degraded_signals or unavailable_methods as if they had succeeded. "
-                    "Structure answer_text into clearly labeled sections: 'Valid findings:' (only from valid_signals), 'Degraded analyses:' (from degraded_signals, with the reason), and 'Unavailable methods:' (from unavailable_methods, with the reason). "
-                    "If a comparative question (e.g. A vs B) lacks data for one side, say so explicitly — do not paper over the gap by summarizing only the side that has data. "
+                    "If a comparative question (e.g. A vs B) lacks data for one side, say so explicitly in the prose where the comparison would otherwise be — do not paper over the gap by summarizing only the side that has data. "
                     "Put every entry from strict_signals.warnings into caveats. "
                     "Put every node in unavailable_methods into unsupported_parts. "
                     "Honest partial analysis beats fake complete analysis."
@@ -5197,6 +5241,72 @@ class MagicBoxOrchestrator:
         )
 
 
+def _extract_nli_summary(snapshot: AgentExecutionSnapshot) -> dict[str, Any] | None:
+    """Pull NLI verdicts off the execution snapshot for manifest metadata.
+
+    Returns None when no nli_verify_claims node ran. Returns the verdict
+    rows plus aggregated counts (supported / contradicted / neutral) when
+    the capability did run. The frontend uses presence of the resulting
+    metadata to decide whether to show real NLI verdicts vs the heuristic
+    claim_strength_score.
+    """
+    for node_id, result in snapshot.node_results.items():
+        record = next(
+            (rec for rec in snapshot.node_records if rec.node_id == node_id and rec.capability == "nli_verify_claims"),
+            None,
+        )
+        if record is None:
+            continue
+        payload = result.payload if hasattr(result, "payload") else {}
+        metadata = result.metadata if hasattr(result, "metadata") else {}
+        rows = payload.get("rows") if isinstance(payload, dict) else None
+        if not isinstance(rows, list):
+            rows = []
+        stats = {
+            "claims_evaluated": int(metadata.get("claims_evaluated", len(rows))) if isinstance(metadata, dict) else len(rows),
+            "claims_supported": int(metadata.get("claims_supported", 0)) if isinstance(metadata, dict) else 0,
+            "claims_contradicted": int(metadata.get("claims_contradicted", 0)) if isinstance(metadata, dict) else 0,
+            "claims_neutral": int(metadata.get("claims_neutral", 0)) if isinstance(metadata, dict) else 0,
+            "verdict_threshold": float(metadata.get("verdict_threshold", 0.7)) if isinstance(metadata, dict) else 0.7,
+            "premises_per_claim": int(metadata.get("premises_per_claim", 3)) if isinstance(metadata, dict) else 3,
+            "nli_model": str(metadata.get("nli_model", "")) if isinstance(metadata, dict) else "",
+            "node_id": record.node_id,
+        }
+        return {"rows": rows, "stats": stats}
+    return None
+
+
+_RUNTIME_LIMITER_ENV_VARS = (
+    # Retrieval-side caps
+    "CORPUSAGENT2_RETRIEVAL_RERANK_TOP_K",
+    "CORPUSAGENT2_RETRIEVAL_FUSION_K",
+    # Analysis-side per-capability caps
+    "CORPUSAGENT2_WORKING_SET_ANALYSIS_MAX_DOCS",
+    "CORPUSAGENT2_NOUN_SPACY_MAX_DOCS",
+    "CORPUSAGENT2_ENTITY_ANALYSIS_MAX_DOCS",
+    "CORPUSAGENT2_ENTITY_PROVIDER_MAX_DOCS",
+    "CORPUSAGENT2_TOPIC_MODEL_ANALYSIS_MAX_DOCS",
+    "CORPUSAGENT2_SENTIMENT_ANALYSIS_MAX_DOCS",
+    # Python-runner sandbox bounds
+    "CORPUSAGENT2_PYTHON_RUNNER_TIMEOUT_S",
+    "CORPUSAGENT2_PYTHON_RUNNER_CPUS",
+    "CORPUSAGENT2_PYTHON_RUNNER_MEMORY",
+    # Executor scheduling bounds
+    "CORPUSAGENT2_NODE_DEFAULT_TIMEOUT_S",
+    "CORPUSAGENT2_NODE_MAX_ATTEMPTS",
+)
+
+
+def _collect_runtime_limiters() -> dict[str, Any]:
+    """Surface every numeric/text cap that can silently truncate analysis.
+
+    The user explicitly asked for visibility on hidden choke points. Values
+    are reported exactly as the environment provides them (empty string =
+    unset, in which case the capability's internal default applies).
+    """
+    return {name: os.getenv(name, "") for name in _RUNTIME_LIMITER_ENV_VARS}
+
+
 class AgentRuntime:
     def __init__(
         self,
@@ -5258,6 +5368,94 @@ class AgentRuntime:
             self._startup_repaired_runs = int(self.working_store.cleanup_interrupted_runs())
         except Exception:
             self._startup_repaired_runs = 0
+
+        self._warmup_state: dict[str, Any] = {
+            "complete": False,
+            "started_at_utc": datetime.now(UTC).isoformat(),
+            "completed_at_utc": None,
+            "duration_ms": None,
+            "stages": {},
+            "errors": [],
+        }
+        self._warmup_thread = threading.Thread(
+            target=self._run_warmup, name="agent-warmup", daemon=True
+        )
+        self._warmup_thread.start()
+
+    _EXPECTED_WARMUP_STAGES = ("torch_init", "spacy_en_load", "llm_endpoint_reachable")
+
+    def _run_warmup(self) -> None:
+        started = time.monotonic()
+        self._warmup_stage("torch_init", self._warmup_probe_torch)
+        self._warmup_stage("spacy_en_load", self._warmup_probe_spacy_en)
+        self._warmup_stage("llm_endpoint_reachable", self._warmup_probe_llm)
+        if dense_retrieval_enabled(default=False):
+            self._warmup_stage("dense_embedder_load", self._warmup_probe_dense_embedder)
+        self._warmup_state["complete"] = True
+        self._warmup_state["completed_at_utc"] = datetime.now(UTC).isoformat()
+        self._warmup_state["duration_ms"] = round((time.monotonic() - started) * 1000, 1)
+
+    def _warmup_stage(self, name: str, fn: Callable[[], None]) -> None:
+        started = time.monotonic()
+        try:
+            fn()
+            self._warmup_state["stages"][name] = {
+                "ok": True,
+                "duration_ms": round((time.monotonic() - started) * 1000, 1),
+            }
+        except Exception as exc:
+            self._warmup_state["stages"][name] = {
+                "ok": False,
+                "duration_ms": round((time.monotonic() - started) * 1000, 1),
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+            self._warmup_state["errors"].append(f"{name}: {type(exc).__name__}: {exc}")
+
+    def _warmup_probe_torch(self) -> None:
+        import torch  # noqa: F401
+
+        _ = torch.cuda.is_available()
+
+    def _warmup_probe_spacy_en(self) -> None:
+        import spacy
+
+        _ = spacy.load("en_core_web_sm")
+
+    def _warmup_probe_llm(self) -> None:
+        import socket
+        from urllib.parse import urlparse
+
+        parsed = urlparse(self.llm_config.base_url or "")
+        host = parsed.hostname
+        if not host:
+            raise RuntimeError("LLM base_url has no host")
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        with socket.create_connection((host, port), timeout=5):
+            pass
+
+    def _warmup_probe_dense_embedder(self) -> None:
+        dense_id = self.runtime.dense_model_id
+        if not dense_id:
+            return
+        from sentence_transformers import SentenceTransformer
+
+        _ = SentenceTransformer(dense_id, device="cpu")
+
+    def warmup_info(self) -> dict[str, Any]:
+        """Snapshot of background warmup progress for /health and /runtime-info."""
+        state = {
+            "complete": bool(self._warmup_state.get("complete")),
+            "started_at_utc": self._warmup_state.get("started_at_utc"),
+            "completed_at_utc": self._warmup_state.get("completed_at_utc"),
+            "duration_ms": self._warmup_state.get("duration_ms"),
+            "stages": dict(self._warmup_state.get("stages", {})),
+            "errors": list(self._warmup_state.get("errors", [])),
+        }
+        expected = list(self._EXPECTED_WARMUP_STAGES)
+        if dense_retrieval_enabled(default=False):
+            expected.append("dense_embedder_load")
+        state["pending_stages"] = [name for name in expected if name not in state["stages"]]
+        return state
 
     def _build_search_backend(self):
         lexical_backend = None
@@ -5690,6 +5888,19 @@ class AgentRuntime:
                 if status.status not in TERMINAL_RUN_STATUSES
             ]
 
+    def list_live_runs(self) -> list[dict[str, Any]]:
+        """Snapshot of currently in-flight (non-terminal) live runs.
+
+        Returns dicts compatible with the agent_run_history row shape so the
+        /runs endpoint can prepend them to the persisted history list.
+        """
+        with self._run_lock:
+            return [
+                status.to_dict()
+                for status in self._live_runs.values()
+                if status.status not in TERMINAL_RUN_STATUSES
+            ]
+
     def _provider_modules_installed(self) -> dict[str, bool]:
         if self._provider_modules_cache is None:
             self._provider_modules_cache = {
@@ -5854,6 +6065,7 @@ class AgentRuntime:
             "provider_order": provider_orders,
             "corpus": corpus_info,
             "capability_count": len(self.registry.list_tools()),
+            "limiters": _collect_runtime_limiters(),
             "retrieval": {
                 "backend": self.runtime.retrieval_backend,
                 "configured_default_mode": configured_default_mode,
@@ -5874,19 +6086,17 @@ class AgentRuntime:
                 "Classical spaCy/textacy/gensim analytics are usually CPU-bound even when CUDA is available.",
                 "GPU is mainly relevant for torch- or Flair-backed models and only when those providers are selected.",
                 "Per-node provider choice and artifacts are captured in the run manifest so you can verify what really ran.",
-                "Some analytics remain heuristic by design in the prototype, especially claim scoring, quote attribution, and burst detection; check provenance and caveats per node.",
-                "Provider chips are import checks only; per-node provenance shows which provider actually executed.",
                 (
                     f"Recovered {self._startup_repaired_runs} interrupted run(s) from 'started' to 'failed' on startup."
                     if self._startup_repaired_runs
                     else "No interrupted runs needed cleanup on startup."
                 ),
-                (
-                    f"Dense retrieval is using '{retrieval_health['dense_strategy']}' because full-corpus dense assets are not fully ready yet."
+                *(
+                    [f"Dense retrieval is using '{retrieval_health['dense_strategy']}' because full-corpus dense assets are not fully ready yet."]
                     if not retrieval_health["full_corpus_dense_ready"] and retrieval_health["dense_candidate_fallback_ready"]
-                    else "Full-corpus dense retrieval is ready."
+                    else []
                     if retrieval_health["full_corpus_dense_ready"]
-                    else "Dense retrieval is unavailable until corpus metadata is loaded."
+                    else ["Dense retrieval is unavailable until corpus metadata is loaded."]
                 ),
                 *(
                     [f"doc_metadata.parquet is missing on this host: {retrieval_health['metadata_error']}. Local lexical/dense assets and corpus row counts will read as 0 until the file is restored or re-built."]
@@ -6751,6 +6961,68 @@ class AgentRuntime:
                 if maybe_aborted is not None:
                     return maybe_aborted
 
+        retrieval_bailout_failures = [
+            failure
+            for failure in snapshot.failures
+            if failure.capability in _RETRIEVAL_BAILOUT_CAPABILITIES
+        ]
+        if retrieval_bailout_failures and snapshot.status == "failed":
+            bailout_reason = "; ".join(
+                failure.message for failure in retrieval_bailout_failures if failure.message
+            ) or "Retrieval returned no documents matching the requested scope."
+            self._set_live_status(
+                run_id,
+                current_phase="empty_retrieval_one_shot",
+                detail=f"Retrieval returned no documents; producing model-only answer. {bailout_reason}",
+                planner_actions=list(state.planner_actions),
+                llm_traces=list(state.llm_traces),
+            )
+            one_shot_answer = self._out_of_corpus_model_answer(
+                state=state,
+                unsupported_reason=f"No documents matched: {bailout_reason}",
+            )
+            manifest = AgentRunManifest(
+                run_id=run_id,
+                question=question,
+                rewritten_question=state.rewritten_question,
+                status="rejected",
+                clarification_questions=[],
+                assumptions=list(state.assumptions),
+                planner_actions=list(state.planner_actions),
+                plan_dags=plan_dags,
+                tool_calls=self._current_tool_calls(run_id),
+                selected_docs=list(snapshot.selected_docs),
+                node_records=list(snapshot.node_records),
+                provenance_records=list(snapshot.provenance_records),
+                evidence_table=[],
+                final_answer=one_shot_answer,
+                artifacts_dir=str(artifacts_dir),
+                failures=list(snapshot.failures),
+                metadata={
+                    "force_answer": bool(state.force_answer),
+                    "no_cache": bool(state.no_cache),
+                    "planner_calls_used": state.planner_calls_used,
+                    "clarification_history": list(state.clarification_history),
+                    "llm_traces": list(state.llm_traces),
+                    "runtime_info": self.runtime_info(),
+                    "answer_grounding": "model_only_out_of_corpus",
+                    "out_of_corpus_model_answer": True,
+                    "corpus_unsupported_reason": bailout_reason,
+                    "out_of_corpus_model": self.llm_config.planner_model,
+                    "retrieval_bailout_one_shot": True,
+                },
+            )
+            self._set_live_status(
+                run_id,
+                status="rejected",
+                current_phase="empty_retrieval_one_shot",
+                detail=bailout_reason,
+                planner_actions=list(state.planner_actions),
+                llm_traces=list(state.llm_traces),
+            )
+            self._persist_manifest(manifest)
+            return manifest
+
         self._set_live_status(run_id, current_phase="final_synthesis", detail="Synthesizing grounded answer")
         maybe_aborted = self._maybe_abort(
             run_id=run_id,
@@ -6771,6 +7043,20 @@ class AgentRuntime:
             plan_dags=plan_dags,
         )
         self._attach_execution_diagnostic_to_answer(final_answer, execution_diagnostics)
+        nli_summary = _extract_nli_summary(snapshot)
+        manifest_metadata: dict[str, Any] = {
+            "force_answer": bool(state.force_answer),
+            "no_cache": bool(state.no_cache),
+            "planner_calls_used": state.planner_calls_used,
+            "clarification_history": list(state.clarification_history),
+            "llm_traces": list(state.llm_traces),
+            "runtime_info": self.runtime_info(),
+            "execution_diagnostics": execution_diagnostics,
+        }
+        if nli_summary is not None:
+            manifest_metadata["nli_verifier_ran"] = True
+            manifest_metadata["nli_verdicts"] = nli_summary["rows"]
+            manifest_metadata["nli_stats"] = nli_summary["stats"]
         manifest = AgentRunManifest(
             run_id=run_id,
             question=question,
@@ -6788,15 +7074,7 @@ class AgentRuntime:
             final_answer=final_answer,
             artifacts_dir=str(artifacts_dir),
             failures=list(snapshot.failures),
-            metadata={
-                "force_answer": bool(state.force_answer),
-                "no_cache": bool(state.no_cache),
-                "planner_calls_used": state.planner_calls_used,
-                "clarification_history": list(state.clarification_history),
-                "llm_traces": list(state.llm_traces),
-                "runtime_info": self.runtime_info(),
-                "execution_diagnostics": execution_diagnostics,
-            },
+            metadata=manifest_metadata,
         )
         self._persist_manifest(manifest)
         return manifest
@@ -6897,12 +7175,102 @@ class AgentRuntime:
         thread.start()
         return status
 
+    def replan_from_run(
+        self,
+        prior_run_id: str,
+        *,
+        additional_instruction: str = "",
+    ) -> LiveRunStatus:
+        """Submit a new run that inherits the prior run's question, assumptions,
+        and working-set context. The planner is told to reuse the existing
+        working_set_ref via filter_working_set instead of re-running db_search.
+        """
+        prior = self.get_run(prior_run_id)
+        question = str(prior.get("question") or prior.get("rewritten_question") or "").strip()
+        if not question:
+            raise ValueError(f"Prior run {prior_run_id} has no question text to replan from")
+
+        prior_assumptions = [
+            str(item).strip()
+            for item in (prior.get("assumptions") or [])
+            if str(item).strip()
+        ]
+        prior_failures = [
+            str(failure.get("capability") or failure.get("node_id") or "").strip()
+            for failure in (prior.get("failures") or [])
+            if isinstance(failure, dict)
+        ]
+        prior_failures = [name for name in prior_failures if name]
+
+        working_set_refs: list[tuple[str, int]] = []
+        seen_refs: set[str] = set()
+        for call in prior.get("tool_calls") or []:
+            if not isinstance(call, dict):
+                continue
+            summary = call.get("summary") or {}
+            payload_preview = summary.get("payload_preview") if isinstance(summary, dict) else None
+            if not isinstance(payload_preview, dict):
+                continue
+            ref = str(payload_preview.get("working_set_ref") or "").strip()
+            if not ref or ref in seen_refs:
+                continue
+            seen_refs.add(ref)
+            try:
+                count = int(payload_preview.get("document_count") or 0)
+            except (TypeError, ValueError):
+                count = 0
+            working_set_refs.append((ref, count))
+
+        synthetic_parts: list[str] = []
+        synthetic_parts.append(
+            f"REPLAN: This is a re-plan of prior run {prior_run_id}. "
+            f"Original question is unchanged. Build a new plan that improves on "
+            f"the prior plan."
+        )
+        if working_set_refs:
+            ref_lines = ", ".join(f"{ref} ({count} docs)" for ref, count in working_set_refs)
+            synthetic_parts.append(
+                f"Prior run produced working set(s): {ref_lines}. "
+                f"Reuse the largest of these via filter_working_set (working_set_ref=\"<ref>\") "
+                f"instead of running new db_search/fetch_documents, unless the prior retrieval is the "
+                f"root cause being investigated."
+            )
+        if prior_assumptions:
+            synthetic_parts.append("Prior assumptions to keep in mind: " + " | ".join(prior_assumptions))
+        if prior_failures:
+            synthetic_parts.append(
+                "Prior failed nodes/capabilities (avoid where possible, or substitute): "
+                + ", ".join(sorted(set(prior_failures)))
+            )
+        if additional_instruction.strip():
+            synthetic_parts.append("Additional user instruction: " + additional_instruction.strip())
+
+        synthetic_entry = " ".join(synthetic_parts)
+        clarification_history: list[str] = list(prior.get("clarification_questions") or [])
+        clarification_history.append(synthetic_entry)
+
+        force_answer = bool((prior.get("metadata") or {}).get("force_answer", False))
+        return self.submit_query(
+            question,
+            force_answer=force_answer,
+            no_cache=True,
+            clarification_history=clarification_history,
+        )
+
     def _persist_manifest(self, manifest: AgentRunManifest) -> None:
         manifest_path = Path(manifest.artifacts_dir) / "run_manifest.json"
+        if not manifest.finished_at_utc:
+            manifest.finished_at_utc = datetime.now(UTC).isoformat()
         save_agent_manifest(manifest_path, manifest.to_dict())
         try:
             self.working_store.record_output(manifest.run_id, "final_answer", manifest.final_answer.to_dict())
             self.working_store.finalize_run(manifest.run_id, manifest.status)
+        except Exception:
+            pass
+        try:
+            from . import run_history as _run_history
+
+            _run_history.record_run(manifest.to_dict(), manifest_path=str(manifest_path))
         except Exception:
             pass
         self._set_live_status(

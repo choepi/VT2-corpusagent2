@@ -28,6 +28,15 @@ class QueryRequest(BaseModel):
     )
 
 
+class ReplanRequest(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    additional_instruction: str = Field(
+        default="",
+        validation_alias=AliasChoices("additional_instruction", "additionalInstruction"),
+    )
+
+
 class LLMSettingsRequest(BaseModel):
     use_openai: bool
     planner_model: str = Field(default="")
@@ -59,7 +68,14 @@ def build_app(runtime: AgentRuntime | None = None, project_root: Path | None = N
 
     @app.get("/health")
     def health() -> dict[str, Any]:
-        return {"status": "ok", "service": "corpusagent2-agent-runtime"}
+        warmup = resolved_runtime.warmup_info()
+        return {
+            "status": "ok",
+            "service": "corpusagent2-agent-runtime",
+            "ready": bool(warmup.get("complete")),
+            "warming": list(warmup.get("pending_stages", [])),
+            "warmup_errors": list(warmup.get("errors", [])),
+        }
 
     @app.get("/capabilities")
     def capabilities() -> dict[str, Any]:
@@ -67,7 +83,9 @@ def build_app(runtime: AgentRuntime | None = None, project_root: Path | None = N
 
     @app.get("/runtime-info")
     def runtime_info() -> dict[str, Any]:
-        return resolved_runtime.runtime_info()
+        info = resolved_runtime.runtime_info()
+        info["warmup"] = resolved_runtime.warmup_info()
+        return info
 
     @app.get("/tool-usage")
     def tool_usage() -> dict[str, Any]:
@@ -97,6 +115,113 @@ def build_app(runtime: AgentRuntime | None = None, project_root: Path | None = N
         except RuntimeError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
 
+    @app.post("/diagnostics/dry-run")
+    def diagnostics_dry_run() -> dict[str, Any]:
+        """Smoke-test the API surface without prompting an LLM.
+
+        Verifies warmup state, capability registry, LLM endpoint reachability,
+        retrieval health, and python_runner availability. Every check is
+        wrapped so one failure does not mask the others.
+        """
+        import socket
+        import time
+        from urllib.parse import urlparse
+
+        started_total = time.monotonic()
+        checks: dict[str, Any] = {}
+        overall_ok = True
+
+        warmup = resolved_runtime.warmup_info()
+        checks["warmup"] = {
+            "ok": bool(warmup.get("complete")),
+            "ready": bool(warmup.get("complete")),
+            "pending_stages": list(warmup.get("pending_stages", [])),
+            "errors": list(warmup.get("errors", [])),
+            "duration_ms": warmup.get("duration_ms"),
+        }
+        if not checks["warmup"]["ok"]:
+            overall_ok = False
+
+        try:
+            tools = list(resolved_runtime.registry.list_tools())
+            checks["capability_registry"] = {"ok": True, "tool_count": len(tools)}
+        except Exception as exc:
+            checks["capability_registry"] = {
+                "ok": False,
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+            overall_ok = False
+
+        started = time.monotonic()
+        try:
+            parsed = urlparse(resolved_runtime.llm_config.base_url or "")
+            host = parsed.hostname
+            if not host:
+                raise RuntimeError("LLM base_url has no host")
+            port = parsed.port or (443 if parsed.scheme == "https" else 80)
+            with socket.create_connection((host, port), timeout=5):
+                pass
+            checks["llm_endpoint"] = {
+                "ok": True,
+                "host": host,
+                "port": port,
+                "duration_ms": round((time.monotonic() - started) * 1000, 1),
+            }
+        except Exception as exc:
+            checks["llm_endpoint"] = {
+                "ok": False,
+                "error": f"{type(exc).__name__}: {exc}",
+                "duration_ms": round((time.monotonic() - started) * 1000, 1),
+            }
+            overall_ok = False
+
+        started = time.monotonic()
+        try:
+            retrieval_health = resolved_runtime._cached_retrieval_health()
+            checks["retrieval"] = {
+                "ok": True,
+                "health": retrieval_health,
+                "duration_ms": round((time.monotonic() - started) * 1000, 1),
+            }
+        except Exception as exc:
+            checks["retrieval"] = {
+                "ok": False,
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+            overall_ok = False
+
+        started = time.monotonic()
+        try:
+            result = resolved_runtime.python_runner.run(
+                code="import json; open(OUTPUT_DIR + '/result.json', 'w').write(json.dumps({'value': 42}))",
+                inputs_json={},
+            )
+            artifact_count = len(getattr(result, "artifacts", []) or [])
+            exit_code = getattr(result, "exit_code", None)
+            checks["python_runner"] = {
+                "ok": exit_code == 0,
+                "exit_code": exit_code,
+                "artifact_count": artifact_count,
+                "duration_ms": round((time.monotonic() - started) * 1000, 1),
+                "stdout_tail": (getattr(result, "stdout", "") or "")[-400:],
+                "stderr_tail": (getattr(result, "stderr", "") or "")[-400:],
+            }
+            if not checks["python_runner"]["ok"]:
+                overall_ok = False
+        except Exception as exc:
+            checks["python_runner"] = {
+                "ok": False,
+                "error": f"{type(exc).__name__}: {exc}",
+                "duration_ms": round((time.monotonic() - started) * 1000, 1),
+            }
+            overall_ok = False
+
+        return {
+            "ok": overall_ok,
+            "duration_ms": round((time.monotonic() - started_total) * 1000, 1),
+            "checks": checks,
+        }
+
     @app.post("/query")
     def query(request: QueryRequest) -> dict[str, Any]:
         if request.async_mode:
@@ -124,6 +249,44 @@ def build_app(runtime: AgentRuntime | None = None, project_root: Path | None = N
             clarification_history=request.clarification_history,
         )
         return status.to_dict()
+
+    @app.get("/runs")
+    def list_runs(limit: int = 50, offset: int = 0) -> dict[str, Any]:
+        """Return the most recent runs from the agent_run_history table,
+        plus any currently in-flight runs from the runtime's live registry.
+
+        Live runs are merged at the top so the UI can show "running" rows
+        before they've been persisted to Postgres on completion.
+        """
+        from . import run_history as _run_history
+
+        persisted = _run_history.list_runs(limit=limit, offset=offset)
+        persisted_ids = {str(r.get("run_id") or "") for r in persisted}
+
+        live_rows: list[dict[str, Any]] = []
+        try:
+            live_runs = resolved_runtime.list_live_runs()
+        except Exception:
+            live_runs = []
+        for live in live_runs:
+            run_id = str(live.get("run_id") or "")
+            if not run_id or run_id in persisted_ids:
+                continue
+            live_rows.append({
+                "run_id": run_id,
+                "question": live.get("question") or "",
+                "status": live.get("status") or "running",
+                "created_at_utc": live.get("started_at_utc") or "",
+                "completed_at_utc": None,
+                "duration_ms": None,
+                "node_count": len(live.get("completed_steps") or []),
+                "failure_count": len(live.get("failed_steps") or []),
+                "artifacts_dir": None,
+                "manifest_path": None,
+            })
+
+        merged = live_rows + persisted
+        return {"runs": merged, "limit": int(limit), "offset": int(offset)}
 
     @app.get("/runs/{run_id}")
     def get_run(run_id: str) -> dict[str, Any]:
@@ -155,6 +318,19 @@ def build_app(runtime: AgentRuntime | None = None, project_root: Path | None = N
             return resolved_runtime.abort_run(run_id)
         except FileNotFoundError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.post("/runs/{run_id}/replan")
+    def replan_run(run_id: str, request: ReplanRequest | None = None) -> dict[str, Any]:
+        try:
+            status = resolved_runtime.replan_from_run(
+                run_id,
+                additional_instruction=(request.additional_instruction if request else ""),
+            )
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return status.to_dict()
 
     @app.post("/runs/abort-all")
     def abort_all_runs() -> dict[str, Any]:

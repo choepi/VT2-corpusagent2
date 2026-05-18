@@ -2779,7 +2779,7 @@ def _load_flair_object(kind: str) -> Any | None:
     return obj
 
 
-def _db_search(params: dict[str, Any], deps: dict[str, ToolExecutionResult], context: AgentExecutionContext) -> ToolExecutionResult:
+def _db_search_run(params: dict[str, Any], deps: dict[str, ToolExecutionResult], context: AgentExecutionContext) -> ToolExecutionResult:
     query = str(
         params.get("query")
         or getattr(context.state, "rewritten_question", "")
@@ -3053,6 +3053,125 @@ def _db_search(params: dict[str, Any], deps: dict[str, ToolExecutionResult], con
     )
 
 
+_AUTO_BROADEN_FLOOR = 30
+_AUTO_BROADEN_FRACTION = 0.5
+
+
+def _auto_broaden_enabled() -> bool:
+    return _env_flag("CORPUSAGENT2_AUTO_BROADEN_SEARCH", True)
+
+
+def _search_returned_count(result: ToolExecutionResult) -> int:
+    payload = result.payload if isinstance(result.payload, dict) else {}
+    for key in ("document_count", "result_count", "full_result_count"):
+        try:
+            value = int(payload.get(key) or 0)
+        except (TypeError, ValueError):
+            value = 0
+        if value:
+            return value
+    metadata = result.metadata if isinstance(result.metadata, dict) else {}
+    try:
+        return int(metadata.get("full_result_count") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _requested_top_k_value(params: dict[str, Any]) -> int:
+    for key in ("top_k", "lexical_top_k", "dense_top_k"):
+        try:
+            value = int(params.get(key) or 0)
+        except (TypeError, ValueError):
+            value = 0
+        if value > 0:
+            return value
+    return 0
+
+
+def _broadened_search_params(
+    params: dict[str, Any], step: int, original_top_k: int
+) -> tuple[dict[str, Any], str]:
+    broadened = dict(params)
+    notes: list[str] = []
+    bump = max(original_top_k * 3, 200)
+    for key in ("top_k", "lexical_top_k", "dense_top_k"):
+        try:
+            current = int(broadened.get(key) or 0)
+        except (TypeError, ValueError):
+            current = 0
+        if current and current < bump:
+            broadened[key] = bump
+            notes.append(f"{key}={bump}")
+    mode = str(broadened.get("retrieval_mode", "")).strip().lower()
+    upgrade = {"lexical": "hybrid", "tfidf": "hybrid", "hybrid": "dense"}
+    if mode in upgrade:
+        broadened["retrieval_mode"] = upgrade[mode]
+        notes.append(f"mode->{upgrade[mode]}")
+    if step >= 2:
+        if broadened.get("date_from") or broadened.get("date_to"):
+            broadened["date_from"] = ""
+            broadened["date_to"] = ""
+            notes.append("dropped date filter")
+        elif str(broadened.get("retrieval_strategy", "")).strip() not in ("", "semantic_exploratory"):
+            broadened["retrieval_strategy"] = "semantic_exploratory"
+            notes.append("strategy=semantic_exploratory")
+    return broadened, ", ".join(notes) if notes else "no-op"
+
+
+def _db_search(
+    params: dict[str, Any], deps: dict[str, ToolExecutionResult], context: AgentExecutionContext
+) -> ToolExecutionResult:
+    result = _db_search_run(params, deps, context)
+    if not _auto_broaden_enabled():
+        return result
+    if bool(params.get("retrieve_all")):
+        return result
+    requested = _requested_top_k_value(params)
+    if not requested:
+        return result
+    returned = _search_returned_count(result)
+    threshold = max(_AUTO_BROADEN_FLOOR, int(requested * _AUTO_BROADEN_FRACTION))
+    if returned >= _AUTO_BROADEN_FLOOR and returned >= int(requested * _AUTO_BROADEN_FRACTION):
+        return result
+    initial_returned = returned
+    current_params = dict(params)
+    notes_accum: list[str] = []
+    for step in (1, 2):
+        broadened_params, note = _broadened_search_params(current_params, step, requested)
+        if note == "no-op":
+            break
+        broadened_result = _db_search_run(broadened_params, deps, context)
+        broadened_returned = _search_returned_count(broadened_result)
+        if broadened_returned <= returned:
+            break
+        result = broadened_result
+        returned = broadened_returned
+        notes_accum.append(note)
+        current_params = broadened_params
+        if returned >= _AUTO_BROADEN_FLOOR and returned >= int(requested * _AUTO_BROADEN_FRACTION):
+            break
+    if notes_accum:
+        caveat = (
+            f"Initial search returned {initial_returned} docs (asked for {requested}); "
+            f"automatically broadened ({'; '.join(notes_accum)}) and got {returned}. "
+            f"Downstream analysis still filters the result set by date, entity, and quality."
+        )
+        meta = dict(result.metadata) if isinstance(result.metadata, dict) else {}
+        meta["auto_broadened"] = True
+        meta["auto_broaden_initial_count"] = initial_returned
+        meta["auto_broaden_final_count"] = returned
+        meta["auto_broaden_steps"] = notes_accum
+        result = ToolExecutionResult(
+            payload=result.payload,
+            evidence=result.evidence,
+            artifacts=result.artifacts,
+            caveats=list(result.caveats) + [caveat],
+            unsupported_parts=result.unsupported_parts,
+            metadata=meta,
+        )
+    return result
+
+
 def _sql_query_search(params: dict[str, Any], deps: dict[str, ToolExecutionResult], context: AgentExecutionContext) -> ToolExecutionResult:
     query = str(
         params.get("query")
@@ -3299,7 +3418,7 @@ def _fetch_documents(params: dict[str, Any], deps: dict[str, ToolExecutionResult
 
 def _create_working_set(params: dict[str, Any], deps: dict[str, ToolExecutionResult], context: AgentExecutionContext) -> ToolExecutionResult:
     filters = dict(params.get("filter", {})) if isinstance(params.get("filter"), dict) else {}
-    upstream_ref = str(params.get("working_set_ref", "") or _working_set_ref(deps)).strip()
+    upstream_ref = _resolve_working_set_ref(params, deps).strip()
     if upstream_ref and not filters:
         count = _count_working_set(context, upstream_ref, 0)
         preview_ids = _fetch_working_set_ids(context, upstream_ref, limit=_result_preview_limit())
@@ -3639,7 +3758,7 @@ def _filter_working_set(params: dict[str, Any], deps: dict[str, ToolExecutionRes
     document_filters = {key: value for key, value in filters.items() if str(key) not in annotation_filter_keys}
     limit = _positive_int_param(params.get("limit", params.get("top_k", params.get("max_documents"))))
     sort_specs = _working_set_sort_specs(params)
-    upstream_ref = str(params.get("working_set_ref", "") or _resolve_working_set_ref(params, deps)).strip()
+    upstream_ref = _resolve_working_set_ref(params, deps).strip()
     if not upstream_ref:
         return ToolExecutionResult(
             payload={"results": [], "document_count": 0},
@@ -5688,7 +5807,7 @@ def _doc_embeddings(params: dict[str, Any], deps: dict[str, ToolExecutionResult]
     from corpusagent2 import strict_mode as _strict
 
     max_documents = _working_set_analysis_max_documents()
-    docs, deref_diag = resolve_documents_from_node(deps, context, text_field="text", max_documents=max_documents)
+    docs, deref_diag = resolve_documents_from_node(deps, context, text_field="text", max_documents=max_documents, params=params)
     if not docs:
         return ToolExecutionResult(
             payload={"rows": [], "diagnostics": deref_diag, "warnings": ["could_not_resolve_documents"]},
@@ -5732,7 +5851,7 @@ def _similarity_index(params: dict[str, Any], deps: dict[str, ToolExecutionResul
     from corpusagent2 import strict_mode as _strict
 
     max_documents = _working_set_analysis_max_documents()
-    docs, deref_diag = resolve_documents_from_node(deps, context, text_field="text", max_documents=max_documents)
+    docs, deref_diag = resolve_documents_from_node(deps, context, text_field="text", max_documents=max_documents, params=params)
     if len(docs) < 2:
         reason = "no_embeddings" if not docs else "insufficient_documents_for_similarity"
         return ToolExecutionResult(
@@ -6152,7 +6271,220 @@ def _time_series_rows_from_named_metrics(
     return rows, skipped
 
 
-def _time_series_aggregate(params: dict[str, Any], deps: dict[str, ToolExecutionResult], context: AgentExecutionContext) -> ToolExecutionResult:
+def _time_series_aggregate(
+    params: dict[str, Any], deps: dict[str, ToolExecutionResult], context: AgentExecutionContext
+) -> ToolExecutionResult:
+    """Public capability. Wraps the real implementation in an LLM-managed
+    python_runner fallback so a shape-mismatch / pandas exception does not
+    halt the run. See _time_series_python_llm_fallback for the recovery path.
+    """
+    try:
+        return _time_series_aggregate_impl(params, deps, context)
+    except Exception as exc:
+        return _time_series_python_llm_fallback(params, deps, context, exc)
+
+
+def _time_series_python_llm_fallback(
+    params: dict[str, Any],
+    deps: dict[str, ToolExecutionResult],
+    context: AgentExecutionContext,
+    original_error: Exception,
+) -> ToolExecutionResult:
+    """Recover from time_series_aggregate exception with an LLM-written python_runner script.
+
+    The LLM sees the original params, a sample of upstream rows, and the
+    exception. It produces a pandas script that adapts the row shape and
+    emits TSA-shape rows. The script runs in the sandbox; output is
+    validated minimally (period + value present) before returning. On any
+    sub-failure the node returns no_data honestly with the captured script,
+    error, and stdout/stderr for debugging.
+    """
+    error_label = f"{type(original_error).__name__}: {original_error}"
+
+    if context.llm_client is None or context.python_runner is None:
+        return ToolExecutionResult(
+            payload={"rows": [], "skipped_row_count": 0},
+            caveats=[f"time_series_aggregate failed and the python fallback path is unavailable: {error_label}"],
+            metadata={
+                "no_data": True,
+                "no_data_reason": "tsa_failed_no_fallback",
+                "tsa_original_error": error_label,
+            },
+        )
+
+    upstream_rows: list[dict[str, Any]] = []
+    upstream_source: str = ""
+    for dep_name, dep_result in deps.items():
+        if not isinstance(dep_result.payload, dict):
+            continue
+        rows = dep_result.payload.get("rows")
+        if isinstance(rows, list) and rows:
+            upstream_rows = [row for row in rows if isinstance(row, dict)]
+            upstream_source = dep_name
+            break
+
+    sample_for_prompt = upstream_rows[:5]
+    granularity = (
+        params.get("granularity")
+        or params.get("frequency")
+        or params.get("time_granularity")
+        or params.get("interval")
+        or _default_time_granularity()
+    )
+
+    llm_messages = [
+        {
+            "role": "system",
+            "content": (
+                "You are repairing a failed time_series_aggregate call. Read INPUTS_JSON['rows'] "
+                "and produce a JSON file at Path(OUTPUT_DIR, 'result.json') containing a key 'rows' "
+                "whose value is a list of dicts with at least keys 'period' and 'value'. Use the "
+                "string 'period' format that matches INPUTS_JSON['granularity']: month -> 'YYYY-MM', "
+                "year -> 'YYYY', day -> 'YYYY-MM-DD'. Add a 'group' field when the data has an "
+                "entity/series label. Use pandas. Do not raise — if a row cannot be parsed, skip it. "
+                "Return strict JSON with keys: code (the full python script), explanation (one sentence "
+                "describing what you adapted)."
+            ),
+        },
+        {
+            "role": "user",
+            "content": json.dumps(
+                {
+                    "tsa_params": {k: v for k, v in params.items() if not isinstance(v, (dict, list)) or len(str(v)) < 1000},
+                    "tsa_exception": error_label,
+                    "upstream_source": upstream_source,
+                    "upstream_rows_sample": sample_for_prompt,
+                    "upstream_row_count": len(upstream_rows),
+                    "granularity": granularity,
+                },
+                ensure_ascii=False,
+                default=str,
+            ),
+        },
+    ]
+
+    model = getattr(getattr(context.llm_client, "config", None), "planner_model", "") or getattr(
+        getattr(context.llm_client, "config", None), "synthesis_model", ""
+    )
+    llm_response: dict[str, Any] = {}
+    script_code = ""
+    try:
+        llm_response = context.llm_client.complete_json(llm_messages, model=model or "", temperature=0.0)
+        script_code = str(llm_response.get("code", "")).strip()
+        if not script_code:
+            raise ValueError("LLM returned empty 'code'")
+    except Exception as exc:
+        return ToolExecutionResult(
+            payload={"rows": [], "skipped_row_count": 0},
+            caveats=[f"time_series_aggregate failed; LLM fallback also failed: {type(exc).__name__}: {exc}"],
+            metadata={
+                "no_data": True,
+                "no_data_reason": "tsa_failed_llm_fallback_failed",
+                "tsa_original_error": error_label,
+                "tsa_llm_fallback_error": f"{type(exc).__name__}: {exc}",
+            },
+        )
+
+    try:
+        runner_result = context.python_runner.run(
+            code=script_code,
+            inputs_json={"rows": upstream_rows, "granularity": granularity, "tsa_params": params},
+        )
+    except Exception as exc:
+        return ToolExecutionResult(
+            payload={"rows": [], "skipped_row_count": 0},
+            caveats=[f"time_series_aggregate fallback runner crashed: {type(exc).__name__}: {exc}"],
+            metadata={
+                "no_data": True,
+                "no_data_reason": "tsa_failed_runner_crashed",
+                "tsa_original_error": error_label,
+                "tsa_llm_fallback_code": script_code,
+            },
+        )
+
+    if runner_result.exit_code != 0:
+        return ToolExecutionResult(
+            payload={"rows": [], "skipped_row_count": 0},
+            caveats=[
+                f"time_series_aggregate fallback script exit code {runner_result.exit_code}",
+                f"stderr tail: {(runner_result.stderr or '')[-400:]}",
+            ],
+            metadata={
+                "no_data": True,
+                "no_data_reason": "tsa_failed_runner_nonzero_exit",
+                "tsa_original_error": error_label,
+                "tsa_llm_fallback_code": script_code,
+                "tsa_runner_stdout": (runner_result.stdout or "")[-2000:],
+                "tsa_runner_stderr": (runner_result.stderr or "")[-2000:],
+            },
+        )
+
+    result_rows: list[dict[str, Any]] = []
+    for artifact in runner_result.artifacts:
+        if artifact.name != "result.json":
+            continue
+        try:
+            decoded = json.loads(base64.b64decode(artifact.bytes_b64.encode("ascii")).decode("utf-8"))
+        except Exception:
+            continue
+        rows = decoded.get("rows") if isinstance(decoded, dict) else decoded
+        if isinstance(rows, list):
+            result_rows = [row for row in rows if isinstance(row, dict)]
+        break
+
+    valid_rows: list[dict[str, Any]] = []
+    for row in result_rows:
+        period = row.get("period") or row.get("date") or row.get("time")
+        value = row.get("value")
+        if period is None or value is None:
+            continue
+        normalised: dict[str, Any] = {
+            "period": str(period),
+            "value": value,
+            "group": str(row.get("group", row.get("entity", row.get("label", "")))),
+        }
+        for key, val in row.items():
+            if key not in {"period", "value", "group", "date", "time", "entity", "label"}:
+                normalised[key] = val
+        valid_rows.append(normalised)
+
+    if not valid_rows:
+        return ToolExecutionResult(
+            payload={"rows": [], "skipped_row_count": 0},
+            caveats=[
+                "time_series_aggregate fallback produced no usable rows.",
+                f"Original error: {error_label}",
+            ],
+            metadata={
+                "no_data": True,
+                "no_data_reason": "tsa_failed_fallback_shape_invalid",
+                "tsa_original_error": error_label,
+                "tsa_llm_fallback_code": script_code,
+                "tsa_runner_stdout": (runner_result.stdout or "")[-2000:],
+            },
+        )
+
+    return ToolExecutionResult(
+        payload={
+            "rows": valid_rows,
+            "skipped_row_count": max(0, len(result_rows) - len(valid_rows)),
+        },
+        caveats=[
+            "time_series_aggregate failed; recovered with an LLM-written python_runner script.",
+            f"Original error: {error_label}",
+        ],
+        metadata={
+            "degraded": True,
+            "recovery": "llm_python_fallback",
+            "tsa_original_error": error_label,
+            "tsa_llm_fallback_code": script_code,
+            "tsa_llm_fallback_explanation": str(llm_response.get("explanation", "")),
+            "tsa_runner_stdout_tail": (runner_result.stdout or "")[-400:],
+        },
+    )
+
+
+def _time_series_aggregate_impl(params: dict[str, Any], deps: dict[str, ToolExecutionResult], context: AgentExecutionContext) -> ToolExecutionResult:
     params = _payload_or_params(params)
     granularity = str(
         params.get(
@@ -6443,7 +6775,7 @@ def _claim_span_extract(params: dict[str, Any], deps: dict[str, ToolExecutionRes
     fallback_keywords = sorted(CLAIM_KEYWORDS)
     rows = []
     max_documents = _working_set_analysis_max_documents()
-    documents, deref_diag = resolve_documents_from_node(deps, context, text_field="text", max_documents=max_documents)
+    documents, deref_diag = resolve_documents_from_node(deps, context, text_field="text", max_documents=max_documents, params=params)
     if not documents:
         return ToolExecutionResult(
             payload={"rows": [], "diagnostics": deref_diag, "warnings": ["no_sentence_rows"]},
@@ -6547,6 +6879,213 @@ def _claim_strength_score(params: dict[str, Any], deps: dict[str, ToolExecutionR
         scored.append({**row, "score": claim_strength, "claim_strength_score": claim_strength})
     scored.sort(key=lambda item: float(item.get("score", 0.0)), reverse=True)
     return ToolExecutionResult(payload={"rows": scored})
+
+
+def _nli_verify_claims(
+    params: dict[str, Any],
+    deps: dict[str, ToolExecutionResult],
+    context: AgentExecutionContext,
+) -> ToolExecutionResult:
+    """Verify claims against source-document sentences using a real NLI model.
+
+    Replaces the heuristic claim_strength_score with cross-encoder entailment
+    probabilities. For each claim span the verifier picks the top-K most
+    lexically-relevant non-self sentences from the source document and runs
+    NLI(premise=sentence, hypothesis=claim). The best entailment across the
+    candidate premises yields the verdict.
+
+    This is the implementation behind RQ3 (does NLI-based verification
+    reduce hallucinated final answers?). When this capability runs, the
+    manifest carries metadata.nli_verifier_ran=True so the UI can show
+    the real verdicts instead of the heuristic scores.
+    """
+    from corpusagent2.retrieval import _load_cross_encoder
+    from corpusagent2.node_resolution import resolve_documents_from_node
+    import numpy as np
+
+    params = _payload_or_params(params) if "_payload_or_params" in globals() else params
+
+    claim_rows: list[dict[str, Any]] = []
+    for result in deps.values():
+        payload = result.payload
+        if not isinstance(payload, dict):
+            continue
+        rows = payload.get("rows")
+        if not isinstance(rows, list):
+            continue
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            claim_text = str(
+                row.get("claim_span") or row.get("excerpt") or row.get("claim") or row.get("text") or ""
+            ).strip()
+            if not claim_text:
+                continue
+            claim_rows.append(
+                {
+                    "claim": claim_text,
+                    "doc_id": str(row.get("doc_id", "")),
+                    "outlet": str(row.get("outlet", row.get("source", ""))),
+                    "published_at": str(row.get("published_at", row.get("date", ""))),
+                }
+            )
+        if claim_rows:
+            break
+
+    if not claim_rows:
+        return ToolExecutionResult(
+            payload={"rows": [], "warnings": ["no_claims_to_verify"]},
+            caveats=["nli_verify_claims received no claim spans from upstream."],
+            metadata={"no_data": True, "no_data_reason": "no_claims_to_verify"},
+        )
+
+    max_claims = _int_param(params, "max_claims", default=50, maximum=200)
+    if len(claim_rows) > max_claims:
+        claim_rows = claim_rows[:max_claims]
+
+    documents, _diag = resolve_documents_from_node(deps, context, text_field="text", params=params)
+    doc_lookup = {str(doc.get("doc_id", "")): doc for doc in documents if str(doc.get("doc_id", ""))}
+
+    model_id = str(params.get("model_id") or "cross-encoder/nli-deberta-v3-base").strip()
+    device = (os.getenv("CORPUSAGENT2_DEVICE", "cpu").strip().lower() or "cpu")
+
+    try:
+        model, _resolved_device = _load_cross_encoder(model_id, device=device)
+    except Exception as exc:
+        return ToolExecutionResult(
+            payload={"rows": [], "warnings": [f"nli_model_load_failed:{type(exc).__name__}"]},
+            caveats=[f"NLI model {model_id} could not be loaded: {type(exc).__name__}: {exc}"],
+            metadata={
+                "no_data": True,
+                "no_data_reason": "nli_model_load_failed",
+                "nli_model": model_id,
+                "nli_model_load_error": f"{type(exc).__name__}: {exc}",
+            },
+        )
+
+    label_index = {"contradiction": 0, "entailment": 1, "neutral": 2}
+    label2id = getattr(getattr(getattr(model, "model", None), "config", None), "label2id", None)
+    if isinstance(label2id, dict) and label2id:
+        try:
+            label_index = {str(k).lower(): int(v) for k, v in label2id.items()}
+        except Exception:
+            pass
+    contradiction_idx = label_index.get("contradiction", 0)
+    entailment_idx = label_index.get("entailment", 1)
+    neutral_idx = label_index.get("neutral", 2)
+
+    per_claim_premise_count = _int_param(params, "premises_per_claim", default=3, maximum=10)
+    raw_threshold = params.get("verdict_threshold")
+    try:
+        verdict_threshold = float(raw_threshold) if raw_threshold not in (None, "") else 0.7
+    except (TypeError, ValueError):
+        verdict_threshold = 0.7
+    verdict_threshold = max(0.5, min(0.95, verdict_threshold))
+
+    verdicts: list[dict[str, Any]] = []
+    supported_count = 0
+    contradicted_count = 0
+    neutral_count = 0
+
+    for claim_row in claim_rows:
+        claim_text = claim_row["claim"]
+        doc_id = claim_row["doc_id"]
+        source_doc = doc_lookup.get(doc_id)
+        if source_doc is None:
+            verdicts.append(
+                {
+                    **claim_row,
+                    "verdict": "no_evidence_doc",
+                    "entailment_prob": 0.0,
+                    "contradiction_prob": 0.0,
+                    "neutral_prob": 1.0,
+                    "premise": "",
+                    "premise_doc_id": "",
+                }
+            )
+            neutral_count += 1
+            continue
+        doc_text = _row_analysis_text(source_doc)
+        sentences = simple_sentence_split(doc_text)
+        claim_normalised = " ".join(claim_text.lower().split())
+        premise_candidates = [
+            sentence.strip()
+            for sentence in sentences
+            if sentence.strip() and " ".join(sentence.lower().split()) != claim_normalised
+        ]
+        claim_tokens = set(re.findall(r"[A-Za-z0-9]+", claim_text.lower()))
+
+        def _overlap(sentence: str) -> int:
+            return sum(1 for token in re.findall(r"[A-Za-z0-9]+", sentence.lower()) if token in claim_tokens)
+
+        scored_premises = sorted(premise_candidates, key=lambda sentence: -_overlap(sentence))
+        top_premises = scored_premises[:per_claim_premise_count]
+        if not top_premises:
+            verdicts.append(
+                {
+                    **claim_row,
+                    "verdict": "no_other_sentences",
+                    "entailment_prob": 0.0,
+                    "contradiction_prob": 0.0,
+                    "neutral_prob": 1.0,
+                    "premise": "",
+                    "premise_doc_id": doc_id,
+                }
+            )
+            neutral_count += 1
+            continue
+
+        pairs = [(premise, claim_text) for premise in top_premises]
+        try:
+            scores = model.predict(pairs, apply_softmax=True)
+        except TypeError:
+            raw_scores = np.asarray(model.predict(pairs))
+            exp_scores = np.exp(raw_scores - raw_scores.max(axis=1, keepdims=True))
+            scores = exp_scores / exp_scores.sum(axis=1, keepdims=True)
+        scores = np.asarray(scores)
+        if scores.ndim == 1:
+            scores = scores.reshape(1, -1)
+        best_idx = int(np.argmax(scores[:, entailment_idx]))
+        ent_prob = float(scores[best_idx, entailment_idx])
+        con_prob = float(scores[best_idx, contradiction_idx])
+        neu_prob = float(scores[best_idx, neutral_idx])
+        if ent_prob >= verdict_threshold:
+            verdict = "supported"
+            supported_count += 1
+        elif con_prob >= verdict_threshold:
+            verdict = "contradicted"
+            contradicted_count += 1
+        else:
+            verdict = "neutral"
+            neutral_count += 1
+        verdicts.append(
+            {
+                **claim_row,
+                "verdict": verdict,
+                "entailment_prob": round(ent_prob, 4),
+                "contradiction_prob": round(con_prob, 4),
+                "neutral_prob": round(neu_prob, 4),
+                "premise": top_premises[best_idx][:320],
+                "premise_doc_id": doc_id,
+            }
+        )
+
+    return ToolExecutionResult(
+        payload={"rows": verdicts},
+        caveats=[
+            f"NLI claim verification ran on {len(verdicts)} claim(s) using {model_id}.",
+        ],
+        metadata={
+            "nli_verifier_ran": True,
+            "nli_model": model_id,
+            "claims_evaluated": len(verdicts),
+            "claims_supported": supported_count,
+            "claims_contradicted": contradicted_count,
+            "claims_neutral": neutral_count,
+            "verdict_threshold": verdict_threshold,
+            "premises_per_claim": per_claim_premise_count,
+        },
+    )
 
 
 def _quote_extract(params: dict[str, Any], deps: dict[str, ToolExecutionResult], context: AgentExecutionContext) -> ToolExecutionResult:
@@ -9289,6 +9828,7 @@ def build_agent_registry() -> ToolRegistry:
         ("burst_detect", "burst_detect", "analytics", 65, _burst_detect),
         ("claim_span_extract", "claim_span_extract", "analytics", 64, _claim_span_extract),
         ("claim_strength_score", "claim_strength_score", "analytics", 63, _claim_strength_score),
+        ("nli_verify_claims", "nli_verify_claims", "transformers", 64, _nli_verify_claims),
         ("quote_extract", "quote_extract", "analytics", 62, _quote_extract),
         ("quote_attribute", "quote_attribute", "analytics", 61, _quote_attribute),
         ("build_evidence_table", "build_evidence_table", "analytics", 60, _build_evidence_table),
