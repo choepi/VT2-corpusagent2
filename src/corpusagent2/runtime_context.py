@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -24,6 +25,62 @@ from .seed import runtime_device_report
 
 DEFAULT_RERANK_MODEL_ID = "cross-encoder/ms-marco-MiniLM-L-6-v2"
 DEFAULT_NLI_MODEL_ID = "FacebookAI/roberta-large-mnli"
+
+
+def _truthy_env(name: str, default: bool) -> bool:
+    raw = os.getenv(name, "").strip().lower()
+    if not raw:
+        return default
+    return raw not in {"0", "false", "no", "off"}
+
+
+def _probe_opensearch_health() -> dict[str, Any]:
+    base_url = os.getenv("CORPUSAGENT2_OPENSEARCH_URL", "").strip()
+    index = os.getenv("CORPUSAGENT2_OPENSEARCH_INDEX", "article-corpus-opensearch").strip() or "article-corpus-opensearch"
+    result: dict[str, Any] = {
+        "configured": bool(base_url),
+        "base_url": base_url,
+        "index": index,
+        "ready": False,
+        "total_rows": 0,
+        "cluster_status": "",
+        "error": "",
+    }
+    if not base_url:
+        return result
+    try:
+        import httpx
+    except ImportError as exc:
+        result["error"] = f"httpx not available: {exc}"
+        return result
+    username = os.getenv("CORPUSAGENT2_OPENSEARCH_USERNAME", "").strip()
+    password = os.getenv("CORPUSAGENT2_OPENSEARCH_PASSWORD", "").strip()
+    auth = (username, password) if (username or password) else None
+    verify = _truthy_env("CORPUSAGENT2_OPENSEARCH_VERIFY_SSL", False)
+    try:
+        timeout = float(os.getenv("CORPUSAGENT2_OPENSEARCH_TIMEOUT_S", "5").strip() or "5")
+    except ValueError:
+        timeout = 5.0
+    try:
+        with httpx.Client(timeout=min(timeout, 5.0), verify=verify, auth=auth) as client:
+            health = client.get(f"{base_url.rstrip('/')}/_cluster/health")
+            if health.status_code != 200:
+                result["error"] = f"_cluster/health HTTP {health.status_code}"
+                return result
+            result["cluster_status"] = str(health.json().get("status", ""))
+            count = client.get(f"{base_url.rstrip('/')}/{index}/_count")
+            if count.status_code == 404:
+                result["error"] = f"index '{index}' not found"
+                return result
+            if count.status_code != 200:
+                result["error"] = f"{index}/_count HTTP {count.status_code}"
+                return result
+            total = int(count.json().get("count", 0))
+            result["total_rows"] = total
+            result["ready"] = total > 0 and result["cluster_status"] in {"green", "yellow"}
+    except Exception as exc:
+        result["error"] = f"{type(exc).__name__}: {exc}"
+    return result
 
 
 @dataclass(slots=True)
@@ -212,6 +269,8 @@ class CorpusRuntime:
             except Exception as exc:
                 pgvector["error"] = str(exc)
 
+        opensearch = _probe_opensearch_health()
+
         dense_strategy = "candidate_rerank_fallback"
         full_corpus_dense_ready = False
         if self.retrieval_backend == "pgvector" and pgvector["ready"]:
@@ -228,12 +287,20 @@ class CorpusRuntime:
         else:
             dense_candidate_fallback_ready = bool(metadata_rows > 0)
 
+        lexical_strategy = "unavailable"
+        if opensearch["ready"]:
+            lexical_strategy = "opensearch"
+        elif local_lexical["ready"]:
+            lexical_strategy = "local_tfidf"
+
         return {
             "document_count": metadata_rows,
             "backend": self.retrieval_backend,
             "local_lexical": local_lexical,
             "local_dense": local_dense,
             "pgvector": pgvector,
+            "opensearch": opensearch,
+            "lexical_strategy": lexical_strategy,
             "dense_strategy": dense_strategy,
             "full_corpus_dense_ready": full_corpus_dense_ready,
             "dense_candidate_fallback_ready": dense_candidate_fallback_ready,
