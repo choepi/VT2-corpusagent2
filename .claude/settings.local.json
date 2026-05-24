@@ -104,7 +104,17 @@
       "PowerShell(& \"D:\\\\Programmieren\\\\GitHub\\\\VT2-corpusagent2\\\\.venv\\\\Scripts\\\\python.exe\" -m pytest -q 2>&1 | Select-Object -Last 5)",
       "PowerShell(& \"D:\\\\Programmieren\\\\GitHub\\\\VT2-corpusagent2\\\\.venv\\\\Scripts\\\\python.exe\" -m pytest tests/test_start_local_stack.py::test_dockerized_api_and_mcp_share_runtime_image_and_sandbox_mounts -x 2>&1 | Select-Object -Last 30)",
       "PowerShell(docker exec corpusagent2_api *)",
-      "PowerShell(docker run *)"
+      "PowerShell(docker run *)",
+      "PowerShell(docker compose *)",
+      "PowerShell(docker system df *)",
+      "PowerShell(Get-ChildItem *)",
+      "PowerShell(docker image prune *)",
+      "PowerShell(docker builder prune *)",
+      "PowerShell(docker container prune *)",
+      "PowerShell(& \\(Get-Content graphify-out\\\\.graphify_python\\) graphify-out\\\\.graphify_step_ast.py)",
+      "PowerShell(& \\(Get-Content graphify-out\\\\.graphify_python\\) graphify-out\\\\.graphify_step_cache.py)",
+      "PowerShell(& \\(Get-Content graphify-out\\\\.graphify_python\\) -c \"import json; d = json.loads\\(open\\('graphify-out/.graphify_chunk_08.json', encoding='utf-8'\\).read\\(\\)\\); print\\(f'nodes={len\\(d.get\\(\\\\\"nodes\\\\\", []\\)\\)} edges={len\\(d.get\\(\\\\\"edges\\\\\", []\\)\\)} hyperedges={len\\(d.get\\(\\\\\"hyperedges\\\\\", []\\)\\)}'\\)\")",
+      "Bash(awk '/^## God Nodes/,/^## /' graphify-out/GRAPH_REPORT.md)"
     ]
   }
 }
