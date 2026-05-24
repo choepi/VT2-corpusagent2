@@ -3,6 +3,7 @@
 ## Add docker-compose.mcp.gpu.yml only on hosts with a working NVIDIA/CDI GPU runtime.
 services:
   corpusagent2-mcp:
+    platform: linux/amd64
     build:
       context: ..
       dockerfile: deploy/Dockerfile
