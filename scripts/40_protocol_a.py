@@ -60,6 +60,12 @@ JUDGE_CONTEXT_TOKENS = 1024
 JUDGE_MODEL = "gpt-5.4-nano-2026-03-17"
 
 # Phase toggles -- skip a phase if its inputs are already on disk.
+# PHASE_SANITY_CHECK runs first if enabled: it judges a small hand-curated set
+# of (clearly relevant, clearly irrelevant) doc pairs so the operator can
+# eyeball judge behaviour before committing budget to the full eval. If
+# PHASE_SANITY_CHECK is on and any sanity case fails the expected-label test,
+# the script exits before running Phase 1.
+PHASE_SANITY_CHECK = True
 PHASE_RETRIEVE = True
 PHASE_JUDGE = True
 PHASE_METRICS = True
@@ -121,6 +127,140 @@ def _prompt_hash(question: str, document: str, judge_model: str) -> str:
 def _truncate_doc(text: str, tokens: int) -> str:
     char_limit = tokens * 4
     return text[:char_limit]
+
+
+# ============================================================================
+# Phase 0: judge sanity check
+# ============================================================================
+
+# Four hand-curated probes: two should obviously score 2-3, two should score 0-1.
+# If the judge's labels diverge from these expectations, treat as a red flag
+# and inspect before spending eval budget.
+SANITY_CASES = [
+    {
+        "id": "sanity_pos_1",
+        "question": "What was the Federal Reserve's interest-rate policy in 2022?",
+        "document": (
+            "The Federal Reserve raised its benchmark interest rate by 75 basis points "
+            "in June 2022, the largest single increase since 1994, as policymakers "
+            "moved aggressively to contain inflation that had reached a 40-year high. "
+            "Chair Jerome Powell signalled further hikes through the rest of the year."
+        ),
+        "expected_min_label": 2,  # Relevant or Highly Relevant
+        "rationale": "directly answers the question with specific 2022 Fed actions",
+    },
+    {
+        "id": "sanity_pos_2",
+        "question": "How did Swiss newspapers cover the 2022 invasion of Ukraine?",
+        "document": (
+            "Neue Zürcher Zeitung devoted its front page on 25 February 2022 to "
+            "Russia's invasion of Ukraine, with editorials condemning the action "
+            "and live-blog coverage from Kyiv. Tages-Anzeiger and Le Temps "
+            "followed similar editorial lines through the early weeks of the war."
+        ),
+        "expected_min_label": 2,
+        "rationale": "directly describes Swiss newspaper coverage of the invasion",
+    },
+    {
+        "id": "sanity_neg_1",
+        "question": "What was the Federal Reserve's interest-rate policy in 2022?",
+        "document": (
+            "Recipe for traditional French onion soup: caramelise four large onions "
+            "over low heat for 45 minutes, deglaze with white wine, add beef stock "
+            "and simmer. Top with toasted baguette and Gruyère cheese, then broil."
+        ),
+        "expected_max_label": 1,  # Not Relevant or Marginally Relevant
+        "rationale": "soup recipe, unrelated to Fed policy",
+    },
+    {
+        "id": "sanity_neg_2",
+        "question": "How did Swiss newspapers cover the 2022 invasion of Ukraine?",
+        "document": (
+            "FC Basel won the Swiss Super League in 2017 with a record points total. "
+            "The club's youth academy produced several internationals during the "
+            "2010s, including Granit Xhaka and Mohamed Salah's brief loan spell."
+        ),
+        "expected_max_label": 1,
+        "rationale": "Swiss football history, unrelated to Ukraine war coverage",
+    },
+]
+
+
+def run_sanity_check() -> bool:
+    """Returns True if every sanity case lands inside its expected range."""
+    from corpusagent2.llm_provider import LLMProviderConfig, OpenAICompatibleLLMClient
+
+    provider = LLMProviderConfig(
+        base_url=os.getenv("CORPUSAGENT2_OPENAI_BASE_URL", "https://api.openai.com/v1"),
+        api_key=os.getenv("OPENAI_API_KEY", ""),
+        timeout_s=float(os.getenv("CORPUSAGENT2_LLM_TIMEOUT_S", "60")),
+        verify_ssl=True,
+    )
+    if not provider.api_key:
+        print("[sanity] OPENAI_API_KEY not set; cannot run judge. Set the env var first.")
+        return False
+    client = OpenAICompatibleLLMClient(provider)
+
+    all_passed = True
+    rows = []
+    for case in SANITY_CASES:
+        user = JUDGE_USER_TEMPLATE.format(
+            question=case["question"],
+            document=case["document"],
+            tokens=JUDGE_CONTEXT_TOKENS,
+        )
+        messages = [
+            {"role": "system", "content": JUDGE_SYSTEM_PROMPT},
+            {"role": "user", "content": user},
+        ]
+        try:
+            parsed = client.complete_json(messages, model=JUDGE_MODEL, temperature=0.0)
+            label = int(parsed.get("label", -1))
+            reason = str(parsed.get("reason", ""))
+        except Exception as exc:
+            print(f"[sanity] {case['id']}: JUDGE CALL FAILED -- {type(exc).__name__}: {exc}")
+            return False
+
+        expected = (
+            f">= {case['expected_min_label']}" if "expected_min_label" in case
+            else f"<= {case['expected_max_label']}"
+        )
+        if "expected_min_label" in case:
+            passed = label >= case["expected_min_label"]
+        else:
+            passed = label <= case["expected_max_label"]
+        if not passed:
+            all_passed = False
+        rows.append({
+            "id": case["id"],
+            "expected": expected,
+            "label": label,
+            "passed": passed,
+            "reason": reason,
+        })
+        marker = "PASS" if passed else "FAIL"
+        print(f"[sanity] {case['id']}: label={label} expected {expected}  [{marker}]")
+        if reason:
+            print(f"          judge said: {reason[:120]}")
+
+    # Persist for auditability
+    (OUTPUT_DIR / "sanity").mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    out = {
+        "judge_model": JUDGE_MODEL,
+        "rows": rows,
+        "all_passed": all_passed,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    (OUTPUT_DIR / "sanity" / f"{stamp}.json").write_text(
+        json.dumps(out, indent=2, ensure_ascii=False), encoding="utf-8"
+    )
+
+    if not all_passed:
+        print()
+        print("[sanity] One or more cases failed expected-label test.")
+        print("[sanity] Consider switching judge model or revising the prompt before Phase 1.")
+    return all_passed
 
 
 # ============================================================================
@@ -430,6 +570,12 @@ if __name__ == "__main__":
     print(f"Output dir:  {OUTPUT_DIR}")
     print()
 
+    if PHASE_SANITY_CHECK:
+        print("=== Phase 0: judge sanity check ===")
+        if not run_sanity_check():
+            print("[main] Sanity check failed -- aborting before Phase 1 to save budget.")
+            sys.exit(2)
+        print()
     if PHASE_RETRIEVE:
         print("=== Phase 1: retrieval ===")
         run_retrieval(questions)

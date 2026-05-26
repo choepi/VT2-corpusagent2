@@ -65,9 +65,11 @@ These are the real evaluation runs that populate Tables 4.1, 4.2 and the Protoco
 
 - [ ] **(P0)** Pick the Protocol A judge model. Constraint: must be different from the synthesis-stage LLM (no judge-equals-producer circularity). Pin the snapshot, temperature 0, deterministic decoding. Record the pinned identifier in `config/app_config.toml`. Candidate `gpt-5.4-nano-2026-03-17` flagged as soft-circularity risk (same family as synthesis `gpt-5.4-2026-03-05`); cross-family options (e.g. `claude-haiku-4.5`) preferred but acceptable to defend nano in a §4.2 subsection.
 - [x] **DONE** Implement Protocol A: `scripts/40_protocol_a.py` does pool dedup → judge call → SHA256 cache keyed on (judge_model, prompt-template, question, document) → graded nDCG@10 / MAP / Recall@K. Three phases (retrieve / judge / metrics), each independently toggleable, all disk-cached.
-- [ ] **(P0)** Run `scripts/40_protocol_a.py` against the eleven worked questions and populate Table 4.1.
-- [ ] **(P0)** Run Protocol B (claim-to-evidence support) on the eleven questions with NLI on and NLI off; populate Table 4.2 per question family.
-- [ ] **(P0)** Run Protocol C (metamorphic robustness) with the four query transformations; populate the placeholder section.
+- [ ] **(P0)** Run `scripts/40_protocol_a.py` against the eleven worked questions and populate Table 4.1. Phase 0 (judge sanity check) runs first and aborts if obviously-wrong labels appear.
+- [x] **DONE** Implement Protocol B: `scripts/41_protocol_b.py` reads agent_runtime synthesis outputs, extracts atomic claims via LLM, retrieves best evidence sentence by lexical overlap, runs `roberta-large-mnli` (or LLM-fallback) for entailment, aggregates per question and per family.
+- [ ] **(P0)** Run `scripts/41_protocol_b.py` and populate Table 4.2.
+- [x] **DONE** Implement Protocol C: `scripts/42_protocol_c.py` generates four metamorphic variants per question via LLM, re-runs retrieval on each, computes top-K Jaccard between original and variant per system.
+- [ ] **(P0)** Run `scripts/42_protocol_c.py` and populate the Protocol C placeholder section.
 - [ ] **(P1)** Run the LLM-synthesis vs deterministic-synthesis ablation (Ch4 §4.5.3) on Families A and B where deterministic templates are feasible.
 - [ ] **(P1)** Per-stage latency instrumentation on the production VM for the eleven questions (Ch4 §4.6.1).
 - [ ] **(P2)** Larger question bank: 50–100 free-form longitudinal questions across the six families. Per-question Protocol A/B/C cost is constant in bank size thanks to the label-free design.
@@ -108,6 +110,43 @@ From the earlier blindspot audit. Not blockers for the paper but should be settl
 
 - [ ] **(P2)** Commit `project_paper/LATEX/.vscode/settings.json` + `LATEX.code-workspace` recipe override.
 - [ ] **(P2)** `.claude/settings.local.json` is locally modified (harness-recorded permissions). Decide: commit, .gitignore-add, or leave dirty.
+
+---
+
+---
+
+## Scientific rigor audit — what's needed for safe 5.5+
+
+Honest reviewer-perspective audit of the current draft. P0 items are the gaps that risk the paper dropping back toward 4.5; P1 are the items that lift the grade ceiling.
+
+### P0 — fix before submission
+
+- [ ] **(P0)** **Chapter 3 citation density is critically low** (~3.4 cites per 1k words, vs ~12+ expected for a method chapter). Add citations to back specific architecture choices: pgvector vs FAISS justification, why `intfloat/e5-base-v2` (cite paper), why `ms-marco-MiniLM-L-6-v2` rerank, why `roberta-large-mnli` for NLI, why temperature-0 deterministic LLM calls, why RRF over learned fusion. Each non-trivial design decision needs at least one cite.
+- [ ] **(P0)** **Replace Figure 3.1 placeholder** with real TikZ architecture diagram (request flow: question → policy → rephrase → planner → PlanDAG → executor → evidence → NLI → synthesis). Without this, Ch3 reads as a system description without a system picture.
+- [ ] **(P0)** **Replace Algorithm 3.1 and 3.2 placeholders** with proper `algorithm2e` listings of `_compile_plan_dag` and degraded-status propagation. Comments in AppendixA already sketch them.
+- [ ] **(P0)** **Populate at least one Chapter 4 results table with real numbers.** A method paper with all-TBD tables looks like a proposal, not a thesis. Protocol A is the cheapest to actually run (script 40 is already written) — single Table 4.1 with real nDCG/Recall/MAP would change the paper's character substantially.
+- [ ] **(P0)** **Cross-judge ablation for methodological defensibility.** Run Protocol A with at least two judge models (e.g. `gpt-5.4-nano` vs `claude-haiku-4.5` vs `unclose/hermes-3`). Report Kendall τ between system rankings under each judge. A reviewer's first concern with LLM-as-judge is judge dependence; pre-empt it. Adds ~1 paragraph to §4.2 plus a small table.
+- [ ] **(P0)** **Statistical methodology subsection in Ch4 must address N=11 underpower honestly.** Current text mentions Wilcoxon signed-rank + bootstrap CIs but at N=11 these are weak. Either (a) explicitly state that the eleven-question results are exploratory rather than confirmatory and frame numbers as effect sizes; or (b) commit to scaling to N≥30 before submission. Pick a side.
+
+### P1 — substantially improve
+
+- [ ] **(P1)** **Architecture-decision-rationale table in Ch3** listing each load-bearing design choice with the citation that supports it and at least one alternative considered. Reviewers love seeing decisions justified, not just announced.
+- [ ] **(P1)** **Related-work comparison table in Ch2** (current sections are descriptive; a single table comparing CorpusAgent, RAG-from-scratch, ReAct, Toolformer, CorpusAgent2 on the dimensions of retrieval architecture, NLP layer, provenance, evaluation regime) crystallises positioning in one glance.
+- [ ] **(P1)** **External validity subsection in §4.7** — currently no acknowledgement that everything is on a single corpus (CC-News English subset). Reviewer will ask: would this generalize to scientific corpora, German news, social media? Address explicitly.
+- [ ] **(P1)** **Add a thesis-roadmap figure to Ch1** — RQ × contribution × evaluation-protocol matrix, single page, shows the whole paper at one glance.
+- [ ] **(P1)** **Add a scaling-pathway visualisation to Ch5 §5.5** — four-step diagram or table mapping each step to which RQ it unblocks at full scale. Currently bullet text only.
+- [ ] **(P1)** **Question taxonomy needs at least one external anchor.** The six families are novel but unvalidated against prior taxonomies. Position against Maron–Kuhns task types, TREC question types, or Bilenko–Anderson information-need categories. Even one paragraph saying "our families partition the space differently because longitudinal corpus questions cut across these" is enough.
+- [ ] **(P1)** **Reproducibility statement** at the end of Ch4 or Ch5: explicit model commit IDs, deterministic seeds, hardware specs, full corpus slice spec, environment lockfile reference. Master's-thesis standard practice; missing now.
+- [ ] **(P1)** **Power analysis paragraph** in Ch4 §4.7: at the expected effect size between hybrid+rerank and lexical, what N is required for α=0.05, β=0.8? Even back-of-envelope with cited assumptions justifies the future-work follow-up.
+
+### P2 — defensible without, but improves
+
+- [ ] **(P2)** Negative-results paragraph: any preliminary cases where the system failed or produced surprising outputs, especially under metamorphic transformations.
+- [ ] **(P2)** Inter-judge calibration appendix (even N=50 pairs) — shifts the methodology from "we lean on UMBRELA precedent" to "we lean on UMBRELA precedent AND verified locally".
+- [ ] **(P2)** Per-stage latency real numbers populating §4.6.1 placeholder from the actual VM.
+- [ ] **(P2)** Privacy / ethics paragraph (negligible for CC-News public data but reviewers like seeing it explicitly considered).
+- [ ] **(P2)** Language coverage discussion: CC-News is multilingual but the working slice likely English-dominant; quantify and note as constraint.
+- [ ] **(P2)** Discussion of LLM-judge limitations beyond UMBRELA (e.g. Faggioli 2023 explicit concerns about judge bias on long-tail / underrepresented topics).
 
 ---
 
