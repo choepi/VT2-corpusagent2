@@ -63,9 +63,9 @@ When an item closes, move it to "Recently Closed" with the commit hash that clos
 
 These are the real evaluation runs that populate Tables 4.1, 4.2 and the Protocol-C placeholder. None can be filled in from preliminary data — they need a real run on the eleven worked questions. **All protocols are designed to be label-free** so that scale-up to a 50–100 question bank or to the full corpus does not re-incur annotation cost.
 
-- [ ] **(P0)** Pick the Protocol A judge model. Constraint: must be different from the synthesis-stage LLM (no judge-equals-producer circularity). Pin the snapshot, temperature 0, deterministic decoding. Record the pinned identifier in `config/app_config.toml`.
-- [ ] **(P0)** Implement Protocol A: pool dedup → judge call → cache by (question, document, prompt-hash, model-snapshot) → graded nDCG@10 / MAP / Recall@k. Cache keying matters so re-runs are free after the first.
-- [ ] **(P0)** Run Protocol A on the eleven worked questions and populate Table 4.1.
+- [ ] **(P0)** Pick the Protocol A judge model. Constraint: must be different from the synthesis-stage LLM (no judge-equals-producer circularity). Pin the snapshot, temperature 0, deterministic decoding. Record the pinned identifier in `config/app_config.toml`. Candidate `gpt-5.4-nano-2026-03-17` flagged as soft-circularity risk (same family as synthesis `gpt-5.4-2026-03-05`); cross-family options (e.g. `claude-haiku-4.5`) preferred but acceptable to defend nano in a §4.2 subsection.
+- [x] **DONE** Implement Protocol A: `scripts/40_protocol_a.py` does pool dedup → judge call → SHA256 cache keyed on (judge_model, prompt-template, question, document) → graded nDCG@10 / MAP / Recall@K. Three phases (retrieve / judge / metrics), each independently toggleable, all disk-cached.
+- [ ] **(P0)** Run `scripts/40_protocol_a.py` against the eleven worked questions and populate Table 4.1.
 - [ ] **(P0)** Run Protocol B (claim-to-evidence support) on the eleven questions with NLI on and NLI off; populate Table 4.2 per question family.
 - [ ] **(P0)** Run Protocol C (metamorphic robustness) with the four query transformations; populate the placeholder section.
 - [ ] **(P1)** Run the LLM-synthesis vs deterministic-synthesis ablation (Ch4 §4.5.3) on Families A and B where deterministic templates are feasible.
