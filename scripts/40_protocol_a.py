@@ -51,13 +51,17 @@ TOP_K = 25
 # beyond this point is by simple character count (4 chars per token estimate).
 JUDGE_CONTEXT_TOKENS = 1024
 
-# Judge model. MUST differ from the synthesis-stage LLM to avoid circularity
-# (the judge should not be the same family/size as the producer it grades).
+# Judge endpoint. Independent of the synthesis-stage LLM provider so judge and
+# producer share neither model family nor inference endpoint.
+JUDGE_BASE_URL = os.getenv("JUDGE_BASE_URL", "https://hermes.ai.unturf.com/v1")
+JUDGE_API_KEY = os.getenv("JUDGE_API_KEY", "")  # may be empty for free endpoints
+
+# Judge model. MUST differ from the synthesis-stage LLM (avoid circularity).
 # Examples:
-#   "claude-haiku-4.5"                 # cross-family, recommended
-#   "gpt-5.4-mini-2026-03-17"          # same family, smaller (soft circularity)
-#   "gpt-5.4-nano-2026-03-17"          # cheapest, biggest agreement risk
-JUDGE_MODEL = "gpt-5.4-nano-2026-03-17"
+#   "adamo1139/Hermes-3-Llama-3.1-8B-FP8-Dynamic"  # Unclose, free, cross-family
+#   "claude-haiku-4.5"                              # Anthropic, strongest cross-family
+#   "gpt-5.4-nano-2026-03-17"                       # OpenAI, soft circularity risk
+JUDGE_MODEL = "adamo1139/Hermes-3-Llama-3.1-8B-FP8-Dynamic"
 
 # Phase toggles -- skip a phase if its inputs are already on disk.
 # PHASE_SANITY_CHECK runs first if enabled: it judges a small hand-curated set
@@ -191,14 +195,11 @@ def run_sanity_check() -> bool:
     from corpusagent2.llm_provider import LLMProviderConfig, OpenAICompatibleLLMClient
 
     provider = LLMProviderConfig(
-        base_url=os.getenv("CORPUSAGENT2_OPENAI_BASE_URL", "https://api.openai.com/v1"),
-        api_key=os.getenv("OPENAI_API_KEY", ""),
+        base_url=JUDGE_BASE_URL,
+        api_key=JUDGE_API_KEY,
         timeout_s=float(os.getenv("CORPUSAGENT2_LLM_TIMEOUT_S", "60")),
         verify_ssl=True,
     )
-    if not provider.api_key:
-        print("[sanity] OPENAI_API_KEY not set; cannot run judge. Set the env var first.")
-        return False
     client = OpenAICompatibleLLMClient(provider)
 
     all_passed = True
@@ -354,18 +355,13 @@ def run_judging(questions: list[dict]) -> None:
 
     (OUTPUT_DIR / "judge_cache").mkdir(parents=True, exist_ok=True)
 
-    app_config = AppConfig.from_project_root(PROJECT_ROOT)
-    # Build a provider config that uses the OpenAI-compatible endpoint
-    # regardless of which path the synthesis uses; the judge is always OpenAI
-    # in this initial cut. (Switch endpoint here if judging via Claude/Hermes.)
+    # Judge endpoint independent of the synthesis-stage LLM provider.
     provider = LLMProviderConfig(
-        base_url=os.getenv("CORPUSAGENT2_OPENAI_BASE_URL", "https://api.openai.com/v1"),
-        api_key=os.getenv("OPENAI_API_KEY", ""),
+        base_url=JUDGE_BASE_URL,
+        api_key=JUDGE_API_KEY,
         timeout_s=float(os.getenv("CORPUSAGENT2_LLM_TIMEOUT_S", "60")),
         verify_ssl=True,
     )
-    if not provider.api_key:
-        raise SystemExit("OPENAI_API_KEY not set; required for judge calls.")
     client = OpenAICompatibleLLMClient(provider)
 
     judged = 0

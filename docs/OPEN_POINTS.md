@@ -150,6 +150,17 @@ Honest reviewer-perspective audit of the current draft. P0 items are the gaps th
 
 ---
 
+## Frontend (Bloomberg rebuild)
+
+- [x] **DONE** HTML + CSS skeleton in `web/index.html` and `web/styles.css`: 6-pane CSS-Grid layout (query / plan-DAG / evidence on row 1, synthesis / NLI on row 2, entity trends / sentiment / topics on row 3) + dark top bar + bottom artefact strip. Light theme primary with `theme-dark` body class as drafted alternate. Mono-first typography (JetBrains Mono / IBM Plex Mono), oxblood `#7a1d2e` accent, sharp 0px corners, no glassmorphism. Previous `web/` snapshot saved to `web_old_apple/` for diff/rollback.
+- [ ] **(P1)** Migrate `app.js` to the new DOM IDs. Most existing IDs were preserved (`providerBadge`, `modelBadge`, `deviceBadge`, `accessGate*`, `submitButton`, `queryInput`, `clarificationPanel`, etc.) but new tables (`evidenceTableBody`, `nliTableBody`, `entityTableBody`, `sentimentTableBody`, `topicTableBody`) and the plan ASCII pane (`planAsciiTree`) need population code that doesn't currently exist in `app.js`. Without this migration, the new UI renders but stays empty after a query.
+- [ ] **(P2)** Add a plan-DAG ASCII renderer: take the manifest's plan structure and render as the indented tree shown in the mockup (root → children with `├──` / `└──` lines).
+- [ ] **(P2)** Streaming updates: if `streamCheckbox` is checked, switch the API call to `POST /query/submit` then poll `/runs/{id}/status` with progressive updates to the panes as nodes complete. Already supported by the backend.
+- [ ] **(P2)** Theme-dark toggle button in the top bar (CSS already drafted via `body.theme-dark`).
+- [ ] **(P2)** Keyboard shortcuts: `cmd/ctrl+enter` to submit, `esc` to abort, `g e` to focus evidence, `g s` to focus synthesis (vim-style mnemonic).
+
+---
+
 ## Recently closed
 
 | Item | Commit |

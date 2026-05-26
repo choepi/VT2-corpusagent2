@@ -50,7 +50,9 @@ sys.path.insert(0, str(PROJECT_ROOT / "src"))
 QUESTIONS_PATH = PROJECT_ROOT / "config" / "smoke_questions_10_rows.json"
 OUTPUT_DIR = PROJECT_ROOT / "outputs" / "protocol_c"
 
-MUTATOR_MODEL = "gpt-5.4-nano-2026-03-17"
+MUTATOR_BASE_URL = os.getenv("MUTATOR_BASE_URL", "https://hermes.ai.unturf.com/v1")
+MUTATOR_API_KEY = os.getenv("MUTATOR_API_KEY", "")
+MUTATOR_MODEL = "adamo1139/Hermes-3-Llama-3.1-8B-FP8-Dynamic"
 TOP_K = 25
 
 PHASE_MUTATE = True
@@ -122,13 +124,11 @@ def run_mutate(questions: list[dict]) -> None:
     from corpusagent2.llm_provider import LLMProviderConfig, OpenAICompatibleLLMClient
 
     provider = LLMProviderConfig(
-        base_url=os.getenv("CORPUSAGENT2_OPENAI_BASE_URL", "https://api.openai.com/v1"),
-        api_key=os.getenv("OPENAI_API_KEY", ""),
+        base_url=MUTATOR_BASE_URL,
+        api_key=MUTATOR_API_KEY,
         timeout_s=float(os.getenv("CORPUSAGENT2_LLM_TIMEOUT_S", "60")),
         verify_ssl=True,
     )
-    if not provider.api_key:
-        raise SystemExit("OPENAI_API_KEY required for question mutation.")
     client = OpenAICompatibleLLMClient(provider)
 
     (OUTPUT_DIR / "variants").mkdir(parents=True, exist_ok=True)

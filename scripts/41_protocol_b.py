@@ -49,12 +49,14 @@ OUTPUT_DIR = PROJECT_ROOT / "outputs" / "protocol_b"
 # specific subfolder if you want to evaluate a frozen run set.
 AGENT_RUNTIME_ROOT = PROJECT_ROOT / "outputs" / "agent_runtime"
 
-# Claim extraction LLM. Same provider config as Protocol A.
-CLAIM_EXTRACTOR_MODEL = "gpt-5.4-nano-2026-03-17"
+# LLM endpoint for claim extraction + fallback NLI. Independent of synthesis-stage LLM.
+EXTRACTOR_BASE_URL = os.getenv("EXTRACTOR_BASE_URL", "https://hermes.ai.unturf.com/v1")
+EXTRACTOR_API_KEY = os.getenv("EXTRACTOR_API_KEY", "")
+CLAIM_EXTRACTOR_MODEL = "adamo1139/Hermes-3-Llama-3.1-8B-FP8-Dynamic"
 
-# NLI: prefer local roberta-large-mnli; fall back to LLM judge if unavailable.
+# NLI: prefer local roberta-large-mnli; fall back to LLM if unavailable.
 NLI_USE_LOCAL = True
-NLI_FALLBACK_LLM_MODEL = "gpt-5.4-nano-2026-03-17"
+NLI_FALLBACK_LLM_MODEL = "adamo1139/Hermes-3-Llama-3.1-8B-FP8-Dynamic"
 
 # Phase toggles
 PHASE_DECOMPOSE = True
@@ -200,13 +202,11 @@ def run_decompose(questions: list[dict]) -> None:
     from corpusagent2.llm_provider import LLMProviderConfig, OpenAICompatibleLLMClient
 
     provider = LLMProviderConfig(
-        base_url=os.getenv("CORPUSAGENT2_OPENAI_BASE_URL", "https://api.openai.com/v1"),
-        api_key=os.getenv("OPENAI_API_KEY", ""),
+        base_url=EXTRACTOR_BASE_URL,
+        api_key=EXTRACTOR_API_KEY,
         timeout_s=float(os.getenv("CORPUSAGENT2_LLM_TIMEOUT_S", "60")),
         verify_ssl=True,
     )
-    if not provider.api_key:
-        raise SystemExit("OPENAI_API_KEY required for claim extraction.")
     client = OpenAICompatibleLLMClient(provider)
 
     (OUTPUT_DIR / "claims").mkdir(parents=True, exist_ok=True)
@@ -292,8 +292,8 @@ def run_verify(questions: list[dict]) -> None:
         nli_backend = "llm_fallback"
         from corpusagent2.llm_provider import LLMProviderConfig, OpenAICompatibleLLMClient
         client = OpenAICompatibleLLMClient(LLMProviderConfig(
-            base_url=os.getenv("CORPUSAGENT2_OPENAI_BASE_URL", "https://api.openai.com/v1"),
-            api_key=os.getenv("OPENAI_API_KEY", ""),
+            base_url=EXTRACTOR_BASE_URL,
+            api_key=EXTRACTOR_API_KEY,
             timeout_s=float(os.getenv("CORPUSAGENT2_LLM_TIMEOUT_S", "60")),
             verify_ssl=True,
         ))
