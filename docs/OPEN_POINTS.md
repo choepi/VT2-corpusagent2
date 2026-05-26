@@ -61,15 +61,17 @@ When an item closes, move it to "Recently Closed" with the commit hash that clos
 
 ## Evaluation (Ch4 TBD tables)
 
-These are the real evaluation runs that populate Tables 4.1, 4.2 and the Protocol-C placeholder. None can be filled in from preliminary data — they need a real run on the eleven worked questions.
+These are the real evaluation runs that populate Tables 4.1, 4.2 and the Protocol-C placeholder. None can be filled in from preliminary data — they need a real run on the eleven worked questions. **All protocols are designed to be label-free** so that scale-up to a 50–100 question bank or to the full corpus does not re-incur annotation cost.
 
-- [ ] **(P0)** Build the labelled gold-evidence pool for Protocol A: union top-25 retrieved docs from four systems × eleven questions, manually label relevance.
-- [ ] **(P0)** Run Protocol A (pooled IR judgements) on the eleven worked questions and populate Table 4.1 (lexical / dense / hybrid / hybrid+rerank × nDCG@10, Recall@25, MAP).
+- [ ] **(P0)** Pick the Protocol A judge model. Constraint: must be different from the synthesis-stage LLM (no judge-equals-producer circularity). Pin the snapshot, temperature 0, deterministic decoding. Record the pinned identifier in `config/app_config.toml`.
+- [ ] **(P0)** Implement Protocol A: pool dedup → judge call → cache by (question, document, prompt-hash, model-snapshot) → graded nDCG@10 / MAP / Recall@k. Cache keying matters so re-runs are free after the first.
+- [ ] **(P0)** Run Protocol A on the eleven worked questions and populate Table 4.1.
 - [ ] **(P0)** Run Protocol B (claim-to-evidence support) on the eleven questions with NLI on and NLI off; populate Table 4.2 per question family.
 - [ ] **(P0)** Run Protocol C (metamorphic robustness) with the four query transformations; populate the placeholder section.
 - [ ] **(P1)** Run the LLM-synthesis vs deterministic-synthesis ablation (Ch4 §4.5.3) on Families A and B where deterministic templates are feasible.
 - [ ] **(P1)** Per-stage latency instrumentation on the production VM for the eleven questions (Ch4 §4.6.1).
-- [ ] **(P2)** Larger question bank: target 30–50 questions across the six families, with two-annotator pooling and Cohen's κ inter-annotator agreement (Ch4 §4.7.3).
+- [ ] **(P2)** Larger question bank: 50–100 free-form longitudinal questions across the six families. Per-question Protocol A/B/C cost is constant in bank size thanks to the label-free design.
+- [ ] **(P2)** Optional judge calibration: $\sim$50 human-labelled (question, document) pairs to put a local Cohen's $\kappa$ error bar on the judge's behaviour for CC-News-style content. Not blocking submission, but a clear reviewer-defensible follow-up.
 
 ---
 
@@ -97,7 +99,6 @@ The four-step scaling plan from Ch5 §5.5. Each step must be executable independ
 
 From the earlier blindspot audit. Not blockers for the paper but should be settled before any real evaluation runs.
 
-- [ ] **(P0)** Resolve `gpt-5.4-2026-03-05` placeholder model ID in both `config/app_config.toml` and `.env` — that ID does not exist on the public OpenAI API and would 404 on every planner call. Decide what to use (concrete model id, or a self-hosted Hermes-3 endpoint).
 - [ ] **(P1)** Reconcile `CORPUSAGENT2_RETRIEVAL_BACKEND=pgvector` vs the CLAUDE.md statement that current operating mode is "Lexical OpenSearch + Postgres fetch + optional rerank". Pick one and align both.
 - [ ] **(P2)** Strengthen secret handling: `CORPUSAGENT2_OPENSEARCH_PASSWORD` is in `.env` (which is gitignored) but is printed in clear by `scripts/16_print_effective_config.py`. Either redact in the printer or document the leakage risk.
 
