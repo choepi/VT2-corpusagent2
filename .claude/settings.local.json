@@ -72,7 +72,19 @@
       "Bash(git check-ignore *)",
       "Bash(git rm *)",
       "PowerShell(.\\\\.venv\\\\Scripts\\\\python.exe -m pytest tests/test_agent_runtime.py tests/test_app_config.py -q --timeout=30 2>&1 | Select-Object -Last 20)",
-      "PowerShell(.\\\\.venv\\\\Scripts\\\\python.exe -m pytest tests/test_agent_runtime.py tests/test_app_config.py -q 2>&1 | Select-Object -Last 15)"
+      "PowerShell(.\\\\.venv\\\\Scripts\\\\python.exe -m pytest tests/test_agent_runtime.py tests/test_app_config.py -q 2>&1 | Select-Object -Last 15)",
+      "Bash(pandoc --version)",
+      "Bash(grep -oP \"^@\\\\w+\\\\{[^,]+,\" project_paper/LATEX/VT2.bib)",
+      "Bash(grep -oP \"^@\\\\w+\\\\{[^,]+,\" project_paper/LATEX/zotero_export.bib)",
+      "Bash(git commit -m ' *)",
+      "Bash(pdflatex --version)",
+      "Bash(biber --version)",
+      "Bash(cmd.exe /c \"where latexmk\")",
+      "Bash(cmd.exe /c \"where pdflatex\")",
+      "Read(//c/Users/Choep/AppData/Local/Programs/MiKTeX/scripts/latexmk/**)",
+      "Read(//c/Users/Choep/AppData/Local/Programs/MiKTeX/miktex/bin/x64/**)",
+      "Bash(cp -r web web_old_apple)",
+      "Read(//d/d/Programmieren/GitHub/VT2-corpusagent2/**)"
     ]
   }
 }
