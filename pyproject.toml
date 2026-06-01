@@ -8,8 +8,10 @@ dependencies = [
     "bertopic>=0.17.4",
     "datasets>=4.7.0",
     "fastapi>=0.135.2",
+    "gensim>=4.3.3",
     "huggingface-hub>=0.34.0,<1.0.0",
     "httpx>=0.28.1",
+    "langdetect>=1.2.0",
     "joblib>=1.5.2",
     "matplotlib>=3.10.8",
     "mcp[cli]>=1.26.0",
@@ -37,7 +39,6 @@ dependencies = [
 [project.optional-dependencies]
 nlp-providers = [
     "flair>=0.15.1",
-    "gensim>=4.3.3",
     "nltk>=3.9.1",
     "stanza>=1.11.0",
 ]
