@@ -84,7 +84,19 @@
       "Read(//c/Users/Choep/AppData/Local/Programs/MiKTeX/scripts/latexmk/**)",
       "Read(//c/Users/Choep/AppData/Local/Programs/MiKTeX/miktex/bin/x64/**)",
       "Bash(cp -r web web_old_apple)",
-      "Read(//d/d/Programmieren/GitHub/VT2-corpusagent2/**)"
+      "Read(//d/d/Programmieren/GitHub/VT2-corpusagent2/**)",
+      "Bash(git commit *)",
+      "Bash(git push *)",
+      "Bash(graphify query *)",
+      "Bash(ps aux *)",
+      "Bash(grep -E '^[0-9]+$')",
+      "Bash(systemctl is-enabled *)",
+      "Bash(systemctl status *)",
+      "Bash(sudo cloudflared *)",
+      "Read(//home/dongtten/.cloudflared/**)",
+      "Read(//home/dongtten/**)",
+      "Bash(systemctl is-active *)",
+      "Bash(docker restart *)"
     ]
   }
 }
