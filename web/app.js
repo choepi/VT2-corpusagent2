@@ -169,7 +169,6 @@ async function refreshRuntimeInfo() {
       dom.backendBadge.className = `badge ${cls}`;
       setBadge(dom.backendBadge, "backend", lex && dense ? "hybrid ok" : (lex ? "lexical only" : (dense ? "dense only" : "down")));
     }
-    renderRuntimeProfile(info);
   } catch (e) {
     if (dom.backendBadge) {
       setBadge(dom.backendBadge, "backend", "unreachable");
@@ -267,8 +266,6 @@ async function renderFinalManifest() {
     renderEntityTrends(manifest);
     renderSentiment(manifest);
     renderTopics(manifest);
-    renderTranscript(manifest);
-    renderTracePanel(manifest);
     if (dom.manifestLink) dom.manifestLink.href = `${API}/runs/${encodeURIComponent(currentRunId)}`;
     if (dom.provenanceLink) dom.provenanceLink.href = `${API}/runs/${encodeURIComponent(currentRunId)}/provenance`;
   } catch (e) {
@@ -462,179 +459,6 @@ function renderTopics(m) {
     dom.topicBody.appendChild(tr);
   });
 }
-
-// --- tab switching -------------------------------------------------------
-
-function activateTab(name) {
-  document.querySelectorAll(".tab-panel").forEach((p) =>
-    p.classList.toggle("tab-active", p.dataset.tab === name)
-  );
-  document.querySelectorAll(".tab-btn").forEach((b) => {
-    const active = b.dataset.tab === name;
-    b.classList.toggle("tab-active", active);
-    b.setAttribute("aria-selected", active ? "true" : "false");
-  });
-  if (name === "history") loadRunHistory();
-}
-
-document.querySelectorAll(".tab-btn").forEach((b) =>
-  b.addEventListener("click", () => activateTab(b.dataset.tab))
-);
-
-// --- advanced tab: runtime profile ---------------------------------------
-
-function renderRuntimeProfile(info) {
-  const el = document.getElementById("runtimeProfile");
-  const badge = document.getElementById("runtimeModeBadge");
-  if (!el) return;
-  const llm = info.llm || {};
-  const device = info.device || {};
-  const retrieval = info.retrieval || {};
-  const health = retrieval.health || {};
-  if (badge) badge.textContent = llm.use_openai ? "openai" : "local";
-
-  const rows = [
-    ["provider",       llm.provider_name        || "?"],
-    ["planner model",  llm.planner_model         || "?"],
-    ["synthesis model",llm.synthesis_model       || "?"],
-    ["device",         device.recommended_device || "?"],
-    ["cuda",           device.cuda_available ? "yes" : "no"],
-    ["retrieval mode", retrieval.default_mode    || "?"],
-    ["opensearch",     health.opensearch?.ready  ? "ok" : "—"],
-    ["pgvector",       health.pgvector?.ready    ? "ok" : "—"],
-    ["corpus",         (info.corpus || {}).display_name || (info.corpus || {}).name || "?"],
-  ];
-
-  const metricsHtml = rows.map(([k, v]) =>
-    `<div class="metric-row"><span>${esc(k)}</span><strong>${esc(String(v))}</strong></div>`
-  ).join("");
-
-  const providers = info.providers_installed || {};
-  const chipsHtml = Object.entries(providers).map(([name, ok]) =>
-    `<span class="chip ${ok ? "ok" : "bad"}">${esc(name)}</span>`
-  ).join("");
-
-  el.innerHTML = metricsHtml + (chipsHtml ? `<div class="chip-row">${chipsHtml}</div>` : "");
-}
-
-// --- advanced tab: execution transcript ----------------------------------
-
-const fmtMs = (ms) => {
-  const n = Number(ms);
-  if (!isFinite(n) || n < 0) return "—";
-  return n < 1000 ? `${Math.round(n)}ms` : `${(n / 1000).toFixed(1)}s`;
-};
-
-function renderTranscript(manifest) {
-  const el = document.getElementById("transcriptPanel");
-  const meta = document.getElementById("transcriptMeta");
-  if (!el) return;
-  const calls = manifest.tool_calls || [];
-  if (meta) setText(meta, `${calls.length} call${calls.length === 1 ? "" : "s"}`);
-  if (!calls.length) { el.innerHTML = "<span class='dim'>no tool calls recorded.</span>"; return; }
-  el.innerHTML = calls.map((c) => {
-    const st = (c.status || "?").toLowerCase();
-    const cls = st === "completed" ? "tc-completed" : st === "failed" ? "tc-failed" : st === "running" ? "tc-running" : "";
-    const bc  = st === "completed" ? "ok" : st === "failed" ? "bad" : st === "running" ? "warn" : "";
-    const preview = c.summary?.payload_preview;
-    const hasPreview = preview && typeof preview === "object" && Object.keys(preview).length;
-    return `<div class="tc-card ${cls}">
-      <div class="tc-head">
-        <span class="tc-badge ${bc}">${esc(st)}</span>
-        <strong>${esc(c.tool_name || c.capability || c.node_id || "tool")}</strong>
-      </div>
-      <div class="tc-detail">${esc(c.call_signature || `${c.tool_name || c.capability || "tool"}()`)}${c.provider ? ` · ${esc(c.provider)}` : ""}${c.duration_ms ? ` · ${fmtMs(c.duration_ms)}` : ""}</div>
-      ${c.error ? `<div class="tc-error">error: ${esc(c.error)}</div>` : ""}
-      ${c.summary?.no_data_reason ? `<div class="tc-detail">no data: ${esc(c.summary.no_data_reason)}</div>` : ""}
-      ${hasPreview ? `<details class="tc-json"><summary>output preview</summary><pre>${esc(JSON.stringify(preview, null, 2))}</pre></details>` : ""}
-    </div>`;
-  }).join("");
-}
-
-// --- advanced tab: planner + llm trace -----------------------------------
-
-function renderTracePanel(manifest) {
-  const el = document.getElementById("tracePanel");
-  if (!el) return;
-  const actions = manifest.planner_actions || [];
-  const traces  = manifest.metadata?.llm_traces || [];
-
-  const actHtml = actions.map((a, i) => `<div class="tc-card">
-    <div class="tc-head"><span class="tc-badge">${i + 1}</span><strong>${esc(a.action || "action")}</strong></div>
-    ${a.rewritten_question ? `<div class="tc-detail">rewrite: ${esc(a.rewritten_question)}</div>` : ""}
-    ${a.clarification_question ? `<div class="tc-detail">clarification: ${esc(a.clarification_question)}</div>` : ""}
-    ${(a.assumptions || []).length ? `<div class="tc-detail">assumptions: ${esc(a.assumptions.join(" | "))}</div>` : ""}
-  </div>`).join("");
-
-  const traceHtml = traces.map((t, i) => {
-    const fb = t.used_fallback;
-    return `<div class="tc-card ${fb ? "tc-running" : ""}">
-      <div class="tc-head">
-        <span class="tc-badge ${fb ? "warn" : ""}">${esc(t.stage || String(i + 1))}</span>
-        <strong>${esc(t.provider_name || "")}${t.model ? ` / ${esc(t.model)}` : ""}</strong>
-      </div>
-      ${t.error ? `<div class="tc-error">${esc(t.error)}</div>` : ""}
-      ${t.note  ? `<div class="tc-detail">${esc(t.note)}</div>` : ""}
-      ${t.raw_text ? `<details class="tc-json"><summary>raw output (${t.raw_text.length} chars)</summary><pre>${esc(t.raw_text.slice(0, 1200))}</pre></details>` : ""}
-    </div>`;
-  }).join("");
-
-  el.innerHTML =
-    (actHtml  || "<span class='dim'>no planner actions.</span>") +
-    (traceHtml ? `<hr class="tc-divider">${traceHtml}` : "");
-}
-
-// --- history tab ---------------------------------------------------------
-
-const IN_PROGRESS_STATUSES = new Set(["queued", "running", "aborting", "cancel_requested", "on_hold"]);
-
-async function loadRunHistory() {
-  const listEl = document.getElementById("histList");
-  const statusEl = document.getElementById("histStatus");
-  if (!listEl) return;
-  if (statusEl) setText(statusEl, "loading…");
-  try {
-    const r = await fetch(`${API}/runs?limit=100`, { cache: "no-store" });
-    if (!r.ok) {
-      if (statusEl) setText(statusEl, `HTTP ${r.status}`);
-      listEl.innerHTML = "<span class='dim'>failed to load.</span>";
-      return;
-    }
-    const payload = await r.json();
-    const runs = Array.isArray(payload.runs) ? payload.runs : [];
-    if (!runs.length) {
-      if (statusEl) setText(statusEl, "no runs yet.");
-      listEl.innerHTML = "<span class='dim'>no runs recorded yet.</span>";
-      return;
-    }
-    if (statusEl) setText(statusEl, `${runs.length} run${runs.length === 1 ? "" : "s"}`);
-    listEl.innerHTML = runs.map(renderHistRow).join("");
-  } catch (e) {
-    if (statusEl) setText(statusEl, e.message);
-    listEl.innerHTML = `<span class='dim'>${esc(e.message)}</span>`;
-  }
-}
-
-function renderHistRow(run) {
-  const id = String(run.run_id || "");
-  const q  = String(run.question || "(no question)");
-  const st = String(run.status || "unknown");
-  const created = run.created_at_utc ? new Date(run.created_at_utc).toLocaleString() : "—";
-  const dur = run.duration_ms != null ? fmtMs(run.duration_ms) : "—";
-  const stCls = ["completed", "partial"].includes(st) ? "s-completed"
-    : st === "failed" ? "s-failed"
-    : IN_PROGRESS_STATUSES.has(st) ? "s-running"
-    : "";
-  return `<a class="hist-row" href="?run=${encodeURIComponent(id)}" target="_blank" rel="noopener noreferrer" title="${esc(q)}">
-    <span class="hist-status ${stCls}">${esc(st)}</span>
-    <span class="hist-id">${esc(created)}</span>
-    <span class="hist-q">${esc(q)}</span>
-    <span class="hist-id">${esc(id.slice(-12))}</span>
-    <span class="hist-dur">${esc(dur)}</span>
-  </a>`;
-}
-
-document.getElementById("histRefreshBtn")?.addEventListener("click", () => loadRunHistory());
 
 // --- boot ----------------------------------------------------------------
 

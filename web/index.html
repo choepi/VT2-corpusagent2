@@ -36,13 +36,6 @@
       </div>
     </header>
 
-    <nav class="tab-bar" role="tablist" aria-label="view">
-      <button class="tab-btn tab-active" data-tab="main" role="tab" aria-selected="true">main</button>
-      <button class="tab-btn" data-tab="advanced" role="tab" aria-selected="false">advanced</button>
-      <button class="tab-btn" data-tab="history" role="tab" aria-selected="false">history</button>
-    </nav>
-
-    <div class="tab-panel tab-active" data-tab="main">
     <!-- 6-pane grid -->
     <main class="grid">
 
@@ -152,34 +145,6 @@ submit a question to compile a PlanDAG.
         </div>
       </section>
     </main>
-    </div><!-- /tab main -->
-
-    <div class="tab-panel" data-tab="advanced">
-      <div class="adv-wrap">
-        <section class="adv-section">
-          <header class="adv-head"><h2>runtime profile</h2><span id="runtimeModeBadge" class="muted">—</span></header>
-          <div class="adv-body adv-scroll" id="runtimeProfile"><span class="dim">loading…</span></div>
-        </section>
-        <section class="adv-section">
-          <header class="adv-head"><h2>execution transcript</h2><span id="transcriptMeta" class="muted">—</span></header>
-          <div class="adv-body adv-scroll" id="transcriptPanel"><span class="dim">no run yet.</span></div>
-        </section>
-        <section class="adv-section">
-          <header class="adv-head"><h2>planner + llm trace</h2></header>
-          <div class="adv-body adv-scroll" id="tracePanel"><span class="dim">no run yet.</span></div>
-        </section>
-      </div>
-    </div><!-- /tab advanced -->
-
-    <div class="tab-panel" data-tab="history">
-      <div class="hist-section">
-        <div class="hist-controls">
-          <button id="histRefreshBtn" class="btn">refresh</button>
-          <span id="histStatus" class="muted">not loaded</span>
-        </div>
-        <div id="histList"><span class="dim">click refresh to load.</span></div>
-      </div>
-    </div><!-- /tab history -->
 
     <!-- Bottom strip: artifacts, provenance, raw -->
     <footer class="botstrip">
