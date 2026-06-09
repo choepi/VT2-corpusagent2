@@ -96,7 +96,13 @@
       "Read(//home/dongtten/.cloudflared/**)",
       "Read(//home/dongtten/**)",
       "Bash(systemctl is-active *)",
-      "Bash(docker restart *)"
+      "Bash(docker restart *)",
+      "Bash(git checkout *)",
+      "Bash(grep -oE '\\\\$\\\\{\\(API|apiBase\\)[^`]*`?[^\\)]*' web_old_apple/app.js)",
+      "Bash(xargs python3 -c \"import json,sys; d=json.load\\(open\\(sys.argv[1]\\)\\); print\\(list\\(d.keys\\(\\)\\)[:15]\\)\")",
+      "Bash(.venv/bin/python *)",
+      "Bash(CORPUSAGENT2_PG_DSN=postgresql://corpus:corpus@corpus_postgres:5432/corpus_db .venv/bin/python *)",
+      "Bash(CORPUSAGENT2_PG_DSN=postgresql://corpus:corpus@localhost:5432/corpus_db .venv/bin/python *)"
     ]
   }
 }
