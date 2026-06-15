@@ -97,9 +97,20 @@ class OpenSearchBackend:
         text = str(query or "")
         if not text.strip():
             return False
-        return any(token in text for token in ('"', "(", ")", " AND ", " OR ", " NOT ", "+", "-")) or bool(
-            re.search(r"\b(?:AND|OR|NOT)\b", text, flags=re.IGNORECASE)
-        )
+        # Only explicit Lucene syntax counts. Boolean operators must be UPPERCASE
+        # standalone tokens (Lucene is case-sensitive), so a lowercase "and"/"or"
+        # in a natural-language question is NOT an operator. Likewise an internal
+        # hyphen ("Russia-Ukraine") is not the prefix "-" operator; +/- only count
+        # when they actually prefix a term. Misclassifying a plain question as a
+        # structured query routes it to query_string with default AND and returns
+        # zero hits, so this guard is deliberately strict.
+        if any(ch in text for ch in ('"', "(", ")")):
+            return True
+        if re.search(r"\b(?:AND|OR|NOT)\b", text):  # case-sensitive: uppercase only
+            return True
+        if re.search(r"(?:^|\s)[+\-]\w", text):  # +term / -term prefix operator
+            return True
+        return False
 
     def _query_clause(self, query: str) -> dict[str, Any]:
         if self._looks_structured_query(query):

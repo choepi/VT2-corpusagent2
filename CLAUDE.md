@@ -25,9 +25,9 @@ This is a research prototype, not a production system.
 - **B** — Claim-to-evidence support labeling from the system's own evidence tables
 - **C** — Metamorphic robustness testing via query transformations
 
-**Current operating mode (honest):** Lexical OpenSearch + Postgres fetch + optional rerank. Dense/pgvector retrieval and local TF-IDF assets are NOT operational end-to-end. Do not claim hybrid retrieval until this is fixed and validated.
+**Current operating mode (verified 2026-06-14):** Hybrid retrieval is operational end-to-end. pgvector holds 624k×768 E5 embeddings with an IVFFlat index; OpenSearch BM25 is indexed over all 624k docs (reachable from the host only via `localhost:9200`, not the docker name `os_news`); RRF fusion + cross-encoder rerank run live. Local TF-IDF/dense assets are also present. Protocol A has been run (see below).
 
-**Evaluation approach:** No reference answers exist — the professor confirmed that ground truth answers are not definable for this type of open-ended corpus question. Evaluation is oracle-free by design: relevance judgements, evidence-support labeling, and metamorphic robustness testing. Do not try to build a gold-answer set.
+**Evaluation approach — ORACLE-FREE, NO GOLD SETS (hard rule):** No reference answers exist — the professor confirmed ground truth is not definable for open-ended questions over an arbitrarily large corpus. NEVER add or rely on gold document lists, gold evidence-sentence lists, or gold answers (`relevant_doc_ids` / `gold_evidence_doc_ids` are deprecated; the `scripts/03_evaluate_retrieval.py` gold-ID path must not be extended). All quantitative results come from one rerunnable suite, **`scripts/50_run_eval_suite.py`**, which runs oracle-free protocols (Protocol A = LLM-as-judge graded relevance → nDCG@10/Recall@25/MAP; cross-judge Kendall τ; Protocol C = metamorphic robustness; retrievability/Gini corpus-access bias) and writes tables + plots directly into `project_paper/LATEX/generated/` (the paper `\input`s them, so a re-run refreshes the paper). Questions live in `config/eval_questions_11.json` (no gold fields).
 
 ## Commands
 

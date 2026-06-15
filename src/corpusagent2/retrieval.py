@@ -286,8 +286,17 @@ def _load_sentence_transformer(model_id: str, device: str | None = None):
             # internals. Drop the cache entry and retry once cleanly.
             if _is_meta_tensor_error(exc):
                 _SENTENCE_TRANSFORMER_CACHE.pop(cache_key, None)
+                # The meta-tensor failure comes from accelerate/transformers
+                # initialising weights on the `meta` device (low_cpu_mem_usage),
+                # after which `.to(device)` cannot copy real data. Forcing
+                # low_cpu_mem_usage=False materialises the weights directly and
+                # is the deterministic fix for cold CPU loads.
                 try:
-                    model = SentenceTransformer(model_id, device=resolved_device)
+                    model = SentenceTransformer(
+                        model_id,
+                        device=resolved_device,
+                        model_kwargs={"low_cpu_mem_usage": False},
+                    )
                     _SENTENCE_TRANSFORMER_CACHE[cache_key] = model
                     return model, resolved_device
                 except Exception:
