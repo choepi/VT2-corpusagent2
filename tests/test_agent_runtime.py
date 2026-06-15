@@ -3258,7 +3258,10 @@ def test_finance_question_heuristic_plan_uses_symbol_next_to_stock_word(tmp_path
     assert any(node["node_id"] == "plot_framing_shift" for node in planned_nodes)
 
 
-def test_finance_question_does_not_infer_market_series_from_company_name(tmp_path: Path, monkeypatch) -> None:
+def test_finance_question_infers_market_series_from_company_name(tmp_path: Path, monkeypatch) -> None:
+    # When a question explicitly ties coverage to a company's STOCK (market intent
+    # present), the runtime resolves the company to its ticker and attaches an external
+    # market series so the comparison can actually be made.
     monkeypatch.setenv("CORPUSAGENT2_PROVIDER_ORDER_SENTIMENT", "heuristic")
     monkeypatch.setenv("CORPUSAGENT2_PROVIDER_ORDER_TOPIC_MODEL", "heuristic")
     runtime = build_test_runtime(
@@ -3271,6 +3274,31 @@ def test_finance_question_does_not_infer_market_series_from_company_name(tmp_pat
 
     manifest = runtime.handle_query(
         "How did Facebook coverage shift from innovation/growth framing to privacy/regulation framing from 2016 to 2019, and how did this correspond to stock drawdowns?",
+        force_answer=True,
+        no_cache=True,
+    )
+
+    assert any(
+        any(node.get("capability") == "join_external_series" for node in dag.get("nodes", []))
+        for dag in manifest.plan_dags
+    )
+
+
+def test_company_coverage_without_market_intent_skips_market_series(tmp_path: Path, monkeypatch) -> None:
+    # A company-coverage question with NO market/stock/price intent must NOT get a
+    # spurious external market series just because a company name was mentioned.
+    monkeypatch.setenv("CORPUSAGENT2_PROVIDER_ORDER_SENTIMENT", "heuristic")
+    monkeypatch.setenv("CORPUSAGENT2_PROVIDER_ORDER_TOPIC_MODEL", "heuristic")
+    runtime = build_test_runtime(
+        tmp_path=tmp_path,
+        documents=_sample_documents(),
+        search_rows_by_query=_search_rows(_sample_documents()),
+    )
+    runtime.llm_client = None
+    runtime.orchestrator.llm_client = None
+
+    manifest = runtime.handle_query(
+        "How did Facebook coverage change between 2016 and 2019?",
         force_answer=True,
         no_cache=True,
     )

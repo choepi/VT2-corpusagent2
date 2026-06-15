@@ -31,6 +31,7 @@ class ToolSpec:
     capabilities: list[str]
     input_schema: SchemaDescriptor
     output_schema: SchemaDescriptor
+    description: str = ""
     requirements: list[ToolRequirement] = field(default_factory=list)
     cost_class: str = "medium"
     deterministic: bool = True

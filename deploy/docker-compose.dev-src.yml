@@ -1,0 +1,27 @@
+## Dev-only override: bind-mount the host source tree into the editable-installed
+## location (/app/src) so code changes take effect on container restart without a
+## full image rebuild. Use alongside the base + mcp (+ gpu) compose files:
+##   docker compose -f docker-compose.yml -f docker-compose.mcp.yml \
+##     -f docker-compose.mcp.gpu.yml -f docker-compose.dev-src.yml up -d \
+##     --no-deps corpusagent2-api corpusagent2-mcp
+## Do NOT use in production — it shadows the baked /app/src with the working tree.
+services:
+  corpusagent2-api:
+    volumes:
+      - ../src:/app/src
+    environment:
+      # LLM-primary adaptive planning (general for open-ended questions). Node-level
+      # fixes + the degenerate-plan guard keep it robust; set to "heuristic" for a
+      # reproducible deterministic plan when needed.
+      CORPUSAGENT2_PLANNER_MODE: ${CORPUSAGENT2_PLANNER_MODE:-auto}
+      # Larger timeouts so heavy back-to-back analytical runs (BM25 over 624k +
+      # synthesis over large evidence) do not hit transient ConnectionTimeouts.
+      CORPUSAGENT2_OPENSEARCH_TIMEOUT_S: ${CORPUSAGENT2_OPENSEARCH_TIMEOUT_S:-60}
+      CORPUSAGENT2_LLM_TIMEOUT_S: ${CORPUSAGENT2_LLM_TIMEOUT_S:-180}
+  corpusagent2-mcp:
+    volumes:
+      - ../src:/app/src
+    environment:
+      CORPUSAGENT2_PLANNER_MODE: ${CORPUSAGENT2_PLANNER_MODE:-heuristic}
+      CORPUSAGENT2_OPENSEARCH_TIMEOUT_S: ${CORPUSAGENT2_OPENSEARCH_TIMEOUT_S:-60}
+      CORPUSAGENT2_LLM_TIMEOUT_S: ${CORPUSAGENT2_LLM_TIMEOUT_S:-180}

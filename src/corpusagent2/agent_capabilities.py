@@ -2304,6 +2304,7 @@ class FunctionalToolAdapter(CapabilityToolAdapter):
         deterministic: bool = True,
         cost_class: str = "low",
         fallback_of: str | None = None,
+        description: str = "",
     ) -> None:
         self._run_fn = run_fn
         self.spec = ToolSpec(
@@ -2312,6 +2313,7 @@ class FunctionalToolAdapter(CapabilityToolAdapter):
             capabilities=[capability],
             input_schema=SchemaDescriptor(name=f"{tool_name}_input", fields={"payload": "dict"}),
             output_schema=SchemaDescriptor(name=f"{tool_name}_output", fields={"payload": "dict"}),
+            description=description,
             deterministic=deterministic,
             cost_class=cost_class,
             priority=priority,
@@ -2683,6 +2685,49 @@ def _infer_market_ticker_from_text(text: str) -> str:
         return "CL=F"
     if any(term in lowered for term in ("gasoline price", "gas prices", "gas price")):
         return "RB=F"
+    # Currencies / FX. Checked before company names so "movements in the pound"
+    # resolves to the FX pair rather than being missed. Word-boundary matched to
+    # avoid false hits (e.g. "european" must not match "euro").
+    _CURRENCY_TICKERS = (
+        ((r"british pound", r"pound sterling", r"sterling", r"\bgbp\b", r"\bpound\b"), "GBPUSD=X"),
+        ((r"\beuro\b", r"eurozone", r"\beur\b"), "EURUSD=X"),
+        ((r"japanese yen", r"\byen\b", r"\bjpy\b"), "JPY=X"),
+        ((r"swiss franc", r"\bchf\b"), "CHF=X"),
+        ((r"chinese yuan", r"renminbi", r"\bcny\b", r"\brmb\b"), "CNY=X"),
+    )
+    for patterns, symbol in _CURRENCY_TICKERS:
+        if any(re.search(p, lowered) for p in patterns):
+            return symbol
+    # Named companies -> equity ticker. Only resolved when the text carries genuine
+    # market/stock intent, so pure-coverage questions that merely mention a company
+    # (e.g. "how did coverage of Facebook change") do not get a spurious stock series.
+    market_intent = bool(
+        re.search(
+            r"\b(?:stock|stocks|share price|shares?|equity|equities|valuation|market cap|"
+            r"share[- ]price|stock[- ]price|stock performance|traded|trading|nasdaq|nyse|ticker)\b",
+            lowered,
+        )
+    )
+    if market_intent:
+        _COMPANY_TICKERS = (
+            ((r"\btesla\b",), "TSLA"),
+            ((r"\bapple\b",), "AAPL"),
+            ((r"\bamazon\b",), "AMZN"),
+            ((r"\bmicrosoft\b",), "MSFT"),
+            ((r"\bnetflix\b",), "NFLX"),
+            ((r"\bnvidia\b",), "NVDA"),
+            ((r"\balphabet\b", r"\bgoogle\b"), "GOOGL"),
+            ((r"\bmeta platforms\b", r"\bfacebook\b", r"\bmeta\b"), "META"),
+            ((r"\btwitter\b",), "TWTR"),
+            ((r"\bboeing\b",), "BA"),
+            ((r"\bford\b",), "F"),
+            ((r"\bgeneral motors\b",), "GM"),
+            ((r"\bintel\b",), "INTC"),
+            ((r"\bqualcomm\b",), "QCOM"),
+        )
+        for patterns, symbol in _COMPANY_TICKERS:
+            if any(re.search(p, lowered) for p in patterns):
+                return symbol
     return ""
 
 
@@ -6278,10 +6323,70 @@ def _time_series_aggregate(
     python_runner fallback so a shape-mismatch / pandas exception does not
     halt the run. See _time_series_python_llm_fallback for the recovery path.
     """
+    flat_params = _payload_or_params(params)
+    first_error: Exception | None = None
+    result: ToolExecutionResult | None = None
     try:
-        return _time_series_aggregate_impl(params, deps, context)
+        result = _time_series_aggregate_impl(params, deps, context)
+        if not _tsa_result_is_empty(result):
+            return result
     except Exception as exc:
-        return _time_series_python_llm_fallback(params, deps, context, exc)
+        first_error = exc
+    # Honesty guard: under strict fail-on-empty mode, an empty metric source must
+    # surface as no_data rather than being silently recovered into a document_count
+    # series. Skip the ungrouped fallback so strict-mode runs stay faithful.
+    from corpusagent2 import strict_mode as _strict
+    if _strict.fail_on_metric_source_empty() and first_error is None and result is not None:
+        return result
+    # The grouped/metric aggregation came back empty or raised — commonly because the
+    # planner asked to group by a field the upstream rows do not carry (e.g.
+    # group_by='target_label', annotations_from=<node>) or requested a metric with no
+    # annotations. Retry ungrouped, then with the always-available document_count
+    # metric, so the node still yields a usable series over time instead of failing the
+    # whole run. (Fixes the recurring time_series_aggregate "empty rows" failure.)
+    if _tsa_params_request_grouping(flat_params) or first_error is not None:
+        ungrouped = dict(flat_params)
+        for key in ("group_by", "series_key", "series", "series_definitions", "annotations_from", "target_label", "group_by_time"):
+            ungrouped.pop(key, None)
+        retry_variants = [ungrouped]
+        doc_count_variant = dict(ungrouped)
+        doc_count_variant["metrics"] = ["document_count"]
+        for key in ("value_field", "metric", "aggregation", "agg"):
+            doc_count_variant.pop(key, None)
+        retry_variants.append(doc_count_variant)
+        for variant in retry_variants:
+            try:
+                retry = _time_series_aggregate_impl(variant, deps, context)
+            except Exception:
+                continue
+            if not _tsa_result_is_empty(retry):
+                retry.caveats = list(retry.caveats) + [
+                    "Requested grouping/metric was unavailable in upstream rows; aggregated ungrouped document counts over time instead."
+                ]
+                return retry
+    if result is not None:
+        return result
+    return _time_series_python_llm_fallback(params, deps, context, first_error or RuntimeError("time_series_aggregate produced no rows"))
+
+
+def _tsa_result_is_empty(result: "ToolExecutionResult | None") -> bool:
+    if result is None:
+        return True
+    payload = result.payload if isinstance(result.payload, dict) else {}
+    rows = payload.get("rows")
+    if isinstance(rows, list) and rows:
+        return bool((result.metadata or {}).get("no_data"))
+    return True
+
+
+def _tsa_params_request_grouping(params: dict[str, Any]) -> bool:
+    if not isinstance(params, dict):
+        return False
+    for key in ("group_by", "series_key", "series", "series_definitions", "annotations_from", "target_label"):
+        value = params.get(key)
+        if value not in (None, "", [], {}):
+            return True
+    return False
 
 
 def _time_series_python_llm_fallback(
@@ -9844,6 +9949,51 @@ def build_agent_registry() -> ToolRegistry:
                 provider=provider,
                 priority=priority,
                 run_fn=fn,
+                description=_FUNCTIONAL_TOOL_DESCRIPTIONS.get(capability, ""),
             )
         )
     return registry
+
+
+# Planner-facing one-line descriptions for capabilities whose name alone does not
+# make their behaviour (or available data source) obvious to the planning LLM.
+# Surfaced verbatim in the tool catalog the planner reads, so it can select the
+# right tool instead of grounded-rejecting answerable questions.
+_FUNCTIONAL_TOOL_DESCRIPTIONS: dict[str, str] = {
+    "join_external_series": (
+        "Fetches an EXTERNAL market price time series (company stock/equity, FX "
+        "currency pair, market index, or commodity) from Yahoo Finance by ticker, "
+        "computes per-bin close/return/drawdown, and joins it onto an internal "
+        "time_series_aggregate table on the 'time_bin' key. Use whenever a question "
+        "compares corpus coverage/framing/volume with a stock price, a currency or "
+        "exchange rate, a market index, or a commodity (e.g. oil) price. Pass 'ticker' "
+        "(e.g. TSLA=Tesla, AAPL=Apple, GBPUSD=X=British pound, EURUSD=X=euro, "
+        "CL=F=crude oil, ^GSPC=S&P 500) and optional date_from/date_to/interval. "
+        "External market data IS available through this tool: do NOT reject "
+        "market/stock/currency/commodity comparison questions for lack of external data."
+    ),
+    "time_series_aggregate": (
+        "Aggregates a materialized working set of documents into a temporal table "
+        "(document_count / share_of_documents / average_sentiment per time bin). "
+        "Required for any over-time, trend, peak, or burst question. Emits a "
+        "'time_bin' key that join_external_series and plot_artifact consume."
+    ),
+    "plot_artifact": (
+        "Renders a chart PNG from an analytical TABLE node (time series, aggregate, "
+        "or distribution) — never from raw document evidence rows. Pass x, y "
+        "(column name or list of column names), optional series, title, and limit."
+    ),
+    "change_point_detect": (
+        "Detects significant level shifts / change points in a numeric time-series "
+        "column produced by time_series_aggregate."
+    ),
+    "build_evidence_table": (
+        "Builds a structured evidence/claim table from fetched documents; supports "
+        "named tasks such as noun_frequency_distribution."
+    ),
+    "nli_verify_claims": (
+        "Cross-encoder NLI verification of extracted claims against source-document "
+        "sentences; returns supported/contradicted/neutral verdicts. Prefer over "
+        "claim_strength_score for honest claim verification."
+    ),
+}

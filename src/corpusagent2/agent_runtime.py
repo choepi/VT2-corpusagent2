@@ -282,6 +282,13 @@ TOPIC_QUERY_EXPANSIONS = (
         "triggers": ("protest", "protests", "protester", "protesters", "demonstration", "demonstrators", "unrest"),
         "query": "protest OR protests OR protesters OR protestors OR demonstrators OR demonstrations OR unrest OR police OR \"law enforcement\"",
     },
+    {
+        # "AI" is a 2-letter topic that otherwise gets diluted by filler terms; expand
+        # to its strong surface forms so retrieval focuses on the real AI coverage
+        # (the corpus has ~2.6k artificial-intelligence / machine-learning documents).
+        "triggers": ("ai", "a.i.", "artificial intelligence", "machine learning", "deep learning", "neural network", "neural networks"),
+        "query": "\"artificial intelligence\" OR \"machine learning\" OR \"deep learning\" OR \"neural network\" OR \"neural networks\" OR algorithm OR algorithms OR \"a.i.\" OR AI",
+    },
 )
 
 
@@ -592,6 +599,26 @@ class MagicBoxOrchestrator:
             "note": note,
         }
         state.llm_traces.append(entry)
+
+    # Capabilities that only retrieve/materialize documents and cannot, on their own,
+    # produce an answer. A plan containing ONLY these is degenerate (e.g. the planner
+    # LLM intermittently emits malformed JSON that the salvage parser reduces to just
+    # a search + working_set), and must be replaced with the deterministic heuristic plan.
+    _NON_ANALYTICAL_BACKBONE_CAPABILITIES = {
+        "db_search",
+        "sql_query_search",
+        "fetch_documents",
+        "create_working_set",
+        "filter_working_set",
+    }
+
+    def _plan_is_degenerate(self, dag: "AgentPlanDAG | None") -> bool:
+        if dag is None or not getattr(dag, "nodes", None):
+            return True
+        return not any(
+            node.capability not in self._NON_ANALYTICAL_BACKBONE_CAPABILITIES
+            for node in dag.nodes
+        )
 
     def _planner_payload_is_actionable(self, payload: dict[str, Any]) -> bool:
         if not isinstance(payload, dict) or not payload:
@@ -940,7 +967,12 @@ class MagicBoxOrchestrator:
             "extract_ngrams": ("ngram", "n-gram", "phrase distribution", "bigram", "trigram"),
             "extract_keyterms": ("keyterm", "key term", "keywords", "dominant terms", "recurring terms", "explanation", "explanations"),
             "extract_svo_triples": ("svo", "subject", "verb", "object", "who did what", "acted upon", "acting"),
-            "join_external_series": ("stock", "drawdown", "market", "price", "oil", "equity", "ticker"),
+            "join_external_series": (
+                "stock", "drawdown", "market", "price", "oil", "equity", "ticker",
+                "share price", "stock price", "stock performance", "shares",
+                "pound", "sterling", "currency", "exchange rate", "forex",
+                "euro", "yen", "dollar",
+            ),
             "ner": ("named entities", "named entity", "actors", "actor", "entities", "named people", "institutions"),
             "noun_chunks": ("noun chunk", "noun phrase", "noun phrases", "syntax", "grammatical", "subject", "verb", "object", "acted upon"),
             "plot_artifact": ("chart", "plot", "graph", "visualize", "visualise", "visualization", "visualisation"),
@@ -1300,6 +1332,20 @@ class MagicBoxOrchestrator:
                             query_text,
                         )
                         normalized_search_inputs["query"] = self._apply_source_scope_to_query(repaired_query, dag_text)
+                # Unconditionally strip planner-invented inline source: filters (e.g.
+                # source:("major"), source:("with Tesla's stock performance")). The
+                # planner repeatedly mis-reads question words as outlet names; such
+                # filters match no real corpus source (which are domains) and collapse
+                # retrieval to zero docs. This runs even when the query_text repair above
+                # was skipped (query_text empty). Broad media phrases must never become
+                # source filters (R12).
+                current_query = str(normalized_search_inputs.get("query", "") or "")
+                if re.search(r"\bsource\s*:", current_query, flags=re.IGNORECASE):
+                    cleaned_query = self._remove_source_field_filters(current_query)
+                    if cleaned_query.strip():
+                        normalized_search_inputs["query"] = cleaned_query
+                    elif query_text:
+                        normalized_search_inputs["query"] = query_text
                 if self._needs_source_comparison_analysis(dag_text) and not needs_specialized_intent:
                     normalized_search_inputs["retrieval_strategy"] = "exhaustive_analytic"
                     normalized_search_inputs["retrieve_all"] = True
@@ -2962,10 +3008,48 @@ class MagicBoxOrchestrator:
             for match in re.finditer(pattern, value, flags=re.IGNORECASE):
                 left = self._trim_source_candidate(match.group(1))
                 right = self._trim_source_candidate(match.group(2))
+                # Only treat a "compare X and Y" / "X vs Y" pair as a SOURCE-scope
+                # comparison when BOTH sides look like media outlets. Otherwise the
+                # pair is an entity/topic comparison (e.g. "compare Ronaldo and Messi")
+                # and must not become a source filter — doing so drops the real
+                # entities from retrieval and filters to non-existent outlets (R12).
+                if not (self._looks_like_media_outlet(left) and self._looks_like_media_outlet(right)):
+                    continue
                 for candidate in (left, right):
                     if candidate and candidate.lower() not in {item.lower() for item in candidates}:
                         candidates.append(candidate)
         return candidates
+
+    @staticmethod
+    def _looks_like_media_outlet(candidate: str) -> bool:
+        value = str(candidate or "").strip()
+        if not value:
+            return False
+        lowered = value.lower()
+        # Domain-like tokens are outlets (e.g. uk.reuters.com, nypost.com).
+        if re.search(r"[a-z0-9-]+\.(?:com|co|net|org|uk|de|ch|news|tv)\b", lowered):
+            return True
+        # Short ALL-CAPS acronyms (3-5 letters) are typically outlet call-signs:
+        # NZZ, BBC, CNN, NPR, NYT, WSJ, ZDF, ARD, RAI. Restricted to >=3 chars so
+        # broad 2-letter geo codes (US, UK, EU) do not qualify.
+        if re.fullmatch(r"[A-Z]{3,5}", value):
+            return True
+        outlet_signal_tokens = {
+            "news", "times", "post", "journal", "tribune", "gazette", "herald",
+            "press", "magazine", "telegraph", "mirror", "express", "mail", "observer",
+            "economist", "bloomberg", "reuters", "guardian", "bbc", "cnn", "fox",
+            "msnbc", "nbc", "abc", "cbs", "npr", "sky", "aljazeera", "axios", "politico",
+            "vox", "wire", "daily", "weekly", "chronicle", "standard", "review",
+            "spiegel", "zeit", "welt", "tagesanzeiger", "anzeiger", "zeitung", "blatt",
+            "blick", "nzz", "wsj", "ft", "presse", "courier", "tagesschau", "figaro",
+            "monde", "corriere", "pravda", "xinhua",
+            "vice", "buzzfeed", "techcrunch", "verge", "wired", "atlantic", "newsweek",
+            "huffpost", "huffington", "breitbart", "yahoo", "msn",
+        }
+        # Split on whitespace, hyphens and dots so "Tages-Anzeiger" / "New York Times"
+        # match on any constituent outlet-signal token.
+        tokens = {token.lower().strip(".") for token in re.split(r"[\s.\-]+", value) if token}
+        return bool(tokens & outlet_signal_tokens)
 
     def _explicit_source_scope_matches(self, text: str) -> list[dict[str, Any]]:
         matches: list[dict[str, Any]] = []
@@ -3017,13 +3101,47 @@ class MagicBoxOrchestrator:
             rf"\b(?:in|from|by|among|across|within|of)\s+(?:the\s+)?(?P<descriptor>{descriptor})\s+{source_noun}\b",
             rf"\b(?P<descriptor>{descriptor})\s+{source_noun}\s+(?:reported|reports|report|covered|covers|cover|explained|explains|explain|portrayed|portrays|portray|framed|frames|frame|wrote|writes|write)\b",
         )
+        # Super-national / language / hemisphere media descriptors are NOT resolvable
+        # source scopes (R12: do not invent outlet alias lists for phrases like
+        # "American media"). These analyze unscoped instead of producing a spurious
+        # "source scope could not be resolved" answer. Single-nation descriptors
+        # (Swiss, British, Chinese, ...) are intentionally EXCLUDED here so they remain
+        # resolvable source scopes that the guardrail can flag when unresolved.
+        broad_scope_terms = {
+            "us", "u.s.", "u.s", "usa", "american", "america", "western", "west",
+            "english", "english-language", "englishlanguage", "european", "europe",
+            "global", "international", "mainstream", "national", "foreign", "major",
+            "world", "worldwide", "domestic", "eastern", "western", "asian",
+        }
+        filler_prefix = re.compile(
+            r"^(?:and|but|so|how|did|does|do|the|those|these|that|this|in|on|of|by|from|to|over|during|when|major)\s+",
+            flags=re.IGNORECASE,
+        )
         for pattern in patterns:
             for match in re.finditer(pattern, value, flags=re.IGNORECASE):
                 phrase = " ".join(str(match.group("descriptor")).split()).strip(" ,.;:!?()[]{}")
+                # The greedy descriptor regex can capture an entity + preposition prefix
+                # (e.g. "Huawei in Western media" -> "Huawei in Western"). Keep only the
+                # segment adjacent to the source noun by splitting on internal prepositions.
+                segments = re.split(
+                    r"\b(?:in|of|by|from|across|within|among|for|about|on|over|during|with)\b",
+                    phrase,
+                    flags=re.IGNORECASE,
+                )
+                if len(segments) > 1 and segments[-1].strip(" ,.;:!?()[]{}"):
+                    phrase = segments[-1].strip(" ,.;:!?()[]{}")
+                # Drop leading interrogative/filler tokens the greedy descriptor regex captures.
+                prev = None
+                while phrase and phrase != prev:
+                    prev = phrase
+                    phrase = filler_prefix.sub("", phrase).strip(" ,.;:!?()[]{}")
                 lowered = phrase.lower()
                 if not phrase or lowered in SOURCE_CANDIDATE_GENERIC_VALUES:
                     continue
                 if lowered in {"social", "news", "mainstream", "online", "legacy", "traditional"}:
+                    continue
+                # Skip when every remaining token is a broad geographic/language term.
+                if all(token in broad_scope_terms for token in lowered.split()):
                     continue
                 if lowered not in {item.lower() for item in descriptors}:
                     descriptors.append(phrase)
@@ -3218,6 +3336,11 @@ class MagicBoxOrchestrator:
             "america",
             "american",
             "usa",
+            "us",
+            "uk",
+            "eu",
+            "un",
+            "uae",
             "united",
             "states",
             "state",
@@ -3264,8 +3387,12 @@ class MagicBoxOrchestrator:
         def _add_anchor(token: str) -> None:
             for part in re.findall(r"[A-Za-z][A-Za-z0-9]+", str(token or "")):
                 lowered = part.lower()
+                # Keep 2-character ALL-CAPS acronyms (e.g. "AI", "EU") which are often
+                # the central topic; only drop other sub-3-char tokens. Without this,
+                # "AI coverage" loses its only content term and retrieval collapses.
+                too_short = len(lowered) < 3 and not (len(lowered) == 2 and part.isupper())
                 if (
-                    len(lowered) < 3
+                    too_short
                     or lowered in stopwords
                     or lowered in blocked_source_tokens
                     or lowered in seen
@@ -3998,11 +4125,16 @@ class MagicBoxOrchestrator:
                                 "ticker": market_ticker,
                                 "date_from": search_inputs.get("date_from", ""),
                                 "date_to": search_inputs.get("date_to", ""),
+                                "interval": "1d",
+                                "join_granularity": "month",
                                 "left_key": "time_bin",
                                 "right_key": "time_bin",
                                 "how": "left",
                             },
-                            depends_on=["fetch"],
+                            # Depend on the aggregate time series (not raw fetched
+                            # documents) so the external price series is JOINED onto the
+                            # per-time-bin coverage rows instead of returned standalone.
+                            depends_on=["series"],
                         )
                     )
                     nodes.append(
@@ -4058,12 +4190,22 @@ class MagicBoxOrchestrator:
         )
 
     def plan(self, state: AgentRunState) -> PlannerAction:
-        if self.llm_client is None:
+        # Planner mode: "auto" (default) uses the LLM planner with a deterministic
+        # heuristic fallback; "heuristic" forces the deterministic planner (reproducible,
+        # no malformed/over-filtering LLM plans — recommended for the evaluation suite);
+        # "llm" forces the LLM planner. The LLM rephrase/clarify/rejection stage still
+        # runs before this regardless of mode.
+        planner_mode = os.getenv("CORPUSAGENT2_PLANNER_MODE", "auto").strip().lower()
+        if self.llm_client is None or planner_mode == "heuristic":
             self._record_llm_trace(
                 state,
                 stage="plan",
                 used_fallback=True,
-                note="No LLM client configured; heuristic planning policy used.",
+                note=(
+                    "No LLM client configured; heuristic planning policy used."
+                    if self.llm_client is None
+                    else "CORPUSAGENT2_PLANNER_MODE=heuristic; deterministic planning policy used."
+                ),
             )
             heuristic = self._heuristic_plan(state)
             if heuristic.action == "emit_plan_dag" and heuristic.plan_dag is not None:
@@ -4132,13 +4274,13 @@ class MagicBoxOrchestrator:
 
                     R10 — For linguistic questions about nouns, verbs, adjectives, grammatical roles, or subject-verb-object patterns: include sentence_split, tokenize, pos_morph, lemmatize, dependency_parse, extract_svo_triples, noun_chunks, named_entities, entity_linking. For noun frequency tables, use build_evidence_table with task_name='noun_frequency_distribution'. noun_frequency_distribution rows contain lemma, count, relative_frequency, document_frequency, rank. Plot noun distributions with x='lemma' and y='count'.
 
-                    R11 — For price/external-series explanation questions: combine external price/time series with time_series_aggregate, burst/change detection, keyterms, quote_extract, quote_attribute, claim_span_extract, claim_strength_score, NER/entity_linking, and an evidence table. Align corpus evidence windows with external time-series movement windows.
+                    R11 — For questions that compare corpus coverage/framing/volume with a company STOCK price, a CURRENCY/exchange rate, a market INDEX, or a COMMODITY price (e.g. oil), the external price series IS available: emit a join_external_series node that depends on a time_series_aggregate node, and pass an explicit `ticker` (company→its ticker, e.g. Tesla=TSLA, Apple=AAPL; British pound=GBPUSD=X; euro=EURUSD=X; crude oil=CL=F; S&P 500=^GSPC). Then add a plot_artifact comparing corpus volume/share against the external series. For price-MOVEMENT EXPLANATION questions also combine burst/change detection, keyterms, quote_extract, quote_attribute, claim_span_extract, NER/entity_linking, and an evidence table, aligning corpus evidence windows with external movement windows. Never claim external market/stock/FX/commodity data is unavailable — join_external_series fetches it from Yahoo Finance.
 
                     R12 — Source filters: only when the user names specific outlets or the corpus metadata clearly supplies source names. Do not invent backend alias lists for broad phrases such as "Swiss newspapers" or "American media". If outlet aliases may be needed, list them in assumptions and keep source terms separate from topical query terms.
 
                     R13 — Clarification policy: ask clarification only when the missing information would change the plan structure. If clarification_history resolves a term, use the resolved term as the retrieval anchor. If prior clarification resolved only part of an ambiguity, ask only for the remainder. When a clarification says one term means another, use the resolved term as the retrieval anchor and avoid broad synonym paraphrases that dilute retrieval.
 
-                    R14 — Rejection policy: use grounded_rejection only when the question cannot be answered from the available corpus/tools, violates constraints, or requires unavailable external data. Explain the missing requirement precisely in rejection_reason."""
+                    R14 — Rejection policy: use grounded_rejection only when the question cannot be answered from the available corpus/tools, violates constraints, or requires unavailable external data. A request to compare corpus coverage with stock/equity prices, currency/exchange rates, market indices, or commodity prices is NOT a valid rejection ground — the join_external_series tool fetches that external series from Yahoo Finance, so plan it instead of rejecting. Only the corpus's own time/topic coverage limits (not external price availability) can make such a question partially unanswerable, and that is handled in synthesis, not by rejection. Explain any genuine missing requirement precisely in rejection_reason."""
                 ),
             },
             {
@@ -4215,6 +4357,38 @@ class MagicBoxOrchestrator:
                     action.plan_dag,
                     question_text=self._planning_context_text(state, action.rewritten_question),
                 )
+                if self._plan_is_degenerate(action.plan_dag):
+                    # The LLM plan has no analysis node (commonly because gpt-class
+                    # planners intermittently emit malformed JSON that the salvage
+                    # parser reduces to a bare search/working_set). Fall back to the
+                    # deterministic heuristic plan so the question is actually analyzed
+                    # instead of answered from a retrieval-only skeleton.
+                    heuristic = self._heuristic_plan(state)
+                    if heuristic.action == "emit_plan_dag" and heuristic.plan_dag is not None:
+                        heuristic.plan_dag = self._normalize_plan_dag(
+                            heuristic.plan_dag,
+                            question_text=self._planning_context_text(state, heuristic.rewritten_question),
+                        )
+                        if not self._plan_is_degenerate(heuristic.plan_dag):
+                            heuristic.rewritten_question = (
+                                action.rewritten_question
+                                or heuristic.rewritten_question
+                                or state.rewritten_question
+                            )
+                            heuristic.assumptions = list(
+                                dict.fromkeys(
+                                    list(action.assumptions)
+                                    + list(heuristic.assumptions)
+                                    + ["LLM planner returned an analysis-free plan; deterministic heuristic plan was used to ensure the question is fully analyzed."]
+                                )
+                            )
+                            self._record_llm_trace(
+                                state,
+                                stage="plan",
+                                used_fallback=True,
+                                note="LLM plan was degenerate (retrieval-only); heuristic planning fallback used.",
+                            )
+                            return heuristic
             if action.action == "ask_clarification" and state.force_answer:
                 heuristic = self._heuristic_plan(state)
                 if heuristic.action == "emit_plan_dag" and heuristic.plan_dag is not None:
@@ -5104,7 +5278,13 @@ class MagicBoxOrchestrator:
             or str(result.metadata.get("filtered_from_working_set", "")).lower() == "true"
             for result in snapshot.node_results.values()
         )
-        if (unresolved_source_scope or requested_described_source_scope) and not has_source_filter:
+        # Only emit the hard "cannot answer source-scoped question" guardrail when the
+        # question genuinely DESCRIBES a specific source scope that could not be
+        # resolved. Broad geographic/language phrases ("US media", "Western media",
+        # "English-language sources") are not source filters (R12); the planner
+        # correctly analyzes them unscoped, and its assumption text about not inventing
+        # outlet aliases must NOT be mistaken for an unresolved scope.
+        if requested_described_source_scope and not has_source_filter:
             note = (
                 "The requested source scope could not be resolved from corpus metadata or explicit outlet names; "
                 "the analysis rows are therefore not a supported source-scoped answer."
