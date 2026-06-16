@@ -48,7 +48,7 @@ class OpenSearchConfig:
             username=os.getenv("CORPUSAGENT2_OPENSEARCH_USERNAME", "").strip(),
             password=os.getenv("CORPUSAGENT2_OPENSEARCH_PASSWORD", "").strip(),
             verify_ssl=_truthy_env("CORPUSAGENT2_OPENSEARCH_VERIFY_SSL", False),
-            timeout_s=float(os.getenv("CORPUSAGENT2_OPENSEARCH_TIMEOUT_S", "20").strip() or "20"),
+            timeout_s=float(os.getenv("CORPUSAGENT2_OPENSEARCH_TIMEOUT_S", "45").strip() or "45"),
         )
 
 

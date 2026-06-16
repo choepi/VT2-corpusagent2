@@ -146,7 +146,8 @@ class LLMProviderConfig:
     api_key: str = ""
     planner_model: str = "adamo1139/Hermes-3-Llama-3.1-8B-FP8-Dynamic"
     synthesis_model: str = "adamo1139/Hermes-3-Llama-3.1-8B-FP8-Dynamic"
-    timeout_s: float = 60.0
+    # Synthesis over large evidence under load can exceed a minute; allow headroom.
+    timeout_s: float = 120.0
     verify_ssl: bool = True
     extra_headers: dict[str, str] = field(default_factory=dict)
 
@@ -261,7 +262,7 @@ class LLMProviderConfig:
             api_key=api_key,
             planner_model=resolved_planner_model,
             synthesis_model=resolved_synthesis_model,
-            timeout_s=float(os.getenv("CORPUSAGENT2_LLM_TIMEOUT_S", "60").strip() or "60"),
+            timeout_s=float(os.getenv("CORPUSAGENT2_LLM_TIMEOUT_S", "120").strip() or "120"),
             verify_ssl=os.getenv("CORPUSAGENT2_LLM_VERIFY_SSL", "true").strip().lower()
             not in {"0", "false", "no", "off"},
         )
