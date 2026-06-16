@@ -1408,6 +1408,80 @@ def test_attributed_price_explanation_question_forces_quotes_claims_and_external
     assert normalized.metadata["question_family"] == "attributed_explanation_series"
 
 
+def test_generic_market_question_attaches_external_series(tmp_path: Path) -> None:
+    # A market-intent question that lands in the generic plan family (no portrayal /
+    # attributed-explanation triggers) must still get a real external price series joined
+    # onto a corpus time-series. Regression: "how did the pound move around Brexit, and how
+    # did Western media cover it" previously produced a retrieval-only plan with no
+    # market_series node despite a resolvable GBPUSD=X ticker.
+    docs = _sample_documents()
+    runtime = build_test_runtime(tmp_path=tmp_path, documents=docs, search_rows_by_query=_search_rows(docs))
+    question = "How did the British pound move around Brexit, and how did Western media cover it?"
+    boring_dag = AgentPlanDAG(
+        nodes=[
+            AgentPlanNode("search", "db_search", inputs={"query": "British pound Brexit", "top_k": 10}),
+            AgentPlanNode("fetch", "fetch_documents", depends_on=["search"]),
+            AgentPlanNode("working_set", "create_working_set", depends_on=["fetch"]),
+            AgentPlanNode("keyterms", "extract_keyterms", depends_on=["fetch"]),
+        ],
+        metadata={"question_family": "generic"},
+    )
+
+    normalized = runtime.orchestrator._normalize_plan_dag(boring_dag, question_text=question)
+    capabilities = {node.capability for node in normalized.nodes}
+    assert {"time_series_aggregate", "join_external_series"}.issubset(capabilities)
+    market_node = next(node for node in normalized.nodes if node.capability == "join_external_series")
+    assert market_node.inputs["ticker"] == "GBPUSD=X"
+    # The market series must depend (transitively) on a corpus time-series anchor.
+    series_ids = {node.node_id for node in normalized.nodes if node.capability == "time_series_aggregate"}
+    assert any(dep in series_ids for dep in market_node.depends_on)
+
+
+def test_generic_nonmarket_question_keeps_no_external_series(tmp_path: Path) -> None:
+    # The market-series normalization is gated on a resolvable ticker; a non-market generic
+    # question must not gain a spurious join_external_series node.
+    docs = _sample_documents()
+    runtime = build_test_runtime(tmp_path=tmp_path, documents=docs, search_rows_by_query=_search_rows(docs))
+    question = "What did the corpus report about local school funding debates?"
+    boring_dag = AgentPlanDAG(
+        nodes=[
+            AgentPlanNode("search", "db_search", inputs={"query": "school funding", "top_k": 10}),
+            AgentPlanNode("fetch", "fetch_documents", depends_on=["search"]),
+            AgentPlanNode("working_set", "create_working_set", depends_on=["fetch"]),
+        ],
+        metadata={"question_family": "generic"},
+    )
+
+    normalized = runtime.orchestrator._normalize_plan_dag(boring_dag, question_text=question)
+    capabilities = {node.capability for node in normalized.nodes}
+    assert "join_external_series" not in capabilities
+
+
+def test_generic_media_phrase_is_not_a_resolvable_source_scope(tmp_path: Path) -> None:
+    # Generic media references ("the press", "the media") and verb/interrogative filler the
+    # rewriter introduces ("summarize how the press covered ...") must NOT be treated as a
+    # resolvable source scope, so broad-media questions analyze unscoped instead of emitting
+    # a spurious "source scope could not be resolved" answer. A genuine descriptor adjacent
+    # to the source noun (e.g. "Swiss") must still be detected.
+    runtime = build_test_runtime(
+        tmp_path=tmp_path, documents=_sample_documents(), search_rows_by_query=_search_rows(_sample_documents())
+    )
+    orchestrator = runtime.orchestrator
+    for generic in (
+        "How did the press cover the company?",
+        "How did the media cover the election?",
+        "summarize how the press covered the company during that year.",
+        "How did US media explain the oil price?",
+        "How did Western media cover Huawei?",
+    ):
+        assert orchestrator._described_source_scope_phrases(generic) == [], generic
+        assert orchestrator._question_requests_described_source_scope(generic) is False, generic
+    assert orchestrator._described_source_scope_phrases(
+        "Which named entities dominate climate coverage in Swiss newspapers?"
+    ) == ["Swiss"]
+    assert orchestrator._described_source_scope_phrases("How did the tech press cover Apple?") == ["tech"]
+
+
 def test_entity_trend_normalization_removes_unrequested_quote_branch(tmp_path: Path) -> None:
     runtime = build_test_runtime(
         tmp_path=tmp_path,

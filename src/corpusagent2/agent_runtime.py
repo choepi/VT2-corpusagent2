@@ -1425,6 +1425,15 @@ class MagicBoxOrchestrator:
             self._ensure_noun_distribution_nodes(normalized_nodes, unique_node_id, dag_text)
             if metadata.get("question_family", "") in {"", "generic"}:
                 metadata["question_family"] = "noun_distribution"
+        # Universal market-intent normalization: any question with a resolvable external
+        # ticker (oil->CL=F, the pound->GBPUSD=X, Tesla->TSLA) must attach a real external
+        # price series joined onto a corpus time-series, regardless of which question-family
+        # plan was selected. The temporal-portrayal / attributed-explanation families build
+        # this themselves; this catch-all covers the generic family (e.g. "how did the pound
+        # move around Brexit, and how did Western media cover it") so it gets the same
+        # market_series join as "how did the oil price change". Idempotent: a plan that
+        # already has a join_external_series node is left unchanged.
+        self._ensure_market_series_nodes(normalized_nodes, unique_node_id, dag_text)
         normalized_nodes = self._reuse_subsumed_search_branches(normalized_nodes)
         return self._compile_plan_dag(AgentPlanDAG(nodes=normalized_nodes, metadata=metadata), dag_text)
 
@@ -2320,6 +2329,81 @@ class MagicBoxOrchestrator:
                 )
             )
 
+    def _ensure_market_series_nodes(
+        self,
+        normalized_nodes: list[AgentPlanNode],
+        unique_node_id: Callable[[str], str],
+        question_text: str,
+    ) -> None:
+        """Attach a join_external_series (market) node for any plan whose question carries
+        market intent, creating a corpus time-series anchor if the selected plan family did
+        not already build one. Real thesis-core capabilities only (time_series_aggregate,
+        join_external_series); does not alter the planner mode."""
+        market_ticker = self._infer_market_ticker(question_text)
+        if not market_ticker:
+            return
+        if any(node.capability == "join_external_series" for node in normalized_nodes):
+            return
+
+        def first_node_id(capability: str) -> str:
+            return next((node.node_id for node in normalized_nodes if node.capability == capability), "")
+
+        # A market series is only meaningful joined onto a corpus time-series, which needs a
+        # document source to aggregate. Without a retrieval backbone there is nothing to align
+        # the external prices to, so leave the plan unchanged.
+        documents_node_id = first_node_id("fetch_documents") or first_node_id("create_working_set")
+        if not documents_node_id:
+            return
+        series_node_id = first_node_id("time_series_aggregate")
+        if not series_node_id:
+            series_node_id = unique_node_id("series")
+            normalized_nodes.append(
+                AgentPlanNode(
+                    node_id=series_node_id,
+                    capability="time_series_aggregate",
+                    inputs={
+                        "documents_node": documents_node_id,
+                        "time_field": "published_at",
+                        "bucket_granularity": "month",
+                        "metrics": ["document_count"],
+                    },
+                    depends_on=[documents_node_id],
+                )
+            )
+        date_window = self._extract_date_window(question_text)
+        market_node_id = unique_node_id("market_series")
+        normalized_nodes.append(
+            AgentPlanNode(
+                node_id=market_node_id,
+                capability="join_external_series",
+                inputs={
+                    "ticker": market_ticker,
+                    "date_from": date_window.get("date_from", ""),
+                    "date_to": date_window.get("date_to", ""),
+                    "interval": "1mo",
+                    "left_key": "time_bin",
+                    "right_key": "time_bin",
+                    "how": "left",
+                },
+                depends_on=[series_node_id],
+            )
+        )
+        normalized_nodes.append(
+            AgentPlanNode(
+                node_id=unique_node_id("plot_market_drawdown"),
+                capability="plot_artifact",
+                inputs={
+                    "plot_name": f"{market_ticker.lower()}_coverage_vs_drawdown",
+                    "plot_type": "line",
+                    "x": "time_bin",
+                    "y": ["document_count", "market_drawdown"],
+                    "series": "series_name",
+                },
+                depends_on=[market_node_id],
+                optional=True,
+            )
+        )
+
     def _ensure_temporal_portrayal_nodes(
         self,
         normalized_nodes: list[AgentPlanNode],
@@ -3135,6 +3219,31 @@ class MagicBoxOrchestrator:
                 while phrase and phrase != prev:
                     prev = phrase
                     phrase = filler_prefix.sub("", phrase).strip(" ,.;:!?()[]{}")
+                # A genuine source descriptor is the run of tokens immediately ADJACENT to
+                # the source noun (e.g. "Swiss" in "Swiss newspapers", "tech" in "tech
+                # press"). The greedy 0-4 word lookback can still leave a determiner or a
+                # verb/interrogative phrase glued to the front (e.g. "the press" -> "the",
+                # "summarize how the press" -> "summarize how the"). Keep only the maximal
+                # suffix of real descriptor tokens, stopping at the first determiner /
+                # auxiliary / report-verb / interrogative. A bare determiner ("the media",
+                # "the press") therefore yields no descriptor and analyzes unscoped instead
+                # of producing a spurious "source scope could not be resolved" answer.
+                descriptor_stop_tokens = {
+                    "the", "a", "an", "this", "that", "these", "those", "its", "their",
+                    "his", "her", "our", "your", "my", "some", "any", "no", "every", "all",
+                    "how", "did", "do", "does", "was", "were", "is", "are", "has", "have",
+                    "had", "be", "been", "being", "summarize", "summarise", "describe",
+                    "explain", "discuss", "analyze", "analyse", "cover", "covered", "covers",
+                    "report", "reported", "reports", "show", "shows", "tell", "compare",
+                    "characterize", "characterise", "and", "but", "so", "when", "what",
+                    "which", "who",
+                }
+                kept_tokens: list[str] = []
+                for token in reversed(phrase.split()):
+                    if token.lower() in descriptor_stop_tokens:
+                        break
+                    kept_tokens.append(token)
+                phrase = " ".join(reversed(kept_tokens)).strip(" ,.;:!?()[]{}")
                 lowered = phrase.lower()
                 if not phrase or lowered in SOURCE_CANDIDATE_GENERIC_VALUES:
                     continue
