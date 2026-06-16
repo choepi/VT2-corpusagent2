@@ -7550,6 +7550,15 @@ class AgentRuntime:
         manifest_path = Path(manifest.artifacts_dir) / "run_manifest.json"
         if not manifest.finished_at_utc:
             manifest.finished_at_utc = datetime.now(UTC).isoformat()
+        # AgentRunManifest.created_at_utc defaults to manifest-build time, which is the
+        # END of the run, making the recorded duration ~0ms. Stamp the real run start
+        # from the live status (set when the run was first queued/started) so run-history
+        # duration reflects actual wall-clock runtime.
+        with self._run_lock:
+            live = self._live_runs.get(manifest.run_id)
+        started = str(getattr(live, "started_at_utc", "") or "").strip() if live else ""
+        if started:
+            manifest.created_at_utc = started
         save_agent_manifest(manifest_path, manifest.to_dict())
         try:
             self.working_store.record_output(manifest.run_id, "final_answer", manifest.final_answer.to_dict())
