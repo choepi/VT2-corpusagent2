@@ -2728,6 +2728,30 @@ def _infer_market_ticker_from_text(text: str) -> str:
         for patterns, symbol in _COMPANY_TICKERS:
             if any(re.search(p, lowered) for p in patterns):
                 return symbol
+        # General fallback: extract a capitalized company-name phrase adjacent to the
+        # market-intent words and return it as-is. _fetch_yfinance_series_rows resolves
+        # an unknown name to a real ticker via yfinance symbol search at execution time
+        # (e.g. "Disney" -> DIS, "Spotify" -> SPOT); if the search finds nothing the node
+        # reports honestly that no symbol was found. This keeps ticker resolution general
+        # instead of limited to the curated list above.
+        company_phrase = r"([A-Z][A-Za-z.&'-]+(?:\s+[A-Z][A-Za-z.&'-]+){0,3})"
+        market_word = r"(?:stock|stocks|shares?|share\s+price|stock\s+price|equity|equities|valuation|market\s+cap)"
+        for pattern in (
+            rf"\b{company_phrase}(?:'s|’s)?\s+{market_word}\b",
+            rf"\b{market_word}\s+(?:of|for|in)\s+{company_phrase}\b",
+        ):
+            match = re.search(pattern, text)
+            if match:
+                candidate = " ".join(match.group(1).split()).strip(" .,'’&-")
+                candidate = re.sub(r"(?:'s|’s)$", "", candidate).strip(" .,'’&-")
+                # Reject leading question/scope filler captured by the greedy phrase.
+                candidate = re.sub(
+                    r"^(?:How|What|Which|The|US|U\.S\.|American|Western|English|European|Did|Does|Do)\s+",
+                    "",
+                    candidate,
+                ).strip()
+                if candidate and not re.fullmatch(r"(?:18|19|20)\d{2}", candidate):
+                    return candidate
     return ""
 
 
