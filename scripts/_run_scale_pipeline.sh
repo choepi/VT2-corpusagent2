@@ -29,7 +29,9 @@ for i in $(seq 1 60); do
 done
 
 banner "STAGE 4/4: OpenSearch BM25 bulk index (2M, clean recreate)"
-CORPUSAGENT2_OPENSEARCH_RECREATE_INDEX=true CORPUSAGENT2_OPENSEARCH_BULK_BATCH_SIZE="${CORPUSAGENT2_OPENSEARCH_BULK_BATCH_SIZE:-5000}" "$PY" scripts/21_bulk_index_opensearch.py || { echo "STAGE4_FAILED"; exit 1; }
+# Batch size kept modest: full news articles at >2000/bulk can exceed OpenSearch's
+# http.max_content_length (100MB) and fail with HTTP 413.
+CORPUSAGENT2_OPENSEARCH_RECREATE_INDEX=true CORPUSAGENT2_OPENSEARCH_BULK_BATCH_SIZE="${CORPUSAGENT2_OPENSEARCH_BULK_BATCH_SIZE:-2000}" "$PY" scripts/21_bulk_index_opensearch.py || { echo "STAGE4_FAILED"; exit 1; }
 
 banner "SCALE_PIPELINE_DONE"
 docker exec corpus_postgres psql -U corpus -d corpus_db -t -c "SELECT count(*) total, count(*) FILTER (WHERE dense_embedding IS NOT NULL) embedded FROM article_corpus;"
