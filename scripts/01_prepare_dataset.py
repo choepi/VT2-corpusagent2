@@ -7,6 +7,8 @@ import sys
 from pathlib import Path
 
 import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SRC_ROOT = REPO_ROOT / "src"
@@ -84,38 +86,67 @@ if __name__ == "__main__":
     if not raw_files:
         raise RuntimeError(f"No staged raw files found under: {RAW_ROOT}")
 
-    rows: list[dict] = []
+    # Stream rows in batches to a ParquetWriter instead of building one giant
+    # in-memory DataFrame. At multi-million scale the single-DataFrame path exhausts
+    # RAM (pyarrow ArrowMemoryError on a ~60GB realloc). Dedup by doc_id with a seen
+    # set so memory stays bounded to one batch + the id set.
+    COLUMNS = ["doc_id", "title", "text", "published_at", "source"]
+    SCHEMA = pa.schema([(c, pa.string()) for c in COLUMNS])
+    BATCH = 100_000
+
+    PROCESSED_PATH.parent.mkdir(parents=True, exist_ok=True)
+    seen_ids: set[str] = set()
+    batch: list[dict] = []
+    written = 0
+    writer: pq.ParquetWriter | None = None
+
+    def _flush() -> None:
+        global writer, written, batch
+        if not batch:
+            return
+        table = pa.Table.from_pylist(batch, schema=SCHEMA)
+        if writer is None:
+            writer = pq.ParquetWriter(PROCESSED_PATH, SCHEMA)
+        writer.write_table(table)
+        written += len(batch)
+        batch = []
+
+    stop = False
     for raw_file in raw_files:
         for payload in iter_records(raw_file):
             row = normalize_row(payload)
             if not row["text"]:
                 continue
-            rows.append(row)
-            if MODE == "debug" and len(rows) >= DEBUG_MAX_DOCS:
+            doc_id = row["doc_id"]
+            if doc_id in seen_ids:
+                continue
+            seen_ids.add(doc_id)
+            batch.append({c: (str(row.get(c)) if row.get(c) is not None else "") for c in COLUMNS})
+            if len(batch) >= BATCH:
+                _flush()
+            if MODE == "debug" and (written + len(batch)) >= DEBUG_MAX_DOCS:
+                stop = True
                 break
-        if MODE == "debug" and len(rows) >= DEBUG_MAX_DOCS:
+        if stop:
             break
+    _flush()
+    if writer is not None:
+        writer.close()
 
-    if not rows:
+    if written == 0:
         raise RuntimeError("No usable rows found after preprocessing")
-
-    df = pd.DataFrame(rows)
-    df = df.drop_duplicates(subset=["doc_id"]).reset_index(drop=True)
-
-    PROCESSED_PATH.parent.mkdir(parents=True, exist_ok=True)
-    df.to_parquet(PROCESSED_PATH, index=False)
 
     summary = {
         "mode": MODE,
         "seed": SEED,
         "raw_files_used": len(raw_files),
-        "documents_written": int(df.shape[0]),
+        "documents_written": int(written),
         "output_parquet": str(PROCESSED_PATH),
-        "columns": list(df.columns),
+        "columns": COLUMNS,
     }
     write_json(SUMMARY_PATH, summary)
 
-    print(f"Prepared {df.shape[0]} documents")
+    print(f"Prepared {written} documents")
     print(f"Parquet: {PROCESSED_PATH}")
     print(f"Summary: {SUMMARY_PATH}")
 
