@@ -6,3 +6,8 @@ services:
     environment:
       OPENSEARCH_JAVA_OPTS: ${CORPUSAGENT2_OPENSEARCH_JAVA_OPTS:--Xms3g -Xmx3g}
     mem_limit: "${CORPUSAGENT2_OPENSEARCH_MEM_LIMIT:-6g}"
+  corpusagent2-api:
+    # Broad exhaustive (retrieve_all) questions analyze a large working set at query
+    # time; at multi-million scale the default 6g is exceeded and the API process
+    # crashes mid-run (the RQ2 precompute-vs-query-time wall). 20g lets them complete.
+    mem_limit: "${CORPUSAGENT2_API_MEM_LIMIT:-20g}"
