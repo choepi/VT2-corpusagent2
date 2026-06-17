@@ -120,6 +120,19 @@ if __name__ == "__main__":
                         convert_to_numpy=True,
                         normalize_embeddings=True,
                     ).astype(np.float32)
+                    # Sanitize degenerate embeddings. Empty/non-encodable text yields a
+                    # zero-norm vector; normalize_embeddings then divides by zero -> NaN,
+                    # which pgvector rejects ("NaN not allowed in vector"). Replace any
+                    # non-finite or zero-norm row with a deterministic unit placeholder so
+                    # the row gets a valid (cosine-safe) embedding and the backfill does
+                    # not stall re-fetching the same NULL row forever.
+                    finite_rows = np.isfinite(embeddings).all(axis=1)
+                    norms = np.linalg.norm(np.nan_to_num(embeddings), axis=1)
+                    bad = (~finite_rows) | (norms == 0.0)
+                    if bad.any():
+                        embeddings = np.nan_to_num(embeddings, nan=0.0, posinf=0.0, neginf=0.0)
+                        embeddings[bad] = 0.0
+                        embeddings[bad, 0] = 1.0
                     for doc_id, vector in zip(doc_ids, embeddings, strict=False):
                         vectors_by_doc_id[doc_id] = vector_literal(vector)
 
@@ -129,9 +142,25 @@ if __name__ == "__main__":
                     if vector_literal_text
                 ]
                 if updates:
-                    cursor.executemany(
-                        f"UPDATE {table_name} SET dense_embedding = %s::vector WHERE doc_id = %s",
-                        updates,
+                    # Single batched UPDATE ... FROM (VALUES ...) instead of per-row
+                    # executemany. At multi-million scale the row-by-row path starves
+                    # the GPU on DB round-trips; one statement per batch keeps the GPU fed.
+                    from psycopg import sql as _sql
+
+                    placeholders = _sql.SQL(",").join(
+                        _sql.SQL("(%s::vector,%s)") for _ in updates
+                    )
+                    flat_params = []
+                    for vector_literal_text, doc_id in updates:
+                        flat_params.append(vector_literal_text)
+                        flat_params.append(doc_id)
+                    cursor.execute(
+                        _sql.SQL(
+                            "UPDATE {tbl} AS t SET dense_embedding = d.emb "
+                            "FROM (VALUES {vals}) AS d(emb, doc_id) "
+                            "WHERE t.doc_id = d.doc_id"
+                        ).format(tbl=_sql.Identifier(table_name), vals=placeholders),
+                        flat_params,
                     )
                     conn.commit()
 

@@ -50,6 +50,16 @@ def _auth(config: OpenSearchConfig) -> tuple[str, str] | None:
 
 
 def _ensure_index(config: OpenSearchConfig) -> None:
+    # Optional clean replace: delete the index first so a re-ingest does not leave
+    # stale documents from a previous corpus mixed into the BM25 index. Off by default
+    # to preserve incremental-append behaviour.
+    if os.getenv("CORPUSAGENT2_OPENSEARCH_RECREATE_INDEX", "").strip().lower() in {"1", "true", "yes", "on"}:
+        requests.delete(
+            f"{config.base_url.rstrip('/')}/{config.index_name}",
+            auth=_auth(config),
+            verify=config.verify_ssl,
+            timeout=max(config.timeout_s, 120.0),
+        )
     mapping = {
         "settings": {"number_of_shards": 1, "number_of_replicas": 0},
         "mappings": {

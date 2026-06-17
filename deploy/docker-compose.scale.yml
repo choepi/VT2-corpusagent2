@@ -1,0 +1,8 @@
+## Scale override: larger OpenSearch heap for multi-million-doc BM25 indexing.
+## Use together with docker-compose.yml when ingesting/indexing a large corpus:
+##   docker compose -f docker-compose.yml -f docker-compose.scale.yml up -d opensearch
+services:
+  opensearch:
+    environment:
+      OPENSEARCH_JAVA_OPTS: ${CORPUSAGENT2_OPENSEARCH_JAVA_OPTS:--Xms3g -Xmx3g}
+    mem_limit: "${CORPUSAGENT2_OPENSEARCH_MEM_LIMIT:-6g}"
