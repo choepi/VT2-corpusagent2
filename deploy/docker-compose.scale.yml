@@ -5,6 +5,9 @@ services:
   opensearch:
     environment:
       OPENSEARCH_JAVA_OPTS: ${CORPUSAGENT2_OPENSEARCH_JAVA_OPTS:--Xms3g -Xmx3g}
+      # Larger full-shard articles make a 2000-doc bulk exceed the default 100mb
+      # request limit (HTTP 413); raise it so bulk indexing stays fast at scale.
+      http.max_content_length: "${CORPUSAGENT2_OPENSEARCH_MAX_CONTENT:-300mb}"
     mem_limit: "${CORPUSAGENT2_OPENSEARCH_MEM_LIMIT:-6g}"
   corpusagent2-api:
     # Broad exhaustive (retrieve_all) questions analyze a large working set at query
