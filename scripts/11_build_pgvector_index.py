@@ -164,6 +164,30 @@ if __name__ == "__main__":
                     )
                     built_indices.append(hnsw_index_name)
 
+                # Full-text GIN index for the sql_query_search capability (PostgreSQL
+                # FTS). Without it the FTS match does a per-row to_tsvector sequential
+                # scan — fine at ~600k, ~20+ min at 13M. The expression MUST match the
+                # query built in agent_capabilities (the sql_query_search vector_expr)
+                # exactly, or the planner will not use the index.
+                fts_index_name = f"idx_{table_name}_fts"
+                if MAINTENANCE_WORK_MEM:
+                    cursor.execute(f"SET maintenance_work_mem = '{MAINTENANCE_WORK_MEM}';")
+                cursor.execute(
+                    f"""
+                    CREATE INDEX IF NOT EXISTS {fts_index_name}
+                    ON {table_name}
+                    USING gin ((
+                        setweight(to_tsvector('simple', COALESCE(title::text, '')), 'A') ||
+                        setweight(to_tsvector('simple', COALESCE(text::text, '')), 'B')
+                    ));
+                    """
+                )
+                built_indices.append(fts_index_name)
+                # Filter btrees, restored here in case a corpus rebuild dropped them for
+                # fast bulk ingest.
+                cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_{table_name}_source ON {table_name} (source);")
+                cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_{table_name}_published_at ON {table_name} (published_at);")
+
                 cursor.execute(f"ANALYZE {table_name};")
             conn.commit()
 
