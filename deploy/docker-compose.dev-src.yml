@@ -18,6 +18,7 @@ services:
       # synthesis over large evidence) do not hit transient ConnectionTimeouts.
       CORPUSAGENT2_OPENSEARCH_TIMEOUT_S: ${CORPUSAGENT2_OPENSEARCH_TIMEOUT_S:-60}
       CORPUSAGENT2_LLM_TIMEOUT_S: ${CORPUSAGENT2_LLM_TIMEOUT_S:-180}
+      CORPUSAGENT2_CORPUS_NAME: ${CORPUSAGENT2_CORPUS_NAME:-Geralt-Targaryen/CC-News}
   corpusagent2-mcp:
     volumes:
       - ../src:/app/src

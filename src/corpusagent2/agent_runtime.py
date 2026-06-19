@@ -502,7 +502,11 @@ def _runtime_corpus_info(project_root: Path, retrieval_health: dict[str, Any]) -
         local_source = str(first_file.get("source") or first_file.get("destination") or "").strip()
         source_sha256 = str(first_file.get("sha256") or "").strip()
         source_name = Path(local_source).name.lower() if local_source else ""
-        if not hf_dataset and "cc_news" in source_name:
+        # Best-effort dataset guess from the staged file name when no CORPUSAGENT2_HF_DATASET
+        # / CORPUSAGENT2_CORPUS_NAME env is set. Prefer the env in deployments.
+        if not hf_dataset and ("geralt" in source_name or "ccnews_geralt" in source_name):
+            hf_dataset = "Geralt-Targaryen/CC-News"
+        elif not hf_dataset and "cc_news" in source_name:
             hf_dataset = "vblagoje/cc_news"
             hf_split = hf_split or "train"
 
