@@ -5646,6 +5646,7 @@ class AgentRuntime:
         self._device_report_cache: dict[str, Any] | None = None
         self._retrieval_health_cache: tuple[float, dict[str, Any]] | None = None
         self._corpus_date_bounds_cache: tuple[str, str] | None = None
+        self._live_corpus_stats_cache: tuple[int, str, str] | None = None
         try:
             self._runtime_info_health_ttl_s = max(
                 0.0,
@@ -5765,8 +5766,48 @@ class AgentRuntime:
             require_backend_services=self.require_backend_services,
         )
 
+    def _live_corpus_stats(self) -> tuple[int, str, str] | None:
+        """(count, min_date, max_date) from the LIVE Postgres corpus the agent actually
+        queries — not the local doc_metadata.parquet assets, which can be stale after a
+        corpus rebuild. Cached for the process; falls back to None if Postgres is
+        unavailable (e.g. local-only backend) so callers use load_metadata instead."""
+        if self._live_corpus_stats_cache is not None:
+            return self._live_corpus_stats_cache
+        try:
+            import psycopg
+
+            from .retrieval import pg_connect_kwargs, pg_dsn_from_env, pg_table_from_env
+
+            dsn = pg_dsn_from_env(required=False)
+            if not dsn:
+                return None
+            table = pg_table_from_env()
+            with psycopg.connect(dsn, **pg_connect_kwargs()) as conn:
+                with conn.cursor() as cur:
+                    cur.execute(f"SELECT count(*) FROM {table}")
+                    count = int(cur.fetchone()[0])
+                    # Range-bounded so the published_at btree is used (a regex filter
+                    # would force a 13M seq scan); excludes empty/invalid date strings.
+                    cur.execute(
+                        f"SELECT min(published_at), max(published_at) FROM {table} "
+                        "WHERE published_at >= '1900-01-01' AND published_at <= '2100-12-31'"
+                    )
+                    row = cur.fetchone()
+            lo = str((row[0] if row else "") or "")[:10]
+            hi = str((row[1] if row else "") or "")[:10]
+            if not (re.fullmatch(r"\d{4}-\d{2}-\d{2}", lo) and re.fullmatch(r"\d{4}-\d{2}-\d{2}", hi)):
+                return None
+            self._live_corpus_stats_cache = (count, lo, hi)
+            return self._live_corpus_stats_cache
+        except Exception:
+            return None
+
     def _corpus_date_bounds(self) -> tuple[str, str] | None:
         if self._corpus_date_bounds_cache is not None:
+            return self._corpus_date_bounds_cache
+        live = self._live_corpus_stats()
+        if live is not None:
+            self._corpus_date_bounds_cache = (live[1], live[2])
             return self._corpus_date_bounds_cache
         try:
             metadata = self.runtime.load_metadata()
@@ -6599,10 +6640,17 @@ class AgentRuntime:
 
     def corpus_schema(self) -> dict[str, Any]:
         metadata = self.runtime.load_metadata().head(1)
+        # Prefer the live Postgres corpus count; the local doc_metadata.parquet can be
+        # stale after a corpus rebuild (it reported 624k while the DB held 13M).
+        live = self._live_corpus_stats()
+        if live is not None:
+            document_count = live[0]
+        else:
+            document_count = int(self.runtime.load_metadata().shape[0])
         return {
             "metadata_fields": sorted(str(column) for column in metadata.columns),
             "retrieval_backend": "opensearch+postgres",
-            "document_count": int(self.runtime.load_metadata().shape[0]),
+            "document_count": document_count,
         }
 
     def _build_state(self, question: str, force_answer: bool, no_cache: bool) -> AgentRunState:

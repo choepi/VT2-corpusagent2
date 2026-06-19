@@ -293,8 +293,17 @@ class CorpusRuntime:
         elif local_lexical["ready"]:
             lexical_strategy = "local_tfidf"
 
+        # Report the LIVE corpus size from the active backend, not the local
+        # doc_metadata.parquet row count (metadata_rows), which goes stale after a
+        # corpus rebuild (it read 624k while Postgres held 13M).
+        document_count = metadata_rows
+        if self.retrieval_backend == "pgvector" and int(pgvector.get("total_rows") or 0) > 0:
+            document_count = int(pgvector["total_rows"])
+        elif int(opensearch.get("document_count") or 0) > 0:
+            document_count = int(opensearch["document_count"])
+
         return {
-            "document_count": metadata_rows,
+            "document_count": document_count,
             "backend": self.retrieval_backend,
             "local_lexical": local_lexical,
             "local_dense": local_dense,
