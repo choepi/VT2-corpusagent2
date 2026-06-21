@@ -5788,8 +5788,18 @@ class AgentRuntime:
             table = pg_table_from_env()
             with psycopg.connect(dsn, **pg_connect_kwargs()) as conn:
                 with conn.cursor() as cur:
-                    cur.execute(f"SELECT count(*) FROM {table}")
-                    count = int(cur.fetchone()[0])
+                    # Use the planner's row estimate (instant) instead of an exact
+                    # count(*), which is a ~90s seq scan over 13M and ran at every run
+                    # init. reltuples is accurate after ANALYZE (11_build runs it).
+                    cur.execute(
+                        "SELECT reltuples::bigint FROM pg_class WHERE relname = %s",
+                        (table,),
+                    )
+                    est = cur.fetchone()
+                    count = int(est[0]) if est and est[0] and int(est[0]) > 0 else 0
+                    if count <= 0:
+                        cur.execute(f"SELECT count(*) FROM {table}")
+                        count = int(cur.fetchone()[0])
                     # Range-bounded so the published_at btree is used (a regex filter
                     # would force a 13M seq scan); excludes empty/invalid date strings.
                     cur.execute(

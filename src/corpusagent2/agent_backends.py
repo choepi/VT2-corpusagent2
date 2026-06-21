@@ -918,6 +918,8 @@ class PostgresWorkingSetStore:
         *,
         limit: int | None = None,
         offset: int = 0,
+        after_rank: int | None = None,
+        after_doc_id: str | None = None,
     ) -> list[dict[str, Any]]:
         columns = self._document_columns()
         table_name = self._safe_identifier(self.documents_table)
@@ -925,8 +927,21 @@ class PostgresWorkingSetStore:
         select_date = f"doc.{columns['date']}" if columns["date"] else "''"
         select_source = f"doc.{columns['source']}" if columns["source"] else "''"
         params: list[Any] = [run_id, label]
+        # Keyset (seek) pagination: when a cursor is supplied, page with
+        # (rank, doc_id) > (after_rank, after_doc_id) instead of OFFSET. OFFSET makes
+        # streaming a large working set O(N^2) (each batch re-skips all prior rows);
+        # keyset is an O(N) index range scan over idx_ca_agent_working_set_docs_order.
+        keyset_clause = ""
+        use_keyset = after_doc_id is not None
+        if use_keyset:
+            keyset_clause = " AND (ws.rank, ws.doc_id) > (%s, %s)"
+            params.extend([int(after_rank or 0), str(after_doc_id)])
         limit_clause = ""
-        if limit is not None:
+        if use_keyset:
+            if limit is not None:
+                limit_clause = " LIMIT %s"
+                params.append(max(0, int(limit)))
+        elif limit is not None:
             limit_clause = " LIMIT %s OFFSET %s"
             params.extend([max(0, int(limit)), max(0, int(offset))])
         elif offset > 0:
@@ -944,6 +959,7 @@ class PostgresWorkingSetStore:
             f"FROM ca_agent_working_set_docs ws "
             f"JOIN {table_name} doc ON doc.{columns['doc_id']}::text = ws.doc_id "
             f"WHERE ws.run_id = %s AND ws.label = %s "
+            f"{keyset_clause}"
             f"ORDER BY ws.rank, ws.doc_id"
             f"{limit_clause}"
         )

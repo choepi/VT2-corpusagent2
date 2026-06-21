@@ -1128,6 +1128,12 @@ def _iter_working_set_documents(
     resolved_batch_size = max(1, resolved_batch_size)
     offset = 0
     yielded = 0
+    # Prefer keyset (seek) pagination so streaming a large working set is O(N), not the
+    # O(N^2) OFFSET trap (each OFFSET batch re-scans all prior rows -> hours at idle CPU
+    # for million-doc sets). Falls back to OFFSET for stores without keyset support.
+    use_keyset = True
+    last_rank: int | None = None
+    last_doc_id: str | None = None
     while True:
         if _cancel_requested(context):
             break
@@ -1138,7 +1144,17 @@ def _iter_working_set_documents(
             limit = min(limit, max(0, max_documents - yielded))
         if limit <= 0:
             break
-        rows = fetcher(context.run_id, label, limit=limit, offset=offset)
+        if use_keyset:
+            try:
+                rows = fetcher(
+                    context.run_id, label, limit=limit,
+                    after_rank=last_rank, after_doc_id=last_doc_id,
+                )
+            except TypeError:
+                use_keyset = False
+                rows = fetcher(context.run_id, label, limit=limit, offset=offset)
+        else:
+            rows = fetcher(context.run_id, label, limit=limit, offset=offset)
         if not rows:
             break
         for row in rows:
@@ -1147,6 +1163,8 @@ def _iter_working_set_documents(
             if isinstance(row, dict):
                 yield dict(row)
                 yielded += 1
+                last_rank = row.get("rank", last_rank)
+                last_doc_id = str(row.get("doc_id", last_doc_id) or last_doc_id)
                 if max_documents is not None and yielded >= max_documents:
                     break
         if _cancel_requested(context):
