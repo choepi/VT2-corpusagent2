@@ -1428,21 +1428,26 @@ function buildPrintableReportHtml(manifest) {
     <title>${escapeHtml(title)}</title>
     <style>
       :root {
-        --ink: #171512;
-        --muted: #625d55;
-        --border: #d8d0c3;
-        --paper: #fffaf2;
-        --soft: #f4efe6;
-        --accent: #0e6b5b;
-        --danger: #9f2f2f;
+        --ink: #1d1d1f;
+        --muted: #6e6e73;
+        --border: rgba(0, 0, 0, 0.1);
+        --hairline: rgba(0, 0, 0, 0.06);
+        --paper: #ffffff;
+        --soft: #f5f5f7;
+        --accent: #0071e3;
+        --danger: #d92d20;
       }
       * { box-sizing: border-box; }
       body {
         margin: 0;
         color: var(--ink);
-        background: #f5efe2;
-        font-family: Georgia, "Times New Roman", serif;
-        line-height: 1.35;
+        background:
+          radial-gradient(circle at 12% -8%, rgba(0, 113, 227, 0.12), transparent 34%),
+          radial-gradient(circle at 88% 0%, rgba(52, 199, 89, 0.09), transparent 30%),
+          linear-gradient(180deg, #ffffff 0%, #f5f5f7 46%, #eef1f5 100%);
+        font-family: ui-sans-serif, -apple-system, BlinkMacSystemFont, "SF Pro Display", "SF Pro Text", "Segoe UI", sans-serif;
+        line-height: 1.4;
+        -webkit-font-smoothing: antialiased;
       }
       main { max-width: 1120px; margin: 0 auto; padding: 28px; }
       header {
@@ -1451,8 +1456,9 @@ function buildPrintableReportHtml(manifest) {
         border-radius: 20px;
         padding: 22px;
         margin-bottom: 18px;
+        box-shadow: 0 10px 28px rgba(0, 0, 0, 0.07);
       }
-      h1 { margin: 0 0 8px; font-size: 2.2rem; line-height: 1; }
+      h1 { margin: 0 0 8px; font-size: 2.2rem; line-height: 1.05; letter-spacing: -0.022em; }
       h2 {
         margin: 28px 0 12px;
         border-bottom: 2px solid var(--border);
@@ -1464,7 +1470,7 @@ function buildPrintableReportHtml(manifest) {
       .danger { color: var(--danger); }
       .report-card {
         border: 1px solid var(--border);
-        background: rgba(255, 250, 242, 0.86);
+        background: rgba(255, 255, 255, 0.9);
         border-radius: 16px;
         padding: 14px;
         margin: 12px 0;
@@ -1491,7 +1497,7 @@ function buildPrintableReportHtml(manifest) {
         border-radius: 12px;
         background: var(--soft);
         padding: 10px;
-        font-family: "Cascadia Code", Consolas, monospace;
+        font-family: ui-monospace, "SF Mono", "SFMono-Regular", Menlo, Consolas, monospace;
         font-size: 0.82rem;
       }
       table {
