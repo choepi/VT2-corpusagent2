@@ -3968,7 +3968,6 @@ def _filter_working_set(params: dict[str, Any], deps: dict[str, ToolExecutionRes
     relaxed_rows: list[dict[str, Any]] = []
     filter_match_counts: dict[str, int] = {}
     filter_seen_keys: set[str] = set()
-    filter_supported_keys: set[str] = set()
     unsupported_filter_keys: set[str] = set()
     missing_date_count = 0
     scanned = 0
@@ -4011,9 +4010,8 @@ def _filter_working_set(params: dict[str, Any], deps: dict[str, ToolExecutionRes
         # Passes query/date/length/annotation; structured document_filters not yet applied.
         relaxed_rows.append(built_row)
         if document_filters:
-            match_map, unsupported, supported = _structured_filter_match_map(row, document_filters)
+            match_map, unsupported, _supported = _structured_filter_match_map(row, document_filters)
             unsupported_filter_keys.update(unsupported)
-            filter_supported_keys.update(supported)
             for filter_key, matched in match_map.items():
                 filter_seen_keys.add(filter_key)
                 if matched:
@@ -4053,27 +4051,28 @@ def _filter_working_set(params: dict[str, Any], deps: dict[str, ToolExecutionRes
             },
         )
 
-    # Data-driven infeasible-scope retry. If the structured document_filters eliminated
-    # the entire (non-empty) upstream working set, and EVERY evaluated filter key is a
-    # *present* metadata field (so it could be checked) yet was satisfied by zero scanned
-    # documents, then the requested source/outlet scope value simply does not occur in
-    # this corpus and the narrowing scope is unresolvable here. Returning an empty working
-    # set silently starves all downstream analysis (NER, time series), so instead retry
-    # with those scopes relaxed and flag them as infeasible — synthesis then reports the
-    # scope honestly while still answering over the unscoped set. The trigger is purely
-    # the observed match counts; no hardcoded outlet/geography lists. An unevaluable filter
-    # (field absent from the schema) still fails closed — it is not a "present but unmatched"
-    # scope and is excluded by the all-supported requirement below.
-    infeasible_scope_filters: dict[str, Any] = {}
+    # Data-driven unsatisfiable-filter retry. If the structured document_filters eliminated
+    # the entire (non-empty) upstream working set, and EVERY evaluated filter key matched
+    # zero scanned documents — whether because the requested value does not occur in this
+    # corpus (e.g. a source/outlet scope absent here) or because the key is not an
+    # evaluable metadata field (e.g. an LLM-invented directive like require_text) — then
+    # the requested narrowing cannot be applied to this corpus. Returning an empty working
+    # set silently starves all downstream analysis (NER, time series), producing a run that
+    # "finishes" in seconds having done nothing. Instead retry with those filters relaxed
+    # and flag them so synthesis reports the limitation honestly while still answering over
+    # the upstream set. The trigger is purely the observed match counts (rows passing
+    # query/date/length but failing every structured filter); no hardcoded outlet,
+    # geography, or directive-name lists. A query/date/length that legitimately matches
+    # nothing leaves relaxed_rows empty, so genuine empties are still reported honestly.
+    relaxed_filters: dict[str, Any] = {}
     if (
         document_filters
         and not filtered_rows
         and relaxed_rows
         and filter_seen_keys
-        and filter_seen_keys <= filter_supported_keys
         and all(filter_match_counts.get(key, 0) == 0 for key in filter_seen_keys)
     ):
-        infeasible_scope_filters = dict(document_filters)
+        relaxed_filters = dict(document_filters)
         filtered_rows = relaxed_rows
 
     deduped: list[dict[str, Any]] = []
@@ -4108,14 +4107,14 @@ def _filter_working_set(params: dict[str, Any], deps: dict[str, ToolExecutionRes
             f"another full-corpus retrieval; matched {matched_count_before_limit} of {total or scanned} upstream documents."
         )
     ]
-    if infeasible_scope_filters:
+    if relaxed_filters:
         caveats.append(
-            "Requested source scope is INFEASIBLE for this corpus: the structured filter "
-            + json.dumps(infeasible_scope_filters, ensure_ascii=False, sort_keys=True)
-            + " matched zero documents in the upstream working set, so no document carries "
-            "that source value here. The scope was relaxed and the analysis was retried "
-            "unscoped over the upstream working set; treat any source-scoped conclusion as "
-            "unsupported by this corpus."
+            "Requested working-set filter is INFEASIBLE for this corpus: the structured filter "
+            + json.dumps(relaxed_filters, ensure_ascii=False, sort_keys=True)
+            + " matched zero documents in the upstream working set (the requested value/scope is "
+            "not present in this corpus, or the filter key is not an evaluable metadata field). "
+            "It was relaxed and the analysis was retried over the full upstream working set; treat "
+            "any conclusion scoped to that filter as unsupported by this corpus."
         )
     elif document_filters or annotation_filter_keys:
         caveats.append(
@@ -4181,8 +4180,8 @@ def _filter_working_set(params: dict[str, Any], deps: dict[str, ToolExecutionRes
             "missing_date_count": missing_date_count,
             "filtered_from_working_set": True,
             "payload_truncated": result_count > len(preview_rows),
-            "infeasible_source_scope": bool(infeasible_scope_filters),
-            "relaxed_infeasible_filters": infeasible_scope_filters or None,
+            "infeasible_source_scope": bool(relaxed_filters),
+            "relaxed_infeasible_filters": relaxed_filters or None,
         },
     )
 

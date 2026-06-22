@@ -472,7 +472,11 @@ def test_filter_working_set_relaxes_infeasible_source_scope_instead_of_emptying(
     assert "INFEASIBLE" in " ".join(result.caveats)
 
 
-def test_filter_working_set_structured_filters_fail_closed_when_metadata_absent() -> None:
+def test_filter_working_set_relaxes_unevaluable_filter_instead_of_emptying() -> None:
+    # A filter key the corpus cannot evaluate (no such metadata field) must not silently
+    # empty a non-empty working set and starve downstream analysis. Per the chosen policy
+    # it is relaxed and reported infeasible, retrying over the full upstream set rather
+    # than failing closed to zero documents.
     store = InMemoryWorkingSetStore()
     store.document_lookup["doc-1"] = {
         "doc_id": "doc-1",
@@ -497,8 +501,41 @@ def test_filter_working_set_structured_filters_fail_closed_when_metadata_absent(
         context,
     )
 
+    assert result.payload["document_count"] == 1
+    assert result.metadata["infeasible_source_scope"] is True
+    assert "source_country" in json.dumps(result.metadata["relaxed_infeasible_filters"])
+    assert "INFEASIBLE" in " ".join(result.caveats)
+
+
+def test_filter_working_set_returns_empty_when_query_matches_nothing() -> None:
+    # Genuine emptiness from a query (not a structured filter) must still report zero —
+    # the relax path only applies to unsatisfiable structured document_filters.
+    store = InMemoryWorkingSetStore()
+    store.document_lookup["doc-1"] = {
+        "doc_id": "doc-1",
+        "title": "Climate report",
+        "text": "Climate policy story.",
+        "published_at": "2018-02-01",
+        "source": "example.ch",
+    }
+    store.record_working_set("run", "broad", [{"doc_id": "doc-1", "rank": 1, "score": 1.0}])
+    context = AgentExecutionContext(
+        run_id="run",
+        artifacts_dir=Path("."),
+        search_backend=None,
+        working_store=store,
+        runtime=None,
+    )
+    deps = {"working_set": ToolExecutionResult(payload={"working_set_ref": "broad", "document_count": 1})}
+
+    result = _filter_working_set(
+        {"payload": {"working_set": "working_set", "query": "cryptocurrency mining regulation"}},
+        deps,
+        context,
+    )
+
     assert result.payload["document_count"] == 0
-    assert "source_country" in " ".join(result.caveats)
+    assert result.metadata["infeasible_source_scope"] is False
 
 
 def test_filter_working_set_applies_min_text_length_from_document_text() -> None:
