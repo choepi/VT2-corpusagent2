@@ -415,6 +415,63 @@ def test_filter_working_set_applies_nested_payload_filters() -> None:
     assert result.payload["results"][0]["doc_id"] == "doc-1"
 
 
+def test_filter_working_set_relaxes_infeasible_source_scope_instead_of_emptying() -> None:
+    # A source scope whose value matches no document (the 'source' field IS present, but
+    # no outlet matches the requested scope) must not silently empty the working set and
+    # starve downstream analysis. It should retry unscoped and flag the scope infeasible.
+    store = InMemoryWorkingSetStore()
+    store.document_lookup.update(
+        {
+            "doc-1": {
+                "doc_id": "doc-1",
+                "title": "Climate report",
+                "text": "Climate policy story.",
+                "published_at": "2018-02-01",
+                "source": "reuters.com",
+            },
+            "doc-2": {
+                "doc_id": "doc-2",
+                "title": "Climate report",
+                "text": "Climate policy story.",
+                "published_at": "2018-03-01",
+                "source": "bbc.co.uk",
+            },
+        }
+    )
+    store.record_working_set(
+        "run",
+        "broad",
+        [{"doc_id": "doc-1", "rank": 1, "score": 1.0}, {"doc_id": "doc-2", "rank": 2, "score": 0.9}],
+    )
+    context = AgentExecutionContext(
+        run_id="run",
+        artifacts_dir=Path("."),
+        search_backend=None,
+        working_store=store,
+        runtime=None,
+    )
+    deps = {"working_set": ToolExecutionResult(payload={"working_set_ref": "broad", "document_count": 2})}
+
+    result = _filter_working_set(
+        {
+            "payload": {
+                "working_set": "working_set",
+                "filters": {
+                    "source": "retain only explicit Swiss newspaper source values if such values are identifiable in corpus metadata; otherwise pass through unchanged"
+                },
+            }
+        },
+        deps,
+        context,
+    )
+
+    # Retried unscoped: both documents survive instead of being eliminated.
+    assert result.payload["document_count"] == 2
+    assert result.metadata["infeasible_source_scope"] is True
+    assert result.metadata["relaxed_infeasible_filters"]
+    assert "INFEASIBLE" in " ".join(result.caveats)
+
+
 def test_filter_working_set_structured_filters_fail_closed_when_metadata_absent() -> None:
     store = InMemoryWorkingSetStore()
     store.document_lookup["doc-1"] = {

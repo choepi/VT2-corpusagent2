@@ -3718,22 +3718,43 @@ def _row_filter_actual_values(row: dict[str, Any], key: str) -> tuple[list[str],
 
 
 def _structured_filter_matches(row: dict[str, Any], filters: dict[str, Any]) -> tuple[bool, set[str]]:
+    match_map, unsupported, _supported = _structured_filter_match_map(row, filters)
+    return all(match_map.values()), unsupported
+
+
+def _structured_filter_match_map(
+    row: dict[str, Any], filters: dict[str, Any]
+) -> tuple[dict[str, bool], set[str], set[str]]:
+    """Per-key structured-filter evaluation (no short-circuit).
+
+    Returns (match_map, unsupported, supported): match_map[key] is whether the row
+    satisfies that single filter key; unsupported holds keys whose field is absent from
+    the row; supported holds keys whose field IS present (so a non-match is a real value
+    mismatch, not missing metadata). Unlike _structured_filter_matches, which stops at the
+    first failing key, this evaluates every key so the caller can tell *which* scopes a
+    corpus can and cannot satisfy — needed to distinguish an unevaluable filter (fail
+    closed) from a present field whose requested value occurs in zero documents (an
+    infeasible scope worth relaxing). Match semantics match _structured_filter_matches.
+    """
+    match_map: dict[str, bool] = {}
     unsupported: set[str] = set()
+    supported: set[str] = set()
     for raw_key, expected in filters.items():
         key, mode = _normalise_structured_filter_key(str(raw_key))
-        actual_values, supported = _row_filter_actual_values(row, key)
+        actual_values, is_supported = _row_filter_actual_values(row, key)
+        if is_supported:
+            supported.add(key)
         if isinstance(expected, dict) and "exists" in expected:
-            should_exist = bool(expected.get("exists"))
-            has_value = bool(actual_values)
-            if should_exist != has_value:
-                return False, unsupported
+            match_map[key] = bool(actual_values) == bool(expected.get("exists"))
             continue
         expected_values = _filter_expected_values(expected, mode)
         if not expected_values:
+            match_map[key] = True  # no constraint to apply
             continue
-        if not supported:
+        if not is_supported:
             unsupported.add(key)
-            return False, unsupported
+            match_map[key] = False
+            continue
         actual_norm = [_normalize_source_filter(value) for value in actual_values]
         expected_norm = [_normalize_source_filter(value) for value in expected_values]
         if mode == "equals":
@@ -3743,9 +3764,8 @@ def _structured_filter_matches(row: dict[str, Any], filters: dict[str, Any]) -> 
             matched = any(actual in expected_set for actual in actual_norm)
         else:
             matched = any(expected_value in actual for actual in actual_norm for expected_value in expected_norm)
-        if not matched:
-            return False, unsupported
-    return True, unsupported
+        match_map[key] = matched
+    return match_map, unsupported, supported
 
 
 def _positive_int_param(value: Any) -> int | None:
@@ -3943,6 +3963,12 @@ def _filter_working_set(params: dict[str, Any], deps: dict[str, ToolExecutionRes
         )
 
     filtered_rows: list[dict[str, Any]] = []
+    # Rows passing every constraint EXCEPT the structured document_filters, kept so we can
+    # retry without an unresolvable source scope instead of returning an empty set.
+    relaxed_rows: list[dict[str, Any]] = []
+    filter_match_counts: dict[str, int] = {}
+    filter_seen_keys: set[str] = set()
+    filter_supported_keys: set[str] = set()
     unsupported_filter_keys: set[str] = set()
     missing_date_count = 0
     scanned = 0
@@ -3971,23 +3997,30 @@ def _filter_working_set(params: dict[str, Any], deps: dict[str, ToolExecutionRes
             text_for_length = _row_analysis_text(row)
             if len(text_for_length) < min_text_length:
                 continue
+        if query and not _row_matches_query_expression(row, query):
+            continue
+        built_row = {
+            "doc_id": doc_id,
+            "title": str(row.get("title", "")),
+            "snippet": str(row.get("text", row.get("cleaned_text", "")))[:360],
+            "outlet": str(row.get("outlet", row.get("source", ""))),
+            "source": str(row.get("source", row.get("outlet", ""))),
+            "date": published_at,
+            "score": _coerce_score(row.get("score", 0.0)),
+        }
+        # Passes query/date/length/annotation; structured document_filters not yet applied.
+        relaxed_rows.append(built_row)
         if document_filters:
-            filter_matched, unsupported = _structured_filter_matches(row, document_filters)
+            match_map, unsupported, supported = _structured_filter_match_map(row, document_filters)
             unsupported_filter_keys.update(unsupported)
-            if not filter_matched:
+            filter_supported_keys.update(supported)
+            for filter_key, matched in match_map.items():
+                filter_seen_keys.add(filter_key)
+                if matched:
+                    filter_match_counts[filter_key] = filter_match_counts.get(filter_key, 0) + 1
+            if not all(match_map.values()):
                 continue
-        if not query or _row_matches_query_expression(row, query):
-            filtered_rows.append(
-                {
-                    "doc_id": doc_id,
-                    "title": str(row.get("title", "")),
-                    "snippet": str(row.get("text", row.get("cleaned_text", "")))[:360],
-                    "outlet": str(row.get("outlet", row.get("source", ""))),
-                    "source": str(row.get("source", row.get("outlet", ""))),
-                    "date": published_at,
-                    "score": _coerce_score(row.get("score", 0.0)),
-                }
-            )
+        filtered_rows.append(built_row)
     if not cancelled and _cancel_requested(context):
         cancelled = True
 
@@ -4019,6 +4052,29 @@ def _filter_working_set(params: dict[str, Any], deps: dict[str, ToolExecutionRes
                 "no_data_reason": "cancelled" if not filtered_rows else "",
             },
         )
+
+    # Data-driven infeasible-scope retry. If the structured document_filters eliminated
+    # the entire (non-empty) upstream working set, and EVERY evaluated filter key is a
+    # *present* metadata field (so it could be checked) yet was satisfied by zero scanned
+    # documents, then the requested source/outlet scope value simply does not occur in
+    # this corpus and the narrowing scope is unresolvable here. Returning an empty working
+    # set silently starves all downstream analysis (NER, time series), so instead retry
+    # with those scopes relaxed and flag them as infeasible — synthesis then reports the
+    # scope honestly while still answering over the unscoped set. The trigger is purely
+    # the observed match counts; no hardcoded outlet/geography lists. An unevaluable filter
+    # (field absent from the schema) still fails closed — it is not a "present but unmatched"
+    # scope and is excluded by the all-supported requirement below.
+    infeasible_scope_filters: dict[str, Any] = {}
+    if (
+        document_filters
+        and not filtered_rows
+        and relaxed_rows
+        and filter_seen_keys
+        and filter_seen_keys <= filter_supported_keys
+        and all(filter_match_counts.get(key, 0) == 0 for key in filter_seen_keys)
+    ):
+        infeasible_scope_filters = dict(document_filters)
+        filtered_rows = relaxed_rows
 
     deduped: list[dict[str, Any]] = []
     seen_ids: set[str] = set()
@@ -4052,7 +4108,16 @@ def _filter_working_set(params: dict[str, Any], deps: dict[str, ToolExecutionRes
             f"another full-corpus retrieval; matched {matched_count_before_limit} of {total or scanned} upstream documents."
         )
     ]
-    if document_filters or annotation_filter_keys:
+    if infeasible_scope_filters:
+        caveats.append(
+            "Requested source scope is INFEASIBLE for this corpus: the structured filter "
+            + json.dumps(infeasible_scope_filters, ensure_ascii=False, sort_keys=True)
+            + " matched zero documents in the upstream working set, so no document carries "
+            "that source value here. The scope was relaxed and the analysis was retried "
+            "unscoped over the upstream working set; treat any source-scoped conclusion as "
+            "unsupported by this corpus."
+        )
+    elif document_filters or annotation_filter_keys:
         caveats.append(
             "Applied structured working-set filters: "
             + json.dumps(filters, ensure_ascii=False, sort_keys=True)
@@ -4116,6 +4181,8 @@ def _filter_working_set(params: dict[str, Any], deps: dict[str, ToolExecutionRes
             "missing_date_count": missing_date_count,
             "filtered_from_working_set": True,
             "payload_truncated": result_count > len(preview_rows),
+            "infeasible_source_scope": bool(infeasible_scope_filters),
+            "relaxed_infeasible_filters": infeasible_scope_filters or None,
         },
     )
 
