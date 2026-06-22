@@ -64,6 +64,15 @@ wheels/
 /outputs/**/*.jsonl
 /outputs/**/*.jsonl.gz
 
+# Local DB dumps / backups (too large for GitHub; keep on disk only)
+/backups/
+
+# Scratch run-id files written by ad-hoc query submissions
+/.fbrid
+/.oilrid
+/.climate_rid
+/*.rid
+
 # IDE / OS
 .DS_Store
 Thumbs.db
