@@ -249,8 +249,26 @@ class CorpusRuntime:
 
                 with connect(self.pg_dsn, **pg_connect_kwargs()) as conn:
                     with conn.cursor() as cursor:
-                        cursor.execute(f"SELECT COUNT(*), COUNT(*) FILTER (WHERE dense_embedding IS NOT NULL) FROM {self.pg_table}")
-                        total_rows, dense_rows = cursor.fetchone()
+                        # Avoid COUNT(*) over the whole table (full seq scan, ~tens of
+                        # seconds at 13M, re-run every health-cache TTL). Use the planner
+                        # row estimate for the total, and an exact NULL-embedding count
+                        # that rides the partial index idx_<table>_dense_missing (instant
+                        # — the index is ~empty once backfill is complete).
+                        cursor.execute(
+                            "SELECT reltuples::bigint FROM pg_class WHERE relname = %s",
+                            (self.pg_table,),
+                        )
+                        est_row = cursor.fetchone()
+                        total_rows = int(est_row[0]) if est_row and est_row[0] is not None else 0
+                        if total_rows <= 0:
+                            # reltuples is -1/0 before the first ANALYZE — fall back to exact.
+                            cursor.execute(f"SELECT COUNT(*) FROM {self.pg_table}")
+                            total_rows = int(cursor.fetchone()[0] or 0)
+                        cursor.execute(
+                            f"SELECT COUNT(*) FROM {self.pg_table} WHERE dense_embedding IS NULL"
+                        )
+                        missing_dense = int(cursor.fetchone()[0] or 0)
+                        dense_rows = max(0, total_rows - missing_dense)
                         cursor.execute(
                             """
                             SELECT indexname

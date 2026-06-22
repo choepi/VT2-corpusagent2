@@ -187,6 +187,16 @@ if __name__ == "__main__":
                 # fast bulk ingest.
                 cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_{table_name}_source ON {table_name} (source);")
                 cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_{table_name}_published_at ON {table_name} (published_at);")
+                # Partial index over rows still missing a dense embedding. Once backfill
+                # is complete this index is ~empty, so the health check's
+                # "COUNT(*) WHERE dense_embedding IS NULL" is an instant index scan
+                # instead of a full 13M seq scan on every health-cache refresh.
+                dense_missing_index_name = f"idx_{table_name}_dense_missing"
+                cursor.execute(
+                    f"CREATE INDEX IF NOT EXISTS {dense_missing_index_name} "
+                    f"ON {table_name} (doc_id) WHERE dense_embedding IS NULL;"
+                )
+                built_indices.append(dense_missing_index_name)
 
                 cursor.execute(f"ANALYZE {table_name};")
             conn.commit()

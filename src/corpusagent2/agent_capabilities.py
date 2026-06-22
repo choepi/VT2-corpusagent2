@@ -1940,14 +1940,25 @@ def _sql_search_rows(
     query_clauses = _sql_websearch_query_clauses(query, tokens)
     if not query_clauses:
         return []
-    rank_expr = " + ".join(
-        f"ts_rank_cd({vector_expr}, websearch_to_tsquery('simple', %s))"
-        for _ in query_clauses
-    )
     match_expr = " AND ".join(
         f"{vector_expr} @@ websearch_to_tsquery('simple', %s)"
         for _ in query_clauses
     )
+    # Exhaustive retrieval (top_k <= 0) materializes the FULL match set for aggregate
+    # analysis, so recomputing ts_rank_cd per matched row and sorting ~1M+ matches is
+    # pure waste — the GIN index already found them. Skip ranking in that mode; only
+    # compute ts_rank when a ranked top-k is actually requested.
+    exhaustive = top_k <= 0
+    if exhaustive:
+        score_select = "0.0::float AS score"
+        rank_params: list[Any] = []
+    else:
+        rank_expr = " + ".join(
+            f"ts_rank_cd({vector_expr}, websearch_to_tsquery('simple', %s))"
+            for _ in query_clauses
+        )
+        score_select = f"({rank_expr}) AS score"
+        rank_params = list(query_clauses)
     sql = (
         f"SELECT "
         f"{columns['doc_id']}::text AS doc_id, "
@@ -1955,7 +1966,7 @@ def _sql_search_rows(
         f"SUBSTRING({text_expr} FROM 1 FOR 360) AS snippet, "
         f"{source_expr} AS outlet, "
         f"{date_expr} AS date, "
-        f"({rank_expr}) AS score "
+        f"{score_select} "
         f"FROM {table_name} "
         f"WHERE {match_expr}"
     )
@@ -1963,8 +1974,9 @@ def _sql_search_rows(
         sql += f" AND {' AND '.join(date_clauses)}"
     if source_clauses:
         sql += f" AND ({' OR '.join(source_clauses)})"
-    sql += " ORDER BY score DESC"
-    params: list[Any] = [*query_clauses, *query_clauses, *date_params, *source_params]
+    if not exhaustive:
+        sql += " ORDER BY score DESC"
+    params: list[Any] = [*rank_params, *query_clauses, *date_params, *source_params]
     if top_k > 0:
         sql += " LIMIT %s"
         params.append(int(top_k))
@@ -2001,7 +2013,8 @@ def _sql_search_rows(
             fallback_sql += f" AND {' AND '.join(date_clauses)}"
         if source_clauses:
             fallback_sql += f" AND ({' OR '.join(source_clauses)})"
-        fallback_sql += " ORDER BY score DESC"
+        if not exhaustive:
+            fallback_sql += " ORDER BY score DESC"
         fallback_params: list[Any] = score_params + hit_params + [min_hits] + date_params + source_params
         if top_k > 0:
             fallback_sql += " LIMIT %s"
@@ -2864,6 +2877,41 @@ def _load_flair_object(kind: str) -> Any | None:
         return None
     _FLAIR_OBJECTS[kind] = obj
     return obj
+
+
+def _flair_batch_size() -> int:
+    """Mini-batch size for flair predictions. Larger on GPU (throughput-bound),
+    smaller on CPU. Overridable via CORPUSAGENT2_FLAIR_BATCH_SIZE."""
+    raw = os.getenv("CORPUSAGENT2_FLAIR_BATCH_SIZE", "").strip()
+    if raw:
+        try:
+            return max(1, int(raw))
+        except ValueError:
+            pass
+    return 128 if resolve_device("auto") == "cuda" else 32
+
+
+def _flair_predict_batched(
+    model: Any, sentences: list[Any], context: AgentExecutionContext | None = None
+) -> bool:
+    """Predict a list of flair Sentences in GPU/CPU mini-batches.
+
+    Identical output to calling ``model.predict`` once per sentence, but with far
+    fewer forward passes (one per batch instead of one per document) — the real win
+    at corpus scale. Empty sentences (no tokens) are skipped, since flair can error
+    on them inside a batch. Returns False if the run was cancelled mid-way.
+    """
+    batch_size = _flair_batch_size()
+    pending = [sentence for sentence in sentences if len(sentence) > 0]
+    for start in range(0, len(pending), batch_size):
+        if context is not None and _cancel_requested(context):
+            return False
+        batch = pending[start : start + batch_size]
+        try:
+            model.predict(batch, mini_batch_size=len(batch), verbose=False)
+        except TypeError:
+            model.predict(batch, mini_batch_size=len(batch))
+    return True
 
 
 def _db_search_run(params: dict[str, Any], deps: dict[str, ToolExecutionResult], context: AgentExecutionContext) -> ToolExecutionResult:
@@ -3897,57 +3945,51 @@ def _filter_working_set(params: dict[str, Any], deps: dict[str, ToolExecutionRes
     filtered_rows: list[dict[str, Any]] = []
     unsupported_filter_keys: set[str] = set()
     missing_date_count = 0
-    offset = 0
+    scanned = 0
     cancelled = False
-    while True:
+    # Stream the upstream working set via the keyset-paginated generator (O(N) index
+    # range scan) rather than a manual OFFSET loop (O(N^2) — each batch re-skips all
+    # prior rows, which is hours of idle-CPU paging on million-doc working sets).
+    for raw_row in _iter_working_set_documents(context, upstream_ref, batch_size=batch_size):
         if _cancel_requested(context):
             cancelled = True
             break
-        batch = fetcher(context.run_id, upstream_ref, limit=batch_size, offset=offset)
-        if not batch:
-            break
-        for raw_row in batch:
-            if _cancel_requested(context):
-                cancelled = True
-                break
-            row = _with_cleaned_document_text(dict(raw_row))
-            published_at = str(row.get("published_at", row.get("date", "")) or "")
-            if (date_from or date_to) and not published_at:
-                missing_date_count += 1
+        scanned += 1
+        row = _with_cleaned_document_text(dict(raw_row))
+        published_at = str(row.get("published_at", row.get("date", "")) or "")
+        if (date_from or date_to) and not published_at:
+            missing_date_count += 1
+            continue
+        if date_from and published_at and published_at < date_from:
+            continue
+        if date_to and published_at and published_at > date_to:
+            continue
+        doc_id = str(row.get("doc_id", "")).strip()
+        if annotation_doc_ids is not None and doc_id not in annotation_doc_ids:
+            continue
+        if min_text_length is not None:
+            text_for_length = _row_analysis_text(row)
+            if len(text_for_length) < min_text_length:
                 continue
-            if date_from and published_at and published_at < date_from:
+        if document_filters:
+            filter_matched, unsupported = _structured_filter_matches(row, document_filters)
+            unsupported_filter_keys.update(unsupported)
+            if not filter_matched:
                 continue
-            if date_to and published_at and published_at > date_to:
-                continue
-            doc_id = str(row.get("doc_id", "")).strip()
-            if annotation_doc_ids is not None and doc_id not in annotation_doc_ids:
-                continue
-            if min_text_length is not None:
-                text_for_length = _row_analysis_text(row)
-                if len(text_for_length) < min_text_length:
-                    continue
-            if document_filters:
-                filter_matched, unsupported = _structured_filter_matches(row, document_filters)
-                unsupported_filter_keys.update(unsupported)
-                if not filter_matched:
-                    continue
-            if not query or _row_matches_query_expression(row, query):
-                filtered_rows.append(
-                    {
-                        "doc_id": doc_id,
-                        "title": str(row.get("title", "")),
-                        "snippet": str(row.get("text", row.get("cleaned_text", "")))[:360],
-                        "outlet": str(row.get("outlet", row.get("source", ""))),
-                        "source": str(row.get("source", row.get("outlet", ""))),
-                        "date": published_at,
-                        "score": _coerce_score(row.get("score", 0.0)),
-                    }
-                )
-        if cancelled:
-            break
-        offset += len(batch)
-        if total and offset >= total:
-            break
+        if not query or _row_matches_query_expression(row, query):
+            filtered_rows.append(
+                {
+                    "doc_id": doc_id,
+                    "title": str(row.get("title", "")),
+                    "snippet": str(row.get("text", row.get("cleaned_text", "")))[:360],
+                    "outlet": str(row.get("outlet", row.get("source", ""))),
+                    "source": str(row.get("source", row.get("outlet", ""))),
+                    "date": published_at,
+                    "score": _coerce_score(row.get("score", 0.0)),
+                }
+            )
+    if not cancelled and _cancel_requested(context):
+        cancelled = True
 
     if cancelled:
         preview_limit = _result_preview_limit()
@@ -4007,7 +4049,7 @@ def _filter_working_set(params: dict[str, Any], deps: dict[str, ToolExecutionRes
     caveats = [
         (
             f"Filtered upstream working_set_ref='{upstream_ref}' with the requested query/metadata filters instead of running "
-            f"another full-corpus retrieval; matched {matched_count_before_limit} of {total or offset} upstream documents."
+            f"another full-corpus retrieval; matched {matched_count_before_limit} of {total or scanned} upstream documents."
         )
     ]
     if document_filters or annotation_filter_keys:
@@ -4385,9 +4427,9 @@ def _pos_morph(params: dict[str, Any], deps: dict[str, ToolExecutionResult], con
                     continue
                 from flair.data import Sentence
 
-                for row in rows:
-                    sentence = Sentence(_row_analysis_text(row))
-                    tagger.predict(sentence)
+                sentences = [Sentence(_row_analysis_text(row)) for row in rows]
+                _flair_predict_batched(tagger, sentences, context)
+                for row, sentence in zip(rows, sentences):
                     for token in sentence.tokens:
                         output.append(
                             {
@@ -4768,12 +4810,11 @@ def _ner(params: dict[str, Any], deps: dict[str, ToolExecutionResult], context: 
                     continue
                 from flair.data import Sentence
 
-                for row in rows:
-                    if _cancel_requested(context):
-                        cancelled = True
-                        return finish()
-                    sentence = Sentence(_row_analysis_text(row))
-                    tagger.predict(sentence)
+                sentences = [Sentence(_row_analysis_text(row)) for row in rows]
+                if not _flair_predict_batched(tagger, sentences, context):
+                    cancelled = True
+                    return finish()
+                for row, sentence in zip(rows, sentences):
                     for entity in sentence.get_spans("ner"):
                         entities.append(
                             {
@@ -5711,13 +5752,12 @@ def _sentiment(params: dict[str, Any], deps: dict[str, ToolExecutionResult], con
                 from flair.data import Sentence
 
                 rows = []
-                for unit in units:
-                    if _cancel_requested(context):
-                        cancelled = True
-                        return finish()
+                sentences = [Sentence(str(unit.get("text", ""))[:1500]) for unit in units]
+                if not _flair_predict_batched(classifier, sentences, context):
+                    cancelled = True
+                    return finish()
+                for unit, sentence in zip(units, sentences):
                     doc = unit["doc"]
-                    sentence = Sentence(str(unit.get("text", ""))[:1500])
-                    classifier.predict(sentence)
                     label = sentence.labels[0].value.lower() if sentence.labels else "neutral"
                     confidence = float(sentence.labels[0].score) if sentence.labels else 0.0
                     numeric_score = confidence if label == "positive" else -confidence if label == "negative" else 0.0
