@@ -46,7 +46,13 @@ sys.path.insert(0, str(PROJECT_ROOT / "src"))
 # CONFIG -- edit before running (no argparse, by repo convention)
 # ============================================================================
 
-QUESTIONS_PATH = PROJECT_ROOT / "config" / "eval_questions_11.json"
+# Question file: defaults to the 11-question set; override with the env var to run
+# an alternative set (e.g. config/eval_questions_curated.json) without editing here.
+QUESTIONS_PATH = (
+    Path(os.environ["CORPUSAGENT2_EVAL_QUESTIONS"]).expanduser().resolve()
+    if os.environ.get("CORPUSAGENT2_EVAL_QUESTIONS", "").strip()
+    else PROJECT_ROOT / "config" / "eval_questions_11.json"
+)
 OUTPUT_DIR = PROJECT_ROOT / "outputs" / "eval_suite"
 LATEX_GEN_DIR = PROJECT_ROOT / "project_paper" / "LATEX" / "generated"
 

@@ -1,0 +1,14 @@
+[
+  {"question_id": "c01", "family": "A", "raw_question": "What is the distribution of nouns in The Guardian's football reporting between 2017 and 2019?"},
+  {"question_id": "c02", "family": "A", "raw_question": "Which named entities dominated English-language climate change coverage, and how did that change between 2017 and 2021?"},
+  {"question_id": "c03", "family": "B", "raw_question": "How did the New York Times and the BBC differ in their coverage of football between 2017 and 2021?"},
+  {"question_id": "c04", "family": "B", "raw_question": "How did the New York Times and Fox News differ in their coverage of climate change between 2017 and 2021?"},
+  {"question_id": "c05", "family": "C", "raw_question": "How did the portrayal of Donald Trump change in conservative-leaning US media between 2017 and 2020?"},
+  {"question_id": "c06", "family": "C", "raw_question": "How did the framing of artificial intelligence shift from innovation to risk and regulation across major English-language newspapers between 2017 and 2021?"},
+  {"question_id": "c07", "family": "D", "raw_question": "Which actors dominated the public discourse on housing affordability, and how did this change between 2017 and 2021?"},
+  {"question_id": "c08", "family": "E", "raw_question": "How did the perceived value of Cristiano Ronaldo versus Lionel Messi evolve between 2017 and 2021?"},
+  {"question_id": "c09", "family": "F", "raw_question": "How did the oil price change between 2017 and 2021, and how did US media explain the major moves?"},
+  {"question_id": "c10", "family": "F", "raw_question": "How did news coverage of Tesla change between 2017 and 2021, and how did major coverage peaks compare with TSLA stock performance?"},
+  {"question_id": "c11", "family": "E", "raw_question": "Is there a difference in how Cristiano Ronaldo is portrayed by male versus female journalists?"},
+  {"question_id": "c12", "family": "D", "raw_question": "Which media predicted the outbreak of the Russia-Ukraine war in 2022?"}
+]
