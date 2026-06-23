@@ -579,8 +579,8 @@ def _normalize_source_filter(value: str) -> str:
 # reference data (a small outlet gazetteer), not a result-faking heuristic: it only
 # makes the source filter match the documents that genuinely carry that outlet.
 _OUTLET_DOMAIN_ALIASES: dict[str, tuple[str, ...]] = {
-    "nytimes": ("newyorktimes", "nyt", "nytimes"),
-    "foxnews": ("foxnews", "fox"),
+    "nytimes": ("newyorktimes", "nytimes"),
+    "foxnews": ("foxnews",),
     "bbc": ("bbc", "bbcnews"),
     "theguardian": ("theguardian", "guardian"),
     "washingtonpost": ("washingtonpost", "wapo", "thewashingtonpost"),
@@ -3758,7 +3758,11 @@ def _normalise_structured_filter_key(key: str) -> tuple[str, str]:
 
 def _filter_expected_values(value: Any, mode: str) -> list[str]:
     if isinstance(value, dict):
-        for key in ("contains", "in", "equals", "eq", "value", "values"):
+        # "include"/"any_of"/"oneof" are membership forms the planner emits as
+        # alternatives to a bare list; without them the filter silently parsed to an
+        # empty constraint and matched every document (a no-op filter). They behave
+        # like "in" (membership), keeping the outer mode for the per-value comparison.
+        for key in ("contains", "in", "include", "any_of", "anyof", "oneof", "equals", "eq", "value", "values"):
             if key in value:
                 next_mode = "contains" if key == "contains" else mode
                 return _filter_expected_values(value.get(key), next_mode)
