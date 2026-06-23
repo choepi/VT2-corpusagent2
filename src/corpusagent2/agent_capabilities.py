@@ -569,6 +569,90 @@ def _normalize_source_filter(value: str) -> str:
     return re.sub(r"[^a-z0-9]+", "", str(value or "").strip().lower())
 
 
+# Outlet display-name <-> domain-stem aliases. Needed because corpora differ in how
+# the `source` field is populated: some packagings (e.g. vblagoje/cc_news) store a
+# human-readable outlet name ("New York Times"), others (e.g. Geralt-Targaryen/CC-News)
+# store the originating host ("www.nytimes.com"). A filter value of "New York Times"
+# must therefore also match a "www.nytimes.com" source, which plain normalisation
+# (newyorktimes vs wwwnytimescom) cannot do. Each entry maps a set of normalised
+# name/acronym forms to the domain stem actually present in host-style sources. This is
+# reference data (a small outlet gazetteer), not a result-faking heuristic: it only
+# makes the source filter match the documents that genuinely carry that outlet.
+_OUTLET_DOMAIN_ALIASES: dict[str, tuple[str, ...]] = {
+    "nytimes": ("newyorktimes", "nyt", "nytimes"),
+    "foxnews": ("foxnews", "fox"),
+    "bbc": ("bbc", "bbcnews"),
+    "theguardian": ("theguardian", "guardian"),
+    "washingtonpost": ("washingtonpost", "wapo", "thewashingtonpost"),
+    "wsj": ("wallstreetjournal", "wsj", "thewallstreetjournal"),
+    "cnn": ("cnn",),
+    "reuters": ("reuters",),
+    "apnews": ("associatedpress", "apnews"),
+    "bloomberg": ("bloomberg",),
+    "cnbc": ("cnbc",),
+    "npr": ("npr",),
+    "usatoday": ("usatoday", "usatoday"),
+    "latimes": ("losangelestimes", "latimes"),
+    "nbcnews": ("nbcnews", "nbc"),
+    "cbsnews": ("cbsnews", "cbs"),
+    "abcnews": ("abcnews",),
+    "politico": ("politico",),
+    "huffpost": ("huffingtonpost", "huffpost"),
+    "breitbart": ("breitbart",),
+    "telegraph": ("thetelegraph", "telegraph"),
+    "independent": ("theindependent", "independent"),
+    "dailymail": ("dailymail",),
+    "forbes": ("forbes",),
+}
+# Reverse index: normalised name/acronym form -> domain stem.
+_OUTLET_NAME_TO_STEM: dict[str, str] = {
+    name: stem for stem, names in _OUTLET_DOMAIN_ALIASES.items() for name in names
+}
+
+
+def _source_match_variants(value: str) -> set[str]:
+    """All normalised forms a source value should be allowed to match on.
+
+    Includes the plain normalised value, plus outlet alias expansions in both
+    directions: a display name ("New York Times" -> nytimes stem) and a host-style
+    source ("www.nytimes.com" -> the same stem) both reduce to a shared token, so a
+    filter expressed either way matches a corpus storing either form.
+    """
+    norm = _normalize_source_filter(value)
+    if not norm:
+        return set()
+    variants = {norm}
+    # name/acronym -> domain stem
+    stem = _OUTLET_NAME_TO_STEM.get(norm)
+    if stem:
+        variants.add(stem)
+        variants.update(_OUTLET_DOMAIN_ALIASES.get(stem, ()))
+    # host-style source -> any domain stem it contains (nytimes within wwwnytimescom)
+    for cand_stem, names in _OUTLET_DOMAIN_ALIASES.items():
+        if cand_stem in norm:
+            variants.add(cand_stem)
+            variants.update(names)
+    return variants
+
+
+def _source_values_match(actual_values: list[str], expected_values: list[str], mode: str) -> bool:
+    """Outlet-aware source matching: match if any expected variant relates to any
+    actual variant by equality (equals/in modes) or substring (contains mode)."""
+    actual_variants = [_source_match_variants(v) for v in actual_values]
+    expected_variants = [_source_match_variants(v) for v in expected_values]
+    for av in actual_variants:
+        for ev in expected_variants:
+            if mode in ("equals", "in"):
+                if av & ev:
+                    return True
+            else:  # contains: substring either direction
+                for a in av:
+                    for e in ev:
+                        if e and (e in a or a in e):
+                            return True
+    return False
+
+
 def _query_source_filters(query: str) -> list[str]:
     filters: list[str] = []
     seen: set[str] = set()
@@ -1927,11 +2011,19 @@ def _sql_search_rows(
     date_expr = f"COALESCE({columns['date']}::text, '')" if columns["date"] else "''"
     source_expr = f"COALESCE({columns['source']}::text, '')" if columns["source"] else "''"
     source_filters = _query_source_filters(query)
-    source_clauses = [
-        f"regexp_replace(LOWER({source_expr}), '[^a-z0-9]+', '', 'g') LIKE %s"
-        for _ in source_filters
-    ]
-    source_params = [f"%{item}%" for item in source_filters]
+    # Outlet-aware source scoping: expand each requested source into its match variants
+    # (display-name <-> domain stem) so "new york times" also matches a www.nytimes.com
+    # host source. Each requested outlet becomes one OR-group over its variants.
+    norm_source_expr = f"regexp_replace(LOWER({source_expr}), '[^a-z0-9]+', '', 'g')"
+    source_clauses: list[str] = []
+    source_params: list[Any] = []
+    for item in source_filters:
+        variants = sorted(_source_match_variants(item)) or [_normalize_source_filter(item)]
+        variants = [v for v in variants if v]
+        if not variants:
+            continue
+        source_clauses.append("(" + " OR ".join(f"{norm_source_expr} LIKE %s" for _ in variants) + ")")
+        source_params.extend(f"%{v}%" for v in variants)
     vector_expr = (
         f"setweight(to_tsvector('simple', {title_expr}), 'A') || "
         f"setweight(to_tsvector('simple', {text_expr}), 'B')"
@@ -3754,6 +3846,13 @@ def _structured_filter_match_map(
         if not is_supported:
             unsupported.add(key)
             match_map[key] = False
+            continue
+        if key in {"source", "outlet", "site", "domain", "source_domain", "publication"}:
+            # Outlet-aware matching: resolves display-name <-> domain-stem so a
+            # {"source": ["New York Times"]} filter matches a "www.nytimes.com" source
+            # (and vice versa). The default "in" mode is treated as substring-capable
+            # here, since an outlet scope is conceptually "documents from this outlet".
+            match_map[key] = _source_values_match(actual_values, expected_values, mode)
             continue
         actual_norm = [_normalize_source_filter(value) for value in actual_values]
         expected_norm = [_normalize_source_filter(value) for value in expected_values]
