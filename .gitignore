@@ -77,3 +77,6 @@ wheels/
 .DS_Store
 Thumbs.db
 .claude/settings.local.json
+
+# Large run-provenance archives (reproducible from outputs/; keep out of git)
+project_paper/results_exports/*.zip
