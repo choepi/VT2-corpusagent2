@@ -1575,6 +1575,45 @@ def _noun_frequency_rows_from_working_set(
     return rows, metadata
 
 
+def _noun_n_process(full_working_set: bool) -> int:
+    """Worker count for spaCy POS over the noun-frequency working set.
+
+    Multiprocessing only pays off for the large full-working-set path (exhaustive
+    noun distribution over 10^4-10^6 documents); small/preview sets stay single
+    process to avoid fork/startup overhead. os.cpu_count() inside a CPU-capped
+    container reports host threads, not the cgroup quota, so the worker count is
+    taken from CORPUSAGENT2_NOUN_N_PROCESS (set it to the container's --cpus minus
+    one). Defaults conservatively when unset.
+    """
+    if not full_working_set:
+        return 1
+    raw = os.getenv("CORPUSAGENT2_NOUN_N_PROCESS", "").strip()
+    if raw:
+        try:
+            return max(1, int(raw))
+        except ValueError:
+            pass
+    return max(1, min(8, (os.cpu_count() or 2) - 1))
+
+
+_SPACY_NPROC_OK: bool | None = None
+
+
+def _spacy_n_process_works(nlp: Any, n_process: int, batch_size: int) -> bool:
+    """One-time probe that spaCy multiprocessing can actually spawn workers in this
+    runtime (e.g. not blocked by a daemonic parent). Cached for the process lifetime so
+    the few-second worker spin-up is paid once, before the real working-set stream."""
+    global _SPACY_NPROC_OK
+    if _SPACY_NPROC_OK is not None:
+        return _SPACY_NPROC_OK
+    try:
+        list(nlp.pipe(["alpha test sentence", "beta test sentence"], n_process=min(2, n_process), batch_size=batch_size))
+        _SPACY_NPROC_OK = True
+    except Exception:
+        _SPACY_NPROC_OK = False
+    return _SPACY_NPROC_OK
+
+
 def _noun_frequency_rows_from_documents(
     documents: Iterable[dict[str, Any]],
     *,
@@ -1620,25 +1659,45 @@ def _noun_frequency_rows_from_documents(
         provider = "spacy_batch"
         disabled = _spacy_noun_pipe_disabled(nlp)
         context_manager = nlp.select_pipes(disable=disabled) if disabled else None
+        n_process = _noun_n_process(full_working_set)
+
+        def _count_doc(doc: Any, doc_id: str) -> None:
+            nonlocal total_tokens
+            for token in doc:
+                label = _normalized_pos_label(getattr(token, "pos_", ""))
+                if label not in {"NOUN", "PROPN"}:
+                    continue
+                lemma = str(getattr(token, "lemma_", "") or getattr(token, "text", "") or "").strip().lower()
+                if lemma == "-pron-":
+                    lemma = str(getattr(token, "text", "") or "").strip().lower()
+                if not _valid_noun_lemma(lemma, min_length=3):
+                    continue
+                lemma_counts[lemma] += 1
+                doc_counts[lemma].add(doc_id)
+                total_tokens += 1
+
+        # Probe multiprocessing once on dummy text before committing the (one-shot)
+        # working-set stream, so a doomed n_process path never partially consumes it.
+        if n_process > 1 and not _spacy_n_process_works(nlp, n_process, batch_size):
+            n_process = 1
         try:
             if context_manager is not None:
                 context_manager.__enter__()
-            for batch in _iter_batches(prepared_documents(), batch_size):
-                doc_ids = [item[0] for item in batch]
-                texts = [item[1] for item in batch]
-                for doc_id, doc in zip(doc_ids, nlp.pipe(texts, batch_size=batch_size), strict=False):
-                    for token in doc:
-                        label = _normalized_pos_label(getattr(token, "pos_", ""))
-                        if label not in {"NOUN", "PROPN"}:
-                            continue
-                        lemma = str(getattr(token, "lemma_", "") or getattr(token, "text", "") or "").strip().lower()
-                        if lemma == "-pron-":
-                            lemma = str(getattr(token, "text", "") or "").strip().lower()
-                        if not _valid_noun_lemma(lemma, min_length=3):
-                            continue
-                        lemma_counts[lemma] += 1
-                        doc_counts[lemma].add(doc_id)
-                        total_tokens += 1
+            if n_process > 1:
+                # Parallel: stream every (text, doc_id) tuple through spaCy across
+                # n_process worker processes. as_tuples carries doc_id alongside each
+                # parsed doc, and spaCy preserves order; the full working set is still
+                # processed (no clipping), just across cores instead of one.
+                provider = "spacy_batch_parallel"
+                pairs = ((text, doc_id) for doc_id, text in prepared_documents())
+                for doc, doc_id in nlp.pipe(pairs, as_tuples=True, batch_size=batch_size, n_process=n_process):
+                    _count_doc(doc, doc_id)
+            else:
+                for batch in _iter_batches(prepared_documents(), batch_size):
+                    doc_ids = [item[0] for item in batch]
+                    texts = [item[1] for item in batch]
+                    for doc_id, doc in zip(doc_ids, nlp.pipe(texts, batch_size=batch_size), strict=False):
+                        _count_doc(doc, doc_id)
         finally:
             if context_manager is not None:
                 context_manager.__exit__(None, None, None)
