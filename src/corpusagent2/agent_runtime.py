@@ -2645,8 +2645,14 @@ class MagicBoxOrchestrator:
                 return {"date_from": f"{year}-01-01", "date_to": f"{year}-12-31"}
             year_pattern = re.escape(str(year))
             has_open_start_marker = bool(
+                # NOTE: the bounded ".{0,40}" wildcard replaces an earlier
+                # "(?:\W+\w+){0,4}\W+" form whose nested quantifiers caused
+                # catastrophic regex backtracking — single-year questions (e.g.
+                # "...in January 2017") hit this branch and hung planning at 100% CPU
+                # for many minutes. A linear bounded window is backtracking-safe and
+                # preserves intent (open-start keyword within ~40 chars before the year).
                 re.search(
-                    rf"\b(?:from|since|starting|started|beginning|began|after)\b(?:\W+\w+){{0,4}}\W+{year_pattern}\b",
+                    rf"\b(?:from|since|starting|started|beginning|began|after)\b.{{0,40}}\b{year_pattern}\b",
                     text,
                     flags=re.IGNORECASE,
                 )
