@@ -66,6 +66,38 @@ def build_app(runtime: AgentRuntime | None = None, project_root: Path | None = N
         allow_headers=["*"],
     )
 
+    @app.get("/debug/stacks")
+    async def _debug_stacks() -> dict[str, Any]:
+        # Dump every thread's Python stack AND every pending asyncio task stack. Used to
+        # diagnose runtime hangs (e.g. a node stuck at idle CPU with no active DB query)
+        # when py-spy is unavailable in the container. Async so it runs on the event loop
+        # and can enumerate tasks; for an idle-loop hang the stuck work shows as an
+        # unresolved await in the task stacks, not in the thread frames. Read-only.
+        import asyncio as _asyncio
+        import sys as _sys
+        import threading as _threading
+        import traceback as _traceback
+
+        frames = _sys._current_frames()
+        names = {t.ident: t.name for t in _threading.enumerate()}
+        thread_dump: dict[str, list[str]] = {}
+        for ident, frame in frames.items():
+            label = f"{names.get(ident, '?')}-{ident}"
+            thread_dump[label] = [line.rstrip() for line in _traceback.format_stack(frame)]
+
+        task_dump: dict[str, list[str]] = {}
+        try:
+            for task in _asyncio.all_tasks():
+                try:
+                    coro = task.get_coro()
+                    label = f"{getattr(coro, '__qualname__', repr(coro))}-{id(task)}"
+                    task_dump[label] = [line.rstrip() for frame in task.get_stack() for line in _traceback.format_stack(frame)]
+                except Exception as exc:  # noqa: BLE001
+                    task_dump[f"err-{id(task)}"] = [f"{type(exc).__name__}: {exc}"]
+        except RuntimeError:
+            pass
+        return {"thread_count": len(thread_dump), "task_count": len(task_dump), "threads": thread_dump, "tasks": task_dump}
+
     @app.get("/health")
     def health() -> dict[str, Any]:
         warmup = resolved_runtime.warmup_info()
