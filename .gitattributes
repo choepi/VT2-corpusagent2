@@ -2,6 +2,5 @@
 # generated HTML (repo-state dumps, the graphify visualisation, pytest cache),
 # which otherwise buries the Python the project is actually made of.
 
-out/**           linguist-generated=true
 graphify-out/**  linguist-generated=true
 web_old_apple/** linguist-vendored=true

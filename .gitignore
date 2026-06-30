@@ -29,6 +29,9 @@ wheels/
 /outputs/**
 !/outputs/.gitkeep
 
+# Throwaway HTML/markdown-preview exports and repo-state dumps
+/out/
+
 # Logs
 /log/
 /logs/
