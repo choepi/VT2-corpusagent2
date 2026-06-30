@@ -1,127 +1,72 @@
 # CorpusAgent2
 
-CorpusAgent2 is a prototype for asking questions over a large news corpus.
+A prototype for asking questions over a large news corpus. The backend does the
+retrieval and analysis; the frontend is a small inspector UI so I can watch the
+plan, tool calls, evidence, and final answer as a run happens.
 
-The backend does the retrieval and analysis work. The frontend is just a small
-inspector UI so I can see the plan, tool calls, evidence, artifacts, and final
-answer while a run is happening.
+It's a research prototype, not a polished product — some parts are cleaner than
+others.
 
-It is not meant to be a polished product yet. It is a working research/prototype
-repo, so some parts are cleaner than others.
-
-## What is in here
+## What's in here
 
 - FastAPI backend for the agent runtime
-- Static frontend in `web/`
-- Postgres/pgvector and OpenSearch retrieval support
-- local lexical/dense retrieval assets
-- planner/executor traces saved per run
-- evidence tables, plots, and run artifacts under `outputs/`
-- scripts for preparing CC-News style data
+- Static inspector frontend (`web/`)
+- Hybrid retrieval: Postgres/pgvector (dense) + OpenSearch (lexical)
+- Local lexical/dense retrieval assets for offline work
+- Per-run planner/executor traces, evidence tables, and plots under `outputs/`
+- Scripts for preparing CC-News style data
 
 ## Requirements
 
-- Python 3.11
-- `uv`
-- Docker, if you want to run Postgres and OpenSearch locally
-- an OpenAI-compatible API key, unless you are only testing non-LLM pieces
-- corpus data, if you are building the index from scratch
+- Python 3.11 and [`uv`](https://github.com/astral-sh/uv)
+- Docker, if you want Postgres and OpenSearch locally
+- An OpenAI-compatible API key, unless you're only testing the non-LLM pieces
+- Corpus data, if you're building the index from scratch
 
-## One-shot setup (recommended)
+## Setup
 
-```powershell
-python scripts/setup.py     # auto-detects CUDA, writes .env, runs uv sync
-python scripts/run.py up    # docker compose, picks CPU/GPU profile automatically
-```
-
-Then open `http://127.0.0.1:8001` — the FastAPI app serves both the UI and the
-API on the same port. `scripts/run.py` exposes `up / up-nodb / build / down /
-stop / logs / status / local / api / mcp` and always uses the same commands
-whether you are on CPU or GPU.
-
-Manual flow below is still supported if you want fine-grained control.
-
-## Quick start on Windows
-
-From PowerShell:
+The quickest path auto-detects CUDA, writes `.env`, and brings everything up:
 
 ```powershell
-uv sync
-Copy-Item .env.example .env
-notepad .env
+python scripts/setup.py     # detects CUDA, writes .env, runs uv sync
+python scripts/run.py up    # docker compose, picks CPU/GPU profile for you
 ```
 
-At minimum, set these in `.env`:
+Then open `http://127.0.0.1:8001` — the FastAPI app serves the UI and the API on
+the same port. `scripts/run.py` also takes `up-nodb / build / down / stop / logs
+/ status / local / api / mcp`.
 
-```dotenv
-OPENAI_API_KEY=your_key_here
-CORPUSAGENT2_FRONTEND_API_BASE_URL=http://127.0.0.1:8001
-```
+### Manual setup
 
-If you want the local database services:
-
-```powershell
-docker compose -f deploy\docker-compose.yml up -d postgres opensearch
-```
-
-Start the backend and frontend:
-
-```powershell
-.\.venv\Scripts\python.exe scripts\15_start_local_stack.py
-```
-
-Then open:
-
-```text
-http://127.0.0.1:5500
-```
-
-The API is on:
-
-```text
-http://127.0.0.1:8001
-```
-
-## Quick start on Linux/macOS
+If you'd rather do it by hand:
 
 ```bash
 uv sync
-cp .env.example .env
+cp .env.example .env        # Copy-Item on Windows PowerShell
 ```
 
-Edit `.env` and set:
+Set at least these in `.env`:
 
 ```dotenv
 OPENAI_API_KEY=your_key_here
 CORPUSAGENT2_FRONTEND_API_BASE_URL=http://127.0.0.1:8001
 ```
 
-Start local services if needed:
+Start the database services if you need them, then run the stack:
 
 ```bash
 docker compose -f deploy/docker-compose.yml up -d postgres opensearch
+python scripts/15_start_local_stack.py
 ```
 
-Run the app:
+On Windows use `.\.venv\Scripts\python.exe` for the last command. The UI comes up
+on `http://127.0.0.1:5500` and the API on `http://127.0.0.1:8001`.
 
-```bash
-.venv/bin/python scripts/15_start_local_stack.py
-```
+## If the app runs but retrieval comes back empty
 
-Open `http://127.0.0.1:5500`.
-
-## If the app starts but retrieval is empty
-
-That usually means the UI and backend are running, but the corpus/index is not
-ready yet.
-
-For a fresh local corpus build, put `.jsonl` or `.jsonl.gz` files in:
-
-```text
-data/raw/incoming/
-```
-
-Then run the preparation scripts:
+Usually the UI and backend are fine but the corpus/index isn't built yet. Drop
+`.jsonl` / `.jsonl.gz` files into `data/raw/incoming/` and run the prep scripts
+in order:
 
 ```bash
 python scripts/00_stage_ccnews_files.py
@@ -134,23 +79,19 @@ python scripts/26_backfill_pgvector_embeddings.py
 python scripts/11_build_pgvector_index.py
 ```
 
-This can take a while on a real corpus.
-
-For a fresh Ubuntu VM, the easier path is:
-
-```bash
-python3 scripts/22_prepare_vm_stack.py --install-system
-```
+On a real corpus this takes a while. For a fresh Ubuntu VM the shortcut is
+`python3 scripts/22_prepare_vm_stack.py --install-system`.
 
 ## Useful commands
 
-Print the config the backend is actually using:
-
 ```bash
-python scripts/16_print_effective_config.py
+python scripts/16_print_effective_config.py   # show the config actually in use
+python scripts/14_run_static_frontend.py       # frontend only
+python scripts/07_mcp_server.py                # MCP server (dev)
+python -m pytest -q                            # tests
 ```
 
-Run the Dockerized backend stack:
+Dockerized backend stack:
 
 ```bash
 cd deploy
@@ -158,50 +99,13 @@ docker compose -f docker-compose.yml -f docker-compose.mcp.yml up -d --no-recrea
 docker compose -f docker-compose.yml -f docker-compose.mcp.yml up -d --build --no-deps corpusagent2-api corpusagent2-mcp
 ```
 
-Build the real CPU NLP/embedding stack on a CPU-only VM:
+Add `-f docker-compose.mcp.gpu.yml` to the second command on a host where Docker
+can see an NVIDIA/CDI GPU.
 
-```bash
-cd deploy
-CORPUSAGENT2_DOCKER_TORCH_PROFILE=cpu \
-CORPUSAGENT2_DOCKER_INSTALL_NLP_PROVIDERS=true \
-CORPUSAGENT2_DOCKER_DOWNLOAD_PROVIDER_ASSETS=true \
-docker compose -f docker-compose.yml -f docker-compose.mcp.yml build corpusagent2-api corpusagent2-mcp
-```
+## Config
 
-Use the GPU override only on a host where Docker can discover an NVIDIA/CDI GPU runtime:
-
-```bash
-cd deploy
-docker compose -f docker-compose.yml -f docker-compose.mcp.yml -f docker-compose.mcp.gpu.yml up -d --build --no-deps corpusagent2-api corpusagent2-mcp
-```
-
-Run the frontend only:
-
-```bash
-python scripts/14_run_static_frontend.py
-```
-
-Run tests:
-
-```bash
-python -m pytest -q
-```
-
-Run the MCP server locally for development:
-
-```bash
-python scripts/07_mcp_server.py
-```
-
-## Config notes
-
-Most defaults live in:
-
-```text
-config/app_config.toml
-```
-
-Machine-specific values go in `.env`. The main ones I usually touch are:
+Defaults live in `config/app_config.toml`; machine-specific values go in `.env`.
+The ones I touch most:
 
 ```dotenv
 OPENAI_API_KEY=
@@ -212,44 +116,37 @@ CORPUSAGENT2_OPENSEARCH_URL=
 CORPUSAGENT2_DEVICE=
 ```
 
-The frontend writes `web/config.js` when it starts. If the frontend is calling
-the wrong backend URL, check `CORPUSAGENT2_FRONTEND_API_BASE_URL`.
+The frontend writes `web/config.js` at startup. If it's calling the wrong
+backend, check `CORPUSAGENT2_FRONTEND_API_BASE_URL`.
 
-## Where output goes
+## Output
 
-Runs write files under:
-
-```text
-outputs/agent_runtime/
-```
-
-The useful files are usually:
+Runs write to `outputs/agent_runtime/`. The files I actually open:
 
 - `summary.json`
-- `nodes/*.json`
-- generated plots/artifacts
-- selected evidence rows
+- `nodes/*.json` — what each tool received, returned, and why it may have been empty
+- generated plots/artifacts and selected evidence rows
 
-When a run looks strange, start with the node JSON files. They show what each
-tool received, what it returned, and why it may have produced no data.
+When a run looks off, start with the node JSON.
 
 ## Repo map
 
 ```text
-config/                default config
-data/                  raw and processed corpus data
-deploy/                docker compose for Postgres/OpenSearch
-docs/                  longer notes
-outputs/               generated run output
-scripts/               setup, indexing, runtime, and utility scripts
-src/corpusagent2/      backend/runtime code
-tests/                 pytest suite
-web/                   static frontend
+config/             default config
+data/               raw and processed corpus data
+deploy/             docker compose for Postgres/OpenSearch
+docs/               longer notes
+outputs/            generated run output
+scripts/            setup, indexing, runtime, and utility scripts
+src/corpusagent2/   backend/runtime code
+tests/              pytest suite
+web/                static frontend
 ```
 
-## Current caveats
+## Caveats
 
-- Some analytics are still heuristic in the prototype.
+- Some analytics are still heuristic.
 - Large corpus setup needs disk space and patience.
-- Full hybrid retrieval expects Postgres/pgvector and OpenSearch to be healthy.
+- Full hybrid retrieval expects healthy Postgres/pgvector and OpenSearch.
 - The frontend is a debugging UI, not a finished app.
+</content>
