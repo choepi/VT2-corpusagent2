@@ -1245,6 +1245,23 @@ function reportTextBlock(value, emptyText = "None") {
   return text ? `<pre>${escapeHtml(text)}</pre>` : `<p class="muted">${escapeHtml(emptyText)}</p>`;
 }
 
+// Same rendering path as renderAnswerText: marked when the CDN loaded,
+// escaped plain text otherwise.
+function reportMarkdownBlock(value, emptyText = "None") {
+  const text = String(value || "").trim();
+  if (!text) {
+    return `<p class="muted">${escapeHtml(emptyText)}</p>`;
+  }
+  if (typeof window !== "undefined" && window.marked && typeof window.marked.parse === "function") {
+    try {
+      return `<div class="answer-rendered">${window.marked.parse(text, { breaks: true, gfm: true })}</div>`;
+    } catch (_err) {
+      // fall through to plain text
+    }
+  }
+  return `<div class="answer-rendered answer-plain">${escapeHtml(text)}</div>`;
+}
+
 function reportMetricRows(rows) {
   return `
     <div class="report-metrics">
@@ -1354,72 +1371,74 @@ function buildPrintableReportHtml(manifest) {
     )
     .join("");
 
-  const toolCallBlocks = (manifest.tool_calls || [])
-    .map(
-      (row, index) => `
-        <article class="report-card">
-          <h3>${index + 1}. ${escapeHtml(row.tool_name || row.capability || row.node_id || "tool")}</h3>
-          ${reportMetricRows([
-            ["Status", row.status || ""],
-            ["Provider", row.provider || ""],
-            ["Capability", row.capability || ""],
-            ["Node", row.node_id || ""],
-            ["Duration", stepDurationLabel(row) || ""],
-            ["Cache hit", row.cache_hit ? "yes" : "no"],
-          ])}
-          <p><strong>Call:</strong></p>
-          <pre>${escapeHtml(row.call_signature || "")}</pre>
-          ${row.tool_reason ? `<p><strong>Resolution:</strong> ${escapeHtml(row.tool_reason)}</p>` : ""}
-          ${row.error ? `<p class="danger"><strong>Error:</strong> ${escapeHtml(row.error)}</p>` : ""}
-          ${row.summary?.no_data_reason ? `<p><strong>No data:</strong> ${escapeHtml(row.summary.no_data_reason)}</p>` : ""}
-          <h4>Inputs</h4>
-          ${reportPre(row.inputs || {})}
-          <h4>Output Preview</h4>
-          ${reportPre(row.summary?.payload_preview || {})}
-          <h4>Artifacts</h4>
-          ${reportList(row.artifacts || [])}
-          ${
-            row.summary?.stdout_preview || row.summary?.stderr_preview
-              ? `<h4>Sandbox Output</h4>${reportTextBlock(
-                  [
-                    row.summary.stdout_preview ? `stdout:\n${row.summary.stdout_preview}` : "",
-                    row.summary.stderr_preview ? `stderr:\n${row.summary.stderr_preview}` : "",
-                  ]
-                    .filter(Boolean)
-                    .join("\n\n")
-                )}`
-              : ""
-          }
-        </article>
-      `
-    )
-    .join("");
+  const statusClass = String(manifest.status || "unknown").toLowerCase().replace(/[^a-z0-9_-]/g, "-");
 
-  const llmTraceBlocks = (metadata.llm_traces || [])
-    .map((trace, index) => {
-      const messages = Array.isArray(trace.messages)
-        ? trace.messages.map((item) => `${item.role}: ${String(item.content || "")}`).join("\n\n")
-        : "";
-      return `
-        <article class="report-card">
-          <h3>${index + 1}. ${escapeHtml(trace.stage || "LLM trace")}</h3>
-          ${reportMetricRows([
-            ["Provider", trace.provider_name || ""],
-            ["Model", trace.model || ""],
-            ["Fallback", trace.used_fallback ? "yes" : "no"],
-          ])}
-          ${trace.error ? `<p class="danger"><strong>Error:</strong> ${escapeHtml(trace.error)}</p>` : ""}
-          ${trace.note ? `<p><strong>Note:</strong> ${escapeHtml(trace.note)}</p>` : ""}
-          <h4>Prompt Messages</h4>
-          ${reportTextBlock(messages)}
-          <h4>Raw Output</h4>
-          ${reportTextBlock(trace.raw_text || "")}
-          <h4>Parsed JSON</h4>
-          ${reportPre(trace.parsed_json || {})}
-        </article>
-      `;
-    })
-    .join("");
+  const answerBanner = metadata.out_of_corpus_model_answer
+    ? '<div class="answer-mode-banner">MODEL-ONLY OUT-OF-CORPUS ANSWER: no corpus-grounded evidence was available; this uses the configured planner model\'s prior knowledge.</div>'
+    : "";
+
+  const nliStats = metadata.nli_stats || null;
+  const nliRows =
+    metadata.nli_verifier_ran && Array.isArray(metadata.nli_verdicts) ? metadata.nli_verdicts : [];
+  const claimVerdictBlocks = nliRows.length
+    ? `
+        <h3>Claim Verdicts</h3>
+        ${
+          nliStats
+            ? `<p class="muted">NLI verifier ${escapeHtml(String(nliStats.nli_model || ""))} — ${nliStats.claims_supported ?? 0} supported, ${nliStats.claims_contradicted ?? 0} contradicted, ${nliStats.claims_neutral ?? 0} neutral (threshold ${nliStats.verdict_threshold ?? "0.7"}).</p>`
+            : ""
+        }
+        <div class="claim-verdict-grid">
+          ${nliRows
+            .map((row) => {
+              const verdict = String(row.verdict || "neutral").trim() || "neutral";
+              const safeClass = verdict.toLowerCase().replace(/[^a-z0-9_-]/g, "-");
+              const ent = row.entailment_prob != null ? Number(row.entailment_prob).toFixed(2) : "";
+              const con = row.contradiction_prob != null ? Number(row.contradiction_prob).toFixed(2) : "";
+              return `
+                <article class="claim-card claim-card-${safeClass}">
+                  <span class="claim-verdict-pill">${escapeHtml(verdict)}</span>
+                  <p class="claim-text">${escapeHtml(row.claim || "")}</p>
+                  ${row.premise ? `<p class="claim-evidence">${escapeHtml(row.premise)}</p>` : ""}
+                  ${ent ? `<span class="muted">entail ${ent}${con ? ` · contradict ${con}` : ""}</span>` : ""}
+                </article>
+              `;
+            })
+            .join("")}
+        </div>
+      `
+    : "";
+
+  const evidenceRows = manifest.evidence_table || finalAnswer.evidence_items || [];
+  const evidenceTableHtml = evidenceRows.length
+    ? `
+        <div class="table-wrap">
+          <table>
+            <colgroup>
+              <col style="width: 21%"><col style="width: 18%"><col style="width: 12%"><col style="width: 39%"><col style="width: 10%">
+            </colgroup>
+            <thead>
+              <tr><th>Doc</th><th>Outlet</th><th>Date</th><th>Excerpt</th><th>Score</th></tr>
+            </thead>
+            <tbody>
+              ${evidenceRows
+                .map((row) => {
+                  const docId = String(row.doc_id ?? "");
+                  return `
+                    <tr ${docId ? `id="doc-${escapeHtml(docId)}"` : ""}>
+                      <td class="evidence-doc">${escapeHtml(docId)}</td>
+                      <td>${escapeHtml(row.outlet ?? row.source ?? "")}</td>
+                      <td>${escapeHtml(row.date ?? row.published_at ?? "")}</td>
+                      <td class="evidence-excerpt">${escapeHtml(row.excerpt ?? row.snippet ?? "")}</td>
+                      <td class="evidence-score">${escapeHtml(row.score_display ?? formatScore(row.score ?? ""))}</td>
+                    </tr>`;
+                })
+                .join("")}
+            </tbody>
+          </table>
+        </div>
+      `
+    : '<p class="muted">No evidence rows</p>';
 
   return `<!doctype html>
 <html lang="en">
@@ -1428,14 +1447,19 @@ function buildPrintableReportHtml(manifest) {
     <title>${escapeHtml(title)}</title>
     <style>
       :root {
+        --bg: #f5f5f7;
+        --paper: rgba(255, 255, 255, 0.78);
+        --paper-strong: rgba(255, 255, 255, 0.94);
         --ink: #1d1d1f;
         --muted: #6e6e73;
-        --border: rgba(0, 0, 0, 0.1);
-        --hairline: rgba(0, 0, 0, 0.06);
-        --paper: #ffffff;
-        --soft: #f5f5f7;
         --accent: #0071e3;
+        --accent-soft: rgba(0, 113, 227, 0.1);
+        --warn: #b7791f;
         --danger: #d92d20;
+        --danger-soft: #fee4e2;
+        --border: rgba(0, 0, 0, 0.08);
+        --hairline: rgba(0, 0, 0, 0.06);
+        --shadow: 0 22px 70px rgba(0, 0, 0, 0.08);
       }
       * { box-sizing: border-box; }
       body {
@@ -1446,76 +1470,199 @@ function buildPrintableReportHtml(manifest) {
           radial-gradient(circle at 88% 0%, rgba(52, 199, 89, 0.09), transparent 30%),
           linear-gradient(180deg, #ffffff 0%, #f5f5f7 46%, #eef1f5 100%);
         font-family: ui-sans-serif, -apple-system, BlinkMacSystemFont, "SF Pro Display", "SF Pro Text", "Segoe UI", sans-serif;
-        line-height: 1.4;
+        line-height: 1.45;
         -webkit-font-smoothing: antialiased;
       }
-      main { max-width: 1120px; margin: 0 auto; padding: 28px; }
-      header {
-        border: 1px solid var(--border);
-        background: var(--paper);
-        border-radius: 20px;
-        padding: 22px;
-        margin-bottom: 18px;
-        box-shadow: 0 10px 28px rgba(0, 0, 0, 0.07);
+      main { max-width: 1180px; margin: 0 auto; padding: 28px 20px 44px; }
+      .card {
+        background: linear-gradient(180deg, rgba(255, 255, 255, 0.94), rgba(255, 255, 255, 0.76));
+        border: 1px solid var(--hairline);
+        border-radius: 30px;
+        padding: 24px;
+        box-shadow: var(--shadow);
+        margin-bottom: 20px;
       }
-      h1 { margin: 0 0 8px; font-size: 2.2rem; line-height: 1.05; letter-spacing: -0.022em; }
-      h2 {
-        margin: 28px 0 12px;
-        border-bottom: 2px solid var(--border);
-        padding-bottom: 6px;
-        page-break-after: avoid;
+      .eyebrow {
+        margin: 0 0 12px;
+        text-transform: uppercase;
+        letter-spacing: 0.12em;
+        color: #65656a;
+        font-size: 0.82rem;
+        font-weight: 700;
       }
-      h3, h4 { margin: 14px 0 8px; page-break-after: avoid; }
+      h1 {
+        margin: 0 0 14px;
+        font-size: clamp(1.9rem, 3vw, 2.9rem);
+        line-height: 1.05;
+        letter-spacing: -0.03em;
+        font-weight: 760;
+      }
+      h2 { margin: 0; font-size: 1.32rem; font-weight: 700; letter-spacing: -0.02em; }
+      h3 { margin: 16px 0 10px; font-size: 1rem; page-break-after: avoid; }
+      h4 { margin: 12px 0 6px; font-size: 0.92rem; page-break-after: avoid; }
       .muted { color: var(--muted); }
       .danger { color: var(--danger); }
-      .report-card {
-        border: 1px solid var(--border);
-        background: rgba(255, 255, 255, 0.9);
-        border-radius: 16px;
-        padding: 14px;
-        margin: 12px 0;
-        break-inside: avoid;
+      .section-head {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        margin-bottom: 12px;
+        page-break-after: avoid;
       }
+      .view-label {
+        width: fit-content;
+        margin: 26px 0 14px;
+        padding: 10px 22px;
+        border-radius: 999px;
+        background: var(--ink);
+        color: #fff;
+        font-weight: 600;
+        font-size: 0.95rem;
+        page-break-after: avoid;
+      }
+      .pill {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        border-radius: 999px;
+        padding: 8px 12px;
+        font-size: 0.86rem;
+        font-weight: 600;
+        letter-spacing: -0.005em;
+        background: rgba(0, 0, 0, 0.05);
+        color: var(--ink);
+      }
+      .pill.subtle { background: rgba(0, 0, 0, 0.04); color: var(--muted); }
+      .pill-row { display: flex; gap: 8px; flex-wrap: wrap; margin: 6px 0 4px; }
+      .status-completed, .status-partial { background: rgba(52, 199, 89, 0.14); color: #16773a; }
+      .status-failed, .status-rejected { background: var(--danger-soft); color: var(--danger); }
+      .status-needs_clarification { background: rgba(255, 149, 0, 0.13); color: var(--warn); }
+      .status-running { background: var(--accent-soft); color: var(--accent); }
       .report-metrics {
         display: grid;
         grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
-        gap: 8px;
-        margin: 12px 0;
+        gap: 10px;
+        margin: 16px 0 4px;
       }
       .report-metrics > div {
-        border: 1px solid var(--border);
-        border-radius: 12px;
-        background: #fff;
-        padding: 9px;
+        background: linear-gradient(180deg, rgba(255, 255, 255, 0.92), rgba(246, 247, 249, 0.78));
+        border: 1px solid var(--hairline);
+        border-radius: 20px;
+        padding: 13px 14px;
       }
       .report-metrics span { display: block; color: var(--muted); font-size: 0.86rem; }
-      .report-metrics strong { overflow-wrap: anywhere; }
+      .report-metrics strong { display: block; margin-top: 4px; overflow-wrap: anywhere; }
+      .answer-rendered {
+        background: var(--paper);
+        border: 1px solid var(--border);
+        border-radius: 14px;
+        padding: 16px 20px;
+        line-height: 1.65;
+        font-size: 1rem;
+      }
+      .answer-rendered.answer-plain { white-space: pre-wrap; }
+      .answer-rendered h1, .answer-rendered h2 { font-size: 1.15rem; margin: 18px 0 8px; font-weight: 700; letter-spacing: 0; }
+      .answer-rendered h3 { font-size: 1.02rem; margin: 14px 0 6px; font-weight: 600; }
+      .answer-rendered :first-child { margin-top: 0; }
+      .answer-rendered p { margin: 8px 0; }
+      .answer-rendered ul, .answer-rendered ol { padding-left: 22px; margin: 8px 0; }
+      .answer-rendered li { margin: 4px 0; }
+      .answer-rendered code { background: var(--accent-soft); padding: 1px 6px; border-radius: 6px; font-size: 0.92em; }
+      .answer-rendered a { color: var(--accent); text-decoration: none; border-bottom: 1px solid currentColor; }
+      .answer-rendered a[href^="#doc-"] { border-bottom: 0; font-weight: 700; font-size: 0.95em; padding: 0 3px; }
+      .answer-mode-banner {
+        margin: 0 0 12px;
+        padding: 14px 16px;
+        border: 2px solid rgba(217, 45, 32, 0.4);
+        border-radius: 18px;
+        background: linear-gradient(135deg, rgba(217, 45, 32, 0.16), rgba(255, 149, 0, 0.14));
+        color: #7a1e14;
+        font-weight: 800;
+        letter-spacing: 0.02em;
+        text-transform: uppercase;
+      }
+      .claim-verdict-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+        gap: 12px;
+        margin: 10px 0 18px;
+      }
+      .claim-card {
+        border: 1px solid var(--hairline);
+        border-radius: 20px;
+        padding: 13px;
+        background: rgba(255, 255, 255, 0.84);
+        break-inside: avoid;
+      }
+      .claim-verdict-pill {
+        display: inline-flex;
+        width: fit-content;
+        border-radius: 999px;
+        padding: 5px 9px;
+        margin-bottom: 8px;
+        background: rgba(0, 0, 0, 0.055);
+        color: var(--muted);
+        font-size: 0.78rem;
+        font-weight: 780;
+        text-transform: uppercase;
+        letter-spacing: 0.04em;
+      }
+      .claim-card-supported .claim-verdict-pill { background: rgba(52, 199, 89, 0.14); color: #16773a; }
+      .claim-card-partially_supported .claim-verdict-pill,
+      .claim-card-partial .claim-verdict-pill { background: rgba(255, 149, 0, 0.15); color: #a45a00; }
+      .claim-card-unsupported .claim-verdict-pill,
+      .claim-card-refuted .claim-verdict-pill,
+      .claim-card-contradicted .claim-verdict-pill { background: rgba(217, 45, 32, 0.12); color: var(--danger); }
+      .claim-text { margin: 0; font-weight: 700; line-height: 1.35; }
+      .claim-evidence { margin: 8px 0 0; color: var(--muted); line-height: 1.35; }
+      .report-card {
+        background: rgba(255, 255, 255, 0.86);
+        border: 1px solid var(--hairline);
+        border-radius: 22px;
+        padding: 15px;
+        margin: 12px 0;
+        break-inside: avoid;
+      }
+      .report-card h3 { margin-top: 0; }
       pre {
         white-space: pre-wrap;
         overflow-wrap: anywhere;
-        border: 1px solid var(--border);
-        border-radius: 12px;
-        background: var(--soft);
-        padding: 10px;
+        background: rgba(246, 247, 249, 0.88);
+        border: 1px solid var(--hairline);
+        border-radius: 16px;
+        padding: 12px;
         font-family: ui-monospace, "SF Mono", "SFMono-Regular", Menlo, Consolas, monospace;
         font-size: 0.82rem;
+      }
+      .table-wrap {
+        border: 1px solid var(--hairline);
+        border-radius: 20px;
+        background: rgba(255, 255, 255, 0.82);
+        overflow: hidden;
       }
       table {
         width: 100%;
         border-collapse: collapse;
         table-layout: fixed;
-        margin: 10px 0;
-        font-size: 0.88rem;
+        font-size: 0.92rem;
       }
       th, td {
-        border: 1px solid var(--border);
-        padding: 7px;
+        border-bottom: 1px solid var(--border);
+        padding: 9px 10px;
         text-align: left;
         vertical-align: top;
         overflow-wrap: anywhere;
       }
-      th { background: var(--soft); }
-      ul { margin-top: 8px; padding-left: 20px; }
+      th { background: rgba(246, 247, 249, 0.96); }
+      tr:last-child td { border-bottom: 0; }
+      .evidence-doc {
+        font-family: ui-monospace, "SF Mono", "SFMono-Regular", Menlo, Consolas, monospace;
+        font-size: 0.8rem;
+      }
+      .evidence-excerpt { line-height: 1.35; }
+      .evidence-score { font-variant-numeric: tabular-nums; white-space: nowrap; }
+      ul { margin: 8px 0 0; padding-left: 18px; }
       li { margin-bottom: 6px; overflow-wrap: anywhere; }
       a { color: var(--accent); }
       .report-plots {
@@ -1525,41 +1672,53 @@ function buildPrintableReportHtml(manifest) {
       }
       figure {
         margin: 0;
-        border: 1px solid var(--border);
-        border-radius: 16px;
-        padding: 10px;
-        background: #fff;
+        background: rgba(255, 255, 255, 0.86);
+        border: 1px solid var(--hairline);
+        border-radius: 20px;
+        padding: 12px;
         break-inside: avoid;
       }
       figure img {
         width: 100%;
         max-height: 520px;
         object-fit: contain;
-        border: 1px solid var(--border);
-        border-radius: 10px;
+        border: 1px solid var(--hairline);
+        border-radius: 12px;
         display: block;
       }
       figcaption { margin-top: 8px; font-weight: 700; }
-      .report-actions {
-        display: flex;
-        gap: 10px;
-        margin-top: 16px;
-      }
+      .report-actions { display: flex; gap: 10px; margin-top: 16px; }
       button {
-        border: 0;
+        padding: 12px 20px;
         border-radius: 999px;
-        padding: 10px 14px;
-        background: var(--accent);
+        border: none;
+        background: linear-gradient(180deg, #0a84ff, #0071e3);
         color: #fff;
         font: inherit;
+        font-weight: 600;
         cursor: pointer;
+        box-shadow: 0 10px 22px rgba(0, 113, 227, 0.24);
       }
-      .appendix pre { font-size: 0.68rem; }
+      button.ghost-button {
+        background: rgba(255, 255, 255, 0.9);
+        color: var(--ink);
+        border: 1px solid var(--hairline);
+        box-shadow: 0 4px 12px rgba(0, 0, 0, 0.04);
+      }
       @page { margin: 14mm; }
       @media print {
         body { background: #fff; }
         main { max-width: none; padding: 0; }
-        header, .report-card, figure { box-shadow: none; }
+        .card, .report-card, figure { box-shadow: none; break-inside: avoid; }
+        .view-label {
+          width: 100%;
+          padding: 0 0 6px;
+          border-radius: 0;
+          background: none;
+          color: var(--ink);
+          border-bottom: 2px solid var(--border);
+          font-size: 1.1rem;
+        }
         .no-print { display: none !important; }
         a { color: inherit; text-decoration: none; }
       }
@@ -1567,27 +1726,31 @@ function buildPrintableReportHtml(manifest) {
   </head>
   <body>
     <main>
-      <header>
-        <p class="muted">CorpusAgent2 Full Analysis Report</p>
+      <header class="card">
+        <p class="eyebrow">CorpusAgent2 · Run Report</p>
         <h1>${escapeHtml(manifest.question || manifest.question_spec?.original_question || "Run analysis")}</h1>
-        ${reportMetricRows([
-          ["Run ID", manifest.run_id || ""],
-          ["Status", manifest.status || ""],
-          ["Generated", generatedAt],
-          ["Created", manifest.created_at_utc || ""],
-          ["Executor time", nodeDuration],
-          ["Plots", plotCount],
-        ])}
+        <div class="pill-row">
+          <span class="pill status-${statusClass}">${escapeHtml(manifest.status || "unknown")}</span>
+          <span class="pill subtle">Run ${escapeHtml(manifest.run_id || "n/a")}</span>
+          <span class="pill subtle">Created ${escapeHtml(manifest.created_at_utc || "n/a")}</span>
+          <span class="pill subtle">Report generated ${escapeHtml(generatedAt)}</span>
+          <span class="pill subtle">Tool execution ${escapeHtml(nodeDuration)}</span>
+          <span class="pill subtle">${plotCount} plot${plotCount === 1 ? "" : "s"}</span>
+        </div>
         <div class="report-actions no-print">
           <button type="button" onclick="window.print()">Print / Save PDF</button>
-          <button type="button" onclick="window.close()">Close</button>
+          <button type="button" class="ghost-button" onclick="window.close()">Close</button>
         </div>
         <p class="muted no-print">Use the browser print dialog and choose "Save as PDF" to download the report.</p>
       </header>
 
-      <section>
-        <h2>Answer</h2>
-        ${reportTextBlock(finalAnswer.answer_text || "")}
+      <div class="view-label">Simple view</div>
+
+      <section class="card">
+        <div class="section-head"><h2>Answer</h2></div>
+        ${answerBanner}
+        ${reportMarkdownBlock(finalAnswer.answer_text || "", "No answer text returned.")}
+        ${claimVerdictBlocks}
         <h3>Caveats</h3>
         ${reportList(finalAnswer.caveats || [])}
         ${
@@ -1595,20 +1758,28 @@ function buildPrintableReportHtml(manifest) {
             ? `<h3>Unsupported Parts</h3>${reportList(finalAnswer.unsupported_parts || [])}`
             : ""
         }
-        ${
-          metadata.nli_verifier_ran && Array.isArray(metadata.nli_verdicts) && metadata.nli_verdicts.length
-            ? `<h3>Claim Verdicts</h3>${reportTable(
-                ["Verdict", "Claim", "Evidence"],
-                metadata.nli_verdicts,
-                (row) => [row.verdict || "", row.claim || "", row.premise || ""],
-                "No claim verdicts"
-              )}`
-            : ""
-        }
       </section>
 
-      <section>
-        <h2>Run Summary</h2>
+      ${
+        plotCount
+          ? `
+      <section class="card">
+        <div class="section-head"><h2>Plots</h2></div>
+        ${reportPlots(manifest)}
+      </section>
+      `
+          : ""
+      }
+
+      <section class="card">
+        <div class="section-head"><h2>Evidence</h2></div>
+        ${evidenceTableHtml}
+      </section>
+
+      <div class="view-label">Advanced view</div>
+
+      <section class="card">
+        <div class="section-head"><h2>Run Summary</h2><span class="pill subtle">Runtime profile</span></div>
         ${reportMetricRows([
           ["LLM provider", llm.provider_name || ""],
           ["Planner model", llm.planner_model || ""],
@@ -1626,69 +1797,14 @@ function buildPrintableReportHtml(manifest) {
         ${reportList(manifest.assumptions || [])}
       </section>
 
-      <section>
-        <h2>Plots</h2>
-        ${reportPlots(manifest)}
-      </section>
-
-      <section>
-        <h2>Execution Transcript</h2>
-        ${toolCallBlocks || '<p class="muted">No tool calls recorded.</p>'}
-      </section>
-
-      <section>
-        <h2>Planner Actions</h2>
+      <section class="card">
+        <div class="section-head"><h2>Planner Actions</h2><span class="pill subtle">Magic box trace</span></div>
         ${plannerActionBlocks || '<p class="muted">No planner actions recorded.</p>'}
       </section>
 
-      <section>
-        <h2>Plan DAG</h2>
+      <section class="card">
+        <div class="section-head"><h2>Plan DAG</h2><span class="pill subtle">Planned nodes</span></div>
         ${planBlocks || '<p class="muted">No plan nodes recorded.</p>'}
-      </section>
-
-      <section>
-        <h2>Evidence Rows</h2>
-        ${reportTable(
-          ["Doc", "Outlet", "Date", "Excerpt", "Score"],
-          manifest.evidence_table || finalAnswer.evidence_items || [],
-          (row) => [
-            row.doc_id || "",
-            row.outlet || row.source || "",
-            row.date || row.published_at || "",
-            row.excerpt || row.snippet || "",
-            row.score_display || formatScore(row.score ?? ""),
-          ],
-          "No evidence rows"
-        )}
-      </section>
-
-      <section>
-        <h2>Raw LLM Outputs</h2>
-        ${llmTraceBlocks || '<p class="muted">No LLM traces recorded.</p>'}
-      </section>
-
-      <section>
-        <h2>Node Records</h2>
-        ${reportTable(
-          ["Node", "Capability", "Tool", "Provider", "Status", "Duration", "Artifacts", "Caveats"],
-          manifest.node_records || [],
-          (row) => [
-            row.node_id || "",
-            row.capability || "",
-            row.tool_name || "",
-            row.provider || "",
-            row.status || "",
-            formatDurationMs(row.duration_ms || 0),
-            (row.artifacts_used || []).join("\n"),
-            (row.caveats || []).join("\n"),
-          ],
-          "No node records"
-        )}
-      </section>
-
-      <section class="appendix">
-        <h2>Full Run Output JSON</h2>
-        ${reportPre(manifest)}
       </section>
     </main>
     <script>
