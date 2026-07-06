@@ -81,5 +81,6 @@ wheels/
 Thumbs.db
 .claude/settings.local.json
 
-# Large run-provenance archives (reproducible from outputs/; keep out of git)
-project_paper/results_exports/*.zip
+# Paper lives outside this repo now (private OneDrive workspace); eval scripts may
+# recreate project_paper/LATEX/generated/ locally as a staging dir — never commit it
+project_paper/
