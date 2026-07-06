@@ -439,9 +439,11 @@ dependencies = [
     { name = "datasets" },
     { name = "en-core-web-sm" },
     { name = "fastapi" },
+    { name = "gensim" },
     { name = "httpx" },
     { name = "huggingface-hub" },
     { name = "joblib" },
+    { name = "langdetect" },
     { name = "matplotlib" },
     { name = "mcp", extra = ["cli"] },
     { name = "networkx" },
@@ -470,7 +472,6 @@ dependencies = [
 [package.optional-dependencies]
 nlp-providers = [
     { name = "flair" },
-    { name = "gensim" },
     { name = "nltk" },
     { name = "stanza" },
 ]
@@ -482,10 +483,11 @@ requires-dist = [
     { name = "en-core-web-sm", url = "https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl" },
     { name = "fastapi", specifier = ">=0.135.2" },
     { name = "flair", marker = "extra == 'nlp-providers'", specifier = ">=0.15.1" },
-    { name = "gensim", marker = "extra == 'nlp-providers'", specifier = ">=4.3.3" },
+    { name = "gensim", specifier = ">=4.3.3" },
     { name = "httpx", specifier = ">=0.28.1" },
     { name = "huggingface-hub", specifier = ">=0.34.0,<1.0.0" },
     { name = "joblib", specifier = ">=1.5.2" },
+    { name = "langdetect", specifier = ">=1.0.9" },
     { name = "matplotlib", specifier = ">=3.10.8" },
     { name = "mcp", extras = ["cli"], specifier = ">=1.26.0" },
     { name = "networkx", specifier = ">=3.5" },
