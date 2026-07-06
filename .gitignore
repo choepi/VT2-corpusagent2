@@ -84,3 +84,7 @@ Thumbs.db
 # Paper lives outside this repo now (private OneDrive workspace); eval scripts may
 # recreate project_paper/LATEX/generated/ locally as a staging dir — never commit it
 project_paper/
+
+# Generated knowledge graph — regenerable via `graphify update .`; its doc nodes
+# carried paper-derived content, so it stays local-only
+graphify-out/
