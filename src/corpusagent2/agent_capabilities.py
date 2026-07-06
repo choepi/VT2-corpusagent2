@@ -1442,6 +1442,11 @@ def _search_result(
                 "working_set_ref": label,
                 "preview_count": len(preview_rows),
                 "results_truncated": result_count > len(preview_rows),
+                # Mirror under the key the analysis-document resolver checks, so a
+                # plan that feeds an analysis node directly from a search node
+                # streams the full working set instead of silently treating the
+                # preview rows as the complete population.
+                "documents_truncated": result_count > len(preview_rows),
             }
         )
         if result_count > len(preview_rows):

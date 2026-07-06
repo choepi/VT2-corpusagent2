@@ -436,17 +436,25 @@ class QueryTimeEntityTrendTool(CapabilityToolAdapter):
         doc_ids = _doc_results_to_ids(dependency_results["filtered_results"].payload)
         docs_df = runtime.load_docs(doc_ids)
         granularity = _granularity_from_params_or_question(params, _question_spec_from_context(context))
+        ner_max_docs = min(len(docs_df), 500) if len(docs_df) else 0
         rows = run_ner(
             df=docs_df,
             model_name="en_core_web_trf",
             granularity=granularity,
-            max_docs=min(len(docs_df), 500) if len(docs_df) else 0,
+            max_docs=ner_max_docs,
         )
         filtered, caveats = _filter_artifact_rows(rows, params)
+        caveats = list(caveats) + [
+            "Entity trend was computed on the retrieved evidence window, not the full corpus slice."
+        ]
+        if len(docs_df) > ner_max_docs:
+            caveats.append(
+                f"NER window capped at {ner_max_docs} of {len(docs_df)} retrieved documents (deterministic sample)."
+            )
         return ToolExecutionResult(
             payload={"rows": filtered.head(50).to_dict(orient="records"), "analysis_scope": "retrieval_window"},
             caveats=caveats,
-            metadata={"rows": int(filtered.shape[0])},
+            metadata={"rows": int(filtered.shape[0]), "window_document_cap": ner_max_docs, "window_document_count": int(len(docs_df))},
         )
 
 
@@ -489,19 +497,24 @@ class QueryTimeSentimentTool(CapabilityToolAdapter):
         doc_ids = _doc_results_to_ids(dependency_results["filtered_results"].payload)
         docs_df = runtime.load_docs(doc_ids)
         granularity = _granularity_from_params_or_question(params, _question_spec_from_context(context))
+        sentiment_max_docs = min(len(docs_df), 256) if len(docs_df) else 0
         rows, device_used = run_sentiment(
             df=docs_df,
             model_id="cardiffnlp/twitter-roberta-base-sentiment-latest",
             granularity=granularity,
-            preferred_device="cpu",
-            max_docs=min(len(docs_df), 256) if len(docs_df) else 0,
+            preferred_device=None,  # auto: CUDA when available, CPU otherwise
+            max_docs=sentiment_max_docs,
         )
         filtered = _apply_time_filter(rows, params, "time_bin")
         caveats = ["Sentiment was estimated on the retrieved evidence window, not the full corpus slice."]
+        if len(docs_df) > sentiment_max_docs:
+            caveats.append(
+                f"Sentiment window capped at {sentiment_max_docs} of {len(docs_df)} retrieved documents (deterministic sample)."
+            )
         return ToolExecutionResult(
             payload={"rows": filtered.to_dict(orient="records"), "analysis_scope": "retrieval_window"},
             caveats=caveats,
-            metadata={"device_used": device_used},
+            metadata={"device_used": device_used, "window_document_cap": sentiment_max_docs, "window_document_count": int(len(docs_df))},
         )
 
 
@@ -543,16 +556,22 @@ class QueryTimeTopicsTool(CapabilityToolAdapter):
         doc_ids = _doc_results_to_ids(dependency_results["filtered_results"].payload)
         docs_df = runtime.load_docs(doc_ids)
         granularity = _granularity_from_params_or_question(params, _question_spec_from_context(context))
+        topics_max_docs = min(len(docs_df), 128) if len(docs_df) else 0
         rows = run_topics_over_time(
             df=docs_df,
             granularity=granularity,
-            max_docs=min(len(docs_df), 128) if len(docs_df) else 0,
+            max_docs=topics_max_docs,
         )
         filtered = _apply_time_filter(rows, params, "time_bin")
         caveats = ["Topic clusters were induced from the retrieved evidence window and may not reflect the full corpus."]
+        if len(docs_df) > topics_max_docs:
+            caveats.append(
+                f"Topic window capped at {topics_max_docs} of {len(docs_df)} retrieved documents (deterministic sample)."
+            )
         return ToolExecutionResult(
             payload={"rows": filtered.to_dict(orient="records"), "analysis_scope": "retrieval_window"},
             caveats=caveats,
+            metadata={"window_document_cap": topics_max_docs, "window_document_count": int(len(docs_df))},
         )
 
 
