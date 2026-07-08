@@ -326,6 +326,50 @@ def _working_set_analysis_limit_explicit() -> bool:
     return os.getenv("CORPUSAGENT2_WORKING_SET_ANALYSIS_MAX_DOCS") is not None
 
 
+def _token_level_analysis_max_documents() -> int | None:
+    """Cap for per-token/per-parse row emitters (tokenize, pos_morph, lemmatize,
+    dependency_parse, noun_chunks) when they dereference a working_set_ref.
+
+    Unlike the *_ANALYSIS_MAX_DOCS caps this defaults to a bound (1000) instead of
+    uncapped: these tools emit one row per token, so streaming a 10^4-10^6-document
+    working set builds tens of millions of row dicts in memory and OOM-kills the
+    API process. Full-population aggregates (e.g. noun_frequency_distribution)
+    do not consume these rows — they stream the working set with bounded-memory
+    aggregation — so capping here does not limit aggregate answers. Set
+    CORPUSAGENT2_TOKEN_ANALYSIS_MAX_DOCS=-1 for an uncapped offline run.
+    """
+    raw = (os.getenv("CORPUSAGENT2_TOKEN_ANALYSIS_MAX_DOCS", "") or "").strip()
+    if not raw:
+        return 1000
+    try:
+        value = int(raw)
+    except ValueError:
+        return 1000
+    if value < 0:
+        return None
+    return max(1, value)
+
+
+def _token_level_doc_rows(
+    deps: dict[str, "ToolExecutionResult"],
+    context: "AgentExecutionContext",
+    capability: str,
+) -> tuple[list[dict[str, Any]], list[str]]:
+    limit = _token_level_analysis_max_documents()
+    rows = _resolved_doc_rows(deps, context, max_documents=limit)
+    caveats: list[str] = []
+    working_set_ref = _working_set_ref(deps)
+    if limit is not None and working_set_ref and len(rows) >= limit:
+        total = _count_working_set(context, working_set_ref, len(rows))
+        if total > limit:
+            caveats.append(
+                f"{capability} emitted per-token rows for the first {limit} of {total} working-set documents "
+                "(CORPUSAGENT2_TOKEN_ANALYSIS_MAX_DOCS; -1 uncaps for offline runs). Full-population aggregates "
+                "stream the working set separately and are not affected by this cap."
+            )
+    return rows, caveats
+
+
 def _clean_analysis_text(title: Any = "", text: Any = "") -> tuple[str, dict[str, bool]]:
     title_text = _collapse_text(title)
     raw_body_text = str(text or "").replace("\x00", " ")
@@ -1097,7 +1141,11 @@ def _looks_like_plan_node_ref(value: str) -> bool:
     }
 
 
-def _resolve_working_set_ref(params: dict[str, Any], dependency_results: dict[str, ToolExecutionResult]) -> str:
+def _resolve_working_set_ref(
+    params: dict[str, Any],
+    dependency_results: dict[str, ToolExecutionResult],
+    context: "AgentExecutionContext | None" = None,
+) -> str:
     for key in (
         "working_set_ref",
         "working_set",
@@ -1117,6 +1165,16 @@ def _resolve_working_set_ref(params: dict[str, Any], dependency_results: dict[st
                 return str(payload.get("working_set_ref", "")).strip()
         if _looks_like_plan_node_ref(raw):
             continue
+        # Planner params sometimes carry an invented/stale label (e.g.
+        # "guardian_football_2017_2019") instead of the materialized working-set
+        # label. When the store affirmatively reports zero documents for the
+        # explicit label (-1 = store cannot count, so the label stays trusted),
+        # prefer the working set advertised by dependency payloads over silently
+        # streaming a nonexistent set into a zero-row analysis.
+        if context is not None and _count_working_set(context, raw, -1) == 0:
+            dependency_ref = _working_set_ref(dependency_results)
+            if dependency_ref and dependency_ref != raw:
+                return dependency_ref
         return raw
     return _working_set_ref(dependency_results)
 
@@ -3605,7 +3663,7 @@ def _fetch_documents(params: dict[str, Any], deps: dict[str, ToolExecutionResult
         for row in search_rows
         if str(row.get("doc_id", "")).strip()
     }
-    working_set_ref = _resolve_working_set_ref(params, deps)
+    working_set_ref = _resolve_working_set_ref(params, deps, context)
     if working_set_ref and not explicit_doc_ids:
         doc_ids = []
     if not doc_ids and not working_set_ref:
@@ -3709,7 +3767,7 @@ def _fetch_documents(params: dict[str, Any], deps: dict[str, ToolExecutionResult
 
 def _create_working_set(params: dict[str, Any], deps: dict[str, ToolExecutionResult], context: AgentExecutionContext) -> ToolExecutionResult:
     filters = dict(params.get("filter", {})) if isinstance(params.get("filter"), dict) else {}
-    upstream_ref = _resolve_working_set_ref(params, deps).strip()
+    upstream_ref = _resolve_working_set_ref(params, deps, context).strip()
     if upstream_ref and not filters:
         count = _count_working_set(context, upstream_ref, 0)
         preview_ids = _fetch_working_set_ids(context, upstream_ref, limit=_result_preview_limit())
@@ -4080,7 +4138,7 @@ def _filter_working_set(params: dict[str, Any], deps: dict[str, ToolExecutionRes
     document_filters = {key: value for key, value in filters.items() if str(key) not in annotation_filter_keys}
     limit = _positive_int_param(params.get("limit", params.get("top_k", params.get("max_documents"))))
     sort_specs = _working_set_sort_specs(params)
-    upstream_ref = _resolve_working_set_ref(params, deps).strip()
+    upstream_ref = _resolve_working_set_ref(params, deps, context).strip()
     if not upstream_ref:
         return ToolExecutionResult(
             payload={"results": [], "document_count": 0},
@@ -4112,6 +4170,7 @@ def _filter_working_set(params: dict[str, Any], deps: dict[str, ToolExecutionRes
                 "document_count": count,
                 "preview_count": len(preview_ids),
                 "results_truncated": count > len(preview_ids),
+                "documents_truncated": count > len(preview_ids),
             },
             metadata={"working_set_ref": upstream_ref, "full_result_count": count},
         )
@@ -4203,6 +4262,7 @@ def _filter_working_set(params: dict[str, Any], deps: dict[str, ToolExecutionRes
                 "document_count": len(filtered_rows),
                 "preview_count": len(preview_rows),
                 "results_truncated": len(filtered_rows) > len(preview_rows),
+                "documents_truncated": len(filtered_rows) > len(preview_rows),
                 "cancelled": True,
             },
             evidence=preview_rows,
@@ -4330,6 +4390,7 @@ def _filter_working_set(params: dict[str, Any], deps: dict[str, ToolExecutionRes
         "document_count": result_count,
         "preview_count": len(preview_rows),
         "results_truncated": result_count > len(preview_rows),
+        "documents_truncated": result_count > len(preview_rows),
     }
     return ToolExecutionResult(
         payload=payload,
@@ -4452,7 +4513,7 @@ def _clean_normalize(params: dict[str, Any], deps: dict[str, ToolExecutionResult
 
 
 def _tokenize_docs(params: dict[str, Any], deps: dict[str, ToolExecutionResult], context: AgentExecutionContext) -> ToolExecutionResult:
-    rows = _resolved_doc_rows(deps, context)
+    rows, input_caveats = _token_level_doc_rows(deps, context, "tokenize")
     if not rows:
         return _no_input_documents_result("tokenize")
     providers = _provider_order("tokenize", ["spacy", "stanza", "nltk", "regex"])
@@ -4488,6 +4549,7 @@ def _tokenize_docs(params: dict[str, Any], deps: dict[str, ToolExecutionResult],
         output.append({"doc_id": row["doc_id"], "tokens": tokens or _tokenize(text)})
     return ToolExecutionResult(
         payload={"rows": output},
+        caveats=input_caveats,
         metadata=_metadata(used_provider, f"{used_provider}_tokenize"),
     )
 
@@ -4600,7 +4662,7 @@ def _sentence_split_docs(params: dict[str, Any], deps: dict[str, ToolExecutionRe
 
 
 def _pos_morph(params: dict[str, Any], deps: dict[str, ToolExecutionResult], context: AgentExecutionContext) -> ToolExecutionResult:
-    rows = _resolved_doc_rows(deps, context)
+    rows, input_caveats = _token_level_doc_rows(deps, context, "pos_morph")
     if not rows:
         return _no_input_documents_result("pos_morph")
     output: list[dict[str, Any]] = []
@@ -4721,12 +4783,13 @@ def _pos_morph(params: dict[str, Any], deps: dict[str, ToolExecutionResult], con
         return _provider_unavailable_result("pos_morph")
     return ToolExecutionResult(
         payload={"rows": output},
+        caveats=input_caveats,
         metadata=_metadata(used_provider, f"{used_provider}_pos_morph"),
     )
 
 
 def _lemmatize_docs(params: dict[str, Any], deps: dict[str, ToolExecutionResult], context: AgentExecutionContext) -> ToolExecutionResult:
-    rows = _resolved_doc_rows(deps, context)
+    rows, input_caveats = _token_level_doc_rows(deps, context, "lemmatize")
     if not rows:
         return _no_input_documents_result("lemmatize")
     providers = _provider_order("lemmatize", ["spacy", "stanza", "textblob"])
@@ -4792,12 +4855,13 @@ def _lemmatize_docs(params: dict[str, Any], deps: dict[str, ToolExecutionResult]
         return _provider_unavailable_result("lemmatize")
     return ToolExecutionResult(
         payload={"rows": output},
+        caveats=input_caveats,
         metadata=_metadata(used_provider, f"{used_provider}_lemmatize"),
     )
 
 
 def _dependency_parse(params: dict[str, Any], deps: dict[str, ToolExecutionResult], context: AgentExecutionContext) -> ToolExecutionResult:
-    rows = _resolved_doc_rows(deps, context)
+    rows, input_caveats = _token_level_doc_rows(deps, context, "dependency_parse")
     if not rows:
         return _no_input_documents_result("dependency_parse")
     providers = _provider_order("dependency_parse", ["spacy", "stanza"])
@@ -4867,11 +4931,15 @@ def _dependency_parse(params: dict[str, Any], deps: dict[str, ToolExecutionResul
             continue
     if not parsed:
         return _provider_unavailable_result("dependency_parse")
-    return ToolExecutionResult(payload={"rows": parsed}, metadata=_metadata(used_provider, f"{used_provider}_dependency_parse"))
+    return ToolExecutionResult(
+        payload={"rows": parsed},
+        caveats=input_caveats,
+        metadata=_metadata(used_provider, f"{used_provider}_dependency_parse"),
+    )
 
 
 def _noun_chunks(params: dict[str, Any], deps: dict[str, ToolExecutionResult], context: AgentExecutionContext) -> ToolExecutionResult:
-    doc_rows = _resolved_doc_rows(deps, context)
+    doc_rows, input_caveats = _token_level_doc_rows(deps, context, "noun_chunks")
     has_any_input_rows = bool(doc_rows)
     providers = _provider_order("noun_chunks", ["spacy"])
     chunks_by_doc: defaultdict[str, list[str]] = defaultdict(list)
@@ -4898,6 +4966,7 @@ def _noun_chunks(params: dict[str, Any], deps: dict[str, ToolExecutionResult], c
     if chunks_by_doc:
         return ToolExecutionResult(
             payload={"rows": [{"doc_id": doc_id, "noun_chunks": values} for doc_id, values in chunks_by_doc.items()]},
+            caveats=input_caveats,
             metadata=_metadata(used_provider, f"{used_provider}_noun_chunks"),
         )
     pos_rows = []
@@ -7881,7 +7950,7 @@ def _time_series_source_rows(
     rows = _payload_rows_from_all_dependencies(deps)
     if rows:
         return rows
-    working_set_ref = _resolve_working_set_ref(params, deps)
+    working_set_ref = _resolve_working_set_ref(params, deps, context)
     if not working_set_ref:
         return []
     max_documents = _working_set_analysis_max_documents()
@@ -8457,7 +8526,7 @@ def _build_evidence_table(params: dict[str, Any], deps: dict[str, ToolExecutionR
     if _is_noun_frequency_task(task, params):
         top_k = _int_param(params, "top_k", "limit", default=100, maximum=5000)
         documents = _text_rows(deps)
-        working_set_ref = _resolve_working_set_ref(params, deps)
+        working_set_ref = _resolve_working_set_ref(params, deps, context)
         documents_truncated = _dependency_payload_flag(deps, "documents_truncated") or _dependency_payload_flag(deps, "working_set_truncated")
         full_document_count = _dependency_payload_int(deps, "document_count", len(documents))
         if working_set_ref and (documents_truncated or not documents):

@@ -123,9 +123,11 @@ def test_docker_cpu_requirements_use_cpu_torch_and_real_provider_stack() -> None
     provider_requirements = (project_root / "deploy" / "requirements.docker-nlp-providers.txt").read_text(encoding="utf-8")
     gpu_compose = (project_root / "deploy" / "docker-compose.mcp.gpu.yml").read_text(encoding="utf-8")
 
-    assert "torch==2.3.1+cpu" in cpu_requirements
-    assert "torchvision==0.18.1+cpu" in cpu_requirements
-    assert "torchaudio==2.3.1+cpu" in cpu_requirements
+    # torch wheels are pinned as direct sha256-verified CloudFront URLs because this
+    # VM cannot TLS-handshake with download-r2.pytorch.org (see requirements header).
+    assert "torch @ https://download.pytorch.org/whl/cpu/torch-2.3.1%2Bcpu-" in cpu_requirements
+    assert "torchvision @ https://download.pytorch.org/whl/cpu/torchvision-0.18.1%2Bcpu-" in cpu_requirements
+    assert "torchaudio @ https://download.pytorch.org/whl/cpu/torchaudio-2.3.1%2Bcpu-" in cpu_requirements
     assert "cu118" not in cpu_requirements
     assert "cu118" not in provider_requirements
     assert "sentence-transformers" in cpu_requirements

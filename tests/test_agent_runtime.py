@@ -4,6 +4,7 @@ import asyncio
 import base64
 import json
 from pathlib import Path
+import threading
 import time
 
 from corpusagent2 import agent_capabilities
@@ -3796,3 +3797,165 @@ def test_artifact_endpoint_serves_node_artifacts(tmp_path: Path) -> None:
 
     assert artifact_response.status_code == 200
     assert artifact_response.content
+
+
+def test_replan_from_run_carries_prior_answer_and_follow_up_instruction(tmp_path: Path, monkeypatch) -> None:
+    runtime = build_test_runtime(tmp_path=tmp_path, documents=_sample_documents(), search_rows_by_query={})
+    prior_manifest = {
+        "question": "What is the distribution of nouns in The Guardian's football reporting between 2017 and 2019?",
+        "assumptions": ["Noun distribution means noun-lemma frequency."],
+        "failures": [],
+        "clarification_questions": [],
+        "metadata": {"force_answer": False},
+        "final_answer": {"answer_text": "Top nouns were  game,\n team, season."},
+        "tool_calls": [
+            {"summary": {"payload_preview": {"working_set_ref": "ws_prior", "document_count": 37736}}},
+        ],
+    }
+    captured: dict = {}
+    monkeypatch.setattr(runtime, "get_run", lambda run_id: prior_manifest)
+
+    def _capture_submit(question, *, force_answer=False, no_cache=False, clarification_history=None):
+        captured["question"] = question
+        captured["no_cache"] = no_cache
+        captured["clarification_history"] = list(clarification_history or [])
+        return object()
+
+    monkeypatch.setattr(runtime, "submit_query", _capture_submit)
+
+    runtime.replan_from_run("agent_prior", additional_instruction="why no cristiano ronaldo mention?")
+
+    assert captured["question"] == prior_manifest["question"]
+    assert captured["no_cache"] is True
+    entry = captured["clarification_history"][-1]
+    assert "REPLAN" in entry
+    assert "agent_prior" in entry
+    assert 'ws_prior (37736 docs)' in entry
+    # Prior answer is carried (whitespace-condensed) so follow-ups about the prior
+    # output can be answered, and the follow-up instruction itself is included.
+    assert "Top nouns were game, team, season." in entry
+    assert "Additional user instruction: why no cristiano ronaldo mention?" in entry
+
+
+def test_synthesize_passes_clarification_history_to_llm(tmp_path: Path) -> None:
+    captured_messages: list = []
+
+    class _CapturingLLMClient(StaticLLMClient):
+        def complete_json_trace(self, messages, *, model, temperature=0.0):
+            captured_messages.append(messages)
+            return super().complete_json_trace(messages, model=model, temperature=temperature)
+
+    answer_payload = {
+        "answer_text": "## Nouns in Guardian football reporting",
+        "evidence_items": [],
+        "artifacts_used": [],
+        "unsupported_parts": [],
+        "caveats": [],
+        "claim_verdicts": [],
+    }
+    llm = _CapturingLLMClient([dict(answer_payload), dict(answer_payload), dict(answer_payload)])
+    runtime = build_test_runtime(tmp_path=tmp_path, documents=_sample_documents(), search_rows_by_query={}, llm_client=llm)
+    history = [
+        "REPLAN: This is a re-plan of prior run agent_prior. Additional user instruction: why no cristiano ronaldo mention?"
+    ]
+    state = AgentRunState(
+        question="What is the distribution of nouns in The Guardian's football reporting between 2017 and 2019?",
+        rewritten_question="Noun-lemma distribution for Guardian football 2017-2019.",
+        clarification_history=list(history),
+    )
+    snapshot = AgentExecutionSnapshot(
+        node_records=[],
+        node_results={},
+        failures=[],
+        provenance_records=[],
+        selected_docs=[],
+        status="completed",
+    )
+
+    runtime.orchestrator.synthesize(state, snapshot)
+
+    assert captured_messages, "synthesis LLM was not called"
+    user_payload = json.loads(captured_messages[0][-1]["content"])
+    assert user_payload["clarification_history"] == history
+
+
+def _wait_until(predicate, timeout_s: float = 10.0) -> bool:
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.05)
+    return predicate()
+
+
+def test_submit_query_queues_runs_beyond_max_concurrent(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("CORPUSAGENT2_MAX_CONCURRENT_RUNS", "1")
+    documents = _sample_documents()
+    runtime = build_test_runtime(
+        tmp_path=tmp_path,
+        documents=documents,
+        search_rows_by_query=_search_rows(documents),
+    )
+
+    release = threading.Event()
+    started: list[str] = []
+
+    def fake_run_query(run_id: str, question: str, **kwargs) -> None:
+        started.append(run_id)
+        if len(started) == 1:
+            release.wait(timeout=10)
+
+    monkeypatch.setattr(runtime, "_run_query", fake_run_query)
+
+    first = runtime.submit_query("football coverage question one")
+    assert _wait_until(lambda: first.run_id in started), "first run never started"
+
+    second = runtime.submit_query("football coverage question two")
+    assert _wait_until(
+        lambda: "run slot" in str(runtime.get_run_status(second.run_id).get("detail", ""))
+    ), "second run never entered the slot wait"
+    assert second.run_id not in started
+    assert runtime.get_run_status(second.run_id)["status"] == "queued"
+
+    release.set()
+    assert _wait_until(lambda: second.run_id in started), "second run never got the slot"
+    assert _wait_until(lambda: not runtime._run_threads), "runner threads did not finish"
+
+
+def test_abort_while_queued_unblocks_without_slot(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("CORPUSAGENT2_MAX_CONCURRENT_RUNS", "1")
+    documents = _sample_documents()
+    runtime = build_test_runtime(
+        tmp_path=tmp_path,
+        documents=documents,
+        search_rows_by_query=_search_rows(documents),
+    )
+
+    release = threading.Event()
+    started: list[str] = []
+
+    def fake_run_query(run_id: str, question: str, **kwargs) -> None:
+        started.append(run_id)
+        if len(started) == 1:
+            release.wait(timeout=10)
+
+    monkeypatch.setattr(runtime, "_run_query", fake_run_query)
+
+    first = runtime.submit_query("football coverage question one")
+    assert _wait_until(lambda: first.run_id in started), "first run never started"
+
+    second = runtime.submit_query("football coverage question two")
+    assert _wait_until(
+        lambda: "run slot" in str(runtime.get_run_status(second.run_id).get("detail", ""))
+    ), "second run never entered the slot wait"
+
+    runtime.abort_run(second.run_id)
+    # The aborted run must leave the queue promptly even though the first
+    # run still holds the only slot: _run_query is delegated the cheap
+    # immediate-abort path without acquiring a slot.
+    assert _wait_until(lambda: second.run_id in started, timeout_s=5.0), (
+        "aborted queued run stayed stuck behind the running slot holder"
+    )
+
+    release.set()
+    assert _wait_until(lambda: not runtime._run_threads), "runner threads did not finish"

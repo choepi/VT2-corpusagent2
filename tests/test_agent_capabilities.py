@@ -4388,3 +4388,135 @@ def test_topic_model_emits_time_slices_instead_of_all_bucket(monkeypatch, tmp_pa
     assert result.payload["rows"]
     assert any(row["time_bin"] == "2016-06" for row in result.payload["rows"])
     assert any(row["time_bin"] == "2018-03" for row in result.payload["rows"])
+
+
+def test_filter_working_set_flags_documents_truncated_for_preview_rows(monkeypatch) -> None:
+    monkeypatch.setenv("CORPUSAGENT2_RESULT_PREVIEW_ROWS", "1")
+    store = InMemoryWorkingSetStore()
+    store.document_lookup.update(
+        {
+            "doc-1": {
+                "doc_id": "doc-1",
+                "title": "Guardian football one",
+                "text": "The football season opened with a cup match.",
+                "published_at": "2018-02-01",
+                "source": "The Guardian",
+            },
+            "doc-2": {
+                "doc_id": "doc-2",
+                "title": "Guardian football two",
+                "text": "The football team won the league game.",
+                "published_at": "2018-03-01",
+                "source": "The Guardian",
+            },
+        }
+    )
+    store.record_working_set(
+        "run",
+        "broad",
+        [{"doc_id": "doc-1", "rank": 1, "score": 1.0}, {"doc_id": "doc-2", "rank": 2, "score": 0.9}],
+    )
+    context = AgentExecutionContext(
+        run_id="run",
+        artifacts_dir=Path("."),
+        search_backend=None,
+        working_store=store,
+        runtime=None,
+    )
+    deps = {"search": ToolExecutionResult(payload={"working_set_ref": "broad", "document_count": 2})}
+
+    result = _filter_working_set({"source_node_id": "search", "query": "football"}, deps, context)
+
+    assert result.payload["document_count"] == 2
+    assert result.payload["preview_count"] == 1
+    # Downstream evidence-table/analysis nodes key off documents_truncated to stream the
+    # full working set instead of silently analyzing only the preview rows.
+    assert result.payload["results_truncated"] is True
+    assert result.payload["documents_truncated"] is True
+
+
+def test_pos_morph_caps_per_token_streaming_from_large_working_set(monkeypatch) -> None:
+    # Uncapped, pos_morph materializes the full working set and emits one row per
+    # token, which OOM-killed the API on a 37k-document set. The token-level cap
+    # bounds the streamed documents and surfaces an honest caveat.
+    monkeypatch.setenv("CORPUSAGENT2_TOKEN_ANALYSIS_MAX_DOCS", "2")
+    monkeypatch.setenv("CORPUSAGENT2_PROVIDER_ORDER_POS_MORPH", "heuristic")
+    store = InMemoryWorkingSetStore()
+    for index in range(3):
+        store.document_lookup[f"doc-{index}"] = {
+            "doc_id": f"doc-{index}",
+            "title": f"Football report {index}",
+            "text": "The football team won the cup final.",
+            "published_at": "2018-02-01",
+            "source": "The Guardian",
+        }
+    store.record_working_set(
+        "run",
+        "guardian_football",
+        [{"doc_id": f"doc-{index}", "rank": index + 1, "score": 1.0} for index in range(3)],
+    )
+    context = AgentExecutionContext(
+        run_id="run",
+        artifacts_dir=Path("."),
+        search_backend=None,
+        working_store=store,
+        runtime=None,
+    )
+    deps = {
+        "fetch": ToolExecutionResult(
+            payload={
+                "documents": [{"doc_id": "doc-0", "text": "The football team won the cup final."}],
+                "working_set_ref": "guardian_football",
+                "document_count": 3,
+                "documents_truncated": True,
+            }
+        )
+    }
+
+    result = agent_capabilities._pos_morph({}, deps, context)
+
+    analyzed_doc_ids = {str(row.get("doc_id")) for row in result.payload["rows"]}
+    assert len(analyzed_doc_ids) == 2
+    assert any("first 2 of 3 working-set documents" in caveat for caveat in result.caveats)
+
+
+def test_resolve_working_set_ref_rejects_planner_invented_label() -> None:
+    # Observed live: the planner passed working_set_ref="guardian_football_2017_2019"
+    # (a label that was never materialized) into the noun evidence table, so the
+    # analysis streamed a nonexistent set and produced zero rows. The resolver must
+    # fall back to the working set advertised by dependency payloads.
+    store = InMemoryWorkingSetStore()
+    store.document_lookup["doc-1"] = {
+        "doc_id": "doc-1",
+        "title": "Guardian football",
+        "text": "The football team won the cup final.",
+        "published_at": "2018-02-01",
+        "source": "The Guardian",
+    }
+    store.record_working_set("run", "sql_search_real", [{"doc_id": "doc-1", "rank": 1, "score": 1.0}])
+    context = AgentExecutionContext(
+        run_id="run",
+        artifacts_dir=Path("."),
+        search_backend=None,
+        working_store=store,
+        runtime=None,
+    )
+    deps = {"search": ToolExecutionResult(payload={"working_set_ref": "sql_search_real", "document_count": 1})}
+
+    invented = agent_capabilities._resolve_working_set_ref(
+        {"working_set_ref": "guardian_football_2017_2019"}, deps, context
+    )
+    assert invented == "sql_search_real"
+
+    # A label that actually exists in the store keeps priority over dependency refs.
+    store.record_working_set("run", "explicit_real", [{"doc_id": "doc-1", "rank": 1, "score": 1.0}])
+    explicit = agent_capabilities._resolve_working_set_ref(
+        {"working_set_ref": "explicit_real"}, deps, context
+    )
+    assert explicit == "explicit_real"
+
+    # Without a context (legacy callers), behavior is unchanged: label passes through.
+    legacy = agent_capabilities._resolve_working_set_ref(
+        {"working_set_ref": "guardian_football_2017_2019"}, deps
+    )
+    assert legacy == "guardian_football_2017_2019"

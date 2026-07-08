@@ -2546,7 +2546,7 @@ async function abortAllRuns() {
   return payload;
 }
 
-async function submitQuery({ preserveClarificationHistory = false, replanFromRunId = "" } = {}) {
+async function submitQuery({ preserveClarificationHistory = false, replanFromRunId = "", replanInstruction = "" } = {}) {
   if (submissionInFlight) {
     return;
   }
@@ -2601,7 +2601,7 @@ async function submitQuery({ preserveClarificationHistory = false, replanFromRun
     const payload = replanFromRunId
       ? await fetchJson(`${base}/runs/${encodeURIComponent(replanFromRunId)}/replan`, {
           method: "POST",
-          body: JSON.stringify({ additional_instruction: "" }),
+          body: JSON.stringify({ additional_instruction: replanInstruction }),
         })
       : await fetchJson(`${base}/query/submit`, {
           method: "POST",
@@ -2767,8 +2767,14 @@ if (replanButton) {
       return;
     }
     const priorRunId = currentRunId;
+    // Text typed into the question box that differs from the prior run's question is
+    // treated as a follow-up instruction for the re-plan (e.g. a question about the
+    // prior output); an unchanged box means a plain re-plan of the same question.
+    const priorQuestion = String(latestManifest?.question || "").trim();
+    const typedQuestion = questionInput.value.trim();
+    const replanInstruction = typedQuestion && typedQuestion !== priorQuestion ? typedQuestion : "";
     try {
-      await submitQuery({ preserveClarificationHistory: false, replanFromRunId: priorRunId });
+      await submitQuery({ preserveClarificationHistory: false, replanFromRunId: priorRunId, replanInstruction });
     } catch (error) {
       statusBox.textContent = "failed";
       statusBox.className = "status failed";

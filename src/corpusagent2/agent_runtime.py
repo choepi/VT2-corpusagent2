@@ -4713,6 +4713,10 @@ class MagicBoxOrchestrator:
                     "You are the grounded synthesis module for a corpus agent operating over a user-provided corpus. "
                     "Return JSON with keys answer_text, evidence_items, artifacts_used, unsupported_parts, caveats, claim_verdicts. "
                     "Use only the provided summaries, tool outputs, and evidence. "
+                    "clarification_history is authoritative user follow-up memory: when it contains a follow-up question "
+                    "or an additional user instruction (e.g. from a re-plan), answer that follow-up explicitly in "
+                    "answer_text, grounded in the current run's outputs; when it quotes a prior run's answer, you may "
+                    "reference that prior output to explain differences, but make new claims only from current evidence. "
                     "\n\n"
                     "answer_text is a markdown document with these conventions:\n"
                     "- Open with an H2 (##) that restates the question as a thesis sentence.\n"
@@ -4743,6 +4747,7 @@ class MagicBoxOrchestrator:
                         "question": state.question,
                         "rewritten_question": state.rewritten_question,
                         "assumptions": list(state.assumptions),
+                        "clarification_history": list(state.clarification_history),
                         "summary": summary,
                         "evidence_rows": evidence_rows,
                         "strict_signals": strict_signals,
@@ -5593,6 +5598,8 @@ _RUNTIME_LIMITER_ENV_VARS = (
     # Executor scheduling bounds
     "CORPUSAGENT2_NODE_DEFAULT_TIMEOUT_S",
     "CORPUSAGENT2_NODE_MAX_ATTEMPTS",
+    # Run admission (queries beyond this run in a queue, not in parallel)
+    "CORPUSAGENT2_MAX_CONCURRENT_RUNS",
 )
 
 
@@ -5651,6 +5658,18 @@ class AgentRuntime:
         self._run_cancel_events: dict[str, threading.Event] = {}
         self._run_threads: dict[str, threading.Thread] = {}
         self._run_lock = threading.Lock()
+        # Admission gate: at most N query pipelines execute at once; further
+        # submissions wait in "queued" state. Each pipeline runs CPU-bound
+        # torch/spaCy inference, so unbounded parallel runs oversubscribe the
+        # host until the API (and the whole VM) stops responding.
+        try:
+            self._max_concurrent_runs = max(
+                1,
+                int(os.getenv("CORPUSAGENT2_MAX_CONCURRENT_RUNS", "1").strip() or "1"),
+            )
+        except ValueError:
+            self._max_concurrent_runs = 1
+        self._run_slots = threading.BoundedSemaphore(self._max_concurrent_runs)
         self._llm_override_active = False
         self._provider_modules_cache: dict[str, bool] | None = None
         self._device_report_cache: dict[str, Any] | None = None
@@ -6455,6 +6474,7 @@ class AgentRuntime:
                 ),
             ],
             "active_run_ids": self._active_run_ids(),
+            "max_concurrent_runs": self._max_concurrent_runs,
         }
 
     def _set_live_status(self, run_id: str, **updates: Any) -> LiveRunStatus:
@@ -6511,6 +6531,36 @@ class AgentRuntime:
                 event = threading.Event()
                 self._run_cancel_events[run_id] = event
             return event
+
+    def _acquire_run_slot(self, run_id: str) -> bool:
+        """Block until a run slot is free, keeping the run in "queued" state.
+
+        Returns True when a slot was acquired (caller must release it) and
+        False when the run was aborted while waiting. In the False case the
+        caller still invokes _run_query, whose _maybe_abort check writes the
+        aborted manifest immediately without doing pipeline work, so no slot
+        is needed.
+        """
+        if self._run_slots.acquire(blocking=False):
+            return True
+        self._set_live_status(
+            run_id,
+            status="queued",
+            current_phase="queued",
+            detail=(
+                f"Waiting for a free run slot "
+                f"(max {self._max_concurrent_runs} concurrent run(s))"
+            ),
+        )
+        while not self._run_slots.acquire(timeout=0.5):
+            if self._is_cancelled(run_id):
+                return False
+        if self._is_cancelled(run_id):
+            # Aborted between wakeup and here; hand the slot back so the
+            # cheap abort path never withholds it from the next queued run.
+            self._run_slots.release()
+            return False
+        return True
 
     def _is_cancelled(self, run_id: str) -> bool:
         with self._run_lock:
@@ -7447,7 +7497,9 @@ class AgentRuntime:
     ) -> AgentRunManifest:
         run_id = run_id or f"agent_{uuid.uuid4().hex[:12]}"
         self._register_cancel_event(run_id)
+        slot_acquired = False
         try:
+            slot_acquired = self._acquire_run_slot(run_id)
             return self._run_query(
                 run_id,
                 question,
@@ -7469,6 +7521,9 @@ class AgentRuntime:
             )
             self._persist_manifest(manifest)
             return manifest
+        finally:
+            if slot_acquired:
+                self._run_slots.release()
 
     def submit_query(
         self,
@@ -7491,7 +7546,9 @@ class AgentRuntime:
         self._register_cancel_event(run_id)
 
         def _runner() -> None:
+            slot_acquired = False
             try:
+                slot_acquired = self._acquire_run_slot(run_id)
                 self._run_query(
                     run_id,
                     question,
@@ -7523,6 +7580,8 @@ class AgentRuntime:
                 )
                 self._persist_manifest(manifest)
             finally:
+                if slot_acquired:
+                    self._run_slots.release()
                 with self._run_lock:
                     self._run_threads.pop(run_id, None)
 
@@ -7591,6 +7650,13 @@ class AgentRuntime:
                 f"Reuse the largest of these via filter_working_set (working_set_ref=\"<ref>\") "
                 f"instead of running new db_search/fetch_documents, unless the prior retrieval is the "
                 f"root cause being investigated."
+            )
+        prior_answer = str(((prior.get("final_answer") or {}).get("answer_text")) or "").strip()
+        if prior_answer:
+            condensed_answer = re.sub(r"\s+", " ", prior_answer)[:1200]
+            synthetic_parts.append(
+                "Prior run final answer (follow-up instructions below may refer to this output): "
+                + condensed_answer
             )
         if prior_assumptions:
             synthetic_parts.append("Prior assumptions to keep in mind: " + " | ".join(prior_assumptions))
