@@ -1,8 +1,8 @@
 # Re-plan follow-up fix: follow-up instructions now drive the re-planned run
 
-**Date:** 2026-07-11
+**Date:** 2026-07-11 (updated same day after live validation of chained follow-ups)
 **Files changed:** `src/corpusagent2/agent_runtime.py`, `src/corpusagent2/agent_models.py`, `src/corpusagent2/agent_backends.py`, `tests/test_agent_runtime.py`
-**Verified:** live end-to-end against the running API (hybrid pgvector+OpenSearch backend, OpenAI planner `gpt-5.4`, planner mode `auto`), plus full test suite (**430 passed, 1 skipped**).
+**Verified:** live end-to-end against the running API (hybrid pgvector+OpenSearch backend, OpenAI planner `gpt-5.4`, planner mode `auto`), plus full test suite (**430 passed, 1 skipped**). Two independent live validations: the fixed replan run `agent_e668dabc160e` (§5) and a second, user-initiated follow-up replan `agent_06cba55bf249` (§5b).
 
 ## 1. Problem (behavior BEFORE the change)
 
@@ -71,6 +71,8 @@ A `filter_working_set` node referencing an externally materialized working set n
 
 `PostgresWorkingSetStore` (and `InMemoryWorkingSetStore`) now resolve a label that has no rows under the current run_id to the **most recent run that materialized that label** (`_resolve_working_set_owner` / `_resolve_working_set_key`), in `fetch_working_set_documents`, `fetch_working_set_doc_ids`, and `count_working_set`. A run-scoped set with the same label still takes precedence. This makes cross-run working-set reuse actually function (fixes 2e) — for all re-plans, not only follow-up ones.
 
+**Index (added after the initial commit):** the fallback lookup filters `ca_agent_working_set_docs` by label alone, which the existing `(run_id, label, …)` indexes cannot serve — at the current 1.5M rows that was a sequential scan. A supporting index `idx_ca_agent_working_set_docs_label ON (label, run_id)` was created in the live database and added to `ensure_schema`. With it, the reuse filter over the 39k-doc prior working set resolves in <1 s (measured 0.8 s in run `agent_06cba55bf249`).
+
 ## 4. Why this design
 
 - **The follow-up must reach the planner as the question, not as trailing context.** The pipeline is rewrite → plan → execute → synthesize; every retrieval/filter/analysis input is derived from `rewritten_question` (R5). Fixing only synthesis cannot work — with no follow-up-related plan nodes there is no evidence to answer from, and grounded synthesis must not invent claims. The rewrite stage is the single point where the pivot can happen for every downstream consumer, including the heuristic planner fallback.
@@ -101,6 +103,10 @@ A `filter_working_set` node referencing an externally materialized working set n
 
 The re-planned run now (1) answers the typed follow-up, (2) reuses the prior retrieved doc set with zero new retrieval, and (3) explains the prior output's behavior — the intended re-plan semantics.
 
+### §5b Second live validation — chained follow-up (`agent_06cba55bf249`, user-initiated)
+
+A further follow-up replan asked whether the prior analysis had skipped Ronaldo because the model failed to recognize "Ronaldo" as a noun/entity. The LLM planner (no fallback, no repair) produced: `filter_working_set(working_set_ref="sql_search_cfd11d146c62", query=Ronaldo terms)` (0.8 s with the new index, 724-doc subset) → `fetch_documents` → a linguistic verification stack (`sentence_split, tokenize, pos_morph, lemmatize, dependency_parse, ner`, per planner rule R10, because the follow-up was a noun/entity-recognition question) → `build_evidence_table` (noun distribution over the subset) → plot. Total runtime 3 minutes. Answer: *"The prior analysis did not skip Ronaldo because the model failed to see him as a noun … 'ronaldo' is the top noun with a count of 2505, and 'cristiano' also appears among the leading nouns (1079)."* This demonstrates that follow-up replans chain correctly: each replan reuses the same materialized working set and pivots the analysis to the new follow-up.
+
 ## 6. Regression safety
 
 - `python -m pytest -q`: **430 passed, 1 skipped** (full suite, after all changes).
@@ -117,3 +123,15 @@ The re-plan mechanism as originally described ("the re-planned run inherits the 
 The corrected mechanism distinguishes **plain re-plans** (unchanged question, improve the plan, reuse working sets) from **follow-up re-plans** (the typed instruction becomes the primary analytical task; prior question/answer/working sets become context; reuse happens via `filter_working_set(working_set_ref, query)` over the cross-run-resolvable materialized set; an empty filtered subset is reported as evidence of absence). Two robustness rules make this reliable with LLM planners: plan-repair calls must carry the full clarification history (otherwise repaired plans regress to the original question), and structurally valid reuse plans must be accepted (bare-array plan JSON; filter-with-query plans are not "degenerate"; the compiler must not inject a fresh retrieval backbone on top of an explicitly reused working set).
 
 If the paper describes the re-plan / clarification-history design, it should present these two modes and note that follow-up handling is an instruction-ordering/priority property of the planner context, not a capability question — the fix required no new NLP tools (consistent with the "no new capabilities" constraint).
+
+### Three planning layers (terminology for the paper)
+
+Runs mix three distinct plan sources that the paper should not conflate; only the first is "the heuristic planner":
+
+1. **Heuristic planner** (`_heuristic_plan`) — the deterministic fallback plan builder. In `CORPUSAGENT2_PLANNER_MODE=auto` it runs only when the LLM plan is malformed or degenerate; `PLANNER_MODE=heuristic` forces it (used by the evaluation suite for reproducibility). Neither validation run above used it.
+2. **Plan-compiler question-family templates** (`_normalize_plan_dag` → `_ensure_noun_distribution_nodes`, `_ensure_temporal_portrayal_nodes`, …) — deterministic, keyword-triggered node injection applied ON TOP of whatever plan (LLM or heuristic) was accepted. On replans, the keyword match runs over the planning context INCLUDING the inherited original question and clarification history, so family nodes (e.g. sentiment/topic/time-series battery, noun-distribution table + plot) are also added to follow-up plans. **This is retained by design**: the injected nodes run on the (small) reused/filtered working set, cost seconds, and enrich the follow-up answer with supporting distributions — the noun counts quoted in §5b came from a compiler-injected node.
+3. **The LLM plan itself** — e.g. the linguistic verification stack in §5b was genuinely LLM-planned (rule R10), not injected.
+
+### Behavior change relevant to experiments (V1 planner distribution)
+
+Accepting the bare-array `plan_dag` JSON shape (§3.4) does not only affect replans: **normal runs** whose LLM plan previously failed shape validation silently fell back to the deterministic heuristic plan; they now execute the LLM's own plan. This shifts the V1 variant's plan distribution toward genuine LLM plans and should be noted before the config freeze — any experiment comparing planner behavior across dates spanning 2026-07-11 mixes the two acceptance regimes.

@@ -85,7 +85,7 @@
             <label><input id="forceAnswer" type="checkbox" /> Force answer</label>
             <button id="abortButton" type="button" class="ghost-button">Abort</button>
             <button id="replanButton" type="button" class="ghost-button" title="Re-run the planner with the previous run's working set and assumptions">Re-plan</button>
-            <button id="printReportButton" type="button" class="ghost-button">Save / Print PDF</button>
+            <button id="printReportButton" type="button" class="ghost-button">Print PDF</button>
           </div>
 
           <div class="metric-strip simple-metrics">
@@ -171,10 +171,6 @@
                 <label for="plannerModelInput">Planner model</label>
                 <input id="plannerModelInput" type="text" placeholder="gpt-4o-mini" />
               </div>
-              <div>
-                <label for="synthesisModelInput">Synthesis model</label>
-                <input id="synthesisModelInput" type="text" placeholder="gpt-4o-mini" />
-              </div>
             </div>
             <div class="controls llm-settings-controls">
               <button id="applyLlmSettingsButton" type="button">Apply LLM Settings</button>
@@ -186,7 +182,6 @@
           </div>
 
           <div class="controls">
-            <label><input id="noCache" type="checkbox" /> No cache</label>
             <label><input id="notifyOnFinish" type="checkbox" checked /> Browser notification</label>
             <button id="abortAllButton" type="button" class="ghost-button">Abort All Runs</button>
           </div>
@@ -198,7 +193,6 @@
           </div>
           <div class="metric-strip">
             <div><span class="metric-label">Corpus</span><strong id="corpusNameText">unknown</strong></div>
-            <div><span class="metric-label">Saved</span><strong id="runSavedText">not saved yet</strong></div>
             <div title="Time from when you pressed Run to when the run finished. Includes everything: tools, planner, answer, and waiting in between."><span class="metric-label">Total time</span><strong id="totalTimeBreakdown">n/a</strong></div>
             <div title="Time spent inside the actual tool steps (search, NLP, plotting...)."><span class="metric-label">Tool execution</span><strong id="nodeSumTimeText">n/a</strong></div>
             <div title="Total time minus tool execution. This is mostly the planner thinking, the final answer being written, and short waits between steps."><span class="metric-label">Planner + answer + waiting</span><strong id="overheadTimeText">n/a</strong></div>
@@ -259,10 +253,6 @@
             <h2>Historical Tool Usage</h2>
             <span class="pill subtle">All saved runs</span>
           </div>
-          <p class="muted">
-            Aggregated from saved run outputs and backend tool-call history. Completed node count is the main usage
-            metric because one node can emit multiple running/completed call events.
-          </p>
           <div id="toolUsageSummary" class="tool-usage-summary"></div>
           <div id="toolUsagePlot" class="tool-usage-plot"></div>
           <div id="toolUsageNeverUsed" class="tool-usage-never"></div>
@@ -277,8 +267,6 @@
           <div id="plannerActions" class="stack-panel scroll-panel compact-scroll"></div>
           <h3>Plan DAG</h3>
           <div id="planNodes" class="stack-panel scroll-panel compact-scroll"></div>
-          <h3>Raw LLM Outputs</h3>
-          <div id="llmTraces" class="stack-panel scroll-panel tall-scroll"></div>
         </section>
 
         <section class="card plan-tool-card">

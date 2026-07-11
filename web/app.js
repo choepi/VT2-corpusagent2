@@ -8,7 +8,6 @@ const accessGateError = document.getElementById("accessGateError");
 const accessGateButton = document.getElementById("accessGateButton");
 const questionInput = document.getElementById("question");
 const forceAnswerInput = document.getElementById("forceAnswer");
-const noCacheInput = document.getElementById("noCache");
 const notifyOnFinishInput = document.getElementById("notifyOnFinish");
 const runButton = document.getElementById("runButton");
 const abortButton = document.getElementById("abortButton");
@@ -26,7 +25,6 @@ const deviceBadge = document.getElementById("deviceBadge");
 const runtimeModeBadge = document.getElementById("runtimeModeBadge");
 const llmProviderSelect = document.getElementById("llmProvider");
 const plannerModelInput = document.getElementById("plannerModelInput");
-const synthesisModelInput = document.getElementById("synthesisModelInput");
 const applyLlmSettingsButton = document.getElementById("applyLlmSettingsButton");
 const resetLlmSettingsButton = document.getElementById("resetLlmSettingsButton");
 const llmSettingsNote = document.getElementById("llmSettingsNote");
@@ -43,7 +41,6 @@ const totalTimeCount = document.getElementById("totalTimeCount");
 const etaText = document.getElementById("etaText");
 const runIdText = document.getElementById("runIdText");
 const corpusNameText = document.getElementById("corpusNameText");
-const runSavedText = document.getElementById("runSavedText");
 const activeSteps = document.getElementById("activeSteps");
 const completedSteps = document.getElementById("completedSteps");
 const failedSteps = document.getElementById("failedSteps");
@@ -55,7 +52,6 @@ const unsupportedList = document.getElementById("unsupportedList"); // may be nu
 const claimVerdicts = document.getElementById("claimVerdicts");
 const plannerActions = document.getElementById("plannerActions");
 const planNodes = document.getElementById("planNodes");
-const llmTraces = document.getElementById("llmTraces");
 const toolCallSummary = document.getElementById("toolCallSummary");
 const toolCalls = document.getElementById("toolCalls");
 const toolNodeMap = document.getElementById("toolNodeMap");
@@ -245,11 +241,9 @@ function saveUiState() {
     apiBase: apiBaseInput.value,
     question: questionInput.value,
     forceAnswer: forceAnswerInput.checked,
-    noCache: noCacheInput.checked,
     notifyOnFinish: notifyOnFinishInput.checked,
     llmProvider: llmProviderSelect.value,
     plannerModel: plannerModelInput.value,
-    synthesisModel: synthesisModelInput.value,
     clarificationHistory,
     clarificationBaseQuestion,
     pendingClarificationQuestion,
@@ -270,11 +264,9 @@ function restoreUiState() {
     apiBaseInput.value = initialApiBase(payload.apiBase);
     questionInput.value = payload.question || questionInput.value;
     forceAnswerInput.checked = Boolean(payload.forceAnswer);
-    noCacheInput.checked = Boolean(payload.noCache);
     notifyOnFinishInput.checked = payload.notifyOnFinish !== false;
     llmProviderSelect.value = payload.llmProvider || llmProviderSelect.value;
     plannerModelInput.value = payload.plannerModel || plannerModelInput.value;
-    synthesisModelInput.value = payload.synthesisModel || synthesisModelInput.value;
     clarificationBaseQuestion = payload.clarificationBaseQuestion || "";
     if (clarificationMatchesCurrentQuestion()) {
       clarificationHistory = Array.isArray(payload.clarificationHistory) ? payload.clarificationHistory : [];
@@ -315,9 +307,6 @@ function updateRunSaveDisplay() {
     corpus.local_source ? `Source: ${corpus.local_source}` : "",
     corpus.pg_table ? `Table: ${corpus.pg_table}` : "",
   ].filter(Boolean).join(" | ");
-  const saved = Boolean(latestManifest || currentManifestSavedPath);
-  runSavedText.textContent = saved ? "output saved" : currentRunId ? "running" : "not saved yet";
-  runSavedText.title = currentManifestSavedPath || "";
 }
 
 function updateControlState() {
@@ -361,9 +350,6 @@ function applyProviderDefaultsToInputs(providerName) {
   const defaults = defaultModelsForProvider(providerName);
   if (defaults.planner_model) {
     plannerModelInput.value = defaults.planner_model;
-  }
-  if (defaults.synthesis_model) {
-    synthesisModelInput.value = defaults.synthesis_model;
   }
 }
 
@@ -1020,10 +1006,8 @@ function renderToolUsageSummary(payload) {
     <div class="usage-stat-grid">
       <div><span class="metric-label">Runs scanned</span><strong>${formatCount(payload.run_count || 0)}</strong></div>
       <div><span class="metric-label">Registered tools</span><strong>${formatCount(payload.registered_tool_count || tools.length)}</strong></div>
-      <div><span class="metric-label">Used historically</span><strong>${formatCount(payload.used_tool_count || usedTools.length)}</strong></div>
       <div><span class="metric-label">Never completed</span><strong>${formatCount(payload.never_used_tool_count || neverUsed.length)}</strong></div>
     </div>
-    <p class="muted">${escapeHtml((payload.notes || [])[0] || "Counts are derived from saved run outputs and backend tool-call history.")}</p>
   `;
 
   const categoryMax = Math.max(1, ...categories.map((row) => Number(row.completed_node_count || 0)));
@@ -1031,15 +1015,13 @@ function renderToolUsageSummary(payload) {
   toolUsagePlot.innerHTML = `
     <div class="usage-panel">
       <h4>Calls per tool category</h4>
-      <p class="muted">Bar length = how many times tools in this category ran. Number on the right = how many distinct tools in the category were ever used.</p>
       ${categories.length
         ? categories
             .map((row) =>
               renderToolUsageBar(
                 row.category || "Other",
                 row.completed_node_count || 0,
-                categoryMax,
-                `${formatCount(row.used_tool_count || 0)} of ${formatCount(row.registered_tool_count || 0)} distinct tools used`
+                categoryMax
               )
             )
             .join("")
@@ -1053,8 +1035,7 @@ function renderToolUsageSummary(payload) {
               renderToolUsageBar(
                 row.tool_name || "tool",
                 row.completed_node_count || row.completed_event_count || 0,
-                toolMax,
-                `${row.role || "unknown role"} | ${formatCount(row.run_count || 0)} run${Number(row.run_count || 0) === 1 ? "" : "s"}`
+                toolMax
               )
             )
             .join("")
@@ -1072,7 +1053,6 @@ function renderToolUsageSummary(payload) {
               <tr>
                 <th>Tool</th>
                 <th>Category</th>
-                <th>Role</th>
                 <th>Why likely unused</th>
               </tr>
             </thead>
@@ -1083,7 +1063,6 @@ function renderToolUsageSummary(payload) {
                     <tr>
                       <td><strong>${escapeHtml(row.tool_name || "tool")}</strong></td>
                       <td>${escapeHtml(row.category || "Other")}</td>
-                      <td>${escapeHtml(row.role || "question-specific")}</td>
                       <td>${escapeHtml(row.reason || "No historical completed node found.")}</td>
                     </tr>
                   `
@@ -1167,7 +1146,7 @@ function renderToolNodeMap() {
           <th>Resolved tool</th>
           <th>Status</th>
           <th>Depends on</th>
-          <th>Runtime evidence</th>
+          <th>Provider backend | duration</th>
         </tr>
       </thead>
       <tbody>
@@ -1179,9 +1158,9 @@ function renderToolNodeMap() {
             const safeStatusClass = status.replace(/[^a-z0-9_-]/g, "-");
             const dependsOn = Array.isArray(node.depends_on) ? node.depends_on : [];
             const evidenceParts = [
-              call.provider ? `provider ${call.provider}` : "",
-              call.duration_ms ? `duration ${formatDurationMs(call.duration_ms)}` : "",
-              call.summary?.items_count ? `${formatCount(call.summary.items_count)} ${call.summary.items_key || "items"}` : "",
+              call.provider || "",
+              call.duration_ms ? formatDurationMs(call.duration_ms) : "",
+              call.summary?.items_count ? `${formatCount(call.summary.items_count)} rows` : "",
               call.error ? `error ${call.error}` : "",
             ].filter(Boolean);
             return `
@@ -1783,7 +1762,6 @@ function buildPrintableReportHtml(manifest) {
         ${reportMetricRows([
           ["LLM provider", llm.provider_name || ""],
           ["Planner model", llm.planner_model || ""],
-          ["Synthesis model", llm.synthesis_model || ""],
           ["Fallback warnings", (llm.warnings || []).join("; ")],
           ["Device", device.recommended_device || ""],
           ["Retrieval mode", retrieval.default_mode || ""],
@@ -1791,7 +1769,6 @@ function buildPrintableReportHtml(manifest) {
           ["Completed calls", toolTotals.completedCalls],
           ["Failed calls", toolTotals.failedCalls],
           ["Docs read by tools", toolTotals.inputDocumentsSeen],
-          ["Rows produced (entities, sentences, etc.)", toolTotals.outputItems],
         ])}
         <h3>Assumptions</h3>
         ${reportList(manifest.assumptions || [])}
@@ -1941,7 +1918,6 @@ function resetManifestPanels(answerMessage = "Waiting for result...") {
   renderPlannerActions([]);
   renderPlanNodes([]);
   renderToolCalls([]);
-  renderLLMTraces([]);
   renderList(assumptionsList, [], (row) => escapeHtml(row));
 }
 
@@ -2006,21 +1982,17 @@ function renderRuntimeInfo(payload) {
   runtimeModeBadge.textContent = llm.use_openai ? "OpenAI mode" : "UncloseAI mode";
   llmProviderSelect.value = llm.use_openai ? "openai" : "uncloseai";
   plannerModelInput.value = llm.planner_model || "";
-  synthesisModelInput.value = llm.synthesis_model || "";
   llmSettingsNote.textContent = llm.override_active
     ? "Runtime override active. New runs use the UI-selected backend until the server restarts or you reset to startup."
     : "Using startup defaults from the backend config. Apply here to override for future runs without editing .env.";
 
     runtimeSummary.innerHTML = `
       <div class="metric-row"><span>Backend</span><strong>${escapeHtml(llm.base_url || "")}</strong></div>
-      <div class="metric-row"><span>Synthesis model</span><strong>${escapeHtml(llm.synthesis_model || "")}</strong></div>
       <div class="metric-row"><span>API key present</span><strong>${llm.api_key_present ? "yes" : "no"}</strong></div>
-      <div class="metric-row"><span>Override active</span><strong>${llm.override_active ? "yes" : "no"}</strong></div>
       <div class="metric-row"><span>Startup planner</span><strong>${escapeHtml(llm.startup_defaults?.planner_model || "")}</strong></div>
       <div class="metric-row"><span>CUDA available</span><strong>${device.cuda_available ? "yes" : "no"}</strong></div>
       <div class="metric-row"><span>GPU count</span><strong>${escapeHtml(device.cuda_device_count ?? 0)}</strong></div>
-      <div class="metric-row"><span>Configured mode</span><strong>${escapeHtml(retrieval.configured_default_mode || retrieval.default_mode || "unknown")}</strong></div>
-      <div class="metric-row"><span>Effective mode</span><strong>${escapeHtml(retrieval.default_mode || "unknown")}</strong></div>
+      <div class="metric-row"><span>Retrieval mode</span><strong>${escapeHtml(retrieval.default_mode || "unknown")}</strong></div>
       <div class="metric-row"><span>Dense model</span><strong>${escapeHtml(retrieval.dense_model_id || "")}</strong></div>
       <div class="metric-row"><span>Corpus</span><strong>${escapeHtml((payload.corpus || {}).display_name || (payload.corpus || {}).name || "unknown")}</strong></div>
     `;
@@ -2087,31 +2059,6 @@ function renderPlanNodes(planDagList) {
   renderToolCatalog();
 }
 
-function renderLLMTraces(traces) {
-  const blocks = (traces || []).map((trace) => {
-    const messagePreview = Array.isArray(trace.messages)
-      ? trace.messages
-          .map((item) => `${item.role}: ${String(item.content || "").slice(0, 220)}`)
-          .join("\n\n")
-      : "";
-    const errorClass = trace.used_fallback ? "warn" : "danger";
-    return `
-      <div class="trace-head">
-        <span class="pill ${trace.used_fallback ? "warn" : "subtle"}">${trace.used_fallback ? "fallback" : "llm"}</span>
-        <strong>${escapeHtml(trace.stage || "")}</strong>
-      </div>
-      <p><strong>Provider:</strong> ${escapeHtml(trace.provider_name || "")}</p>
-      <p><strong>Model:</strong> ${escapeHtml(trace.model || "")}</p>
-      ${trace.error ? `<p class="${errorClass}"><strong>${trace.used_fallback ? "Fallback reason" : "Error"}:</strong> ${escapeHtml(trace.error)}</p>` : ""}
-      ${trace.note ? `<p><strong>Note:</strong> ${escapeHtml(trace.note)}</p>` : ""}
-      ${renderTextPanel("Prompt messages", messagePreview)}
-      ${renderTextPanel("Raw output", trace.raw_text || "")}
-      ${renderJsonPanel("Parsed JSON", trace.parsed_json || {})}
-    `;
-  });
-  renderStackPanel(llmTraces, blocks, "Planner and synthesis traces will appear here.");
-}
-
 function renderToolCalls(rows) {
   const ordered = [...(rows || [])].sort((left, right) => {
     const leftTime = parseUtcTimestamp(left.finished_at_utc || left.started_at_utc || "") || 0;
@@ -2125,7 +2072,6 @@ function renderToolCalls(rows) {
     { label: "Completed", value: formatCount(totals.completedCalls) },
     { label: "Failed", value: formatCount(totals.failedCalls) },
     { label: "Docs read by tools", value: formatCount(totals.inputDocumentsSeen) },
-    { label: "Rows produced (entities, sentences, etc.)", value: formatCount(totals.outputItems) },
   ]);
   const blocks = ordered.map((row) => {
     const summary = row.summary || {};
@@ -2291,7 +2237,6 @@ function renderManifest(manifest) {
   renderPlannerActions(manifest.planner_actions || []);
   renderPlanNodes(manifest.plan_dags || []);
   renderToolCalls(manifest.tool_calls || []);
-  renderLLMTraces(manifest.metadata?.llm_traces || []);
   renderList(assumptionsList, manifest.assumptions || [], (row) => escapeHtml(row));
 
   if (manifest.metadata?.runtime_info) {
@@ -2360,7 +2305,6 @@ function setStatus(payload) {
   renderPlannerActions(payload.planner_actions || []);
   renderPlanNodes(payload.plan_dags || []);
   renderToolCalls(payload.tool_calls || []);
-  renderLLMTraces(payload.llm_traces || []);
   updateRunTotalTimeDisplay();
   updateEtaDisplay(payload);
   ensureLiveBreakdownTicker();
@@ -2476,7 +2420,6 @@ async function applyLlmSettings() {
     body: JSON.stringify({
       use_openai: requestedProvider === "openai",
       planner_model: plannerModelInput.value.trim(),
-      synthesis_model: synthesisModelInput.value.trim(),
     }),
   });
   renderRuntimeInfo(payload);
@@ -2608,7 +2551,7 @@ async function submitQuery({ preserveClarificationHistory = false, replanFromRun
           body: JSON.stringify({
             question: questionInput.value,
             force_answer: forceAnswerInput.checked,
-            no_cache: noCacheInput.checked,
+            no_cache: false,
             clarification_history: preserveClarificationHistory ? clarificationHistory : [],
           }),
         });
@@ -2875,11 +2818,9 @@ questionInput.addEventListener("input", () => {
   apiBaseInput,
   questionInput,
   forceAnswerInput,
-  noCacheInput,
   notifyOnFinishInput,
   llmProviderSelect,
   plannerModelInput,
-  synthesisModelInput,
   clarificationInput,
 ].forEach((element) => {
   element.addEventListener("input", saveUiState);

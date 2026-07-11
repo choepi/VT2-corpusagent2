@@ -732,6 +732,10 @@ class PostgresWorkingSetStore:
             CREATE INDEX IF NOT EXISTS idx_ca_agent_working_set_docs_order
             ON ca_agent_working_set_docs (run_id, label, rank);
             """,
+            """
+            CREATE INDEX IF NOT EXISTS idx_ca_agent_working_set_docs_label
+            ON ca_agent_working_set_docs (label, run_id);
+            """,
         ]
         with self._connect() as conn:
             with conn.cursor() as cursor:
