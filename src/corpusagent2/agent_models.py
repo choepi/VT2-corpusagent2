@@ -138,6 +138,10 @@ class PlannerAction:
     def from_dict(cls, payload: dict[str, Any]) -> "PlannerAction":
         action = str(payload.get("action", "")).strip()
         dag_payload = payload.get("plan_dag")
+        # Accept the bare-array shape ("plan_dag": [ ...nodes... ]) that gpt-class
+        # planners intermittently emit instead of {"nodes": [...]}.
+        if isinstance(dag_payload, list) and dag_payload:
+            dag_payload = {"nodes": dag_payload}
         if not action:
             if isinstance(dag_payload, dict):
                 action = "emit_plan_dag"

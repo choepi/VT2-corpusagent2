@@ -556,8 +556,19 @@ class InMemoryWorkingSetStore:
             )
         self.working_sets_by_run[(run_id, label)] = materialized
 
+    def _resolve_working_set_key(self, run_id: str, label: str) -> tuple[str, str]:
+        # Cross-run reuse (see PostgresWorkingSetStore._resolve_working_set_owner):
+        # a re-planned run may reference a working set materialized by its prior
+        # run; fall back to the most recently recorded run holding the label.
+        if (run_id, label) in self.working_sets_by_run:
+            return (run_id, label)
+        for key in reversed(list(self.working_sets_by_run)):
+            if key[1] == label and self.working_sets_by_run[key]:
+                return key
+        return (run_id, label)
+
     def fetch_working_set_doc_ids(self, run_id: str, label: str, *, limit: int | None = None, offset: int = 0) -> list[str]:
-        rows = self.working_sets_by_run.get((run_id, label), [])
+        rows = self.working_sets_by_run.get(self._resolve_working_set_key(run_id, label), [])
         selected = rows[max(0, offset) :]
         if limit is not None:
             selected = selected[: max(0, limit)]
@@ -571,7 +582,7 @@ class InMemoryWorkingSetStore:
         limit: int | None = None,
         offset: int = 0,
     ) -> list[dict[str, Any]]:
-        rows = self.working_sets_by_run.get((run_id, label), [])[max(0, offset) :]
+        rows = self.working_sets_by_run.get(self._resolve_working_set_key(run_id, label), [])[max(0, offset) :]
         if limit is not None:
             rows = rows[: max(0, limit)]
         documents: list[dict[str, Any]] = []
@@ -586,7 +597,7 @@ class InMemoryWorkingSetStore:
         return documents
 
     def count_working_set(self, run_id: str, label: str) -> int:
-        return len(self.working_sets_by_run.get((run_id, label), []))
+        return len(self.working_sets_by_run.get(self._resolve_working_set_key(run_id, label), []))
 
     def record_documents(self, run_id: str, rows: list[dict[str, Any]]) -> None:
         self.documents_by_run.setdefault(run_id, []).extend(dict(row) for row in rows)
@@ -886,8 +897,39 @@ class PostgresWorkingSetStore:
                     )
             conn.commit()
 
+    def _resolve_working_set_owner(self, run_id: str, label: str) -> str:
+        """Working sets are keyed by (run_id, label), but a re-planned run may
+        legitimately reference a working set materialized by its prior run (the
+        planner is handed the prior label for reuse via filter_working_set).
+        When the current run has no rows for the label, fall back to the most
+        recent run that materialized it instead of silently streaming an empty
+        set into the analysis."""
+        self.ensure_schema()
+        with self._connect() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    "SELECT 1 FROM ca_agent_working_set_docs WHERE run_id = %s AND label = %s LIMIT 1",
+                    (run_id, label),
+                )
+                if cursor.fetchone():
+                    return run_id
+                cursor.execute(
+                    """
+                    SELECT ws.run_id
+                    FROM ca_agent_working_set_docs ws
+                    LEFT JOIN ca_agent_runs runs ON runs.run_id = ws.run_id
+                    WHERE ws.label = %s
+                    ORDER BY runs.created_at DESC NULLS LAST, ws.run_id DESC
+                    LIMIT 1
+                    """,
+                    (label,),
+                )
+                row = cursor.fetchone()
+        return str(row[0]) if row else run_id
+
     def fetch_working_set_doc_ids(self, run_id: str, label: str, *, limit: int | None = None, offset: int = 0) -> list[str]:
         self.ensure_schema()
+        run_id = self._resolve_working_set_owner(run_id, label)
         params: list[Any] = [run_id, label]
         limit_clause = ""
         if limit is not None:
@@ -926,6 +968,7 @@ class PostgresWorkingSetStore:
         select_title = f"doc.{columns['title']}" if columns["title"] else "''"
         select_date = f"doc.{columns['date']}" if columns["date"] else "''"
         select_source = f"doc.{columns['source']}" if columns["source"] else "''"
+        run_id = self._resolve_working_set_owner(run_id, label)
         params: list[Any] = [run_id, label]
         # Keyset (seek) pagination: when a cursor is supplied, page with
         # (rank, doc_id) > (after_rank, after_doc_id) instead of OFFSET. OFFSET makes
@@ -984,6 +1027,7 @@ class PostgresWorkingSetStore:
 
     def count_working_set(self, run_id: str, label: str) -> int:
         self.ensure_schema()
+        run_id = self._resolve_working_set_owner(run_id, label)
         with self._connect() as conn:
             with conn.cursor() as cursor:
                 cursor.execute(

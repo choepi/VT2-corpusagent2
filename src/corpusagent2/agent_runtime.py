@@ -619,10 +619,27 @@ class MagicBoxOrchestrator:
     def _plan_is_degenerate(self, dag: "AgentPlanDAG | None") -> bool:
         if dag is None or not getattr(dag, "nodes", None):
             return True
-        return not any(
+        if any(
             node.capability not in self._NON_ANALYTICAL_BACKBONE_CAPABILITIES
             for node in dag.nodes
-        )
+        ):
+            return False
+        # A filter_working_set node that references an externally materialized
+        # working set (re-plan reuse) AND carries a query computes a measurable
+        # subset — its document count and diagnostics ARE the analytic result for
+        # presence/absence follow-ups ("why are there no texts about X?"), so a
+        # filter+fetch plan of this shape must not be replaced by the heuristic
+        # plan for the original question.
+        plan_node_ids = {node.node_id for node in dag.nodes}
+        for node in dag.nodes:
+            if node.capability != "filter_working_set":
+                continue
+            inputs = self._effective_node_inputs(node)
+            ref = str(inputs.get("working_set_ref", "") or "").strip()
+            query = str(inputs.get("query", "") or "").strip()
+            if ref and query and ref not in plan_node_ids:
+                return False
+        return True
 
     def _planner_payload_is_actionable(self, payload: dict[str, Any]) -> bool:
         if not isinstance(payload, dict) or not payload:
@@ -631,9 +648,17 @@ class MagicBoxOrchestrator:
         if action:
             if action == "emit_plan_dag":
                 dag_payload = payload.get("plan_dag")
+                # gpt-class planners intermittently emit plan_dag as a bare JSON
+                # array of nodes instead of {"nodes": [...]}. That shape is fully
+                # parseable (PlannerAction.from_dict coerces it), so it must not be
+                # discarded into the context-poorer repair path.
+                if isinstance(dag_payload, list):
+                    return bool(dag_payload)
                 return isinstance(dag_payload, dict) and bool(dag_payload.get("nodes"))
             return True
         dag_payload = payload.get("plan_dag")
+        if isinstance(dag_payload, list) and dag_payload:
+            return True
         if isinstance(dag_payload, dict) and bool(dag_payload.get("nodes")):
             return True
         if str(payload.get("clarification_question", "")).strip():
@@ -1240,7 +1265,21 @@ class MagicBoxOrchestrator:
             node.capability in self._DOC_RETRIEVAL_BACKBONE_CAPABILITIES
             for node in dag.nodes
         ) or needs_semantic_similarity or needs_syntax_roles or needs_attributed_explanations
-        if requires_retrieval_backbone and not search_node_id:
+        # A filter_working_set node that references an already-materialized working set
+        # (a ref string that is not another plan node, e.g. carried over from a re-planned
+        # prior run) IS the retrieval backbone: injecting a fresh db_search here would
+        # re-run the retrieval that the plan explicitly reuses.
+        plan_node_ids = {node.node_id for node in dag.nodes}
+        materialized_filter_node_id = ""
+        for node in dag.nodes:
+            if node.capability != "filter_working_set":
+                continue
+            explicit_ref = str(self._effective_node_inputs(node).get("working_set_ref", "") or "").strip()
+            if explicit_ref and explicit_ref not in plan_node_ids:
+                materialized_filter_node_id = node.node_id
+                break
+        needs_search_injection = requires_retrieval_backbone and not materialized_filter_node_id
+        if needs_search_injection and not search_node_id:
             search_node_id = unique_node_id("search")
         if requires_retrieval_backbone and not fetch_node_id:
             fetch_node_id = unique_node_id("fetch")
@@ -1285,7 +1324,7 @@ class MagicBoxOrchestrator:
             search_inputs["top_k"] = 0
 
         normalized_nodes: list[AgentPlanNode] = []
-        if requires_retrieval_backbone and not any(node.capability in self._SEARCH_BACKBONE_CAPABILITIES for node in dag.nodes):
+        if needs_search_injection and not any(node.capability in self._SEARCH_BACKBONE_CAPABILITIES for node in dag.nodes):
             normalized_nodes.append(
                 AgentPlanNode(
                     node_id=search_node_id,
@@ -1299,7 +1338,7 @@ class MagicBoxOrchestrator:
                     node_id=fetch_node_id,
                     capability="fetch_documents",
                     inputs={},
-                    depends_on=[search_node_id],
+                    depends_on=[search_node_id] if search_node_id else [materialized_filter_node_id],
                 )
             )
 
@@ -1384,6 +1423,9 @@ class MagicBoxOrchestrator:
                 and node.capability in self._DOC_RETRIEVAL_BACKBONE_CAPABILITIES
                 and node.capability != "fetch_documents"
                 and node.node_id != fetch_node_id
+                # The materialized-ref filter node is the backbone root: the injected
+                # fetch depends on it, so wiring it onto fetch would create a cycle.
+                and node.node_id != materialized_filter_node_id
                 and not depends_on
             ):
                 depends_on = [fetch_node_id]
@@ -3677,6 +3719,9 @@ class MagicBoxOrchestrator:
                     "Allowed actions: ask_clarification, accept_with_assumptions, grounded_rejection. "
                     "Reject hidden-motive questions. Ask clarification only if workflow changes materially. "
                     "Treat clarification_history as authoritative user follow-up memory. "
+                    "If clarification_history contains a re-plan follow-up (marked REPLAN FOLLOW-UP or 'Follow-up question'), "
+                    "rewritten_question must state that follow-up as the primary analytical task — the original question is "
+                    "context only; do not restate the original question as the task. "
                     "If prior follow-up answers resolve part of a multi-part clarification, ask only for the remaining unresolved detail instead of repeating the whole clarification prompt. "
                     "Do not assume the corpus is news, media, finance, or any specific domain unless the question or corpus schema indicates that."
                 ),
@@ -4399,7 +4444,9 @@ class MagicBoxOrchestrator:
 
                     R13 — Clarification policy: ask clarification only when the missing information would change the plan structure. If clarification_history resolves a term, use the resolved term as the retrieval anchor. If prior clarification resolved only part of an ambiguity, ask only for the remainder. When a clarification says one term means another, use the resolved term as the retrieval anchor and avoid broad synonym paraphrases that dilute retrieval.
 
-                    R14 — Rejection policy: use grounded_rejection only when the question cannot be answered from the available corpus/tools, violates constraints, or requires unavailable external data. A request to compare corpus coverage with stock/equity prices, currency/exchange rates, market indices, or commodity prices is NOT a valid rejection ground — the join_external_series tool fetches that external series from Yahoo Finance, so plan it instead of rejecting. Only the corpus's own time/topic coverage limits (not external price availability) can make such a question partially unanswerable, and that is handled in synthesis, not by rejection. Explain any genuine missing requirement precisely in rejection_reason."""
+                    R14 — Rejection policy: use grounded_rejection only when the question cannot be answered from the available corpus/tools, violates constraints, or requires unavailable external data. A request to compare corpus coverage with stock/equity prices, currency/exchange rates, market indices, or commodity prices is NOT a valid rejection ground — the join_external_series tool fetches that external series from Yahoo Finance, so plan it instead of rejecting. Only the corpus's own time/topic coverage limits (not external price availability) can make such a question partially unanswerable, and that is handled in synthesis, not by rejection. Explain any genuine missing requirement precisely in rejection_reason.
+
+                    R15 — Re-plan follow-ups: when clarification_history marks this run as a REPLAN FOLLOW-UP to a prior run, plan for the follow-up question, not the original question — the original question and prior answer are context. If the follow-up concerns the content, presence, or absence of a topic/entity within the prior run's materialized working set, start from filter_working_set (working_set_ref=<prior ref>, query=<terms from the follow-up>) instead of a fresh db_search, then analyze the filtered subset (counts, examples, evidence table); an empty filtered subset is reportable evidence of absence, not a failure. Plan fresh retrieval only for parts of the follow-up that need documents outside the prior working set's scope (e.g. checking whether the missing topic exists elsewhere in the corpus)."""
                 ),
             },
             {
@@ -4427,7 +4474,10 @@ class MagicBoxOrchestrator:
             "Preserve specialized intent: semantic wording/abbreviation questions need embeddings and similarity; who-did-what questions need syntax/SVO tools; attributed price-movement explanation questions need external series, quotes, claim spans, and evidence. "
             "Avoid redundant parallel full-corpus searches; use filter_working_set for narrower slices that can be derived from an existing broad retrieve_all working set. "
             "Do not invent source/outlet aliases for broad geographic media phrases; use source filters only for explicit outlet names or metadata-backed source names. "
-            "Use documented build_evidence_table task names, especially noun_frequency_distribution for noun/POS lemma counts, and do not plot document evidence rows as aggregate plots."
+            "Use documented build_evidence_table task names, especially noun_frequency_distribution for noun/POS lemma counts, and do not plot document evidence rows as aggregate plots. "
+            "When clarification_history marks this run as a REPLAN FOLLOW-UP, plan for the follow-up question (not the original question), "
+            "reusing the prior materialized working set via filter_working_set (working_set_ref=<prior ref>, query=<terms from the follow-up>) "
+            "instead of a fresh db_search; an empty filtered subset is reportable evidence of absence, not a failure."
         )
         try:
             trace = self.llm_client.complete_json_trace(
@@ -4448,6 +4498,10 @@ class MagicBoxOrchestrator:
                             {
                                 "question": state.question,
                                 "rewritten_question": state.rewritten_question,
+                                # Without the clarification history the repair call loses
+                                # all re-plan follow-up context and regresses to planning
+                                # the original question.
+                                "clarification_history": list(state.clarification_history),
                                 "available_capabilities": state.available_capabilities,
                                 "tool_catalog": state.tool_catalog,
                                 "corpus_schema": state.corpus_schema,
@@ -7598,8 +7652,13 @@ class AgentRuntime:
         additional_instruction: str = "",
     ) -> LiveRunStatus:
         """Submit a new run that inherits the prior run's question, assumptions,
-        and working-set context. The planner is told to reuse the existing
+        and working-set context. Without an additional_instruction the planner
+        re-plans the unchanged question and is told to reuse the existing
         working_set_ref via filter_working_set instead of re-running db_search.
+        A non-empty additional_instruction is treated as a user FOLLOW-UP that
+        takes priority over the original question: the rewrite/plan/synthesis
+        stages are instructed to answer the follow-up, reusing the prior
+        working set where the follow-up concerns the already-retrieved documents.
         """
         prior = self.get_run(prior_run_id)
         question = str(prior.get("question") or prior.get("rewritten_question") or "").strip()
@@ -7637,25 +7696,49 @@ class AgentRuntime:
                 count = 0
             working_set_refs.append((ref, count))
 
+        instruction = additional_instruction.strip()
         synthetic_parts: list[str] = []
-        synthetic_parts.append(
-            f"REPLAN: This is a re-plan of prior run {prior_run_id}. "
-            f"Original question is unchanged. Build a new plan that improves on "
-            f"the prior plan."
-        )
+        if instruction:
+            # A non-empty instruction is a user follow-up (often a new or shifted
+            # question about the prior output). It must drive the rewrite, the plan,
+            # and the final answer — not be appended as an afterthought behind a
+            # "question is unchanged" framing that reproduces the prior plan.
+            synthetic_parts.append(
+                f"REPLAN FOLLOW-UP: This run is a follow-up to prior run {prior_run_id}. "
+                f"The user's follow-up takes priority over the original question: \"{instruction}\". "
+                f"Rewrite the question so this follow-up is the primary analytical task (the original "
+                f"question is context only), and derive retrieval/filter query terms from the follow-up itself."
+            )
+        else:
+            synthetic_parts.append(
+                f"REPLAN: This is a re-plan of prior run {prior_run_id}. "
+                f"Original question is unchanged. Build a new plan that improves on "
+                f"the prior plan."
+            )
         if working_set_refs:
             ref_lines = ", ".join(f"{ref} ({count} docs)" for ref, count in working_set_refs)
-            synthetic_parts.append(
-                f"Prior run produced working set(s): {ref_lines}. "
-                f"Reuse the largest of these via filter_working_set (working_set_ref=\"<ref>\") "
-                f"instead of running new db_search/fetch_documents, unless the prior retrieval is the "
-                f"root cause being investigated."
-            )
+            if instruction:
+                synthetic_parts.append(
+                    f"Prior run materialized working set(s): {ref_lines} for the original question. "
+                    f"If the follow-up asks about the content, presence, or absence of something within the "
+                    f"already-retrieved documents, reuse the largest working set via filter_working_set "
+                    f"(working_set_ref=\"<ref>\", query=<terms from the follow-up>) instead of a new db_search, "
+                    f"then analyze the filtered subset; an empty filtered subset is itself evidence of absence "
+                    f"and must be reported as the answer, not treated as a failure. Run fresh retrieval only if "
+                    f"the follow-up needs documents outside the prior working set's scope."
+                )
+            else:
+                synthetic_parts.append(
+                    f"Prior run produced working set(s): {ref_lines}. "
+                    f"Reuse the largest of these via filter_working_set (working_set_ref=\"<ref>\") "
+                    f"instead of running new db_search/fetch_documents, unless the prior retrieval is the "
+                    f"root cause being investigated."
+                )
         prior_answer = str(((prior.get("final_answer") or {}).get("answer_text")) or "").strip()
         if prior_answer:
             condensed_answer = re.sub(r"\s+", " ", prior_answer)[:1200]
             synthetic_parts.append(
-                "Prior run final answer (follow-up instructions below may refer to this output): "
+                "Prior run final answer (the user's follow-up may refer to this output): "
                 + condensed_answer
             )
         if prior_assumptions:
@@ -7665,12 +7748,17 @@ class AgentRuntime:
                 "Prior failed nodes/capabilities (avoid where possible, or substitute): "
                 + ", ".join(sorted(set(prior_failures)))
             )
-        if additional_instruction.strip():
-            synthetic_parts.append("Additional user instruction: " + additional_instruction.strip())
-
         synthetic_entry = " ".join(synthetic_parts)
         clarification_history: list[str] = list(prior.get("clarification_questions") or [])
         clarification_history.append(synthetic_entry)
+        if instruction:
+            # Also carry the follow-up as its own clarification entry so the
+            # rephrase, planning, and synthesis stages each see it as a clean,
+            # authoritative user message rather than a tail clause buried behind
+            # the quoted prior answer in the long synthetic REPLAN entry.
+            clarification_history.append(
+                "Follow-up question (this run must answer it): " + instruction
+            )
 
         force_answer = bool((prior.get("metadata") or {}).get("force_answer", False))
         return self.submit_query(

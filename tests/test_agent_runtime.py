@@ -11,7 +11,7 @@ from corpusagent2 import agent_capabilities
 from corpusagent2.agent_runtime import OUT_OF_CORPUS_MODEL_ANSWER_FLAG
 from corpusagent2.agent_capabilities import AgentExecutionContext
 from corpusagent2.agent_backends import InMemoryWorkingSetStore
-from corpusagent2.agent_models import AgentNodeExecutionRecord, AgentPlanDAG, AgentPlanNode, AgentRunState
+from corpusagent2.agent_models import AgentNodeExecutionRecord, AgentPlanDAG, AgentPlanNode, AgentRunState, PlannerAction
 from corpusagent2.api import build_app
 from corpusagent2.agent_executor import AgentExecutionSnapshot, AsyncPlanExecutor
 from corpusagent2.python_runner_service import PythonRunnerResult, SandboxArtifact
@@ -3827,14 +3827,165 @@ def test_replan_from_run_carries_prior_answer_and_follow_up_instruction(tmp_path
 
     assert captured["question"] == prior_manifest["question"]
     assert captured["no_cache"] is True
-    entry = captured["clarification_history"][-1]
-    assert "REPLAN" in entry
+    entry = captured["clarification_history"][-2]
+    # A follow-up instruction switches the framing: the follow-up leads the
+    # synthetic entry and takes priority over the original question, instead of
+    # being appended behind a "question is unchanged" framing that reproduces
+    # the prior plan.
+    assert "REPLAN FOLLOW-UP" in entry
+    assert "Original question is unchanged" not in entry
+    assert entry.index("why no cristiano ronaldo mention?") < entry.index("Top nouns were")
     assert "agent_prior" in entry
     assert 'ws_prior (37736 docs)' in entry
+    assert "filter_working_set" in entry
+    assert "evidence of absence" in entry
     # Prior answer is carried (whitespace-condensed) so follow-ups about the prior
-    # output can be answered, and the follow-up instruction itself is included.
+    # output can be answered.
     assert "Top nouns were game, team, season." in entry
-    assert "Additional user instruction: why no cristiano ronaldo mention?" in entry
+    # The follow-up is also carried as its own trailing clarification entry so
+    # rephrase/planning/synthesis each see it as a clean user message.
+    assert captured["clarification_history"][-1] == (
+        "Follow-up question (this run must answer it): why no cristiano ronaldo mention?"
+    )
+
+
+def test_replan_from_run_without_instruction_keeps_plain_replan_framing(tmp_path: Path, monkeypatch) -> None:
+    runtime = build_test_runtime(tmp_path=tmp_path, documents=_sample_documents(), search_rows_by_query={})
+    prior_manifest = {
+        "question": "What is the distribution of nouns in The Guardian's football reporting between 2017 and 2019?",
+        "assumptions": [],
+        "failures": [],
+        "clarification_questions": [],
+        "metadata": {"force_answer": False},
+        "final_answer": {"answer_text": "Top nouns were game, team, season."},
+        "tool_calls": [
+            {"summary": {"payload_preview": {"working_set_ref": "ws_prior", "document_count": 37736}}},
+        ],
+    }
+    captured: dict = {}
+    monkeypatch.setattr(runtime, "get_run", lambda run_id: prior_manifest)
+
+    def _capture_submit(question, *, force_answer=False, no_cache=False, clarification_history=None):
+        captured["question"] = question
+        captured["clarification_history"] = list(clarification_history or [])
+        return object()
+
+    monkeypatch.setattr(runtime, "submit_query", _capture_submit)
+
+    runtime.replan_from_run("agent_prior")
+
+    entry = captured["clarification_history"][-1]
+    assert "REPLAN:" in entry
+    assert "Original question is unchanged" in entry
+    assert "REPLAN FOLLOW-UP" not in entry
+    assert "Follow-up question" not in entry
+
+
+def test_working_set_store_resolves_prior_run_label_for_replan_reuse() -> None:
+    store = InMemoryWorkingSetStore()
+    store.document_lookup["d1"] = {"doc_id": "d1", "title": "t", "text": "x"}
+    store.record_working_set("agent_prior", "sql_search_prior", [{"doc_id": "d1"}])
+
+    # A re-planned run (different run_id) referencing the prior label must see
+    # the prior run's materialized rows instead of an empty set.
+    assert store.count_working_set("agent_new", "sql_search_prior") == 1
+    assert store.fetch_working_set_doc_ids("agent_new", "sql_search_prior") == ["d1"]
+    assert [d["doc_id"] for d in store.fetch_working_set_documents("agent_new", "sql_search_prior")] == ["d1"]
+
+    # A run-scoped set with the same label still takes precedence.
+    store.document_lookup["d2"] = {"doc_id": "d2", "title": "t2", "text": "y"}
+    store.record_working_set("agent_new", "sql_search_prior", [{"doc_id": "d2"}])
+    assert store.fetch_working_set_doc_ids("agent_new", "sql_search_prior") == ["d2"]
+
+
+def test_planner_action_accepts_bare_array_plan_dag(tmp_path: Path) -> None:
+    payload = {
+        "action": "emit_plan_dag",
+        "rewritten_question": "Check Ronaldo presence in the prior working set.",
+        "plan_dag": [
+            {
+                "node_id": "n1",
+                "capability": "filter_working_set",
+                "inputs": {"working_set_ref": "sql_search_prior", "query": '"Cristiano Ronaldo" OR Ronaldo'},
+                "depends_on": [],
+            },
+            {"node_id": "n2", "capability": "fetch_documents", "inputs": {"limit": 10}, "depends_on": ["n1"]},
+        ],
+    }
+    runtime = build_test_runtime(tmp_path=tmp_path, documents=_sample_documents(), search_rows_by_query={})
+
+    assert runtime.orchestrator._planner_payload_is_actionable(payload) is True
+    action = PlannerAction.from_dict(payload)
+    assert action.action == "emit_plan_dag"
+    assert action.plan_dag is not None
+    assert [node.capability for node in action.plan_dag.nodes] == ["filter_working_set", "fetch_documents"]
+
+
+def test_materialized_query_filter_plan_is_not_degenerate(tmp_path: Path) -> None:
+    runtime = build_test_runtime(tmp_path=tmp_path, documents=_sample_documents(), search_rows_by_query={})
+    reuse_plan = AgentPlanDAG(
+        nodes=[
+            AgentPlanNode(
+                node_id="n1",
+                capability="filter_working_set",
+                inputs={"working_set_ref": "sql_search_prior", "query": "cristiano ronaldo"},
+            ),
+            AgentPlanNode(node_id="n2", capability="fetch_documents", inputs={"limit": 10}, depends_on=["n1"]),
+        ]
+    )
+    bare_plan = AgentPlanDAG(
+        nodes=[
+            AgentPlanNode(node_id="n1", capability="db_search", inputs={"query": "x"}),
+            AgentPlanNode(node_id="n2", capability="filter_working_set", inputs={}, depends_on=["n1"]),
+        ]
+    )
+
+    # The count/diagnostics of a query filter over a materialized prior working set
+    # are the analytic result for a presence/absence follow-up.
+    assert runtime.orchestrator._plan_is_degenerate(reuse_plan) is False
+    # A queryless retrieval-only skeleton remains degenerate.
+    assert runtime.orchestrator._plan_is_degenerate(bare_plan) is True
+
+
+def test_plan_compiler_keeps_materialized_working_set_filter_as_retrieval_backbone(tmp_path: Path) -> None:
+    runtime = build_test_runtime(
+        tmp_path=tmp_path,
+        documents=_sample_documents(),
+        search_rows_by_query=_search_rows(_sample_documents()),
+    )
+    dag = AgentPlanDAG(
+        nodes=[
+            AgentPlanNode(
+                node_id="reuse_filter",
+                capability="filter_working_set",
+                inputs={"working_set_ref": "sql_search_prior", "query": "cristiano ronaldo"},
+            ),
+            AgentPlanNode(
+                node_id="evidence",
+                capability="build_evidence_table",
+                inputs={"task_name": "entity_mention_examples"},
+                depends_on=["reuse_filter"],
+            ),
+        ]
+    )
+
+    compiled = runtime.orchestrator._normalize_plan_dag(
+        dag,
+        "REPLAN FOLLOW-UP: why no cristiano ronaldo mention in the prior working set?",
+    )
+
+    capabilities = [node.capability for node in compiled.nodes]
+    # The materialized prior working set is the retrieval backbone: no fresh
+    # db_search may be injected on top of the explicit filter_working_set reuse.
+    assert "db_search" not in capabilities
+    assert "sql_query_search" not in capabilities
+    filter_node = next(node for node in compiled.nodes if node.capability == "filter_working_set")
+    assert filter_node.inputs.get("working_set_ref") == "sql_search_prior"
+    assert filter_node.inputs.get("query") == "cristiano ronaldo"
+    fetch_nodes = [node for node in compiled.nodes if node.capability == "fetch_documents"]
+    assert fetch_nodes and fetch_nodes[0].depends_on == ["reuse_filter"]
+    # No dependency cycle: the backbone filter must not be rewired onto the fetch.
+    assert fetch_nodes[0].node_id not in filter_node.depends_on
 
 
 def test_synthesize_passes_clarification_history_to_llm(tmp_path: Path) -> None:
