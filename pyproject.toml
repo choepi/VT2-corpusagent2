@@ -42,6 +42,11 @@ nlp-providers = [
     "nltk>=3.9.1",
     "stanza>=1.11.0",
 ]
+# RQ4 scaling ANN benchmark (scripts/50_run_eval_suite.py, EVAL_RUN_SCALING_ANN=1);
+# the suite degrades gracefully (skips FAISS variants) when faiss is absent.
+ann-bench = [
+    "faiss-cpu>=1.8.0",
+]
 
 [tool.uv]
 package = true
