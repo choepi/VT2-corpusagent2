@@ -3226,91 +3226,6 @@ class MagicBoxOrchestrator:
             blocked.update(str(item).lower() for item in match["tokens"])
         return blocked
 
-    def _described_source_scope_phrases(self, text: str) -> list[str]:
-        value = str(text or "").strip()
-        if not value:
-            return []
-        descriptors: list[str] = []
-        source_noun = r"(?:media|newspapers?|press|outlets?|sources?)"
-        descriptor = r"[A-Za-z0-9&.'-]+(?:\s+[A-Za-z0-9&.'-]+){0,4}"
-        patterns = (
-            rf"\b(?:in|from|by|among|across|within|of)\s+(?:the\s+)?(?P<descriptor>{descriptor})\s+{source_noun}\b",
-            rf"\b(?P<descriptor>{descriptor})\s+{source_noun}\s+(?:reported|reports|report|covered|covers|cover|explained|explains|explain|portrayed|portrays|portray|framed|frames|frame|wrote|writes|write)\b",
-        )
-        # Super-national / language / hemisphere media descriptors are NOT resolvable
-        # source scopes (R12: do not invent outlet alias lists for phrases like
-        # "American media"). These analyze unscoped instead of producing a spurious
-        # "source scope could not be resolved" answer. Single-nation descriptors
-        # (Swiss, British, Chinese, ...) are intentionally EXCLUDED here so they remain
-        # resolvable source scopes that the guardrail can flag when unresolved.
-        broad_scope_terms = {
-            "us", "u.s.", "u.s", "usa", "american", "america", "western", "west",
-            "english", "english-language", "englishlanguage", "european", "europe",
-            "global", "international", "mainstream", "national", "foreign", "major",
-            "world", "worldwide", "domestic", "eastern", "western", "asian",
-        }
-        filler_prefix = re.compile(
-            r"^(?:and|but|so|how|did|does|do|the|those|these|that|this|in|on|of|by|from|to|over|during|when|major)\s+",
-            flags=re.IGNORECASE,
-        )
-        for pattern in patterns:
-            for match in re.finditer(pattern, value, flags=re.IGNORECASE):
-                phrase = " ".join(str(match.group("descriptor")).split()).strip(" ,.;:!?()[]{}")
-                # The greedy descriptor regex can capture an entity + preposition prefix
-                # (e.g. "Huawei in Western media" -> "Huawei in Western"). Keep only the
-                # segment adjacent to the source noun by splitting on internal prepositions.
-                segments = re.split(
-                    r"\b(?:in|of|by|from|across|within|among|for|about|on|over|during|with)\b",
-                    phrase,
-                    flags=re.IGNORECASE,
-                )
-                if len(segments) > 1 and segments[-1].strip(" ,.;:!?()[]{}"):
-                    phrase = segments[-1].strip(" ,.;:!?()[]{}")
-                # Drop leading interrogative/filler tokens the greedy descriptor regex captures.
-                prev = None
-                while phrase and phrase != prev:
-                    prev = phrase
-                    phrase = filler_prefix.sub("", phrase).strip(" ,.;:!?()[]{}")
-                # A genuine source descriptor is the run of tokens immediately ADJACENT to
-                # the source noun (e.g. "Swiss" in "Swiss newspapers", "tech" in "tech
-                # press"). The greedy 0-4 word lookback can still leave a determiner or a
-                # verb/interrogative phrase glued to the front (e.g. "the press" -> "the",
-                # "summarize how the press" -> "summarize how the"). Keep only the maximal
-                # suffix of real descriptor tokens, stopping at the first determiner /
-                # auxiliary / report-verb / interrogative. A bare determiner ("the media",
-                # "the press") therefore yields no descriptor and analyzes unscoped instead
-                # of producing a spurious "source scope could not be resolved" answer.
-                descriptor_stop_tokens = {
-                    "the", "a", "an", "this", "that", "these", "those", "its", "their",
-                    "his", "her", "our", "your", "my", "some", "any", "no", "every", "all",
-                    "how", "did", "do", "does", "was", "were", "is", "are", "has", "have",
-                    "had", "be", "been", "being", "summarize", "summarise", "describe",
-                    "explain", "discuss", "analyze", "analyse", "cover", "covered", "covers",
-                    "report", "reported", "reports", "show", "shows", "tell", "compare",
-                    "characterize", "characterise", "and", "but", "so", "when", "what",
-                    "which", "who",
-                }
-                kept_tokens: list[str] = []
-                for token in reversed(phrase.split()):
-                    if token.lower() in descriptor_stop_tokens:
-                        break
-                    kept_tokens.append(token)
-                phrase = " ".join(reversed(kept_tokens)).strip(" ,.;:!?()[]{}")
-                lowered = phrase.lower()
-                if not phrase or lowered in SOURCE_CANDIDATE_GENERIC_VALUES:
-                    continue
-                if lowered in {"social", "news", "mainstream", "online", "legacy", "traditional"}:
-                    continue
-                # Skip when every remaining token is a broad geographic/language term.
-                if all(token in broad_scope_terms for token in lowered.split()):
-                    continue
-                if lowered not in {item.lower() for item in descriptors}:
-                    descriptors.append(phrase)
-        return descriptors
-
-    def _question_requests_described_source_scope(self, text: str) -> bool:
-        return bool(self._described_source_scope_phrases(text))
-
     def _remove_source_field_filters(self, query: str) -> str:
         cleaned = re.sub(
             r"\s*(?:AND|OR)?\s*\(?\s*source\s*:\s*\([^)]+\)\s*\)?",
@@ -3715,8 +3630,14 @@ class MagicBoxOrchestrator:
                 "role": "system",
                 "content": (
                     "You are the rephrasing and clarification module for a corpus agent operating over a user-provided corpus. "
-                    "Return JSON with keys action, rewritten_question, clarification_question, assumptions, rejection_reason, message. "
+                    "Return JSON with keys action, rewritten_question, clarification_question, assumptions, rejection_reason, message, requested_source_scope. "
                     "Allowed actions: ask_clarification, accept_with_assumptions, grounded_rejection. "
+                    "requested_source_scope: if the question restricts the analysis to a specific set of sources/outlets "
+                    "(named outlets like 'The Guardian', or a specific descriptor like 'Swiss newspapers' or 'the tech press'), "
+                    "return that descriptor phrase verbatim; otherwise return an empty string. Broad geographic, language, or "
+                    "generic media descriptors ('US media', 'Western media', 'English-language sources', 'the press', "
+                    "'mainstream media') are NOT a source scope — return an empty string for those; they are analyzed unscoped. "
+                    "requested_source_scope only records the restriction; do not ask a clarification solely because of it. "
                     "Reject hidden-motive questions. Ask clarification only if workflow changes materially. "
                     "Treat clarification_history as authoritative user follow-up memory. "
                     "If clarification_history contains a re-plan follow-up (marked REPLAN FOLLOW-UP or 'Follow-up question'), "
@@ -3756,6 +3677,7 @@ class MagicBoxOrchestrator:
                     rewritten_question=forced_rewrite,
                     assumptions=forced_assumptions,
                     message=action.message,
+                    requested_source_scope=action.requested_source_scope,
                 )
             sufficient, clarification_assumptions = self._broad_scope_clarification_is_sufficient(state)
             if action.action == "ask_clarification" and sufficient:
@@ -3764,6 +3686,7 @@ class MagicBoxOrchestrator:
                     rewritten_question=action.rewritten_question or rewritten or state.question,
                     assumptions=list(dict.fromkeys(list(action.assumptions) + assumptions + clarification_assumptions)),
                     message="Broad-scope clarification accepted; proceeding with explicit assumptions.",
+                    requested_source_scope=action.requested_source_scope,
                 )
             if not action.rewritten_question:
                 action.rewritten_question = rewritten
@@ -4748,6 +4671,7 @@ class MagicBoxOrchestrator:
         evidence_rows = self._extract_evidence(snapshot)
         summary = self._derive_summary(snapshot)
         strict_signals = self._derive_strict_signals(snapshot)
+        unresolved_source_scope = self._unresolved_source_scope_descriptor(state, snapshot)
         if self.llm_client is None:
             self._record_llm_trace(
                 state,
@@ -4777,7 +4701,17 @@ class MagicBoxOrchestrator:
                     "- Follow with prose that directly answers the question. Use H3 (###) subheadings ONLY if the answer has 3+ distinct dimensions (e.g. time period, entity, outlet); otherwise stay in flowing paragraphs.\n"
                     "- Bullet lists only for genuine enumerations (e.g. ranked outlets).\n"
                     "- Cite specific evidence with markdown links of the form [short label](#doc-<doc_id>). Use only doc_ids that appear in evidence_rows; pick the most representative snippet per claim. Multiple claims may link to the same doc_id.\n"
-                    "- DO NOT add a scope-limits paragraph or sentence at the end; scope, gaps, and limits live in the separate caveats / unsupported_parts JSON fields, not in answer_text.\n"
+                    "- DO NOT add a scope-limits paragraph or sentence at the end; scope, gaps, and limits live in the separate caveats / unsupported_parts JSON fields, not in answer_text. "
+                    "The single exception is unresolved_source_scope (below), which is stated once at the top.\n"
+                    "\n"
+                    "If the user-message contains a non-null unresolved_source_scope block, the question asked to restrict "
+                    "the analysis to those sources but no matching source filter could be applied, and the analysis ran over "
+                    "all matching documents regardless of source. In that case: immediately after the opening H2, add one "
+                    "short plain-language paragraph that names the requested sources and says the results cover the whole "
+                    "corpus instead (e.g. 'Note: the question asks about Swiss newspapers, but the corpus metadata does not "
+                    "identify which outlets are Swiss, so the results below cover all climate-related articles regardless of "
+                    "outlet.'). Everywhere else in answer_text, describe the results as corpus-wide — never as belonging to "
+                    "the requested source group.\n"
                     "- DO NOT use the section labels 'Valid findings', 'Degraded analyses', 'Unavailable methods', or 'Unsupported parts' anywhere in answer_text.\n"
                     "\n"
                     "Do not claim direct correspondence to stock-price moves or external market behavior unless an external series was explicitly attached. "
@@ -4808,6 +4742,14 @@ class MagicBoxOrchestrator:
                         "tool_caveats": self._snapshot_caveats(snapshot),
                         "failures": [item.to_dict() for item in snapshot.failures],
                         "has_external_series": self._has_external_series(snapshot),
+                        "unresolved_source_scope": (
+                            {
+                                "requested_sources": unresolved_source_scope,
+                                "note": "No corpus source values could be matched to this description; no source filter was applied and the analysis ran over all matching documents.",
+                            }
+                            if unresolved_source_scope
+                            else None
+                        ),
                     },
                     ensure_ascii=True,
                 ),
@@ -5427,58 +5369,55 @@ class MagicBoxOrchestrator:
     def _has_external_series(self, snapshot: AgentExecutionSnapshot) -> bool:
         return bool(self._external_series_rows(snapshot))
 
+    def _unresolved_source_scope_descriptor(
+        self, state: AgentRunState, snapshot: AgentExecutionSnapshot
+    ) -> str:
+        """Descriptor of a requested source scope that no executed node satisfied.
+
+        Returns the rephrase stage's requested_source_scope when no node in the run
+        applied a source filter (source: query clause or working-set source
+        filtering), and an empty string otherwise. Both inputs are facts — a typed
+        planner field and the execution snapshot — so no question-text heuristics
+        are involved.
+        """
+        descriptor = str(state.requested_source_scope or "").strip()
+        if not descriptor:
+            return ""
+        has_source_filter = any(
+            "source:" in str(result.payload.get("query", "") if isinstance(result.payload, dict) else "").lower()
+            or str(result.metadata.get("filtered_from_working_set", "")).lower() == "true"
+            for result in snapshot.node_results.values()
+        )
+        return "" if has_source_filter else descriptor
+
     def _apply_answer_guardrails(
         self,
         state: AgentRunState,
         snapshot: AgentExecutionSnapshot,
         answer: FinalAnswerPayload,
     ) -> FinalAnswerPayload:
-        raw_question_text = f"{state.question} {state.rewritten_question}"
-        question_text = raw_question_text.lower()
-        assumptions_text = " ".join(str(item) for item in state.assumptions).lower()
-        unresolved_source_scope = any(
-            marker in assumptions_text
-            for marker in (
-                "unclear which source values correspond",
-                "needs either explicit source names",
-                "requires explicit source names",
-                "source scope could not be resolved",
-                "explicit outlet names were provided",
-                "explicit outlet names were not provided",
-                "does not add a source filter",
-                "without inventing outlet aliases",
-                "either already scoped to",
-            )
-        )
-        requested_described_source_scope = self._question_requests_described_source_scope(raw_question_text)
-        has_source_filter = any(
-            "source:" in str(result.payload.get("query", "") if isinstance(result.payload, dict) else "").lower()
-            or str(result.metadata.get("filtered_from_working_set", "")).lower() == "true"
-            for result in snapshot.node_results.values()
-        )
-        # Only emit the hard "cannot answer source-scoped question" guardrail when the
-        # question genuinely DESCRIBES a specific source scope that could not be
-        # resolved. Broad geographic/language phrases ("US media", "Western media",
-        # "English-language sources") are not source filters (R12); the planner
-        # correctly analyzes them unscoped, and its assumption text about not inventing
-        # outlet aliases must NOT be mistaken for an unresolved scope.
-        if requested_described_source_scope and not has_source_filter:
+        question_text = f"{state.question} {state.rewritten_question}".lower()
+        # The rephrase stage reports the requested source scope as structured planner
+        # output (requested_source_scope); whether a matching filter actually ran is an
+        # execution fact of the snapshot. When the scope stayed unresolved, the fact is
+        # recorded here deterministically in caveats/unsupported_parts. The prose
+        # disclaimer lives in answer_text and is written by the synthesis LLM, which
+        # receives the same fact as unresolved_source_scope input.
+        unresolved_scope = self._unresolved_source_scope_descriptor(state, snapshot)
+        if unresolved_scope:
             note = (
-                "The requested source scope could not be resolved from corpus metadata or explicit outlet names; "
-                "the analysis rows are therefore not a supported source-scoped answer."
+                f"The question restricts sources to '{unresolved_scope}', but the corpus metadata does not "
+                "identify which source values belong to that group, so no source filter was applied; the "
+                "results cover all matching documents regardless of source."
             )
-            unsupported = "The requested source-scoped comparison/coverage subset is unsupported without explicit source names or usable source metadata."
+            unsupported = (
+                f"Restricting the analysis to '{unresolved_scope}' was not possible without explicit source "
+                "names or corpus metadata that identifies those sources."
+            )
             if note not in answer.caveats:
                 answer.caveats.append(note)
             if unsupported not in answer.unsupported_parts:
                 answer.unsupported_parts.append(unsupported)
-            lowered_answer = answer.answer_text.lower()
-            if "source scope could not be resolved" not in lowered_answer and "not a supported source-scoped answer" not in lowered_answer:
-                answer.answer_text = (
-                    "I cannot answer the requested source-scoped question as stated because the source scope could not be resolved. "
-                    "The unscoped corpus analysis found: "
-                    + answer.answer_text.lstrip()
-                ).strip()
         needs_market_guardrail = any(
             term in question_text
             for term in ["stock", "drawdown", "share price", "valuation", "market", "oil price", "oil prices", "crude oil", "gas price", "gas prices"]
@@ -7177,6 +7116,8 @@ class AgentRuntime:
         if rephrase_action.assumptions:
             state.assumptions = list(dict.fromkeys(state.assumptions + rephrase_action.assumptions))
             self._set_live_status(run_id, assumptions=list(state.assumptions))
+        if rephrase_action.requested_source_scope:
+            state.requested_source_scope = rephrase_action.requested_source_scope
         maybe_aborted = self._maybe_abort(
             run_id=run_id,
             question=question,

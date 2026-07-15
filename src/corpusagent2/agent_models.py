@@ -129,6 +129,10 @@ class PlannerAction:
     plan_dag: AgentPlanDAG | None = None
     rejection_reason: str = ""
     message: str = ""
+    # Descriptor phrase when the question restricts analysis to a specific set of
+    # sources (e.g. "Swiss newspapers", "the tech press"); empty when unscoped or
+    # when the descriptor is too broad to map to source values ("Western media").
+    requested_source_scope: str = ""
 
     def __post_init__(self) -> None:
         if self.action not in _VALID_ACTIONS:
@@ -190,6 +194,12 @@ class PlannerAction:
                     nodes=parsed_nodes,
                     metadata=_coerce_mapping(dag_payload.get("metadata", {})),
                 )
+        raw_scope = payload.get("requested_source_scope", "")
+        if isinstance(raw_scope, dict):
+            raw_scope = raw_scope.get("descriptor", "")
+        requested_source_scope = " ".join(str(raw_scope or "").split()).strip()
+        if requested_source_scope.lower() in {"null", "none", "n/a", "na"}:
+            requested_source_scope = ""
         return cls(
             action=action,
             rewritten_question=str(payload.get("rewritten_question", "")).strip(),
@@ -198,6 +208,7 @@ class PlannerAction:
             plan_dag=plan_dag,
             rejection_reason=str(payload.get("rejection_reason", "")).strip(),
             message=str(payload.get("message", "")).strip(),
+            requested_source_scope=requested_source_scope,
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -209,6 +220,7 @@ class PlannerAction:
             "plan_dag": self.plan_dag.to_dict() if self.plan_dag is not None else None,
             "rejection_reason": self.rejection_reason,
             "message": self.message,
+            "requested_source_scope": self.requested_source_scope,
         }
 
 
@@ -303,6 +315,9 @@ class AgentRunState:
     llm_traces: list[dict[str, Any]] = field(default_factory=list)
     no_cache: bool = False
     last_plan: dict[str, Any] | None = None
+    # Structured source-scope descriptor reported by the rephrase stage; consumed by
+    # synthesis and the answer guardrail (see _unresolved_source_scope_descriptor).
+    requested_source_scope: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return _serialize(self)

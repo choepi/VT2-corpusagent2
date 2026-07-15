@@ -1458,29 +1458,47 @@ def test_generic_nonmarket_question_keeps_no_external_series(tmp_path: Path) -> 
     assert "join_external_series" not in capabilities
 
 
-def test_generic_media_phrase_is_not_a_resolvable_source_scope(tmp_path: Path) -> None:
-    # Generic media references ("the press", "the media") and verb/interrogative filler the
-    # rewriter introduces ("summarize how the press covered ...") must NOT be treated as a
-    # resolvable source scope, so broad-media questions analyze unscoped instead of emitting
-    # a spurious "source scope could not be resolved" answer. A genuine descriptor adjacent
-    # to the source noun (e.g. "Swiss") must still be detected.
+def test_requested_source_scope_parsing_and_unresolved_detection(tmp_path: Path) -> None:
+    # Source-scope detection is structured planner output (requested_source_scope),
+    # not question-text regex. PlannerAction.from_dict must accept the string, dict,
+    # and null shapes LLMs emit, and _unresolved_source_scope_descriptor must combine
+    # the state field with the execution fact of whether a source filter ran.
+    assert PlannerAction.from_dict(
+        {"action": "accept_with_assumptions", "requested_source_scope": "Swiss newspapers"}
+    ).requested_source_scope == "Swiss newspapers"
+    assert PlannerAction.from_dict(
+        {"action": "accept_with_assumptions", "requested_source_scope": {"descriptor": "the tech press"}}
+    ).requested_source_scope == "the tech press"
+    for empty in ("", None, "null", "none", "N/A"):
+        assert PlannerAction.from_dict(
+            {"action": "accept_with_assumptions", "requested_source_scope": empty}
+        ).requested_source_scope == ""
+
     runtime = build_test_runtime(
         tmp_path=tmp_path, documents=_sample_documents(), search_rows_by_query=_search_rows(_sample_documents())
     )
     orchestrator = runtime.orchestrator
-    for generic in (
-        "How did the press cover the company?",
-        "How did the media cover the election?",
-        "summarize how the press covered the company during that year.",
-        "How did US media explain the oil price?",
-        "How did Western media cover Huawei?",
-    ):
-        assert orchestrator._described_source_scope_phrases(generic) == [], generic
-        assert orchestrator._question_requests_described_source_scope(generic) is False, generic
-    assert orchestrator._described_source_scope_phrases(
-        "Which named entities dominate climate coverage in Swiss newspapers?"
-    ) == ["Swiss"]
-    assert orchestrator._described_source_scope_phrases("How did the tech press cover Apple?") == ["tech"]
+
+    def snapshot_with(payload: dict, metadata: dict) -> AgentExecutionSnapshot:
+        return AgentExecutionSnapshot(
+            node_records=[],
+            node_results={"n1": ToolExecutionResult(payload=payload, metadata=metadata)},
+            failures=[],
+            provenance_records=[],
+            selected_docs=[],
+            status="completed",
+        )
+
+    scoped_state = AgentRunState(question="q", requested_source_scope="Swiss newspapers")
+    unscoped_state = AgentRunState(question="q")
+    unfiltered = snapshot_with({"query": "climate OR klima"}, {})
+    query_filtered = snapshot_with({"query": 'climate AND source:("NZZ")'}, {})
+    working_set_filtered = snapshot_with({"query": "climate"}, {"filtered_from_working_set": "true"})
+
+    assert orchestrator._unresolved_source_scope_descriptor(scoped_state, unfiltered) == "Swiss newspapers"
+    assert orchestrator._unresolved_source_scope_descriptor(scoped_state, query_filtered) == ""
+    assert orchestrator._unresolved_source_scope_descriptor(scoped_state, working_set_filtered) == ""
+    assert orchestrator._unresolved_source_scope_descriptor(unscoped_state, unfiltered) == ""
 
 
 def test_entity_trend_normalization_removes_unrequested_quote_branch(tmp_path: Path) -> None:
@@ -2277,6 +2295,7 @@ def test_unresolved_source_scope_guardrail_blocks_scoped_answer(tmp_path: Path) 
                 "rewritten_question": "Identify dominant named entities in climate coverage in Swiss newspapers over time.",
                 "assumptions": ["Swiss newspapers means sources labeled as Swiss."],
                 "message": "",
+                "requested_source_scope": "Swiss newspapers",
             },
             {
                 "action": "ask_clarification",
@@ -2304,8 +2323,8 @@ def test_unresolved_source_scope_guardrail_blocks_scoped_answer(tmp_path: Path) 
     )
 
     assert manifest.status in {"completed", "partial"}
-    assert "source scope could not be resolved" in manifest.final_answer.answer_text.lower()
-    assert any("source-scoped" in item for item in manifest.final_answer.unsupported_parts)
+    assert any("Swiss newspapers" in item for item in manifest.final_answer.caveats)
+    assert any("Swiss newspapers" in item for item in manifest.final_answer.unsupported_parts)
 
 
 def test_described_source_scope_guardrail_blocks_unfiltered_answer(tmp_path: Path) -> None:
@@ -2317,6 +2336,7 @@ def test_described_source_scope_guardrail_blocks_unfiltered_answer(tmp_path: Pat
                 "rewritten_question": "Identify dominant entities in climate coverage in Swiss newspapers.",
                 "assumptions": ["The corpus is either already scoped to Swiss newspapers or has usable source metadata."],
                 "message": "",
+                "requested_source_scope": "Swiss newspapers",
             },
             {
                 "action": "emit_plan_dag",
@@ -2357,8 +2377,18 @@ def test_described_source_scope_guardrail_blocks_unfiltered_answer(tmp_path: Pat
         no_cache=True,
     )
 
-    assert "source scope could not be resolved" in manifest.final_answer.answer_text.lower()
-    assert any("source-scoped" in item for item in manifest.final_answer.unsupported_parts)
+    assert any("Swiss newspapers" in item for item in manifest.final_answer.caveats)
+    assert any("Swiss newspapers" in item for item in manifest.final_answer.unsupported_parts)
+    # The old post-hoc prose surgery is gone: answer_text is whatever synthesis produced.
+    assert not manifest.final_answer.answer_text.lower().startswith("i cannot answer the requested source-scoped")
+    # The synthesis LLM is given the unresolved scope as structured input so the
+    # disclaimer is written into the answer body instead of prepended afterwards.
+    synthesis_traces = [
+        trace for trace in manifest.metadata.get("llm_traces", []) if trace.get("stage") == "final_synthesis"
+    ]
+    assert synthesis_traces
+    synthesis_input = json.loads(synthesis_traces[-1]["messages"][1]["content"])
+    assert synthesis_input["unresolved_source_scope"]["requested_sources"] == "Swiss newspapers"
 
 
 def test_multi_year_monthly_clarification_is_accepted_as_sufficient(tmp_path: Path) -> None:
