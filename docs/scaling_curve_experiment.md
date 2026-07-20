@@ -1,7 +1,7 @@
 # Scaling-curve experiment: seeded growing-corpus evaluation for RQ1 + RQ4
 
 **Date:** 2026-07-14
-**Status:** IMPLEMENTED — phases live in `scripts/50_run_eval_suite.py`; full 21-condition run NOT yet executed (smoke-tested only, see §8).
+**Status:** EXECUTED — full 21-condition run completed 2026-07-15 (smoke-tested first, see §8; real run results in §10). Not yet integrated into the paper text (§6 checklist still open).
 **Extends:** `scripts/50_run_eval_suite.py` (new phases; no new script, no argparse, per suite convention).
 **Paper target:** Chapter 4 — new "Retrieval quality across corpus scale" subsection under Protocol A results, plus the pending RQ4 architecture benchmark (`sec:arch-tradeoff`), which this design finally executes with measured anchors.
 
@@ -125,7 +125,70 @@ Smoke run 2026-07-14 (CPU VM, live OpenSearch + Postgres + OpenAI judge; exit 0)
   the judge cache keeps the 338 new judgments (they are valid (question, doc, model) labels and will
   be reused).
 
-## 9. Explicitly rejected alternatives (for the record)
+## 9. Real run record (2026-07-15, the run that counts)
+
+Launched in a detached `tmux` session on the CPU VM (`EVAL_RUN_SCALING=1 EVAL_RUN_SCALING_ANN=1`,
+Protocol A/B/C/retrievability phases disabled for this invocation — they were already current from a
+same-day standalone run). Started ~20:36, finished 23:51 (exit 0, ~3h15m), survived unattended with no
+SSH session attached. All 21 RQ1 conditions and all 5 ANN sizes completed.
+
+- **Judge:** `gpt-5.4-nano-2026-03-17`, 5,546 new judgments, 6,142 cache hits, **1 failed** (a single
+  transient DNS `ConnectError` on one (question, doc) pair — negligible, just leaves that pair unjudged).
+- **Cleanup verified:** no leftover `ca2-scaling-*` OpenSearch indexes, no leftover
+  `ca2_scaling_ann_bench` pg table.
+- **Outputs written:** `outputs/eval_suite/scaling_rq1.json`, `scaling_rq4.json`; rendered
+  `generated/plot_scaling_rq1.png`, `results_scaling_rq1.tex`, `plot_scaling_rq4.png`,
+  `results_scaling_rq4.tex`. Copied to the paper workspace
+  (`zhaw_onedrive:MSE_school_files/Sem4/project_paper/LATEX/generated/`) same day.
+
+**RQ1 headline — nDCG@10, mean ± std over 5 seeds (624k point is a single deterministic run, std=0):**
+
+| Size | Lexical (BM25) | Dense (E5) | Hybrid (RRF) | Hybrid + rerank |
+|---|---|---|---|---|
+| 10k | 0.152 ± 0.034 | 0.266 ± 0.036 | 0.248 ± 0.086 | **0.447 ± 0.111** |
+| 50k | 0.147 ± 0.038 | 0.310 ± 0.052 | 0.257 ± 0.059 | **0.381 ± 0.059** |
+| 100k | 0.234 ± 0.063 | 0.276 ± 0.046 | 0.323 ± 0.105 | **0.394 ± 0.061** |
+| 250k | 0.243 ± 0.030 | 0.298 ± 0.026 | 0.327 ± 0.070 | **0.457 ± 0.055** |
+| 624k | 0.233 | 0.250 | 0.333 | **0.391** |
+
+Reading: hybrid + rerank leads at every scale and is roughly scale-stable. Lexical improves with corpus
+size (IDF/avgdl statistics get more informative as the collection grows); dense drifts down; their RRF
+fusion trends upward across the curve — i.e. which signal carries the load does shift with scale, which
+is the RQ1 claim. Pooled Recall@25 for the top two systems narrows from ~0.63 at 10k to ~0.49–0.59 at
+624k (candidate pool grows with N, so this tracks pool dynamics, not a regression — restate the §3
+semantics caveat here).
+
+**RQ4 headline — recall@10 vs exact flat scan, CPU-only VM:**
+
+- **pgvector IVFFlat at the production default `probes=1`** is the standout weak point:
+  recall 0.56–0.65 across all five sizes, and p50 latency balloons to 54 ms at 624k (worse than the
+  exact flat scan's ~40 ms at that size). `probes=10` fixes recall to 0.91–1.00 but costs ~12–44 ms p50.
+- **pgvector HNSW** (`ef_search=40`) holds 0.91–0.99 recall at 1–3 ms p50 up to 250k — clearly the
+  better architecture choice for this workload, if switching the production index is in scope.
+- **FAISS HNSW** holds 0.97–0.99 recall at sub-millisecond p50 at every size, including 624k.
+- **FAISS IVF-PQ** trades recall for compactness/speed: 0.39–0.55 recall, but the smallest index and
+  fastest queries (~0.1–0.4 ms) — a reasonable choice only if recall in that range is acceptable.
+- Exact flat scan crosses above ANN latency at roughly the 50k mark.
+
+**Known gap — pgvector HNSW has no 624k point.** By design, not a bug: the full-corpus condition reuses
+the *production* pgvector index for that row, and production is IVFFlat, not HNSW (see §7 "RQ4
+measurements"). HNSW was only built on scratch tables up to 250k. **Open item:** if the paper wants that
+line complete, run a one-off scratch-table HNSW build at 624k (~30–60 min on this VM) and merge the
+result into `scaling_rq4.json` before the next render — nobody has done this yet.
+
+**Judge-model caveat for the paper text:** the scaling curve (including its 624k point) was judged by
+`gpt-5.4-nano`, the suite's default judge — internally consistent across the curve, but not numerically
+identical to the main Protocol A table (which averages the ensemble). Rankings agree (rerank on top at
+0.39ish either way); don't quote the scaling 624k nDCG@10 as if it were the Protocol A headline number.
+
+**What's NOT done yet (§6 checklist, still open as of 2026-07-15):**
+1. Write the "Retrieval quality across corpus scale" subsection in Chapter 4 using the table/figure
+   above and the reading paragraph.
+2. Update `sec:arch-tradeoff` with the measured RQ4 results, replacing its "pending" placeholder text.
+3. Decide on the pgvector-HNSW-at-624k gap (fill it, or caption the plot to explain the missing point).
+4. Optionally reinstate a 13M projection, now anchored on this measured curve instead of decoration.
+
+## 10. Explicitly rejected alternatives (for the record)
 
 - **1M point / blended curve** — rejected: requires the different 13M packaging; cross-packaging confound.
 - **5 seeds at 500k** — rejected: ≥~80% pairwise draw overlap deflates variance; replaced by 250k seeded + 624k full.
