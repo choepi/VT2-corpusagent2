@@ -101,6 +101,12 @@ RUN_PROTOCOL_B = _phase("PROTOCOL_B")           # claim-to-evidence faithfulness
 RUN_SCALING = _phase("SCALING", default=False)          # RQ1 growing-corpus curve (opt-in)
 RUN_SCALING_JUDGE = _phase("SCALING_JUDGE")             # judge scaling pools (within RUN_SCALING)
 RUN_SCALING_ANN = _phase("SCALING_ANN", default=False)  # RQ4 ANN benchmark (opt-in)
+# One-off backfill (opt-in, independent of RUN_SCALING_ANN): pgvector HNSW has
+# no 624k point today because the full-corpus row reuses the production index,
+# which is IVFFlat -- see docs/scaling_curve_experiment.md \S9 "Known gap".
+# ~30-60 min (scratch-table HNSW build over the full embedding matrix); safe to
+# re-run, no-ops if the row is already present in ann_bench.json.
+RUN_SCALING_ANN_HNSW_FULL = _phase("SCALING_ANN_HNSW_FULL", default=False)
 RENDER = _phase("RENDER")   # write LaTeX tables + plots
 
 # Protocol B: synthesise a grounded answer from the system's OWN retrieved
@@ -1234,6 +1240,102 @@ def phase_scaling_ann() -> dict:
             "generated_at": _now()}
 
 
+def run_scaling_ann_hnsw_full_backfill() -> dict:
+    """One-off: build a scratch-table pgvector HNSW index over the FULL 624k
+    embedding matrix and merge the result into ann_bench.json's full-corpus row.
+
+    Gap this fills (docs/scaling_curve_experiment.md \\S9, "Known gap"): the
+    full-corpus row in the RQ4 benchmark reuses the *production* pgvector
+    index, which is IVFFlat, so pgvector-HNSW has no measured point at 624k --
+    it was only ever built on scratch tables up to 250k in phase_scaling_ann().
+    This does not touch the production table: it builds and drops its own
+    scratch table, exactly like the subset path in _ann_pgvector() does, just
+    at full scale. Expected runtime ~30-60 minutes (the index build dominates);
+    safe to re-run, it no-ops if the row is already present.
+    """
+    out_path = SCALING_DIR / "ann_bench.json"
+    if not out_path.exists():
+        raise RuntimeError(
+            "outputs/eval_suite/scaling/ann_bench.json does not exist yet -- "
+            "run EVAL_RUN_SCALING_ANN=1 at least once first (it produces the "
+            "full-corpus IVFFlat rows this backfill appends to)."
+        )
+    payload = json.loads(out_path.read_text(encoding="utf-8"))
+    results: dict[str, list[dict]] = payload.get("by_size", {})
+
+    emb, _ = _scaling_universe()
+    full_label = str(emb.shape[0])
+    existing = results.get(full_label, [])
+    if any(row.get("arch") == "pgvector_hnsw" for row in existing):
+        print(f"[ann-hnsw-full] {full_label}: pgvector_hnsw already present, nothing to do")
+        return payload
+
+    queries = _ann_queries()
+    k = ANN_RECALL_K[0]
+    print(f"[ann-hnsw-full] {full_label}: computing exact ground truth (flat scan over full corpus) ...")
+    truth = _ann_ground_truth(emb, queries, k)
+
+    from corpusagent2.retrieval import pg_connect_kwargs, pg_dsn_from_env, _vector_literal
+    dsn = pg_dsn_from_env(required=False)
+    if not dsn:
+        raise RuntimeError("no Postgres DSN configured; cannot build the scratch HNSW index")
+    from psycopg import connect
+    import numpy as np
+
+    n = emb.shape[0]
+    n_lat = min(ANN_PG_LATENCY_QUERIES, queries.shape[0])
+    lat_queries = queries[:n_lat]
+    lat_truth = truth[:n_lat]
+    table = "ca2_scaling_ann_bench_full_hnsw"
+
+    with connect(dsn, **pg_connect_kwargs()) as conn:
+        conn.autocommit = True
+        with conn.cursor() as cur:
+            cur.execute(f"DROP TABLE IF EXISTS {table}")
+            cur.execute(f"CREATE UNLOGGED TABLE {table} (row_idx int, dense_embedding vector(768))")
+            print(f"[ann-hnsw-full] copying {n:,} vectors into scratch table {table} ...")
+            with cur.copy(f"COPY {table} (row_idx, dense_embedding) FROM STDIN") as copy:
+                for i in range(n):
+                    copy.write_row((i, _vector_literal(emb[i])))
+            cur.execute("SET maintenance_work_mem = '1GB'")
+            print(f"[ann-hnsw-full] building HNSW index over {n:,} rows (this is the ~30-60 min step) ...")
+            t0 = time.monotonic()
+            cur.execute(f"CREATE INDEX {table}_hnsw ON {table} "
+                        "USING hnsw (dense_embedding vector_cosine_ops) WITH (m = 16, ef_construction = 64)")
+            build_hnsw = time.monotonic() - t0
+            cur.execute("SELECT pg_relation_size(%s)", (f"{table}_hnsw",))
+            index_mb = round((cur.fetchone()[0] or 0) / 1e6, 1)
+            cur.execute("SET hnsw.ef_search = 40")
+            lat: list[float] = []
+            cands = np.empty((n_lat, k), dtype=np.int64)
+            for i in range(n_lat):
+                vec = _vector_literal(lat_queries[i])
+                t0 = time.perf_counter()
+                cur.execute(f"SELECT row_idx FROM {table} ORDER BY dense_embedding <=> %s::vector LIMIT %s",
+                            (vec, k))
+                got = [r[0] for r in cur.fetchall()]
+                lat.append(time.perf_counter() - t0)
+                cands[i] = (got + [-1] * k)[:k]
+            cur.execute(f"DROP TABLE IF EXISTS {table}")
+
+    p50, p95 = _ann_percentiles(lat)
+    row = {"arch": "pgvector_hnsw", "operating_point": "ef_search=40",
+           "build_s": round(build_hnsw, 1), "index_mb": index_mb,
+           "recall@10": round(_ann_recall(cands, lat_truth), 4),
+           "lat_p50_ms": p50, "lat_p95_ms": p95,
+           "params": "m=16, ef_construction=64 (scratch table, one-off backfill)",
+           "n_queries": n_lat}
+    print(f"[ann-hnsw-full] {full_label} pgvector_hnsw/ef_search=40: "
+          f"recall@10={row['recall@10']:.3f} p50={p50:.2f}ms build={build_hnsw:.0f}s")
+
+    results[full_label] = existing + [row]
+    payload["by_size"] = results
+    payload["generated_at"] = _now()
+    out_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    print(f"[ann-hnsw-full] merged into {out_path.relative_to(PROJECT_ROOT)}")
+    return payload
+
+
 # ============================================================================
 # Phase 5: render LaTeX tables + plots
 # ============================================================================
@@ -1276,7 +1378,7 @@ def render_protocol_a(summary: dict) -> None:
 def render_cross_judge(cj: dict) -> None:
     def verdict(t: float) -> str:
         if t >= 0.85:
-            return "judges agree (UMBRELA $\\tau\\geq0.85$)"
+            return "judges agree ($\\tau\\geq0.85$)"
         if t >= 0.6:
             return "moderate agreement"
         return "ranking ambiguous"
@@ -1681,6 +1783,12 @@ if __name__ == "__main__":
         print("=== ANN architecture benchmark (RQ4) ===")
         phase_scaling_subsets()
         scaling_rq4 = phase_scaling_ann()
+        (OUTPUT_DIR / "scaling_rq4.json").write_text(json.dumps(scaling_rq4, indent=2), encoding="utf-8")
+        print()
+
+    if RUN_SCALING_ANN_HNSW_FULL:
+        print("=== One-off backfill: pgvector HNSW at full 624k scale ===")
+        scaling_rq4 = run_scaling_ann_hnsw_full_backfill()
         (OUTPUT_DIR / "scaling_rq4.json").write_text(json.dumps(scaling_rq4, indent=2), encoding="utf-8")
         print()
 
