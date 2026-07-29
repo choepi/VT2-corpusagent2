@@ -1639,7 +1639,8 @@ def render_scaling_rq4(rq4: dict) -> None:
             first = False
             build = "--" if r.get("build_s") is None else f"{r['build_s']:.0f}"
             mb = "--" if r.get("index_mb") is None else f"{r['index_mb']:.0f}"
-            rows.append(f"{size_cell} & {ARCH_LABEL.get(r['arch'], r['arch'])} & {r['operating_point']} "
+            op_point = str(r["operating_point"]).replace("_", "\\_")
+            rows.append(f"{size_cell} & {ARCH_LABEL.get(r['arch'], r['arch'])} & {op_point} "
                         f"& {build} & {mb} & {r['recall@10']:.3f} & {r['lat_p50_ms']:.2f} \\\\")
         rows.append("\\midrule")
     if rows and rows[-1] == "\\midrule":
