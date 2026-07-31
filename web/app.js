@@ -31,7 +31,6 @@ const llmSettingsNote = document.getElementById("llmSettingsNote");
 const runtimeSummary = document.getElementById("runtimeSummary");
 const retrievalHealth = document.getElementById("retrievalHealth");
 const providersInstalled = document.getElementById("providersInstalled");
-const runtimeNotes = document.getElementById("runtimeNotes");
 const statusBox = document.getElementById("statusBox");
 const detailText = document.getElementById("detailText");
 const activeCount = document.getElementById("activeCount");
@@ -49,7 +48,6 @@ const answerModeBanner = document.getElementById("answerModeBanner");
 const answerText = document.getElementById("answerText");
 const caveatsList = document.getElementById("caveatsList");
 const unsupportedList = document.getElementById("unsupportedList"); // may be null after Simple-tab UI cleanup
-const claimVerdicts = document.getElementById("claimVerdicts");
 const plannerActions = document.getElementById("plannerActions");
 const planNodes = document.getElementById("planNodes");
 const toolCallSummary = document.getElementById("toolCallSummary");
@@ -1356,38 +1354,6 @@ function buildPrintableReportHtml(manifest) {
     ? '<div class="answer-mode-banner">MODEL-ONLY OUT-OF-CORPUS ANSWER: no corpus-grounded evidence was available; this uses the configured planner model\'s prior knowledge.</div>'
     : "";
 
-  const nliStats = metadata.nli_stats || null;
-  const nliRows =
-    metadata.nli_verifier_ran && Array.isArray(metadata.nli_verdicts) ? metadata.nli_verdicts : [];
-  const claimVerdictBlocks = nliRows.length
-    ? `
-        <h3>Claim Verdicts</h3>
-        ${
-          nliStats
-            ? `<p class="muted">NLI verifier ${escapeHtml(String(nliStats.nli_model || ""))} — ${nliStats.claims_supported ?? 0} supported, ${nliStats.claims_contradicted ?? 0} contradicted, ${nliStats.claims_neutral ?? 0} neutral (threshold ${nliStats.verdict_threshold ?? "0.7"}).</p>`
-            : ""
-        }
-        <div class="claim-verdict-grid">
-          ${nliRows
-            .map((row) => {
-              const verdict = String(row.verdict || "neutral").trim() || "neutral";
-              const safeClass = verdict.toLowerCase().replace(/[^a-z0-9_-]/g, "-");
-              const ent = row.entailment_prob != null ? Number(row.entailment_prob).toFixed(2) : "";
-              const con = row.contradiction_prob != null ? Number(row.contradiction_prob).toFixed(2) : "";
-              return `
-                <article class="claim-card claim-card-${safeClass}">
-                  <span class="claim-verdict-pill">${escapeHtml(verdict)}</span>
-                  <p class="claim-text">${escapeHtml(row.claim || "")}</p>
-                  ${row.premise ? `<p class="claim-evidence">${escapeHtml(row.premise)}</p>` : ""}
-                  ${ent ? `<span class="muted">entail ${ent}${con ? ` · contradict ${con}` : ""}</span>` : ""}
-                </article>
-              `;
-            })
-            .join("")}
-        </div>
-      `
-    : "";
-
   const evidenceRows = manifest.evidence_table || finalAnswer.evidence_items || [];
   const evidenceTableHtml = evidenceRows.length
     ? `
@@ -1729,7 +1695,6 @@ function buildPrintableReportHtml(manifest) {
         <div class="section-head"><h2>Answer</h2></div>
         ${answerBanner}
         ${reportMarkdownBlock(finalAnswer.answer_text || "", "No answer text returned.")}
-        ${claimVerdictBlocks}
         <h3>Caveats</h3>
         ${reportList(finalAnswer.caveats || [])}
         ${
@@ -1911,7 +1876,6 @@ function resetManifestPanels(answerMessage = "Waiting for result...") {
     answer_text: answerMessage,
     caveats: [],
     unsupported_parts: [],
-    claim_verdicts: [],
   });
   renderEvidence([]);
   renderArtifacts({ run_id: "", node_records: [], final_answer: { artifacts_used: [] } });
@@ -2009,8 +1973,6 @@ function renderRuntimeInfo(payload) {
     chip.textContent = `${name}: ${installed ? "import ok" : "missing"}`;
     providersInstalled.appendChild(chip);
   });
-
-  renderList(runtimeNotes, [...(payload.analysis_notes || []), ...(llm.warnings || []), ...(device.warnings || [])], (row) => escapeHtml(row));
   updateControlState();
   updateRunSaveDisplay();
   saveUiState();
@@ -2188,39 +2150,6 @@ function renderAnswerPayload(finalAnswer, metadata = {}) {
       : "";
   }
   renderAnswerText(finalAnswer?.answer_text || "");
-  const nliRan = Boolean(metadata?.nli_verifier_ran);
-  const nliRows = Array.isArray(metadata?.nli_verdicts) ? metadata.nli_verdicts : [];
-  const nliStats = metadata?.nli_stats || null;
-  const claimSection = document.getElementById("claimVerdictsSection");
-  const meaningful = nliRan && nliRows.length > 0;
-  if (claimSection) {
-    claimSection.classList.toggle("hidden", !meaningful);
-  }
-  if (meaningful) {
-    const header = nliStats
-      ? `<p class="muted small">NLI verifier ${escapeHtml(String(nliStats.nli_model || ""))} — ${nliStats.claims_supported ?? 0} supported, ${nliStats.claims_contradicted ?? 0} contradicted, ${nliStats.claims_neutral ?? 0} neutral (threshold ${nliStats.verdict_threshold ?? "0.7"}).</p>`
-      : "";
-    const cards = nliRows
-      .map((row) => {
-        const verdict = String(row.verdict || "neutral").trim() || "neutral";
-        const safeClass = verdict.toLowerCase().replace(/[^a-z0-9_-]/g, "-");
-        const ent = (row.entailment_prob != null) ? Number(row.entailment_prob).toFixed(2) : "";
-        const con = (row.contradiction_prob != null) ? Number(row.contradiction_prob).toFixed(2) : "";
-        const probs = ent ? `<span class="muted small">entail ${ent}${con ? ` · contradict ${con}` : ""}</span>` : "";
-        return `
-          <article class="claim-card claim-card-${safeClass}">
-            <span class="claim-verdict-pill">${escapeHtml(verdict)}</span>
-            <p class="claim-text">${escapeHtml(row.claim || "")}</p>
-            ${row.premise ? `<p class="claim-evidence">${escapeHtml(row.premise)}</p>` : ""}
-            ${probs}
-          </article>
-        `;
-      })
-      .join("");
-    claimVerdicts.innerHTML = header + cards;
-  } else {
-    claimVerdicts.innerHTML = "";
-  }
   renderList(caveatsList, finalAnswer?.caveats || [], (row) => escapeHtml(row));
   if (unsupportedList) {
     renderList(unsupportedList, finalAnswer?.unsupported_parts || [], (row) => escapeHtml(row));
@@ -2396,7 +2325,7 @@ async function loadRuntimeInfo() {
     renderRuntimeInfo(payload);
   } catch (error) {
     runtimeModeBadge.textContent = "Runtime info unavailable";
-    renderList(runtimeNotes, [`Could not load runtime info: ${error.message}`], (row) => escapeHtml(row));
+    console.warn("Could not load runtime info", error);
   }
   try {
     const payload = await fetchJson(`${base}/capabilities`);

@@ -109,11 +109,6 @@
           <div id="answerModeBanner" class="answer-mode-banner hidden"></div>
           <div id="answerText" class="answer-rendered">Waiting for a run.</div>
 
-          <div id="claimVerdictsSection" class="hidden">
-            <h3>Claim Verdicts</h3>
-            <div id="claimVerdicts" class="claim-verdict-grid"></div>
-          </div>
-
           <h3>Caveats</h3>
           <ul id="caveatsList"></ul>
         </section>
@@ -225,18 +220,13 @@
               <div id="runtimeSummary" class="metric-stack"></div>
             </div>
             <div>
-              <h3>Retrieval Health</h3>
               <div id="retrievalHealth" class="metric-stack"></div>
             </div>
           </div>
-          <details class="mini-details">
-            <summary>Provider imports and runtime notes</summary>
+          <div class="mini-details">
             <h3>Provider Imports</h3>
             <div id="providersInstalled" class="chip-wrap"></div>
-            <p class="muted">These chips show whether provider libraries import. Per-node provenance shows what actually executed.</p>
-            <h3>Execution Notes</h3>
-            <ul id="runtimeNotes"></ul>
-          </details>
+          </div>
         </article>
 
         <article class="card transcript-card">

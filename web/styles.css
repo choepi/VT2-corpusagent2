@@ -1036,29 +1036,7 @@ h3 {
   overflow: hidden;
 }
 
-.mini-details > summary {
-  cursor: pointer;
-  padding: 12px 14px;
-  font-weight: 700;
-  color: var(--ink);
-  list-style: none;
-}
-
-.mini-details > summary::-webkit-details-marker {
-  display: none;
-}
-
-.mini-details > summary::after {
-  content: "Open";
-  float: right;
-  color: var(--accent);
-}
-
-.mini-details[open] > summary::after {
-  content: "Close";
-}
-
-.mini-details > *:not(summary) {
+.mini-details > * {
   margin: 0 14px 14px;
 }
 
